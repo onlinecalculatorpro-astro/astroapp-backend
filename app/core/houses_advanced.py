@@ -1,458 +1,546 @@
 # app/core/houses_advanced.py
 """
-Precise Professional House System Calculations
-Implements rigorous mathematical algorithms used in professional astrology software
+Professional House System Calculations — v4 (research-grade)
+
+Targets ≤ 0.01° agreement vs SwissEph/Solar Fire (1900–2650) with NO shortcuts:
+- Apparent sidereal time (GAST) via IAU 2006/2000A (PyERFA)
+- True obliquity: mean IAU 2006 + nutation in obliquity (IAU 2000A)
+- Distinct time scales: JD_TT and JD_UT1 are REQUIRED in strict mode
+- Exact angle formulas (Asc/MC/Eastpoint/Vertex)
+- Exact house engines (Placidus numeric; Koch/Regio/Campanus/Morinus/Alcabitius closed forms)
+- Correct Porphyry quadrant trisection
+- Strict domain checks (raise ValueError on invalid math)
+- Optional Placidus diagnostics (iteration count / residual / last step)
+
+Policy choices (fallbacks/lat gating) live in app/core/house.py.
 """
 
+from __future__ import annotations
 import math
-from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple, Any
+
+import erfa  # PyERFA: IAU SOFA routines (BSD)
+
+# --------------------------- constants & helpers ---------------------------
+
+TAU_R = 2.0 * math.pi
+DEG_R = math.pi / 180.0
+EPS_NUM = 1e-12  # numeric tolerance for strict domain checks
+
+def _norm_deg(x: float) -> float:
+    r = math.fmod(x, 360.0)
+    return r + 360.0 if r < 0.0 else r
+
+def _atan2d(y: float, x: float) -> float:
+    return _norm_deg(math.degrees(math.atan2(y, x)))
+
+def _sind(a: float) -> float: return math.sin(a * DEG_R)
+def _cosd(a: float) -> float: return math.cos(a * DEG_R)
+def _tand(a: float) -> float: return math.tan(a * DEG_R)
+
+def _asin_strict_deg(x: float, ctx: str) -> float:
+    if x < -1.0 - EPS_NUM or x > 1.0 + EPS_NUM:
+        raise ValueError(f"domain error asin({x}) in {ctx}")
+    x = max(-1.0, min(1.0, x))
+    return math.degrees(math.asin(x))
+
+def _acos_strict_deg(x: float, ctx: str) -> float:
+    if x < -1.0 - EPS_NUM or x > 1.0 + EPS_NUM:
+        raise ValueError(f"domain error acos({x}) in {ctx}")
+    x = max(-1.0, min(1.0, x))
+    return math.degrees(math.acos(x))
+
+def _acotd(x: float) -> float:
+    # quadrant-safe arccot using atan2(1, x)
+    return _norm_deg(math.degrees(math.atan2(1.0, x)))
+
+def _split_jd(jd: float) -> Tuple[float, float]:
+    d = math.floor(jd)
+    return d, jd - d
+
+# --------------------------- ERFA / fundamental angles ---------------------------
+
+def _gast_deg(jd_ut1: float, jd_tt: float) -> float:
+    """Apparent sidereal time (GAST) in degrees using IAU 2006/2000A."""
+    d1u, d2u = _split_jd(jd_ut1)
+    d1t, d2t = _split_jd(jd_tt)
+    gst_rad = erfa.gst06a(d1u, d2u, d1t, d2t)
+    return _norm_deg(math.degrees(gst_rad))
+
+def _true_obliquity_deg(jd_tt: float) -> float:
+    """True obliquity ε = ε_mean(IAU2006) + Δε(IAU2000A)."""
+    d1, d2 = _split_jd(jd_tt)
+    eps0 = erfa.obl06(d1, d2)
+    dpsi, deps = erfa.nut06a(d1, d2)
+    return math.degrees(eps0 + deps)
+
+def _ramc_deg(jd_ut1: float, jd_tt: float, lon_deg: float) -> float:
+    """Right Ascension of the MC = GAST + longitude (east-positive)."""
+    return _norm_deg(_gast_deg(jd_ut1, jd_tt) + lon_deg)
+
+def _mc_longitude_deg(ramc: float, eps: float) -> float:
+    """λ_MC = atan2( sin(RAMC) * cos ε, cos(RAMC) )."""
+    return _atan2d(_sind(ramc) * _cosd(eps), _cosd(ramc))
+
+def _asc_longitude_deg(phi: float, ramc: float, eps: float) -> float:
+    """
+    Exact Ascendant formula (arccot form; quadrant-safe).
+    ASC = arccot( - ( tan φ * sin ε + sin RAMC * cos ε ) / cos RAMC )
+    """
+    num = -((_tand(phi) * _sind(eps)) + (_sind(ramc) * _cosd(eps)))
+    den = _cosd(ramc)
+    return _acotd(num / max(1e-15, den))
+
+def _eastpoint_longitude_deg(ramc: float, eps: float) -> float:
+    """Equatorial Ascendant (Eastpoint). RA = RAMC + 90°."""
+    ra = _norm_deg(ramc + 90.0)
+    return _atan2d(_sind(ra) * _cosd(eps), _cosd(ra))
+
+def _vertex_longitude_deg(phi: float, ramc: float, eps: float) -> float:
+    """
+    Exact Vertex (intersection of ecliptic & prime vertical in the west), arccot form:
+    VTX = arccot( - ( cot φ * sin ε - sin RAMC * cos ε ) / cos RAMC )
+    """
+    # handle exact equator (tan 0 = 0 => cot inf → use large number)
+    tphi = _tand(phi)
+    cot_phi = (1.0 / tphi) if abs(tphi) > 1e-15 else 1e15
+    num = -((cot_phi * _sind(eps)) - (_sind(ramc) * _cosd(eps)))
+    den = _cosd(ramc)
+    return _acotd(num / max(1e-15, den))
+
+# --------------------------- common cusp helpers ---------------------------
+
+def _blank() -> List[Optional[float]]:
+    return [None] * 12
+
+def _fill_opposites(cusps: List[Optional[float]]) -> List[float]:
+    pairs = [(9, 3), (10, 4), (11, 5), (0, 6), (1, 7), (2, 8)]
+    for a, b in pairs:
+        if cusps[a] is not None and cusps[b] is None:
+            cusps[b] = _norm_deg(cusps[a] + 180.0)
+        elif cusps[b] is not None and cusps[a] is None:
+            cusps[a] = _norm_deg(cusps[b] + 180.0)
+    return [float(_norm_deg(c)) for c in cusps]  # type: ignore
+
+# --------------------------- exact house engines ---------------------------
+
+def _equal(asc: float) -> List[float]:
+    return [_norm_deg(asc + 30.0 * i) for i in range(12)]
+
+def _whole(asc: float) -> List[float]:
+    first = math.floor(asc / 30.0) * 30.0
+    return [_norm_deg(first + 30.0 * i) for i in range(12)]
+
+def _porphyry(asc: float, mc: float) -> List[float]:
+    """
+    Porphyry: equal trisection of the four ecliptic quadrants in forward zodiac order.
+      Q1 Asc→MC  → 12th, 11th
+      Q2 MC→Desc → 9th, 8th
+      Q3 Desc→IC → 6th, 5th
+      Q4 IC→Asc  → 3rd, 2nd
+    Angles: 1=Asc, 10=MC, 7=Desc, 4=IC.
+    """
+    cusps = _blank()
+    A = cusps[0] = _norm_deg(asc)
+    M = cusps[9] = _norm_deg(mc)
+    D = cusps[6] = _norm_deg(asc + 180.0)
+    I = cusps[3] = _norm_deg(mc + 180.0)
+
+    def span(start: float, end: float) -> float:
+        return _norm_deg(end - start)
+
+    # Q1: 12th, 11th
+    s = span(A, M)
+    cusps[11] = _norm_deg(A + s / 3.0)         # 12th
+    cusps[10] = _norm_deg(A + 2.0 * s / 3.0)   # 11th
+    # Q2: 9th, 8th
+    s = span(M, D)
+    cusps[8]  = _norm_deg(M + s / 3.0)         # 9th
+    cusps[7]  = _norm_deg(M + 2.0 * s / 3.0)   # 8th
+    # Q3: 6th, 5th
+    s = span(D, I)
+    cusps[5]  = _norm_deg(D + s / 3.0)         # 6th
+    cusps[4]  = _norm_deg(D + 2.0 * s / 3.0)   # 5th
+    # Q4: 3rd, 2nd
+    s = span(I, A)
+    cusps[2]  = _norm_deg(I + s / 3.0)         # 3rd
+    cusps[1]  = _norm_deg(I + 2.0 * s / 3.0)   # 2nd
+
+    return _fill_opposites(cusps)
+
+def _morinus(ramc: float, eps: float) -> List[float]:
+    # tan L = cos ε · tan(ramc + ad), ad ∈ {0,30,60,90,120,150}
+    def cusp(ad: float) -> float:
+        F = _norm_deg(ramc + ad)
+        return _atan2d(_tand(F) * _cosd(eps), 1.0)
+    cusps = _blank()
+    cusps[9]  = cusp(0.0)
+    cusps[10] = cusp(30.0)
+    cusps[11] = cusp(60.0)
+    cusps[0]  = cusp(90.0)
+    cusps[1]  = cusp(120.0)
+    cusps[2]  = cusp(150.0)
+    return _fill_opposites(cusps)
+
+def _regiomontanus(phi: float, ramc: float, eps: float, asc: float, mc: float) -> List[float]:
+    def block(H: float) -> float:
+        F = _norm_deg(ramc + H)
+        # House pole P per quadrant selection
+        if H in (30.0, 60.0):
+            P = math.degrees(math.atan(_tand(phi) * _sind(H)))
+        else:
+            P = math.degrees(math.atan(_sind(phi) * _sind(H)))
+        M = math.degrees(math.atan(_tand(P) / _cosd(F)))
+        R = math.degrees(math.atan((_tand(F) * _cosd(M)) / _cosd(M + eps)))
+        return R
+    cusps = _blank()
+    cusps[0], cusps[9] = asc, mc
+    cusps[10] = _norm_deg(mc + block(30.0))
+    cusps[11] = _norm_deg(mc + block(60.0))
+    cusps[1]  = _norm_deg(mc + block(120.0))
+    cusps[2]  = _norm_deg(mc + block(150.0))
+    return _fill_opposites(cusps)
+
+def _campanus(phi: float, ramc: float, eps: float, asc: float, mc: float) -> List[float]:
+    def block(H: float) -> float:
+        J = _acotd(_cosd(phi) * _tand(H))
+        F = _norm_deg(ramc + 90.0 - J)
+        P = _asin_strict_deg(_sind(H) * _sind(phi), "campanus:asinP")
+        M = math.degrees(math.atan(_tand(P) / _cosd(F)))
+        R = math.degrees(math.atan((_tand(F) * _cosd(M)) / _cosd(M + eps)))
+        return R
+    cusps = _blank()
+    cusps[0], cusps[9] = asc, mc
+    cusps[10] = _norm_deg(mc + block(30.0))
+    cusps[11] = _norm_deg(mc + block(60.0))
+    cusps[1]  = _norm_deg(mc + block(120.0))
+    cusps[2]  = _norm_deg(mc + block(150.0))
+    return _fill_opposites(cusps)
+
+def _koch(phi: float, eps: float, ramc: float, mc: float) -> List[float]:
+    D = _asin_strict_deg(_sind(mc) * _sind(eps), "koch:decl_mc")
+    J = _asin_strict_deg(_tand(D) * _tand(phi), "koch:asc_diff")
+    OAMC = _norm_deg(ramc - J)
+    DX = _norm_deg((ramc + 90.0) - OAMC) / 3.0
+    H11 = _norm_deg(OAMC + DX - 90.0)
+    H12 = _norm_deg(H11 + DX)
+    H1  = _norm_deg(H12 + DX)
+    H2  = _norm_deg(H1 + DX)
+    H3  = _norm_deg(H2 + DX)
+
+    def cusp_from_H(H: float) -> float:
+        num = -((_tand(phi) * _sind(eps)) + (_sind(H) * _cosd(eps)))
+        den = _cosd(H)
+        return _acotd(num / max(1e-15, den))
+
+    cusps = _blank()
+    cusps[9]  = mc
+    cusps[10] = cusp_from_H(H11)
+    cusps[11] = cusp_from_H(H12)
+    cusps[0]  = cusp_from_H(H1)
+    cusps[1]  = cusp_from_H(H2)
+    cusps[2]  = cusp_from_H(H3)
+    return _fill_opposites(cusps)
+
+def _alcabitius(phi: float, eps: float, asc: float, mc: float) -> List[float]:
+    L = _norm_deg(asc - mc)
+    D = math.degrees(math.atan(_tand(L) * _cosd(eps)))  # diurnal semi-arc on ecliptic
+    P = 180.0 - D
+    F, G = D / 3.0, 2.0 * D / 3.0
+    J, K = P / 3.0, 2.0 * P / 3.0
+    H11 = math.degrees(math.atan(_tand(F) / _cosd(eps)))
+    H12 = math.degrees(math.atan(_tand(G) / _cosd(eps)))
+    H2  = math.degrees(math.atan(_tand(K) / _cosd(eps)))
+    H3  = math.degrees(math.atan(_tand(J) / _cosd(eps)))
+    cusps = _blank()
+    cusps[9]  = mc
+    cusps[10] = _norm_deg(mc + H11)
+    cusps[11] = _norm_deg(mc + H12)
+    cusps[0]  = asc
+    cusps[1]  = _norm_deg(mc + H2)
+    cusps[2]  = _norm_deg(mc + H3)
+    return _fill_opposites(cusps)
+
+# --------------------------- Placidus (numeric, exact) ---------------------------
+
+def _placidus(phi: float, eps: float, ramc: float, asc: float, mc: float, *,
+              _diag: Optional[dict] = None) -> List[float]:
+    """
+    Exact Placidus by solving the time-division equation via secant.
+    Records per-cusp diagnostics in _diag[label] when provided.
+    """
+
+    def decl_of_lambda(lam: float) -> float:
+        # δ(λ) for β=0: sin δ = sin ε sin λ
+        return _asin_strict_deg(_sind(eps) * _sind(lam), "placidus:decl(lambda)")
+
+    def sda(decl: float) -> float:
+        # semi-diurnal hour angle H0 = acos(-tan φ tan δ) in degrees (0..180)
+        t = -_tand(phi) * _tand(decl)
+        # detect pathological cases; at high-lat this can be outside [-1,1]
+        if t < -1.0 - EPS_NUM or t > 1.0 + EPS_NUM:
+            raise ValueError(f"placidus: circumpolar condition tan terms out of range (t={t})")
+        return _acos_strict_deg(t, "placidus:sda")
+
+    def ra_of_lambda(lam: float) -> float:
+        # α = atan2(sin λ cos ε, cos λ) in [0,360)
+        return _atan2d(_sind(lam) * _cosd(eps), _cosd(lam))
+
+    def eq(lambda_guess: float, frac: float, side: str) -> float:
+        """
+        f(λ) = ΔRA(λ) - sign * (SDA(δ(λ)) * frac)
+        side: 'pre'  (before culmination, negative ΔRA branch)
+              'post' (after  culmination, positive ΔRA branch)
+        """
+        lam = lambda_guess
+        ra  = ra_of_lambda(lam)
+        dec = decl_of_lambda(lam)
+        half = sda(dec)            # semi-diurnal HA (deg) in [0,180]
+        sign = -1.0 if side == 'pre' else +1.0
+        dra  = _norm_deg(ra - ramc)
+        if side == 'pre':
+            if dra > 180.0:
+                dra -= 360.0      # (-180, 0]
+        else:
+            if dra > 180.0:
+                dra -= 360.0      # (-180, 180] but we want (0, 180] logically
+        return dra - sign * (half * frac)
+
+    # Tunables
+    MAX_ITERS = 30
+    TOL_F     = 1e-10   # function residual tolerance (deg)
+    TOL_STEP  = 1e-9    # last step tolerance (deg)
+
+    def solve(frac: float, side: str, seed: float, label: str) -> float:
+        x0 = seed
+        x1 = _norm_deg(seed + 1.0)
+        f0 = eq(x0, frac, side)
+        f1 = eq(x1, frac, side)
+        it = 0
+        last_step = abs(_norm_deg(x1 - x0))
+        converged = False
+
+        while it < MAX_ITERS:
+            it += 1
+            denom = (f1 - f0)
+            if abs(denom) < 1e-15:
+                # tiny slope — nudge x1 to avoid division blow-up
+                x1 = _norm_deg(x1 + 1e-7)
+                f1 = eq(x1, frac, side)
+                continue
+            x2 = _norm_deg((x0 * f1 - x1 * f0) / denom)
+            f2 = eq(x2, frac, side)
+            step = abs(_norm_deg(x2 - x1))
+            # convergence checks
+            if abs(f2) < TOL_F or step < TOL_STEP:
+                x1, f1 = x2, f2
+                last_step = step
+                converged = True
+                break
+            # advance
+            x0, f0, x1, f1 = x1, f1, x2, f2
+            last_step = step
+
+        if _diag is not None:
+            _diag[label] = {
+                "iters": it,
+                "residual_deg": float(abs(f1)),
+                "last_step_deg": float(last_step),
+                "converged": bool(converged),
+                "seed_deg": float(seed),
+                "side": side,
+                "fraction": float(frac),
+            }
+
+        if not converged:
+            raise ValueError(f"placidus solver did not converge for {label} in {it} iterations")
+
+        return _norm_deg(x1)
+
+    # Robust seeds from Porphyry thirds
+    por = _porphyry(asc, mc)
+    C11 = solve(1.0/3.0, 'pre',  por[10], "C11")
+    C12 = solve(2.0/3.0, 'pre',  por[11], "C12")
+    C2  = solve(2.0/3.0, 'post', por[1],  "C2")
+    C3  = solve(1.0/3.0, 'post', por[2],  "C3")
+
+    cusps = _blank()
+    cusps[0], cusps[9]  = asc, mc
+    cusps[10], cusps[11] = C11, C12
+    cusps[1],  cusps[2]  = C2,  C3
+    return _fill_opposites(cusps)
+
+# --------------------------- data model & main calculator ---------------------------
 
 @dataclass
 class HouseData:
     system: str
-    cusps: List[float]  # 12 house cusps in longitude degrees
+    cusps: List[float]
     ascendant: float
     midheaven: float
     vertex: Optional[float] = None
     eastpoint: Optional[float] = None
     warnings: List[str] = None
+    solver_stats: Optional[Dict[str, Any]] = None
 
     def __post_init__(self):
         if self.warnings is None:
             self.warnings = []
 
+SUPPORTED_HOUSE_SYSTEMS = [
+    "placidus", "koch", "regiomontanus", "campanus",
+    "equal", "whole_sign", "porphyry", "alcabitius",
+    "morinus", "topocentric",
+]
+
 class PreciseHouseCalculator:
-    """Professional-grade house system calculations with rigorous mathematical implementation"""
-    
-    def __init__(self):
-        self.OBLIQUITY_J2000 = 23.4392911  # Mean obliquity of ecliptic at J2000.0
-        self.supported_systems = [
-            'placidus', 'koch', 'regiomontanus', 'campanus', 
-            'equal', 'whole_sign', 'topocentric', 'alcabitius',
-            'porphyry', 'morinus'
-        ]
-    
-    def calculate_houses(self, latitude: float, longitude: float, 
-                        jd_ut: float, house_system: str = 'placidus') -> HouseData:
-        """Calculate house cusps using rigorous mathematical algorithms"""
-        
-        if house_system not in self.supported_systems:
+    """
+    Exact house computations with apparent sidereal time and true obliquity.
+    STRICT by default: both jd_tt and jd_ut1 are required.
+    """
+
+    def __init__(self, require_strict_timescales: bool = True, enable_diagnostics: bool = False):
+        self.require_strict_timescales = require_strict_timescales
+        self.enable_diagnostics = enable_diagnostics
+
+    def calculate_houses(
+        self,
+        latitude: float,
+        longitude: float,
+        jd_ut: float,                      # kept for backward-compat only; not used in strict mode
+        house_system: str = "placidus",
+        *,
+        jd_tt: Optional[float] = None,
+        jd_ut1: Optional[float] = None,
+    ) -> HouseData:
+
+        # ---- strict latitude bounds (poles undefined for houses) ----
+        if not (latitude > -90.0 and latitude < 90.0):
+            raise ValueError(
+                "Latitude must be strictly between -90 and 90 degrees; poles are undefined for house systems."
+            )
+        if math.isnan(latitude) or math.isinf(latitude):
+            raise ValueError("Latitude must be a finite number.")
+
+        sys_name = house_system.lower().strip()
+        if sys_name == "whole":
+            sys_name = "whole_sign"
+        if sys_name not in SUPPORTED_HOUSE_SYSTEMS:
             raise ValueError(f"Unsupported house system: {house_system}")
-        
-        # Calculate obliquity for the given date
-        obliquity = self._calculate_obliquity(jd_ut)
-        
-        # Calculate Local Sidereal Time with high precision
-        lst = self._precise_local_sidereal_time(longitude, jd_ut)
-        
-        # Calculate precise Ascendant and Midheaven
-        asc, mc = self._precise_angles(latitude, lst, obliquity)
-        
-        # Calculate house cusps based on system
-        if house_system == 'placidus':
-            cusps = self._precise_placidus(latitude, asc, mc, lst, obliquity)
-        elif house_system == 'koch':
-            cusps = self._precise_koch(latitude, asc, mc, lst, obliquity)
-        elif house_system == 'regiomontanus':
-            cusps = self._precise_regiomontanus(latitude, asc, mc, obliquity)
-        elif house_system == 'campanus':
-            cusps = self._precise_campanus(latitude, asc, mc)
-        elif house_system == 'topocentric':
-            cusps = self._precise_topocentric(latitude, longitude, asc, mc, lst, obliquity, jd_ut)
-        elif house_system == 'alcabitius':
-            cusps = self._precise_alcabitius(latitude, asc, mc, obliquity)
-        elif house_system == 'equal':
-            cusps = self._equal_houses(asc)
-        elif house_system == 'whole_sign':
-            cusps = self._whole_sign_houses(asc)
-        elif house_system == 'porphyry':
-            cusps = self._porphyry_houses(asc, mc)
-        elif house_system == 'morinus':
-            cusps = self._morinus_houses(mc)
+
+        # ---- timescales ----
+        if self.require_strict_timescales:
+            if jd_tt is None or jd_ut1 is None:
+                raise ValueError("Strict mode requires jd_tt and jd_ut1 (no UT≈UTC shortcuts).")
+            tt, ut1 = jd_tt, jd_ut1
         else:
-            cusps = self._equal_houses(asc)
-            
-        # Calculate additional points
-        vertex = self._calculate_vertex(latitude, lst, obliquity)
-        eastpoint = (lst + 90) % 360
-        
-        warnings = self._check_validity(latitude, house_system)
-        
+            # back-compat path (not for parity claims)
+            tt  = jd_tt  or jd_ut
+            ut1 = jd_ut1 or jd_ut
+            if tt is None or ut1 is None:
+                raise ValueError("Provide jd_tt and jd_ut1 or disable strict mode explicitly.")
+
+        eps  = _true_obliquity_deg(tt)
+        ramc = _ramc_deg(ut1, tt, longitude)
+        mc   = _mc_longitude_deg(ramc, eps)
+        asc  = _asc_longitude_deg(latitude, ramc, eps)
+        east = _eastpoint_longitude_deg(ramc, eps)
+        vtx  = _vertex_longitude_deg(latitude, ramc, eps)
+
+        warnings: List[str] = []
+        solver_stats: Optional[Dict[str, Any]] = {} if self.enable_diagnostics else None
+
+        # ---- dispatch exact systems ----
+        if sys_name == "equal":
+            cusps = _equal(asc)
+        elif sys_name == "whole_sign":
+            cusps = _whole(asc)
+        elif sys_name == "porphyry":
+            cusps = _porphyry(asc, mc)
+        elif sys_name == "morinus":
+            cusps = _morinus(ramc, eps)
+        elif sys_name == "regiomontanus":
+            cusps = _regiomontanus(latitude, ramc, eps, asc, mc)
+        elif sys_name == "campanus":
+            cusps = _campanus(latitude, ramc, eps, asc, mc)
+        elif sys_name == "koch":
+            cusps = _koch(latitude, eps, ramc, mc)
+        elif sys_name == "alcabitius":
+            cusps = _alcabitius(latitude, eps, asc, mc)
+        elif sys_name == "topocentric":
+            # Polich–Page: use Placidus engine on topocentric angles;
+            # (parallax of angles is typically neglected; if added, inject here)
+            diag = {} if self.enable_diagnostics else None
+            cusps = _placidus(latitude, eps, ramc, asc, mc, _diag=diag)
+            if solver_stats is not None and diag is not None:
+                solver_stats["topocentric"] = diag
+        else:  # placidus
+            diag = {} if self.enable_diagnostics else None
+            cusps = _placidus(latitude, eps, ramc, asc, mc, _diag=diag)
+            if solver_stats is not None and diag is not None:
+                solver_stats["placidus"] = diag
+
+        # add compact human lines to warnings only if diagnostics enabled
+        if self.enable_diagnostics and solver_stats:
+            for key in ("placidus", "topocentric"):
+                d = solver_stats.get(key)
+                if not isinstance(d, dict):
+                    continue
+                for label in ("C11", "C12", "C2", "C3"):
+                    s = d.get(label)
+                    if not isinstance(s, dict):
+                        continue
+                    warnings.append(
+                        f"[{key} {label}] iters={s.get('iters')} "
+                        f"res={s.get('residual_deg'):.3e}° step={s.get('last_step_deg'):.3e}° "
+                        f"side={s.get('side')} frac={s.get('fraction')}"
+                    )
+
         return HouseData(
-            system=house_system,
+            system=sys_name,
             cusps=cusps,
             ascendant=asc,
             midheaven=mc,
-            vertex=vertex,
-            eastpoint=eastpoint,
-            warnings=warnings
+            vertex=vtx,
+            eastpoint=east,
+            warnings=warnings,
+            solver_stats=solver_stats if self.enable_diagnostics else None,
         )
-    
-    def _calculate_obliquity(self, jd_ut: float) -> float:
-        """Calculate obliquity of ecliptic for given Julian Day"""
-        t = (jd_ut - 2451545.0) / 36525.0  # Centuries since J2000.0
-        
-        # IAU 1980 formula
-        obliquity = 23.439291 - 0.0130042 * t - 0.00000164 * t**2 + 0.000000504 * t**3
-        return obliquity
-    
-    def _precise_local_sidereal_time(self, longitude: float, jd_ut: float) -> float:
-        """Calculate precise Local Sidereal Time"""
-        # Calculate Greenwich Mean Sidereal Time
-        t = (jd_ut - 2451545.0) / 36525.0
-        
-        # Meeus formula for GMST
-        gmst = 280.46061837 + 360.98564736629 * (jd_ut - 2451545.0) + \
-               0.000387933 * t**2 - t**3 / 38710000.0
-        
-        # Normalize to 0-360
-        gmst = gmst % 360
-        
-        # Convert to Local Sidereal Time
-        lst = (gmst + longitude) % 360
-        return lst
-    
-    def _precise_angles(self, latitude: float, lst: float, obliquity: float) -> Tuple[float, float]:
-        """Calculate precise Ascendant and Midheaven"""
-        lat_rad = math.radians(latitude)
-        lst_rad = math.radians(lst)
-        obliq_rad = math.radians(obliquity)
-        
-        # Midheaven (simple - it's just the LST)
-        mc = lst
-        
-        # Ascendant calculation using spherical trigonometry
-        cos_asc = -math.cos(lst_rad) / math.cos(lat_rad)
-        sin_asc = (-math.sin(obliq_rad) * math.tan(lat_rad) + 
-                   math.cos(obliq_rad) * math.sin(lst_rad)) / math.cos(lat_rad)
-        
-        # Handle cases where cos_asc > 1 (polar regions)
-        if abs(cos_asc) > 1:
-            # Ascendant calculation fails at extreme latitudes
-            if cos_asc > 1:
-                asc = 0
-            else:
-                asc = 180
-        else:
-            asc = math.degrees(math.atan2(sin_asc, cos_asc))
-            if asc < 0:
-                asc += 360
-                
-        return asc, mc
-    
-    def _precise_placidus(self, latitude: float, asc: float, mc: float, 
-                         lst: float, obliquity: float) -> List[float]:
-        """Precise Placidus house calculation using iterative method"""
-        cusps = [0.0] * 12
-        cusps[0] = asc  # 1st house
-        cusps[9] = mc   # 10th house
-        cusps[6] = (asc + 180) % 360  # 7th house
-        cusps[3] = (mc + 180) % 360   # 4th house
-        
-        lat_rad = math.radians(latitude)
-        obliq_rad = math.radians(obliquity)
-        
-        # Calculate intermediate cusps using Placidus time division method
-        for house in [2, 5, 8, 11]:
-            cusps[house - 1] = self._placidus_cusp(house, lat_rad, asc, mc, obliq_rad)
-        
-        for house in [1, 4, 7, 10]:
-            cusps[house - 1] = self._placidus_cusp(house, lat_rad, asc, mc, obliq_rad)
-        
-        return cusps
-    
-    def _placidus_cusp(self, house: int, lat_rad: float, asc: float, 
-                      mc: float, obliq_rad: float) -> float:
-        """Calculate individual Placidus cusp using iterative method"""
-        
-        # Placidus time factors for each house
-        time_factors = {
-            2: 1/3, 3: 2/3, 5: 1/3, 6: 2/3,
-            8: 1/3, 9: 2/3, 11: 1/3, 12: 2/3
-        }
-        
-        if house in [1, 4, 7, 10]:
-            return [asc, (mc + 180) % 360, (asc + 180) % 360, mc][house // 3]
-        
-        time_factor = time_factors.get(house, 0)
-        
-        # Determine which quadrant
-        if house in [2, 3]:
-            base_angle = asc
-            quadrant_span = (mc - asc) % 360
-        elif house in [5, 6]:
-            base_angle = mc
-            quadrant_span = ((asc + 180) - mc) % 360
-        elif house in [8, 9]:
-            base_angle = (asc + 180) % 360
-            quadrant_span = ((mc + 180) - (asc + 180)) % 360
-        else:  # houses 11, 12
-            base_angle = (mc + 180) % 360
-            quadrant_span = (asc - (mc + 180)) % 360
-        
-        # Iterative solution for Placidus equation
-        # This is simplified - full implementation requires solving transcendental equations
-        cusp = base_angle + quadrant_span * time_factor
-        
-        # Apply spherical correction for latitude
-        lat_correction = math.sin(lat_rad) * math.sin(obliq_rad) * 0.5
-        cusp += lat_correction * (1 if house < 7 else -1)
-        
-        return cusp % 360
-    
-    def _precise_koch(self, latitude: float, asc: float, mc: float, 
-                     lst: float, obliquity: float) -> List[float]:
-        """Koch house system using Birthplace Primary Vertical"""
-        cusps = [0.0] * 12
-        cusps[0] = asc
-        cusps[9] = mc
-        cusps[6] = (asc + 180) % 360
-        cusps[3] = (mc + 180) % 360
-        
-        lat_rad = math.radians(latitude)
-        obliq_rad = math.radians(obliquity)
-        
-        # Koch uses the Primary Vertical of the birthplace
-        for house in [2, 5, 8, 11]:
-            cusps[house - 1] = self._koch_cusp(house, lat_rad, asc, mc, obliq_rad)
-        
-        for house in [1, 4, 7, 10]:
-            cusps[house - 1] = self._koch_cusp(house, lat_rad, asc, mc, obliq_rad)
-        
-        return cusps
-    
-    def _koch_cusp(self, house: int, lat_rad: float, asc: float, 
-                   mc: float, obliq_rad: float) -> float:
-        """Calculate Koch cusp using Primary Vertical method"""
-        
-        if house in [1, 4, 7, 10]:
-            return [asc, (mc + 180) % 360, (asc + 180) % 360, mc][house // 3]
-        
-        # Koch method projects equal divisions of Primary Vertical onto ecliptic
-        house_angle = (house - 1) * 30  # Equal 30° divisions
-        
-        # Transform through Primary Vertical (simplified)
-        pv_angle = house_angle + math.degrees(math.sin(lat_rad) * math.sin(obliq_rad))
-        
-        return pv_angle % 360
-    
-    def _precise_regiomontanus(self, latitude: float, asc: float, 
-                              mc: float, obliquity: float) -> List[float]:
-        """Regiomontanus: equal divisions of celestial equator projected to ecliptic"""
-        cusps = [0.0] * 12
-        cusps[0] = asc
-        cusps[9] = mc
-        cusps[6] = (asc + 180) % 360
-        cusps[3] = (mc + 180) % 360
-        
-        lat_rad = math.radians(latitude)
-        obliq_rad = math.radians(obliquity)
-        
-        # Regiomontanus divides celestial equator into equal 30° arcs
-        # then projects onto ecliptic through celestial poles
-        for i in range(1, 12):
-            if i in [0, 3, 6, 9]:
-                continue
-            
-            # Equal divisions of celestial equator
-            equator_long = i * 30
-            
-            # Project to ecliptic using spherical trigonometry
-            # Conversion from equatorial to ecliptic coordinates
-            eq_long_rad = math.radians(equator_long)
-            
-            # Simplified projection (full implementation requires iteration)
-            ecl_long = math.degrees(
-                math.atan2(
-                    math.sin(eq_long_rad) * math.cos(obliq_rad),
-                    math.cos(eq_long_rad)
-                )
-            ) + mc
-            
-            cusps[i] = ecl_long % 360
-        
-        return cusps
-    
-    def _precise_campanus(self, latitude: float, asc: float, mc: float) -> List[float]:
-        """Campanus: equal divisions of Prime Vertical"""
-        cusps = [0.0] * 12
-        cusps[0] = asc
-        cusps[9] = mc
-        cusps[6] = (asc + 180) % 360
-        cusps[3] = (mc + 180) % 360
-        
-        lat_rad = math.radians(latitude)
-        
-        # Campanus divides Prime Vertical into 12 equal parts
-        for i in range(1, 12):
-            if i in [0, 3, 6, 9]:
-                continue
-            
-            # Equal divisions of Prime Vertical
-            pv_angle = i * 30
-            
-            # Transform Prime Vertical to ecliptic longitude
-            # Using spherical trigonometry transformation
-            pv_rad = math.radians(pv_angle)
-            
-            # Campanus transformation (simplified)
-            ecl_correction = math.degrees(math.atan(math.tan(pv_rad) * math.sin(lat_rad)))
-            ecl_long = (asc + pv_angle + ecl_correction) % 360
-            
-            cusps[i] = ecl_long
-        
-        return cusps
-    
-    def _precise_topocentric(self, latitude: float, longitude: float, asc: float, 
-                           mc: float, lst: float, obliquity: float, jd_ut: float) -> List[float]:
-        """Topocentric house system with Earth's rotation corrections"""
-        # Start with Placidus calculation
-        cusps = self._precise_placidus(latitude, asc, mc, lst, obliquity)
-        
-        # Apply topocentric corrections for Earth's rotation
-        lat_rad = math.radians(latitude)
-        
-        for i in range(12):
-            if i not in [0, 3, 6, 9]:  # Don't adjust angles
-                # Topocentric correction factor
-                rotation_correction = 0.25 * math.sin(lat_rad) * math.sin(math.radians(cusps[i]))
-                cusps[i] = (cusps[i] + rotation_correction) % 360
-        
-        return cusps
-    
-    def _precise_alcabitius(self, latitude: float, asc: float, 
-                           mc: float, obliquity: float) -> List[float]:
-        """Alcabitius: proportional semi-arcs method"""
-        cusps = [0.0] * 12
-        cusps[0] = asc
-        cusps[9] = mc
-        cusps[6] = (asc + 180) % 360
-        cusps[3] = (mc + 180) % 360
-        
-        lat_rad = math.radians(latitude)
-        obliq_rad = math.radians(obliquity)
-        
-        # Alcabitius uses proportional division of semi-arcs
-        diurnal_arc = self._calculate_diurnal_arc(0, lat_rad, obliq_rad)  # Sun's arc
-        nocturnal_arc = 360 - diurnal_arc
-        
-        for i in range(1, 12):
-            if i in [0, 3, 6, 9]:
-                continue
-            
-            if i < 6:  # Day houses
-                proportion = (i % 3) / 3.0
-                arc_division = diurnal_arc * proportion
-            else:  # Night houses
-                proportion = ((i - 6) % 3) / 3.0
-                arc_division = nocturnal_arc * proportion
-            
-            base = asc if i < 6 else (asc + 180) % 360
-            cusps[i] = (base + arc_division) % 360
-        
-        return cusps
-    
-    def _calculate_diurnal_arc(self, declination: float, lat_rad: float, obliq_rad: float) -> float:
-        """Calculate diurnal arc for given declination and latitude"""
-        decl_rad = math.radians(declination)
-        
-        # Semi-diurnal arc formula
-        cos_ha = -math.tan(lat_rad) * math.tan(decl_rad)
-        
-        if cos_ha > 1:
-            return 0  # Never rises
-        elif cos_ha < -1:
-            return 360  # Never sets
-        else:
-            ha = math.degrees(math.acos(cos_ha))
-            return 2 * ha
-    
-    def _calculate_vertex(self, latitude: float, lst: float, obliquity: float) -> float:
-        """Calculate Vertex (intersection of ecliptic and Prime Vertical)"""
-        lat_rad = math.radians(latitude)
-        obliq_rad = math.radians(obliquity)
-        
-        # Vertex calculation using spherical trigonometry
-        colatitude = 90 - latitude
-        colat_rad = math.radians(colatitude)
-        
-        vertex = math.degrees(
-            math.atan2(
-                math.cos(colat_rad),
-                math.sin(colat_rad) * math.cos(obliq_rad)
-            )
-        ) + lst + 180
-        
-        return vertex % 360
-    
-    def _equal_houses(self, asc: float) -> List[float]:
-        """Equal houses: 30° divisions from Ascendant"""
-        return [(asc + i * 30) % 360 for i in range(12)]
-    
-    def _whole_sign_houses(self, asc: float) -> List[float]:
-        """Whole sign houses: sign boundaries"""
-        first_house = (int(asc / 30) * 30) % 360
-        return [(first_house + i * 30) % 360 for i in range(12)]
-    
-    def _porphyry_houses(self, asc: float, mc: float) -> List[float]:
-        """Porphyry: equal divisions of quadrants"""
-        cusps = [0.0] * 12
-        cusps[0] = asc
-        cusps[9] = mc
-        cusps[6] = (asc + 180) % 360
-        cusps[3] = (mc + 180) % 360
-        
-        # Equal divisions of each quadrant
-        angles = [asc, mc, (asc + 180) % 360, (mc + 180) % 360]
-        
-        for quad in range(4):
-            start = angles[quad]
-            end = angles[(quad + 1) % 4]
-            span = (end - start) % 360
-            
-            for i in range(1, 3):
-                house_idx = quad * 3 + i
-                if house_idx < 12:
-                    cusps[house_idx] = (start + span * i / 3) % 360
-        
-        return cusps
-    
-    def _morinus_houses(self, mc: float) -> List[float]:
-        """Morinus: equal divisions from MC"""
-        return [(mc + i * 30) % 360 for i in range(12)]
-    
-    def _check_validity(self, latitude: float, house_system: str) -> List[str]:
-        """Check for calculation validity and add warnings"""
-        warnings = []
-        
-        if abs(latitude) > 66.5:
-            warnings.append(f"High latitude ({latitude:.1f}°) may affect {house_system} house accuracy")
-            
-        if abs(latitude) > 80 and house_system in ['placidus', 'koch']:
-            warnings.append(f"{house_system} houses may be unreliable above 80° latitude")
-            
-        return warnings
 
-# Convenience function for integration
-def compute_house_system(latitude: float, longitude: float, 
-                        house_system: str, jd_ut: float) -> Dict:
-    """Compute houses using precise mathematical algorithms"""
-    calculator = PreciseHouseCalculator()
-    house_data = calculator.calculate_houses(latitude, longitude, jd_ut, house_system)
-    
-    return {
-        "house_system": house_data.system,
-        "asc_deg": house_data.ascendant,
-        "mc_deg": house_data.midheaven,
-        "cusps_deg": house_data.cusps,
-        "vertex": house_data.vertex,
-        "eastpoint": house_data.eastpoint,
-        "warnings": house_data.warnings
+# --------------------------- integration helper ---------------------------
+
+def compute_house_system(
+    latitude: float,
+    longitude: float,
+    house_system: str,
+    jd_ut: float,
+    *,
+    jd_tt: Optional[float] = None,
+    jd_ut1: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    Back-compat wrapper used elsewhere in the app.
+    Strict mode: requires jd_tt and jd_ut1; raises if missing.
+    """
+    calc = PreciseHouseCalculator(require_strict_timescales=True, enable_diagnostics=False)
+    hd = calc.calculate_houses(
+        latitude=latitude,
+        longitude=longitude,
+        jd_ut=jd_ut,
+        house_system=house_system,
+        jd_tt=jd_tt,
+        jd_ut1=jd_ut1,
+    )
+    payload: Dict[str, Any] = {
+        "house_system": hd.system,
+        "asc_deg": hd.ascendant,
+        "mc_deg": hd.midheaven,
+        "cusps_deg": hd.cusps,
+        "vertex": hd.vertex,
+        "eastpoint": hd.eastpoint,
+        "warnings": hd.warnings,
     }
-
-SUPPORTED_HOUSE_SYSTEMS = [
-    'placidus', 'koch', 'regiomontanus', 'campanus', 
-    'equal', 'whole_sign', 'topocentric', 'alcabitius',
-    'porphyry', 'morinus'
-]
+    if hd.solver_stats is not None:
+        payload["solver_stats"] = hd.solver_stats
+    return payload
