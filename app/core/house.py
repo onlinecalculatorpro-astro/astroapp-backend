@@ -2,15 +2,16 @@
 from __future__ import annotations
 
 import os
+import math
 from typing import Any, Dict, List, Optional, Tuple, Final
 
 # ───────────────────────── Public ↔ Engine names ─────────────────────────
 
-# Public names we accept from the API/client. Include common aliases.
+# Public names accepted from the API/client (include common aliases for whole-sign)
 SUPPORTED_HOUSE_SYSTEMS: Final[Tuple[str, ...]] = (
     "placidus",
     "equal",
-    "whole",        # alias family for whole-sign
+    "whole",        # preferred public label for whole-sign
     "whole_sign",
     "whole-sign",
     "whole sign",
@@ -40,17 +41,19 @@ _ENGINE_TO_PUBLIC: Final[Dict[str, str]] = {
 
 POLAR_SOFT_LIMIT_DEG: Final[float] = float(os.getenv("ASTRO_POLAR_SOFT_LAT", "66.0"))
 POLAR_HARD_LIMIT_DEG: Final[float] = float(os.getenv("ASTRO_POLAR_HARD_LAT", "80.0"))
-POLAR_ABSOLUTE_LIMIT_DEG: Final[float] = 89.999999  # hard guard near poles
+POLAR_ABSOLUTE_LIMIT_DEG: Final[float] = 89.999999  # absolute pole guard
 POLAR_POLICY: Final[str] = os.getenv("ASTRO_POLAR_POLICY", "fallback_to_equal_above_66deg")
 
-# Sets of systems that are known to be problematic near the poles
+# Sets of systems problematic near the poles
 _HARD_REJECT_AT_POLAR: Final[set[str]] = {"placidus", "koch", "topocentric", "alcabitius"}
 _RISKY_AT_POLAR: Final[set[str]] = {
     "placidus", "koch", "regiomontanus", "campanus", "topocentric", "alcabitius", "morinus",
 }
 
-# If a numeric solver fails (e.g., placidus non-convergence), should we fall back?
-NUMERIC_FALLBACK_ENABLED: Final[bool] = os.getenv("ASTRO_HOUSES_NUMERIC_FALLBACK", "1").lower() in ("1", "true", "yes", "on")
+# Optional numeric safety net: if risky solver fails, fall back to 'equal'
+NUMERIC_FALLBACK_ENABLED: Final[bool] = os.getenv(
+    "ASTRO_HOUSES_NUMERIC_FALLBACK", "1"
+).lower() in ("1", "true", "yes", "on")
 
 # ───────────────────────── Engine import ─────────────────────────
 
@@ -66,7 +69,7 @@ except Exception as _e:  # pragma: no cover
 # ───────────────────────── Utilities ─────────────────────────
 
 def list_supported_house_systems() -> List[str]:
-    """Public list (includes aliases we accept)."""
+    """Public list (includes accepted aliases)."""
     return list(SUPPORTED_HOUSE_SYSTEMS)
 
 
@@ -77,7 +80,7 @@ def _normalize_system(s: Optional[str]) -> str:
     key = s.strip().lower()
     if key not in SUPPORTED_HOUSE_SYSTEMS:
         raise ValueError(f"unsupported house system: {s}")
-    # Collapse aliases to a single public label where appropriate
+    # Collapse aliases to the preferred public label
     if key in {"whole_sign", "whole-sign", "whole sign"}:
         return "whole"
     return key
@@ -97,11 +100,20 @@ def _needs_polar_fallback(system: str, latitude: float, limit: float) -> bool:
     return abs(latitude) > limit and system in _RISKY_AT_POLAR
 
 
+def _f(x: Any) -> Optional[float]:
+    """Coerce to native float; return None if non-finite or unparseable."""
+    try:
+        xf = float(x)
+        return xf if math.isfinite(xf) else None
+    except Exception:
+        return None
+
+
 # ───────────────────────── Policy façade ─────────────────────────
 
 def compute_houses_with_policy(
     *,
-    # primary
+    # primary (modern names)
     lat: Optional[float] = None,
     lon: Optional[float] = None,
     system: Optional[str] = None,
@@ -110,7 +122,7 @@ def compute_houses_with_policy(
     jd_ut: Optional[float] = None,           # ignored in strict mode
     diagnostics: Optional[bool] = None,
 
-    # legacy aliases (be lenient for callers)
+    # legacy aliases (lenient)
     latitude: Optional[float] = None,
     longitude: Optional[float] = None,
     requested_house_system: Optional[str] = None,
@@ -125,8 +137,15 @@ def compute_houses_with_policy(
     House computation façade with:
       • strict timescales (requires jd_tt & jd_ut1),
       • polar safety (fallback/reject per policy),
-      • numeric safety net (fallback to 'equal' on non-convergence),
-      • stable, API-friendly payload.
+      • numeric safety net (fallback to 'equal' on non-convergence for risky systems),
+      • stable, API-friendly payload:
+          {
+            requested_house_system, house_system,
+            asc_deg, mc_deg, angles,
+            cusps_deg, houses,
+            vertex, eastpoint,
+            warnings, policy, [solver_stats]
+          }
     """
     # ---- inputs & normalization
     latitude = lat if lat is not None else latitude
@@ -170,7 +189,7 @@ def compute_houses_with_policy(
         )
         effective_public = "equal"
 
-    # ---- strict timescales
+    # ---- strict timescales required
     if jd_tt is None or jd_ut1 is None:
         raise ValueError(
             "houses: strict mode requires jd_tt and jd_ut1 (no UT≈UTC shortcuts). "
@@ -209,30 +228,45 @@ def compute_houses_with_policy(
                 used_public = "equal"
                 warnings.append(f"{effective_public} numeric failure → fallback to 'equal' ({type(e).__name__}: {e})")
             except Exception as e2:
-                # If even equal fails, bubble up original error context
                 raise RuntimeError(f"houses engine failed and fallback failed: {type(e2).__name__}: {e2}") from e
         else:
             raise
 
-    # ---- build payload (compat: include asc/mc and asc_deg/mc_deg)
-    all_warnings = list(warnings) + list(hd.warnings or [])
+    # ---- coerce outputs to JSON-safe native floats
+    asc_f = _f(getattr(hd, "ascendant", None))
+    mc_f  = _f(getattr(hd, "midheaven", None))
+    vertex_f = _f(getattr(hd, "vertex", None))
+    eastpoint_f = _f(getattr(hd, "eastpoint", None))
 
+    cusps_list: List[Optional[float]] = []
+    try:
+        for c in list(hd.cusps or []):
+            cusps_list.append(_f(c))
+    except Exception:
+        cusps_list = []
+
+    if len(cusps_list) != 12 or any(v is None for v in cusps_list):
+        warnings.append("compute_houses: one or more cusps are missing or non-finite")
+
+    # Convert Optional[float] → float with None preserved (clients can handle/flag)
+    cusps_native: List[float] = [float(x) if x is not None else float("nan") for x in cusps_list]
+
+    # ---- build stable payload the routes/tests expect
     payload: Dict[str, Any] = {
-        "requested_system": requested_public,         # public label requested
-        "system": used_public,                        # public label used after policy/fallback
-        "engine_system": hd.system,                   # engine canonical actually used
-        "cusps": hd.cusps,                            # list[12] degrees
-        "asc": hd.ascendant,
-        "mc": hd.midheaven,
-        "asc_deg": hd.ascendant,                      # compatibility helpers
-        "mc_deg": hd.midheaven,
-        "angles": {                                   # optional rich angles
-            "ASC": {"deg": hd.ascendant},
-            "MC":  {"deg": hd.midheaven},
+        "requested_house_system": requested_public,   # public label requested
+        "house_system": used_public,                  # public label actually used (after policy/fallback)
+        "asc_deg": asc_f,
+        "mc_deg": mc_f,
+        "angles": {
+            "ASC": {"deg": asc_f},
+            "MC":  {"deg": mc_f},
         },
-        "vertex": hd.vertex,
-        "eastpoint": hd.eastpoint,
-        "warnings": all_warnings,
+        # Keep both keys for compatibility
+        "cusps_deg": cusps_native,
+        "houses": cusps_native,
+        "vertex": vertex_f,
+        "eastpoint": eastpoint_f,
+        "warnings": list(warnings) + list(hd.warnings or []),
         "policy": {
             "polar_policy": polar_policy,
             "polar_soft_limit_deg": soft_lim,
@@ -245,6 +279,7 @@ def compute_houses_with_policy(
     }
     if getattr(hd, "solver_stats", None):
         payload["solver_stats"] = hd.solver_stats
+
     return payload
 
 
