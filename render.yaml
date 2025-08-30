@@ -3,9 +3,21 @@ services:
     name: astroapp-backend
     env: python
     plan: free
-    buildCommand: ""
-    startCommand: gunicorn app.main:app
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app.main:app --preload --workers=2 --threads=4 --timeout=120
+    healthCheckPath: /health
+    autoDeploy: true
     envVars:
+      # --- Runtime / deployment ---
+      - key: FLASK_ENV
+        value: production
+      - key: TZ
+        value: Asia/Kolkata
+      # Keep '*' for smoke; after frontend is live, change to your exact Netlify URL.
+      - key: NETLIFY_ORIGIN
+        value: "*"
+
+      # --- App config files (paths relative to repo root) ---
       - key: ASTRO_CONFIG
         value: config/defaults.yaml
       - key: ASTRO_CALIBRATORS
