@@ -5,6 +5,10 @@ from .qia import qia_adjust
 from .calibration import load_calibrators, apply_calibrator
 from .varga import d9_navamsa_sign, d10_dashamsa_sign, reinforcement_score
 from .transits import detect_transits
+from .astro_extras import (
+    harmonic_longitudes, part_of_fortune, find_aspects,
+    fixed_star_ecliptics, star_conjunctions, lunar_phases
+)
 from math import log
 import os
 
@@ -19,30 +23,89 @@ def natal_points(chart: Dict[str, Any], houses: Dict[str, Any]) -> Dict[str, flo
 
 def evidence_contributions(chart: Dict[str, Any], houses: Dict[str, Any], horizon: str) -> Dict[str, float]:
     pts = natal_points(chart, houses)
+    
+    # Extract planetary positions for enhanced calculations
+    planet_lons = {body["name"]: body["longitude_deg"] for body in chart.get("bodies", [])}
+    
     # Varga reinforcement from D9 (Moon) and D10 (MC approximated as Sun's sign for placeholder)
     moon = pts.get("Moon", 0.0)
     mc = pts.get("MC", 0.0)
     d9_moon = d9_navamsa_sign(moon)
     d10_mc = d10_dashamsa_sign(mc)
     v_score = reinforcement_score(d9_moon, d10_mc)
-
+    
     # Transit score from slow movers toward key points (placeholder uses natal planets as transiting too)
     trans = {k:v for k,v in pts.items() if k in ("Jupiter","Saturn","Mars")}
     t_score = detect_transits({"Sun":pts.get("Sun",0.0), "Moon":pts.get("Moon",0.0), "Asc":pts["Asc"], "MC":pts["MC"]}, trans)
-
+    
     # Dasha score placeholder: based on Moon's nakshatra quarter mapping to a smooth score
     # use fractional part of Moon lon within sign
     d_frac = (moon % 30.0) / 30.0
     d_score = 0.25 + 0.5*abs(0.5 - d_frac)
-
+    
     # Yoga score (placeholder constant small boost)
     y_score = 0.06 if (abs(pts.get("Jupiter",0)-pts.get("Moon",0)) % 90.0) < 15.0 else 0.02
-
-    return {"dasha": round(d_score,3), "transit": round(t_score,3), "varga": round(v_score,3), "yoga": round(y_score,3)}
+    
+    # Enhanced features from astro_extras
+    
+    # Harmonic analysis (D7 and D9)
+    h7_lons = harmonic_longitudes(planet_lons, 7)
+    h9_lons = harmonic_longitudes(planet_lons, 9)
+    harmonic_score = 0.05  # Base score
+    
+    # Arabic parts
+    asc = houses.get("asc_deg", 0)
+    sun_lon = planet_lons.get("Sun", 0)
+    moon_lon = planet_lons.get("Moon", 0)
+    pof = part_of_fortune(asc, sun_lon, moon_lon, True)
+    parts_score = 0.1 if abs(pof - sun_lon) < 30 else 0.05
+    
+    # Aspect analysis
+    aspects = find_aspects(planet_lons, planet_lons, orb_deg=2.0)
+    beneficial_aspects = [a for a in aspects if a["aspect"] in ["trine", "sextile"]]
+    challenging_aspects = [a for a in aspects if a["aspect"] in ["square", "opposition"]]
+    aspect_score = len(beneficial_aspects) * 0.05 - len(challenging_aspects) * 0.02
+    aspect_score = max(0.01, min(0.25, aspect_score + 0.1))
+    
+    # Fixed star influences
+    stars = fixed_star_ecliptics(chart.get("jd_tt", 0))
+    star_conj = star_conjunctions(planet_lons, stars, orb_deg=1.0)
+    star_score = min(len(star_conj) * 0.03, 0.15) + 0.02
+    
+    # Lunar phases
+    lunar_info = lunar_phases(chart.get("jd_tt", 0))
+    lunar_score = 0.05 + lunar_info.get("illumination", 0.5) * 0.1
+    
+    return {
+        "dasha": round(d_score,3), 
+        "transit": round(t_score,3), 
+        "varga": round(v_score,3), 
+        "yoga": round(y_score,3),
+        "harmonic": round(harmonic_score,3),
+        "parts": round(parts_score,3),
+        "aspects": round(aspect_score,3),
+        "stars": round(star_score,3),
+        "lunar": round(lunar_score,3)
+    }
 
 def calibrated_probability(ev: Dict[str, float], domain: str) -> float:
+    # Combine original evidence
     base = combine(ev["dasha"], ev["transit"], ev["varga"], ev["yoga"])
-    q = qia_adjust(base, ev)
+    
+    # Add enhanced evidence with weights
+    enhanced_contrib = (
+        ev.get("harmonic", 0) * 0.1 +
+        ev.get("parts", 0) * 0.15 +
+        ev.get("aspects", 0) * 0.2 +
+        ev.get("stars", 0) * 0.1 +
+        ev.get("lunar", 0) * 0.05
+    )
+    
+    # Combine base with enhanced features
+    enhanced_base = base + enhanced_contrib
+    enhanced_base = max(0.05, min(0.95, enhanced_base))
+    
+    q = qia_adjust(enhanced_base, ev)
     calibrators = load_calibrators(os.environ.get("ASTRO_CALIBRATORS","config/calibrators.json"))
     return apply_calibrator(domain, q, calibrators)
 
