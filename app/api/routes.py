@@ -26,7 +26,6 @@ from app.utils.config import load_config
 
 from app.core.astronomy import compute_chart, compute_houses
 from app.core.predict import predict
-from app.core.rectify import rectification_candidates
 
 api = Blueprint("api", __name__)
 
