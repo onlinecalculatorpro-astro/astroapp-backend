@@ -51,23 +51,29 @@ DEBUG_VERBOSE = os.getenv("ASTRO_DEBUG_VERBOSE", "0").lower() in ("1", "true", "
 
 
 # ─────────────────────────────── timescales ────────────────────────────────
-def _datetime_to_jd_utc(dt_utc: datetime) -> float:
-    """Meeus-style Gregorian JD from an aware UTC datetime."""
-    if dt_utc.tzinfo is None or dt_utc.tzinfo is not timezone.utc:
-        raise ValueError("dt_utc must be timezone-aware UTC")
-    y = dt_utc.year
-    m = dt_utc.month
-    d = dt_utc.day + (
-        dt_utc.hour + (dt_utc.minute + (dt_utc.second + dt_utc.microsecond / 1e6) / 60.0) / 60.0
-    ) / 24.0
-    if m <= 2:
-        y -= 1
-        m += 12
-    A = y // 100
-    B = 2 - A + (A // 25)
-    jd = int(365.25 * (y + 4716)) + int(30.6001 * (m + 1)) + d + B - 1524.5
-    return float(jd)
-
++def _datetime_to_jd_utc(dt_utc: datetime) -> float:
++    """Return Julian Date (UTC). Prefer ERFA; fallback to safe Meeus form."""
++    if dt_utc.tzinfo is None or dt_utc.tzinfo is not timezone.utc:
++        raise ValueError("dt_utc must be timezone-aware UTC")
++    try:
++        import erfa  # PyERFA
++        # eraDtf2d('UTC', ...) → two-part JD in UTC
++        iy, im, id_ = dt_utc.year, dt_utc.month, dt_utc.day
++        ih, iv = dt_utc.hour, dt_utc.minute
++        sf = dt_utc.second + dt_utc.microsecond / 1e6
++        d1, d2 = erfa.dtf2d("UTC", iy, im, id_, ih, iv, sf)
++        return float(d1 + d2)
++    except Exception:
++        # Pure-Python fallback (Meeus). This version matches the one in time_kernel.
++        Y, M, D = dt_utc.year, dt_utc.month, dt_utc.day
++        h, m = dt_utc.hour, dt_utc.minute
++        s = dt_utc.second + dt_utc.microsecond / 1_000_000.0
++        a = (14 - M) // 12
++        y = Y + 4800 - a
++        m_ = M + 12 * a - 3
++        jdn = D + (153 * m_ + 2) // 5 + 365 * y + y // 4 - y // 100 + y // 400 - 32045
++        dayfrac = (h - 12) / 24.0 + m / 1440.0 + s / 86400.0
++        return float(jdn + dayfrac)
 
 def _find_kernel_callable() -> Callable[[float], Dict[str, Any]]:
     """
