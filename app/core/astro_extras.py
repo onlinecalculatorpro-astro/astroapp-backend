@@ -2,8 +2,11 @@
 from __future__ import annotations
 from typing import Dict, Any, List, Optional
 from math import fmod
-
-from skyfield.api import load, wgs84, Star
+try:
+    from skyfield.api import load, wgs84, Star
+    SKYFIELD_AVAILABLE = True
+except ImportError:
+    SKYFIELD_AVAILABLE = False
 
 def _wrap360(x: float) -> float:
     return fmod(fmod(x, 360.0) + 360.0, 360.0)
@@ -21,7 +24,11 @@ def part_of_spirit(asc: float, sun: float, moon: float, is_day: bool) -> float:
 
 # ---------- Aspect engine ----------
 ASPECTS = {
-    "conjunction": 0.0, "sextile": 60.0, "square": 90.0, "trine": 120.0, "opposition": 180.0,
+    "conjunction": 0.0, 
+    "sextile": 60.0, 
+    "square": 90.0, 
+    "trine": 120.0, 
+    "opposition": 180.0,
 }
 
 def _angle_sep(a: float, b: float) -> float:
@@ -43,7 +50,13 @@ def find_aspects(
             for name, exact in aspects.items():
                 delta = min(abs(sep - exact), abs(360.0 - sep - exact))
                 if delta <= orb_deg:
-                    out.append({"a": na, "b": nb, "aspect": name, "sep": sep, "orb": delta})
+                    out.append({
+                        "a": na, 
+                        "b": nb, 
+                        "aspect": name, 
+                        "sep": sep, 
+                        "orb": delta
+                    })
     return out
 
 # ---------- Secondary progressions (1 day = 1 year) ----------
@@ -68,27 +81,87 @@ BRIGHT_STARS = {
 }
 
 def fixed_star_ecliptics(jd_tt: float) -> Dict[str, Dict[str, float]]:
-    ts = load.timescale()
-    eph = load("de421.bsp")
-    t  = ts.tdb(jd=jd_tt)
-    out = {}
-    for name, (rah, decd) in BRIGHT_STARS.items():
-        star = Star(ra_hours=rah, dec_degrees=decd)
-        ast  = eph["earth"].at(t).observe(star).apparent()
-        try:
-            lon, lat, _ = ast.ecliptic_latlon(epoch="date")
-        except TypeError:
-            lon, lat, _ = ast.ecliptic_latlon()
-        out[name] = {"lon": _wrap360(lon.degrees), "lat": float(lat.degrees)}
-    return out
+    if not SKYFIELD_AVAILABLE:
+        # Return empty dict if Skyfield not available
+        return {}
+    
+    try:
+        ts = load.timescale()
+        eph = load("de421.bsp")
+        t = ts.tdb_jd(jd_tt)
+        out = {}
+        
+        for name, (rah, decd) in BRIGHT_STARS.items():
+            star = Star(ra_hours=rah, dec_degrees=decd)
+            ast = eph["earth"].at(t).observe(star)
+            apparent = ast.apparent()
+            
+            try:
+                lon, lat, _ = apparent.ecliptic_latlon(epoch="date")
+            except TypeError:
+                lon, lat, _ = apparent.ecliptic_latlon()
+            
+            out[name] = {
+                "lon": _wrap360(lon.degrees), 
+                "lat": float(lat.degrees)
+            }
+        return out
+    except Exception:
+        return {}
 
-def star_conjunctions(planet_lons: Dict[str, float],
-                      stars: Dict[str, Dict[str, float]],
-                      orb_deg: float = 1.0) -> List[Dict[str, Any]]:
+def star_conjunctions(
+    planet_lons: Dict[str, float],
+    stars: Dict[str, Dict[str, float]],
+    orb_deg: float = 1.0
+) -> List[Dict[str, Any]]:
     out = []
     for p, lp in planet_lons.items():
         for s, coords in stars.items():
             sep = _angle_sep(lp, coords["lon"])
             if sep <= orb_deg:
-                out.append({"planet": p, "star": s, "sep": sep})
+                out.append({
+                    "planet": p, 
+                    "star": s, 
+                    "sep": sep
+                })
     return out
+
+# ---------- Enhanced prediction features ----------
+def lunar_phases(jd_tt: float) -> Dict[str, Any]:
+    """Calculate lunar phase information"""
+    if not SKYFIELD_AVAILABLE:
+        return {"phase_angle": 0.0, "illumination": 0.5}
+    
+    try:
+        ts = load.timescale()
+        eph = load("de421.bsp")
+        t = ts.tdb_jd(jd_tt)
+        
+        earth = eph['earth']
+        sun = eph['sun']
+        moon = eph['moon']
+        
+        # Calculate phase angle
+        e = earth.at(t)
+        s = e.observe(sun).apparent()
+        m = e.observe(moon).apparent()
+        
+        # Simple phase calculation
+        phase_angle = s.separation_from(m).degrees
+        illumination = (1 + (-1) * (phase_angle / 180)) / 2
+        
+        return {
+            "phase_angle": phase_angle,
+            "illumination": illumination
+        }
+    except Exception:
+        return {"phase_angle": 0.0, "illumination": 0.5}
+
+def planetary_speeds(planet_positions: List[Dict[str, Any]]) -> Dict[str, float]:
+    """Extract planetary speeds for retrograde analysis"""
+    speeds = {}
+    for planet in planet_positions:
+        name = planet.get("name", "")
+        speed = planet.get("speed_deg_per_day", planet.get("speed", 0.0))
+        speeds[name] = float(speed)
+    return speeds
