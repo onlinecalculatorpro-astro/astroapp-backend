@@ -51,29 +51,30 @@ DEBUG_VERBOSE = os.getenv("ASTRO_DEBUG_VERBOSE", "0").lower() in ("1", "true", "
 
 
 # ─────────────────────────────── timescales ────────────────────────────────
-+def _datetime_to_jd_utc(dt_utc: datetime) -> float:
-+    """Return Julian Date (UTC). Prefer ERFA; fallback to safe Meeus form."""
-+    if dt_utc.tzinfo is None or dt_utc.tzinfo is not timezone.utc:
-+        raise ValueError("dt_utc must be timezone-aware UTC")
-+    try:
-+        import erfa  # PyERFA
-+        # eraDtf2d('UTC', ...) → two-part JD in UTC
-+        iy, im, id_ = dt_utc.year, dt_utc.month, dt_utc.day
-+        ih, iv = dt_utc.hour, dt_utc.minute
-+        sf = dt_utc.second + dt_utc.microsecond / 1e6
-+        d1, d2 = erfa.dtf2d("UTC", iy, im, id_, ih, iv, sf)
-+        return float(d1 + d2)
-+    except Exception:
-+        # Pure-Python fallback (Meeus). This version matches the one in time_kernel.
-+        Y, M, D = dt_utc.year, dt_utc.month, dt_utc.day
-+        h, m = dt_utc.hour, dt_utc.minute
-+        s = dt_utc.second + dt_utc.microsecond / 1_000_000.0
-+        a = (14 - M) // 12
-+        y = Y + 4800 - a
-+        m_ = M + 12 * a - 3
-+        jdn = D + (153 * m_ + 2) // 5 + 365 * y + y // 4 - y // 100 + y // 400 - 32045
-+        dayfrac = (h - 12) / 24.0 + m / 1440.0 + s / 86400.0
-+        return float(jdn + dayfrac)
+def _datetime_to_jd_utc(dt_utc: datetime) -> float:
+    """Return Julian Date (UTC). Prefer ERFA; fallback to safe Meeus form."""
+    if dt_utc.tzinfo is None or dt_utc.tzinfo is not timezone.utc:
+        raise ValueError("dt_utc must be timezone-aware UTC")
+    try:
+        import erfa  # PyERFA
+        # eraDtf2d('UTC', ...) → two-part JD in UTC
+        iy, im, id_ = dt_utc.year, dt_utc.month, dt_utc.day
+        ih, iv = dt_utc.hour, dt_utc.minute
+        sf = dt_utc.second + dt_utc.microsecond / 1e6
+        d1, d2 = erfa.dtf2d("UTC", iy, im, id_, ih, iv, sf)
+        return float(d1 + d2)
+    except Exception:
+        # Pure-Python fallback (Meeus) — matches time_kernel implementation.
+        Y, M, D = dt_utc.year, dt_utc.month, dt_utc.day
+        h, m = dt_utc.hour, dt_utc.minute
+        s = dt_utc.second + dt_utc.microsecond / 1_000_000.0
+        a = (14 - M) // 12
+        y = Y + 4800 - a
+        m_ = M + 12 * a - 3
+        jdn = D + (153 * m_ + 2) // 5 + 365 * y + y // 4 - y // 100 + y // 400 - 32045
+        dayfrac = (h - 12) / 24.0 + m / 1440.0 + s / 86400.0
+        return float(jdn + dayfrac)
+
 
 def _find_kernel_callable() -> Callable[[float], Dict[str, Any]]:
     """
@@ -275,6 +276,27 @@ def _json_error(code: str, details: Any = None, http: int = 400):
     return jsonify(out), http
 
 
+def _normalize_houses_payload(houses: Any) -> Any:
+    """Ensure houses payload has both 'cusps' and 'cusps_deg' and consistent system fields."""
+    if isinstance(houses, dict):
+        # cusps/cusps_deg compatibility
+        if "cusps" not in houses and "cusps_deg" in houses:
+            houses["cusps"] = houses["cusps_deg"]
+        if "cusps_deg" not in houses and "cusps" in houses:
+            houses["cusps_deg"] = houses["cusps"]
+        # system name compatibility
+        if "house_system" not in houses and "system" in houses:
+            houses["house_system"] = houses["system"]
+        if "system" not in houses and "house_system" in houses:
+            houses["system"] = houses["house_system"]
+        # angles compatibility
+        if "asc_deg" not in houses and "asc" in houses:
+            houses["asc_deg"] = houses["asc"]
+        if "mc_deg" not in houses and "mc" in houses:
+            houses["mc_deg"] = houses["mc"]
+    return houses
+
+
 # ───────────────────────────── endpoints ─────────────────────────────
 @api.get("/api/health")
 def health():
@@ -299,7 +321,13 @@ def calculate():
     ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name)
 
     chart = _call_compute_chart(payload, ts)
-    houses = _call_compute_houses(payload, ts)
+    try:
+        houses = _call_compute_houses(payload, ts)
+        houses = _normalize_houses_payload(houses)
+    except ValueError as e:
+        return _json_error("houses_error", str(e), 400)
+    except Exception as e:
+        return _json_error("houses_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
     return jsonify({"ok": True, "chart": chart, "houses": houses, "meta": {"timescales": ts}}), 200
 
@@ -319,7 +347,13 @@ def report():
     ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name)
 
     chart = _call_compute_chart(payload, ts)
-    houses = _call_compute_houses(payload, ts)
+    try:
+        houses = _call_compute_houses(payload, ts)
+        houses = _normalize_houses_payload(houses)
+    except ValueError as e:
+        return _json_error("houses_error", str(e), 400)
+    except Exception as e:
+        return _json_error("houses_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
     narrative = (
         "This is a placeholder narrative aligned to your mode and computed houses. "
@@ -346,7 +380,13 @@ def predictions_route():
     ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name)
 
     chart = _call_compute_chart(payload, ts)
-    houses = _call_compute_houses(payload, ts)
+    try:
+        houses = _call_compute_houses(payload, ts)
+        houses = _normalize_houses_payload(houses)
+    except ValueError as e:
+        return _json_error("houses_error", str(e), 400)
+    except Exception as e:
+        return _json_error("houses_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
     preds_raw = predict(chart, houses, horizon)
 
