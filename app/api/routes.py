@@ -7,16 +7,17 @@ import inspect
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Dict
+from types import SimpleNamespace
 
 from flask import Blueprint, jsonify, request
-from pydantic import ValidationError as PydValidationError
-from app.core.validators import parse_chart_payload, ValidationError as InputValidationError
+from pydantic import ValidationError as PydanticError
 
+from app.core.validators import parse_chart_payload, InputValidationError
 from app.version import VERSION
 from app.utils.validation import (
-    ChartRequest,          # still used by legacy helpers / type hints
+    ChartRequest,
     PredictionRequest,
-    RectificationRequest,  # kept for compatibility but not required in new flows
+    RectificationRequest,  # kept for compatibility (not used in minimal rectification)
 )
 from app.utils.metrics import metrics
 from app.utils.ratelimit import rate_limit
@@ -28,7 +29,6 @@ from app.core.predict import predict
 from app.core.rectify import rectification_candidates
 
 api = Blueprint("api", __name__)
-
 
 # ---------- helpers -----------------------------------------------------------
 
@@ -50,7 +50,7 @@ def _jd_ut_from_local(date_str: str, time_str: str, tz_name: str) -> float:
     return jdn + day_frac - 0.5
 
 
-def _call_compute_chart(payload: ChartRequest | PredictionRequest | Any) -> Dict[str, Any]:
+def _call_compute_chart(payload: ChartRequest | PredictionRequest | SimpleNamespace) -> Dict[str, Any]:
     """
     Call compute_chart with whatever signature the current implementation expects.
     Ensures 'jd_ut' is present in the returned dict.
@@ -93,32 +93,6 @@ def _call_compute_houses(lat: float, lon: float, mode: str, jd_ut: float | None)
     return compute_houses(lat, lon, mode)
 
 
-def _payload_like_from_validated(p: Dict[str, Any]) -> Any:
-    """
-    Build a tiny attribute-based object the existing compute helpers expect,
-    from the dict returned by parse_chart_payload.
-    Supports either {'dt', ...} shape or {'date','time',...} shape.
-    """
-    if "dt" in p:
-        dt_local = p["dt"]
-        date_str = dt_local.strftime("%Y-%m-%d")
-        time_str = dt_local.strftime("%H:%M")
-    else:
-        # assume normalized strings are present
-        date_str = p["date"]
-        time_str = p["time"]
-
-    class _PayloadLike:
-        date = date_str
-        time = time_str
-        place_tz = p["place_tz"]
-        latitude = p["latitude"]
-        longitude = p["longitude"]
-        mode = p.get("mode", "sidereal")
-
-    return _PayloadLike()
-
-
 # ---------- endpoints ---------------------------------------------------------
 
 @api.get("/api/health")
@@ -128,41 +102,30 @@ def health():
 
 @api.post("/api/calculate")
 def calculate():
-    data = request.get_json(silent=True) or {}
-
-    # Validate & normalize
     try:
-        p = parse_chart_payload(data)
-    except InputValidationError as e:
-        return jsonify({"error": "validation_error", "details": [str(e)]}), 400
+        payload = ChartRequest(**(request.get_json(force=True) or {}))
+    except PydanticError as e:
+        return jsonify({"error": "validation_error", "details": e.errors()}), 400
 
-    payload_like = _payload_like_from_validated(p)
-
-    # Compute
-    chart = _call_compute_chart(payload_like)
-    houses = _call_compute_houses(
-        payload_like.latitude, payload_like.longitude, payload_like.mode, chart.get("jd_ut")
-    )
+    chart = _call_compute_chart(payload)
+    houses = _call_compute_houses(payload.latitude, payload.longitude, payload.mode, chart.get("jd_ut"))
 
     return jsonify({"chart": chart, "houses": houses}), 200
 
 
 @api.post("/api/report")
 def report():
-    data = request.get_json(silent=True) or {}
-
-    # Validate & normalize (accepts minimal format too)
+    body = request.get_json(force=True) or {}
     try:
-        p = parse_chart_payload(data)
+        # Accepts minimal: date, time, place_tz, latitude, longitude (+ defaults like mode)
+        base = parse_chart_payload(body)
     except InputValidationError as e:
-        return jsonify({"error": "validation_error", "details": [str(e)]}), 400
+        return jsonify({"error": "validation_error", "details": [e.as_dict()]}), 400
 
-    payload_like = _payload_like_from_validated(p)
-
-    chart = _call_compute_chart(payload_like)
-    houses = _call_compute_houses(
-        payload_like.latitude, payload_like.longitude, payload_like.mode, chart.get("jd_ut")
-    )
+    # compute with normalized payload
+    shim = SimpleNamespace(**base)
+    chart = _call_compute_chart(shim)
+    houses = _call_compute_houses(base["latitude"], base["longitude"], base["mode"], chart.get("jd_ut"))
 
     narrative = (
         "This is a placeholder narrative aligned to your mode and computed houses. "
@@ -178,7 +141,7 @@ def predictions():
     body = request.get_json(force=True) or {}
     try:
         payload = PredictionRequest(**body)
-    except PydValidationError as e:
+    except PydanticError as e:
         return jsonify({"error": "validation_error", "details": e.errors()}), 400
 
     chart = _call_compute_chart(payload)
@@ -251,51 +214,27 @@ def predictions():
 
 @api.post("/rectification/quick")
 def rect_quick():
-    """
-    Accept BOTH:
-      • Minimal format (date, time, place_tz, latitude, longitude[, mode]) + optional window_minutes
-      • Full RectificationRequest (legacy)
-    Always return 400 on bad inputs.
-    """
-    data = request.get_json(silent=True) or {}
-
-    # Try minimal validator first (so the "minimal format" test passes)
+    body = request.get_json(force=True) or {}
     try:
-        p = parse_chart_payload(data)
-        window_minutes = int(data.get("window_minutes", 30))
-        if not (1 <= window_minutes <= 240):
-            raise InputValidationError("window_minutes must be between 1 and 240")
-        # Normalize to the dict expected by rectification_candidates
-        if "dt" in p:
-            dt_local = p["dt"]
-            date_str = dt_local.strftime("%Y-%m-%d")
-            time_str = dt_local.strftime("%H:%M")
-        else:
-            date_str = p["date"]
-            time_str = p["time"]
+        # Minimal accepted; adds sane defaults (e.g., mode)
+        base = parse_chart_payload(body)
+    except InputValidationError as e:
+        return jsonify({"error": "validation_error", "details": [e.as_dict()]}), 400
 
-        rect_input = {
-            "date": date_str,
-            "time": time_str,
-            "place_tz": p["place_tz"],
-            "latitude": p["latitude"],
-            "longitude": p["longitude"],
-            "mode": p.get("mode", "sidereal"),
-        }
-        result = rectification_candidates(rect_input, window_minutes)
-        return jsonify(result), 200
-
-    except InputValidationError:
-        # Fall back to strict Pydantic model (legacy full format)
-        pass
-
-    # Legacy full model path
+    # default window if not supplied; validate it's an int
     try:
-        payload = RectificationRequest(**data)
-    except PydValidationError as e:
-        return jsonify({"error": "validation_error", "details": e.errors()}), 400
+        window_minutes = int(body.get("window_minutes", 60))
+    except Exception:
+        return jsonify(
+            {
+                "error": "validation_error",
+                "details": [
+                    {"loc": ["window_minutes"], "msg": "must be integer", "type": "type_error.integer"}
+                ],
+            }
+        ), 400
 
-    result = rectification_candidates(payload.dict(), payload.window_minutes)
+    result = rectification_candidates(base, window_minutes)
     return jsonify(result), 200
 
 
