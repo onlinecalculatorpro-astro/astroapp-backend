@@ -24,8 +24,8 @@ from app.core.validators import (
     parse_rectification_payload,
 )
 
-# engine bits
-from app.core.astronomy import compute_chart  # canonical chart call
+# canonical chart call
+from app.core.astronomy import compute_chart
 from app.core.predict import predict
 from app.core.rectify import rectification_candidates
 
@@ -47,7 +47,7 @@ except Exception:  # pragma: no cover
     _leaps = None  # type: ignore
 
 api = Blueprint("api", __name__)
-DEBUG_VERBOSE = os.getenv("ASTRO_DEBUG_VERBOSE", "0") in ("1", "true", "True")
+DEBUG_VERBOSE = os.getenv("ASTRO_DEBUG_VERBOSE", "0").lower() in ("1", "true", "yes", "on")
 
 
 # ─────────────────────────────── timescales ────────────────────────────────
@@ -160,6 +160,7 @@ def _sig_accepts(fn: Callable, *names: str) -> Dict[str, bool]:
         return {n: False for n in names}
     return {n: (n in params) for n in names}
 
+
 def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str, Any]:
     """
     Call compute_chart with signature introspection. Supports alternate names like
@@ -208,34 +209,49 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
     return chart
 
 
-
 def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
     """
     Prefer policy façade if available; pass jd_tt/jd_ut1 when accepted.
     Fallback to legacy compute_houses(lat, lon, mode[, jd_ut]).
-    NOTE:
-      • chart 'mode' is 'sidereal'/'tropical' (NOT a house system).
-      • if the new façade is used, we take house system from payload['house_system']
-        (default is handled inside the façade, typically 'placidus').
+
+    IMPORTANT: chart 'mode' is 'sidereal'/'tropical' (NOT a house system).
+               We pass user's requested house system via payload['house_system']
+               (or 'system' if the client used that name). If omitted, the façade
+               uses its own default (typically 'placidus').
     """
     lat = float(payload["latitude"])
     lon = float(payload["longitude"])
 
+    requested_system = (
+        payload.get("house_system") or
+        payload.get("system") or
+        None
+    )
+
     accepts = _sig_accepts(
-        _houses_fn, "lat", "lon", "system", "mode", "jd_ut", "jd_tt", "jd_ut1", "diagnostics"
+        _houses_fn,
+        "lat", "lon",
+        "system", "requested_house_system", "house_system",  # different APIs
+        "mode", "jd_ut", "jd_tt", "jd_ut1", "diagnostics"
     )
 
     kwargs: Dict[str, Any] = {"lat": lat, "lon": lon}
 
-    if accepts.get("system"):
-        # new façade → use explicit house_system if provided; else let façade default
-        if "house_system" in payload and payload["house_system"]:
-            kwargs["system"] = str(payload["house_system"]).lower()
-    elif accepts.get("mode"):
-        # legacy engine signature
+    # Map requested system to whatever the target supports
+    if requested_system:
+        rs = str(requested_system).lower()
+        if accepts.get("system"):
+            kwargs["system"] = rs
+        elif accepts.get("requested_house_system"):
+            kwargs["requested_house_system"] = rs
+        elif accepts.get("house_system"):
+            kwargs["house_system"] = rs
+
+    # Legacy engines sometimes expect 'mode' (sidereal/tropical)
+    if accepts.get("mode") and "mode" in payload:
         kwargs["mode"] = payload["mode"]
 
-    # timescales
+    # Timescales (prefer jd_tt/jd_ut1; legacy may accept jd_ut)
     if accepts.get("jd_tt"):
         kwargs["jd_tt"] = ts["jd_tt"]
     if accepts.get("jd_ut1"):
@@ -243,7 +259,7 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
     if accepts.get("jd_ut") and "jd_tt" not in kwargs and "jd_ut1" not in kwargs:
         kwargs["jd_ut"] = ts["jd_utc"]
 
-    # diagnostics passthrough
+    # Diagnostics passthrough
     if accepts.get("diagnostics") and "diagnostics" in payload:
         kwargs["diagnostics"] = bool(payload["diagnostics"])
 
