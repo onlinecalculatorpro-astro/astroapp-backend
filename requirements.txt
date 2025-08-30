@@ -1,3 +1,4 @@
+--only-binary=pandas,numpy
 flask==3.0.2
 gunicorn==21.2.0
 pydantic==1.10.12
