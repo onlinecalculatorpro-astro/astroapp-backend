@@ -6,7 +6,7 @@ import os
 import inspect
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
-from typing import Any, Dict, Tuple
+from typing import Any, Dict
 
 from flask import Blueprint, jsonify, request
 from pydantic import ValidationError
@@ -27,7 +27,6 @@ from app.core.predict import predict
 from app.core.rectify import rectification_candidates
 
 api = Blueprint("api", __name__)
-
 
 # ---------- helpers -----------------------------------------------------------
 
@@ -75,7 +74,6 @@ def _call_compute_chart(payload: ChartRequest | PredictionRequest) -> Dict[str, 
         )
 
     if "jd_ut" not in chart:
-        # Compute jd_ut ourselves if chart didn't provide it
         tz = getattr(payload, "place_tz", "UTC")
         chart["jd_ut"] = _jd_ut_from_local(payload.date, payload.time, tz)
 
@@ -132,8 +130,10 @@ def report():
 
 @api.post("/predictions")  # keeping the original path for compatibility
 def predictions():
+    # Read body once so we can pick up optional overrides
+    body = request.get_json(force=True) or {}
     try:
-        payload = PredictionRequest(**request.get_json(force=True))
+        payload = PredictionRequest(**body)
     except ValidationError as e:
         return jsonify({"error": "validation_error", "details": e.errors()}), 400
 
@@ -151,12 +151,35 @@ def predictions():
         hc = {}
 
     defaults = hc.get("defaults", {}) or {}
-    tau = defaults.get("tau", 0.88)
-    floor = defaults.get("floor", 0.60)
+    tau = float(defaults.get("tau", 0.88))
+    floor = float(defaults.get("floor", 0.60))
+
+    # Optional one-off overrides for testing via request body
+    overrides = body.get("hc_overrides") or {}
+    if isinstance(overrides, dict):
+        if "tau" in overrides:
+            tau = float(overrides["tau"])
+        if "floor" in overrides:
+            floor = float(overrides["floor"])
+
+    # (Optional) environment-level debug overrides
+    env_over = os.environ.get("ASTRO_HC_DEBUG_OVERRIDES")
+    if env_over:
+        try:
+            env_dict = json.loads(env_over)
+            if isinstance(env_dict, dict):
+                if "tau" in env_dict:
+                    tau = float(env_dict["tau"])
+                if "floor" in env_dict:
+                    floor = float(env_dict["floor"])
+        except Exception:
+            pass  # ignore malformed env override
 
     preds = []
     for i, pr in enumerate(preds_raw):
         p = float(pr.get("probability", 0.0))
+        abstained = p < floor
+        hc_flag = (not abstained) and (p >= tau)
         preds.append(
             {
                 "prediction_id": f"pred_{i}",
@@ -165,16 +188,20 @@ def predictions():
                 "interval_start_utc": pr.get("interval", {}).get("start"),
                 "interval_end_utc": pr.get("interval", {}).get("end"),
                 "probability_calibrated": p,
-                "hc_flag": p >= tau,
-                "abstained": p < floor,
+                "hc_flag": hc_flag,
+                "abstained": abstained,
                 "evidence": pr.get("evidence"),
                 "mode": chart.get("mode"),
                 "ayanamsa_deg": chart.get("ayanamsa_deg"),
-                "notes": "QIA+calibrated placeholder; subject to M3 tuning",
+                "notes": "QIA+calibrated placeholder; subject to M3 tuning "
+                         + ("abstained" if abstained else "accepted"),
             }
         )
 
-    preds = flag_predictions(preds, payload.horizon, th_path)
+    # Only run file-driven per-domain/horizon adjustments if no explicit overrides were used
+    if not overrides and not os.environ.get("ASTRO_HC_DEBUG_OVERRIDES"):
+        preds = flag_predictions(preds, payload.horizon, th_path)
+
     return jsonify({"predictions": preds}), 200
 
 
@@ -229,7 +256,6 @@ def system_validation():
 @api.get("/metrics")
 def metrics_export():
     from flask import Response
-
     return Response(metrics.export_prometheus(), mimetype="text/plain")
 
 
