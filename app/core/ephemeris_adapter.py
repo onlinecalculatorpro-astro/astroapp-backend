@@ -75,7 +75,7 @@ def ecliptic_longitudes(
     """
     Compute ecliptic longitudes/latitudes and daily speed (deg/day) for
     Sun, Moon, Mercury, Venus, Mars, Jupiter, Saturn. Also append nodes
-    (Rahu/Ketu) from the Moon’s ecliptic longitude (simple approximation).
+    (Rahu/Ketu) from the Moon's ecliptic longitude (simple approximation).
 
     If Skyfield (or its kernels) are unavailable, returns a deterministic
     fallback with the same structure, suitable for smoke tests.
@@ -113,8 +113,9 @@ def ecliptic_longitudes(
 
         # Build Earth+topo observer and evaluate at both times
         topo = wgs84.latlon(latitude_degrees=lat, longitude_degrees=lon, elevation_m=0.0)
-        observer = (eph["earth"] + topo).at(t)
-        observer2 = (eph["earth"] + topo).at(t_next)
+        observer = eph["earth"] + topo
+        observer_at_t = observer.at(t)
+        observer_at_t2 = observer.at(t_next)
 
         # Mapping for de421 outer planet barycenters
         body_keys = {
@@ -128,7 +129,7 @@ def ecliptic_longitudes(
         }
 
         def ecliptic_of_date(astrometric):
-            """Handle API difference: some versions accept epoch='date', others don’t."""
+            """Handle API difference: some versions accept epoch='date', others don't."""
             try:
                 return astrometric.ecliptic_latlon(epoch="date")
             except TypeError:
@@ -140,12 +141,14 @@ def ecliptic_longitudes(
             body = eph[key]
 
             # Version-safe observation from the topocentric observer
-            ast = body.at(t).observe_from(observer).apparent()
+            astrometric = observer_at_t.observe(body)
+            ast = astrometric.apparent()
             lon_a, lat_a, _ = ecliptic_of_date(ast)
             lon_deg = _wrap360(lon_a.degrees)
             lat_deg = float(lat_a.degrees)
 
-            ast2 = body.at(t_next).observe_from(observer2).apparent()
+            astrometric2 = observer_at_t2.observe(body)
+            ast2 = astrometric2.apparent()
             lon_b, _, _ = ecliptic_of_date(ast2)
 
             # Daily motion with wrap-around into (-180, 180]
@@ -155,7 +158,7 @@ def ecliptic_longitudes(
                 {"name": human, "lon": lon_deg, "lat": lat_deg, "speed": speed, "retro": speed < 0.0}
             )
 
-        # Nodes from the Moon’s ecliptic longitude (simple opposite points)
+        # Nodes from the Moon's ecliptic longitude (simple opposite points)
         moon_lon = next(b["lon"] for b in results if b["name"] == "Moon")
         results.append({"name": "Rahu", "lon": (moon_lon + 180.0) % 360.0, "lat": 0.0, "speed": 0.0, "retro": True})
         results.append({"name": "Ketu", "lon": moon_lon, "lat": 0.0, "speed": 0.0, "retro": True})
@@ -223,7 +226,8 @@ def enhanced_ecliptic_longitudes(
 
         t = ts.tdb(jd=jd_tt)
         topo = wgs84.latlon(latitude_degrees=lat, longitude_degrees=lon, elevation_m=0.0)
-        obs_t = (eph["earth"] + topo).at(t)
+        observer = eph["earth"] + topo
+        obs_t = observer.at(t)
 
         keys = {
             "Sun": "sun",
@@ -248,7 +252,8 @@ def enhanced_ecliptic_longitudes(
         bodies: List[Dict[str, Any]] = []
         for name, key in keys.items():
             body = eph[key]
-            ast_app = body.at(t).observe_from(obs_t).apparent()
+            astrometric = obs_t.observe(body)
+            ast_app = astrometric.apparent()
 
             lon_true, lat_true, _ = ecliptic_true(ast_app)
             lon_mean, lat_mean, _ = ecliptic_mean(ast_app)
