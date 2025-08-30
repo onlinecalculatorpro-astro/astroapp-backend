@@ -1,41 +1,60 @@
-from __future__ import annotations
-import os, yaml
-from dataclasses import dataclass
+# app/utils/config.py
+import os
+import json
+import yaml
 
-@dataclass
-class AppConfig:
-    mode: str = "sidereal"
-    ayanamsa: str = "lahiri"
-    ephemeris_kernel: str = "de421"
-    rectification_mode: str = "quick"
-    rect_window_minutes: int = 90
-    rect_step_seconds: int = 120
-    cache_lru_mb: int = 64
-    cache_sqlite_mb: int = 100
-    ttl_houses_days: int = 7
-    ttl_rect_days: int = 2
-    pro_features_enabled: bool = False
-    rate_limits_per_hour: dict | None = None
+class AttrDict(dict):
+    """Dict that also supports attribute access: cfg.mode and cfg['mode'] both work."""
+    def __getattr__(self, item):
+        try:
+            return self[item]
+        except KeyError as e:
+            raise AttributeError(item) from e
+    def __setattr__(self, key, value):
+        self[key] = value
 
-def load_config(path: str) -> AppConfig:
+def _to_attr(obj):
+    if isinstance(obj, dict):
+        return AttrDict({k: _to_attr(v) for k, v in obj.items()})
+    if isinstance(obj, list):
+        return [_to_attr(x) for x in obj]
+    return obj
+
+def _load_json_if(path):
+    if not path:
+        return {}
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f) or {}
+    except Exception:
+        # Keep going even if optional files can't be read
+        return {}
+    return {}
+
+def load_config(path: str):
+    """
+    Load YAML config from `path` and merge optional JSON blobs pointed to by env vars:
+      - ASTRO_CALIBRATORS
+      - ASTRO_HC_THRESHOLDS
+    Optional override:
+      - ASTRO_MODE  (overrides config['mode'] if set)
+    Returns an AttrDict for convenient access.
+    """
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
-    rl = data.get('rate_limits', {})
-cfg = AppConfig(
-        mode=data.get("mode","sidereal"),
-        ayanamsa=data.get("ayanamsa","lahiri"),
-        ephemeris_kernel=data.get("ephemeris_kernel","de421"),
-        rectification_mode=data.get("rectification_mode","quick"),
-        rect_window_minutes=int(data.get("rect_window_minutes",90)),
-        rect_step_seconds=int(data.get("rect_step_seconds",120)),
-        cache_lru_mb=int(data.get("cache_sizes_mb",{}).get("lru",64)),
-        cache_sqlite_mb=int(data.get("cache_sizes_mb",{}).get("sqlite",100)),
-        ttl_houses_days=int(data.get("ttl_days",{}).get("houses",7)),
-        ttl_rect_days=int(data.get("ttl_days",{}).get("rectification_windows",2)),
-        pro_features_enabled=bool(data.get("pro_features_enabled", False)),
-        rate_limits_per_hour=rl if isinstance(rl, dict) else {},
-    )
-    # simple env overrides
-    cfg.mode = os.getenv("ASTRO_MODE", cfg.mode)
-    cfg.ayanamsa = os.getenv("ASTRO_AYANAMSA", cfg.ayanamsa)
-    return cfg
+
+    # Optional env override for mode
+    astro_mode = os.getenv("ASTRO_MODE")
+    if astro_mode:
+        data["mode"] = astro_mode
+
+    # Attach optional JSONs
+    cal_path = os.getenv("ASTRO_CALIBRATORS")
+    thr_path = os.getenv("ASTRO_HC_THRESHOLDS")
+    if cal_path:
+        data["calibrators"] = _load_json_if(cal_path)
+    if thr_path:
+        data["hc_thresholds"] = _load_json_if(thr_path)
+
+    return _to_attr(data)
