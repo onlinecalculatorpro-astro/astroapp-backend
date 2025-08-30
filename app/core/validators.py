@@ -1,380 +1,204 @@
-# app/api/routes.py
+# app/core/validators.py
 from __future__ import annotations
 
-import json
-import os
-import inspect
-from datetime import datetime, timezone
+from datetime import datetime, date, time
+from typing import Any, Dict, List, Tuple
 from zoneinfo import ZoneInfo
-from typing import Any, Dict
-
-from flask import Blueprint, jsonify, request
-from pydantic import ValidationError as PydValidationError
-from app.core.validators import parse_chart_payload, ValidationError as InputValidationError
-
-from app.version import VERSION
-from app.utils.validation import (
-    ChartRequest,          # still used by legacy helpers / type hints
-    PredictionRequest,
-    RectificationRequest,  # kept for compatibility but not required in new flows
-)
-from app.utils.metrics import metrics
-from app.utils.ratelimit import rate_limit
-from app.utils.hc import flag_predictions
-from app.utils.config import load_config
-
-from app.core.astronomy import compute_chart, compute_houses
-from app.core.predict import predict
-from app.core.rectify import rectification_candidates
-
-api = Blueprint("api", __name__)
 
 
-# ---------- helpers -----------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Error type compatible with `e.errors()` that routes expect to jsonify
+# -----------------------------------------------------------------------------
+class ValidationError(ValueError):
+    def __init__(self, errors: List[Dict[str, Any]] | None = None):
+        super().__init__("validation_error")
+        self._errors = errors or []
 
-def _jd_ut_from_local(date_str: str, time_str: str, tz_name: str) -> float:
-    """Compute JD(UT) from local date/time and IANA timezone name."""
-    dt_local = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M").replace(
-        tzinfo=ZoneInfo(tz_name)
-    )
-    dt_utc = dt_local.astimezone(timezone.utc)
+    def add(self, field: str, msg: str, err_type: str = "value_error") -> None:
+        self._errors.append({"loc": [field], "msg": msg, "type": err_type})
 
-    y, m, d = dt_utc.year, dt_utc.month, dt_utc.day
-    day_frac = (dt_utc.hour + dt_utc.minute / 60 + dt_utc.second / 3600) / 24.0
+    def extend(self, items: List[Dict[str, Any]]) -> None:
+        self._errors.extend(items)
 
-    # Gregorian JD at 0h UT
-    a = (14 - m) // 12
-    y2 = y + 4800 - a
-    m2 = m + 12 * a - 3
-    jdn = d + ((153 * m2 + 2) // 5) + 365 * y2 + y2 // 4 - y2 // 100 + y2 // 400 - 32045
-    return jdn + day_frac - 0.5
+    def errors(self) -> List[Dict[str, Any]]:
+        return list(self._errors)
 
 
-def _call_compute_chart(payload: ChartRequest | PredictionRequest | Any) -> Dict[str, Any]:
-    """
-    Call compute_chart with whatever signature the current implementation expects.
-    Ensures 'jd_ut' is present in the returned dict.
-    """
-    # Try (date, time, lat, lon, mode, place_tz)
+# -----------------------------------------------------------------------------
+# Primitive validators
+# -----------------------------------------------------------------------------
+def _require(data: Dict[str, Any], *keys: str) -> List[Dict[str, Any]]:
+    missing = [k for k in keys if k not in data]
+    return [{"loc": [k], "msg": "field required", "type": "missing"} for k in missing]
+
+
+def parse_date(s: Any) -> date:
+    if not isinstance(s, str):
+        raise ValidationError([{"loc": ["date"], "msg": "must be a string 'YYYY-MM-DD'", "type": "type_error"}])
     try:
-        chart = compute_chart(
-            payload.date,
-            payload.time,
-            payload.latitude,
-            payload.longitude,
-            payload.mode,
-            getattr(payload, "place_tz", None),
-        )
-    except TypeError:
-        # Fallback: (date, time, lat, lon, mode)
-        chart = compute_chart(
-            payload.date,
-            payload.time,
-            payload.latitude,
-            payload.longitude,
-            payload.mode,
-        )
-
-    if "jd_ut" not in chart:
-        tz = getattr(payload, "place_tz", "UTC")
-        chart["jd_ut"] = _jd_ut_from_local(payload.date, payload.time, tz)
-
-    return chart
-
-
-def _call_compute_houses(lat: float, lon: float, mode: str, jd_ut: float | None) -> Any:
-    """
-    Call compute_houses; pass jd_ut if the implementation accepts it.
-    """
-    sig = inspect.signature(compute_houses)
-    if "jd_ut" in sig.parameters and jd_ut is not None:
-        return compute_houses(lat, lon, mode, jd_ut=jd_ut)
-    # Legacy 3-arg version
-    return compute_houses(lat, lon, mode)
-
-
-def _payload_like_from_validated(p: Dict[str, Any]) -> Any:
-    """
-    Build a tiny attribute-based object the existing compute helpers expect,
-    from the dict returned by parse_chart_payload.
-    Supports either {'dt', ...} shape or {'date','time',...} shape.
-    """
-    if "dt" in p:
-        dt_local = p["dt"]
-        date_str = dt_local.strftime("%Y-%m-%d")
-        time_str = dt_local.strftime("%H:%M")
-    else:
-        # assume normalized strings are present
-        date_str = p["date"]
-        time_str = p["time"]
-
-    class _PayloadLike:
-        date = date_str
-        time = time_str
-        place_tz = p["place_tz"]
-        latitude = p["latitude"]
-        longitude = p["longitude"]
-        mode = p.get("mode", "sidereal")
-
-    return _PayloadLike()
-
-
-# ---------- endpoints ---------------------------------------------------------
-
-@api.get("/api/health")
-def health():
-    return jsonify({"status": "ok", "version": VERSION}), 200
-
-
-@api.post("/api/calculate")
-def calculate():
-    data = request.get_json(silent=True) or {}
-
-    # Validate & normalize
-    try:
-        p = parse_chart_payload(data)
-    except InputValidationError as e:
-        return jsonify({"error": "validation_error", "details": [str(e)]}), 400
-
-    payload_like = _payload_like_from_validated(p)
-
-    # Compute
-    chart = _call_compute_chart(payload_like)
-    houses = _call_compute_houses(
-        payload_like.latitude, payload_like.longitude, payload_like.mode, chart.get("jd_ut")
-    )
-
-    return jsonify({"chart": chart, "houses": houses}), 200
-
-
-@api.post("/api/report")
-def report():
-    data = request.get_json(silent=True) or {}
-
-    # Validate & normalize (accepts minimal format too)
-    try:
-        p = parse_chart_payload(data)
-    except InputValidationError as e:
-        return jsonify({"error": "validation_error", "details": [str(e)]}), 400
-
-    payload_like = _payload_like_from_validated(p)
-
-    chart = _call_compute_chart(payload_like)
-    houses = _call_compute_houses(
-        payload_like.latitude, payload_like.longitude, payload_like.mode, chart.get("jd_ut")
-    )
-
-    narrative = (
-        "This is a placeholder narrative aligned to your mode and computed houses. "
-        "Evidence chips will explain predictions in /predictions."
-    )
-
-    return jsonify({"chart": chart, "houses": houses, "narrative": narrative}), 200
-
-
-@api.post("/predictions")  # keeping the original path for compatibility
-def predictions():
-    # Read body once so we can pick up optional overrides
-    body = request.get_json(force=True) or {}
-    try:
-        payload = PredictionRequest(**body)
-    except PydValidationError as e:
-        return jsonify({"error": "validation_error", "details": e.errors()}), 400
-
-    chart = _call_compute_chart(payload)
-    houses = _call_compute_houses(payload.latitude, payload.longitude, payload.mode, chart.get("jd_ut"))
-
-    preds_raw = predict(chart, houses, payload.horizon)
-
-    # Load HC thresholds (with sensible defaults)
-    th_path = os.environ.get("ASTRO_HC_THRESHOLDS", "config/hc_thresholds.json")
-    try:
-        with open(th_path, "r", encoding="utf-8") as f:
-            hc = json.load(f) or {}
+        # Strict YYYY-MM-DD
+        return datetime.strptime(s, "%Y-%m-%d").date()
     except Exception:
-        hc = {}
-
-    defaults = hc.get("defaults", {}) or {}
-    tau = float(defaults.get("tau", 0.88))
-    floor = float(defaults.get("floor", 0.60))
-
-    # Optional one-off overrides for testing via request body
-    overrides = body.get("hc_overrides") or {}
-    if isinstance(overrides, dict):
-        if "tau" in overrides:
-            tau = float(overrides["tau"])
-        if "floor" in overrides:
-            floor = float(overrides["floor"])
-
-    # (Optional) environment-level debug overrides
-    env_over = os.environ.get("ASTRO_HC_DEBUG_OVERRIDES")
-    if env_over:
-        try:
-            env_dict = json.loads(env_over)
-            if isinstance(env_dict, dict):
-                if "tau" in env_dict:
-                    tau = float(env_dict["tau"])
-                if "floor" in env_dict:
-                    floor = float(env_dict["floor"])
-        except Exception:
-            pass  # ignore malformed env override
-
-    preds = []
-    for i, pr in enumerate(preds_raw):
-        p = float(pr.get("probability", 0.0))
-        abstained = p < floor
-        hc_flag = (not abstained) and (p >= tau)
-        preds.append(
-            {
-                "prediction_id": f"pred_{i}",
-                "domain": pr.get("domain"),
-                "horizon": payload.horizon,
-                "interval_start_utc": pr.get("interval", {}).get("start"),
-                "interval_end_utc": pr.get("interval", {}).get("end"),
-                "probability_calibrated": p,
-                "hc_flag": hc_flag,
-                "abstained": abstained,
-                "evidence": pr.get("evidence"),
-                "mode": chart.get("mode"),
-                "ayanamsa_deg": chart.get("ayanamsa_deg"),
-                "notes": "QIA+calibrated placeholder; subject to M3 tuning "
-                         + ("abstained" if abstained else "accepted"),
-            }
-        )
-
-    # Only run file-driven per-domain/horizon adjustments if no explicit overrides were used
-    if not overrides and not os.environ.get("ASTRO_HC_DEBUG_OVERRIDES"):
-        preds = flag_predictions(preds, payload.horizon, th_path)
-
-    return jsonify({"predictions": preds}), 200
+        raise ValidationError([{"loc": ["date"], "msg": "must be 'YYYY-MM-DD'", "type": "value_error.date"}])
 
 
-@api.post("/rectification/quick")
-def rect_quick():
-    """
-    Accept BOTH:
-      • Minimal format (date, time, place_tz, latitude, longitude[, mode]) + optional window_minutes
-      • Full RectificationRequest (legacy)
-    Always return 400 on bad inputs.
-    """
-    data = request.get_json(silent=True) or {}
-
-    # Try minimal validator first (so the "minimal format" test passes)
+def parse_time(s: Any) -> time:
+    if not isinstance(s, str):
+        raise ValidationError([{"loc": ["time"], "msg": "must be a string 'HH:MM' (24-hour)", "type": "type_error"}])
     try:
-        p = parse_chart_payload(data)
-        window_minutes = int(data.get("window_minutes", 30))
-        if not (1 <= window_minutes <= 240):
-            raise InputValidationError("window_minutes must be between 1 and 240")
-        # Normalize to the dict expected by rectification_candidates
-        if "dt" in p:
-            dt_local = p["dt"]
-            date_str = dt_local.strftime("%Y-%m-%d")
-            time_str = dt_local.strftime("%H:%M")
-        else:
-            date_str = p["date"]
-            time_str = p["time"]
+        hh, mm = s.split(":")
+        hh_i, mm_i = int(hh), int(mm)
+        if not (0 <= hh_i <= 23):
+            raise ValueError
+        if not (0 <= mm_i <= 59):
+            raise ValueError
+        return time(hh_i, mm_i)
+    except Exception:
+        raise ValidationError([{"loc": ["time"], "msg": "must be 'HH:MM' in 24-hour time", "type": "value_error.time"}])
 
-        rect_input = {
-            "date": date_str,
-            "time": time_str,
-            "place_tz": p["place_tz"],
-            "latitude": p["latitude"],
-            "longitude": p["longitude"],
-            "mode": p.get("mode", "sidereal"),
-        }
-        result = rectification_candidates(rect_input, window_minutes)
-        return jsonify(result), 200
 
-    except InputValidationError:
-        # Fall back to strict Pydantic model (legacy full format)
-        pass
+def validate_iana_timezone(tz_str: Any) -> str:
+    """
+    Accept only:
+      • 'UTC' exactly, or
+      • IANA names with a slash (e.g., 'America/New_York', 'Europe/London') that resolve in tzdb.
+    Reject:
+      • Abbreviations (EST, PST, IST, etc.)
+      • Offset formats (+05:30, -0700)
+      • Empty / non-string
+    """
+    if not isinstance(tz_str, str) or not tz_str:
+        raise ValidationError([{"loc": ["place_tz"], "msg": "must be a non-empty string", "type": "type_error"}])
 
-    # Legacy full model path
+    if tz_str == "UTC":
+        return tz_str
+
+    if "/" not in tz_str:
+        # Force IANA style only
+        raise ValidationError([{
+            "loc": ["place_tz"],
+            "msg": "must be an IANA timezone like 'Area/City' (e.g., 'America/New_York')",
+            "type": "value_error.timezone"
+        }])
+
     try:
-        payload = RectificationRequest(**data)
-    except PydValidationError as e:
-        return jsonify({"error": "validation_error", "details": e.errors()}), 400
+        ZoneInfo(tz_str)  # ensure it exists
+    except Exception:
+        raise ValidationError([{"loc": ["place_tz"], "msg": "unknown timezone", "type": "value_error.timezone"}])
 
-    result = rectification_candidates(payload.dict(), payload.window_minutes)
-    return jsonify(result), 200
-
-
-@api.get("/api/openapi")
-def openapi_spec():
-    # Try local app/openapi.yaml first, then project root
-    import yaml
-
-    base = os.path.dirname(__file__)
-    candidates = [
-        os.path.join(base, "..", "openapi.yaml"),
-        os.path.join(base, "..", "..", "openapi.yaml"),
-    ]
-    for p in candidates:
-        try:
-            with open(p, "r", encoding="utf-8") as f:
-                spec = yaml.safe_load(f)
-                return jsonify(spec), 200
-        except Exception:
-            continue
-
-    return jsonify({"error": "openapi_not_found"}), 404
+    return tz_str
 
 
-@api.get("/system-validation")
-def system_validation():
-    cfg = load_config(os.environ.get("ASTRO_CONFIG", "config/defaults.yaml"))
-    return jsonify(
+def parse_latlon(lat: Any, lon: Any) -> Tuple[float, float]:
+    try:
+        lat_f = float(lat)
+        lon_f = float(lon)
+    except Exception:
+        raise ValidationError([{
+            "loc": ["latitude", "longitude"],
+            "msg": "must be numbers",
+            "type": "type_error.float"
+        }])
+
+    errs: List[Dict[str, Any]] = []
+    if not (-90.0 <= lat_f <= 90.0):
+        errs.append({"loc": ["latitude"], "msg": "must be between -90 and 90", "type": "value_error.number.not_in_range"})
+    if not (-180.0 <= lon_f <= 180.0):
+        errs.append({"loc": ["longitude"], "msg": "must be between -180 and 180", "type": "value_error.number.not_in_range"})
+    if errs:
+        raise ValidationError(errs)
+
+    return lat_f, lon_f
+
+
+def parse_mode(mode: Any | None) -> str:
+    """
+    Normalize mode; default 'sidereal'. Accept only 'sidereal' or 'tropical'.
+    """
+    if mode is None:
+        return "sidereal"
+    if not isinstance(mode, str):
+        raise ValidationError([{"loc": ["mode"], "msg": "must be 'sidereal' or 'tropical'", "type": "type_error"}])
+    m = mode.strip().lower()
+    if m not in ("sidereal", "tropical"):
+        raise ValidationError([{"loc": ["mode"], "msg": "must be 'sidereal' or 'tropical'", "type": "value_error"}])
+    return m
+
+
+# -----------------------------------------------------------------------------
+# High-level payload parser used by endpoints
+# -----------------------------------------------------------------------------
+def parse_chart_payload(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Uniform parser for chart-like payloads used by /api/calculate, /predictions,
+    /rectification/quick, and /api/report.
+
+    Returns normalized dict:
         {
-            "astronomy_accuracy": "free-first (Skyfield if available, fallback approx)",
-            "performance_slo": {"calculate_p95_ms": 800, "rect_quick_p95_s": 20},
-            "mode_consistency": {
-                "sidereal_default": cfg.mode == "sidereal",
-                "ayanamsa": getattr(cfg, "ayanamsa", None),
-            },
-            "version": VERSION,
+          "date": "YYYY-MM-DD",
+          "time": "HH:MM",
+          "place_tz": "Area/City" | "UTC",
+          "latitude": float,
+          "longitude": float,
+          "mode": "sidereal" | "tropical",
+          "dt": timezone-aware datetime with tzinfo
         }
-    ), 200
+    Raises ValidationError(errors=[...]) with .errors() details for 400s.
+    """
+    errors = _require(data, "date", "time", "place_tz", "latitude", "longitude")
+    if errors:
+        raise ValidationError(errors)
 
+    # Field-by-field validation (collect as many as possible before raising)
+    d_val = t_val = tz_val = None
+    lat_val = lon_val = None
+    mode_val = None
 
-@api.get("/metrics")
-def metrics_export():
-    from flask import Response
-    return Response(metrics.export_prometheus(), mimetype="text/plain")
+    field_errors: List[Dict[str, Any]] = []
 
-
-@api.get("/api/config")
-@metrics.middleware("config")
-@rate_limit(1)
-def config_info():
-    cfg_path = os.environ.get("ASTRO_CONFIG", "config/defaults.yaml")
-    calib_path = os.environ.get("ASTRO_CALIBRATORS", "config/calibrators.json")
-    th_path = os.environ.get("ASTRO_HC_THRESHOLDS", "config/hc_thresholds.json")
-
-    cfg = load_config(cfg_path)
-    calib_ver = None
-    th_summary = None
-
+    # date
     try:
-        with open(calib_path, "r", encoding="utf-8") as f:
-            calib_ver = (json.load(f) or {}).get("version")
-    except Exception:
-        pass
+        d_val = parse_date(data["date"])
+    except ValidationError as e:
+        field_errors.extend(e.errors())
 
+    # time
     try:
-        with open(th_path, "r", encoding="utf-8") as f:
-            th = json.load(f) or {}
-            th_summary = {"entropy_H": th.get("entropy_H"), "defaults": th.get("defaults")}
-    except Exception:
-        pass
+        t_val = parse_time(data["time"])
+    except ValidationError as e:
+        field_errors.extend(e.errors())
 
-    return jsonify(
-        {
-            "mode": cfg.mode,
-            "ayanamsa": getattr(cfg, "ayanamsa", None),
-            "rate_limits_per_hour": getattr(cfg, "rate_limits_per_hour", None),
-            "pro_features_enabled": getattr(cfg, "pro_features_enabled", None),
-            "calibrators_version": calib_ver,
-            "hc_thresholds_summary": th_summary,
-            "version": VERSION,
-        }
-    ), 200
+    # tz
+    try:
+        tz_name = validate_iana_timezone(data["place_tz"])
+        tz_val = ZoneInfo(tz_name if tz_name != "UTC" else "UTC")
+    except ValidationError as e:
+        field_errors.extend(e.errors())
+
+    # lat/lon
+    try:
+        lat_val, lon_val = parse_latlon(data["latitude"], data["longitude"])
+    except ValidationError as e:
+        field_errors.extend(e.errors())
+
+    # mode (optional)
+    try:
+        mode_val = parse_mode(data.get("mode"))
+    except ValidationError as e:
+        field_errors.extend(e.errors())
+
+    if field_errors:
+        raise ValidationError(field_errors)
+
+    # Construct aware local datetime
+    dt_local = datetime.combine(d_val, t_val).replace(tzinfo=tz_val)
+
+    return {
+        "date": data["date"],
+        "time": data["time"],
+        "place_tz": "UTC" if tz_val.key == "UTC" else tz_val.key,  # normalized
+        "latitude": lat_val,
+        "longitude": lon_val,
+        "mode": mode_val,
+        "dt": dt_local,
+    }
