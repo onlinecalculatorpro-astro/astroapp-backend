@@ -1,22 +1,27 @@
 # app/main.py
+from __future__ import annotations
+
+import os
 from flask import Flask, jsonify
 from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
+
 from app.api.routes import api
+from app.api.debug_endpoints import debug_api  # <-- debug/test endpoints
 from app.utils.config import load_config
-import os
 
 
-def create_app():
+def create_app() -> Flask:
     app = Flask(__name__)
     app.config["JSON_SORT_KEYS"] = False
 
-    # Load YAML config (plus optional JSONs via env in load_config)
+    # Load YAML config (plus any optional JSONs via load_config)
     cfg_path = os.environ.get("ASTRO_CONFIG", "config/defaults.yaml")
     app.cfg = load_config(cfg_path)
 
-    # Register API blueprint (mounted at /api by routes.py)
-    app.register_blueprint(api)
+    # Register blueprints
+    app.register_blueprint(api)         # main API (paths defined inside routes.py)
+    app.register_blueprint(debug_api)   # debug/test endpoints for Postman
 
     # --- Health endpoints (Render + smoke tests) ---
     @app.get("/api/health-check")
@@ -28,11 +33,16 @@ def create_app():
     def health():
         return jsonify(status="ok"), 200
 
-    # --- Error handling: JSON responses + stack traces in logs ---
+    # --- Error handling: JSON responses; stack traces go to logs ---
     @app.errorhandler(HTTPException)
     def handle_http(e: HTTPException):
         return (
-            jsonify(error="http_error", code=e.code, name=e.name, description=e.description),
+            jsonify(
+                error="http_error",
+                code=e.code,
+                name=e.name,
+                description=e.description,
+            ),
             e.code,
         )
 
