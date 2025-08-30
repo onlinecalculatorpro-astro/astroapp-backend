@@ -1,0 +1,19 @@
+# Config defaults (free-first)
+mode: sidereal
+ayanamsa: lahiri
+ephemeris_kernel: de421
+rectification_mode: quick
+rect_window_minutes: 90
+rect_step_seconds: 120
+cache_sizes_mb:
+  lru: 64
+  sqlite: 100
+ttl_days:
+  houses: 7
+  rectification_windows: 2
+rate_limits:
+  calculate_per_hour: 60
+  report_per_hour: 20
+  predictions_per_hour: 30
+  rectification_quick_per_hour: 2
+pro_features_enabled: false

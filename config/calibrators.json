@@ -1,0 +1,30 @@
+{
+  "version": "0.1",
+  "domains": {
+    "Career/Education": {
+      "method": "temperature",
+      "T": 1.2,
+      "bias": 0.0
+    },
+    "Relationships": {
+      "method": "temperature",
+      "T": 1.25,
+      "bias": 0.0
+    },
+    "Relocation": {
+      "method": "temperature",
+      "T": 1.3,
+      "bias": -0.02
+    },
+    "Health": {
+      "method": "temperature",
+      "T": 1.35,
+      "bias": -0.03
+    },
+    "Finance": {
+      "method": "temperature",
+      "T": 1.25,
+      "bias": 0.01
+    }
+  }
+}
