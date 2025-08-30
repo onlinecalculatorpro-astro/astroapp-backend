@@ -4,15 +4,52 @@ info:
   version: 1.0.0
 servers:
   - url: /
+
 paths:
-  /api/health-check:
+  /api/health:
     get:
       summary: Health check
+      tags: [System]
       responses:
-        "200": { description: OK }
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
   /api/calculate:
     post:
       summary: Compute chart and houses
+      tags: [Astrology]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChartRequest'
+            examples:
+              basic:
+                value:
+                  date: "2020-03-10"
+                  time: "14:30"
+                  place_tz: "Asia/Kolkata"
+                  latitude: 19.076
+                  longitude: 72.8777
+                  mode: "sidereal"
+                  house_system: "placidus"
+      responses:
+        "200":
+          description: Chart and houses
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChartResponse'
+
+  /api/report:
+    post:
+      summary: Generate narrative report
+      tags: [Astrology]
       requestBody:
         required: true
         content:
@@ -21,21 +58,50 @@ paths:
               $ref: '#/components/schemas/ChartRequest'
       responses:
         "200":
-          description: Chart & houses
+          description: Narrative aligned to computed chart/houses
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportResponse'
+
   /predictions:
     post:
-      summary: Predictions
+      summary: Predictions with high-confidence flags
+      tags: [Astrology]
       requestBody:
         required: true
         content:
           application/json:
             schema:
               $ref: '#/components/schemas/PredictionRequest'
+            examples:
+              byDays:
+                value:
+                  date: "2020-03-10"
+                  time: "14:30:02"
+                  timezone: "Asia/Kolkata"
+                  latitude: 19.076
+                  longitude: 72.8777
+                  mode: "sidereal"
+                  horizon: { days: 30 }
       responses:
-        "200": { description: Predictions response }
+        "200":
+          description: Predictions response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PredictionsResponse'
+        "400":
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
   /rectification/quick:
     post:
-      summary: Quick rectification
+      summary: Quick birth-time rectification window search
+      tags: [Astrology]
       requestBody:
         required: true
         content:
@@ -43,35 +109,279 @@ paths:
             schema:
               $ref: '#/components/schemas/RectificationRequest'
       responses:
-        "200": { description: Rectification candidates }
+        "200":
+          description: Rectification candidates
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RectificationResponse'
+
+  /api/config:
+    get:
+      summary: Runtime configuration and timescale sample
+      tags: [System]
+      responses:
+        "200":
+          description: Current config snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConfigResponse'
+
+  /system-validation:
+    get:
+      summary: System validation & policy snapshot
+      tags: [System]
+      responses:
+        "200":
+          description: System validation summary
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemValidationResponse'
+
 components:
   schemas:
+    # ───────── request schemas ─────────
     ChartRequest:
       type: object
-      required: [date, time, place_tz, latitude, longitude, mode]
+      description: >
+        Base request for calculations. Accepts `place_tz` **or** `timezone`. Time supports `HH:MM` or `HH:MM:SS`.
+      required: [date, time, latitude, longitude, mode]
       properties:
-        date: { type: string, example: "1992-11-04" }
-        time: { type: string, example: "05:25" }
-        place_tz: { type: string, example: "Asia/Kolkata" }
-        latitude: { type: number, example: 13.0827 }
-        longitude: { type: number, example: 80.2707 }
-        mode: { type: string, enum: [sidereal, tropical] }
+        date:
+          type: string
+          format: date
+          example: "1992-11-04"
+        time:
+          type: string
+          description: "24h time, 'HH:MM' or 'HH:MM:SS'"
+          example: "05:25"
+        place_tz:
+          type: string
+          description: IANA time zone (alternative to `timezone`)
+          example: "Asia/Kolkata"
+        timezone:
+          type: string
+          description: IANA time zone (alternative to `place_tz`)
+          example: "Asia/Kolkata"
+        latitude:
+          type: number
+          format: double
+          example: 13.0827
+        longitude:
+          type: number
+          format: double
+          example: 80.2707
+        mode:
+          type: string
+          enum: [sidereal, tropical]
+        house_system:
+          type: string
+          description: Optional house system (e.g., 'placidus', 'whole', 'equal')
+          example: "placidus"
+      oneOf:
+        - required: [place_tz]
+        - required: [timezone]
+
     PredictionRequest:
       allOf:
         - $ref: '#/components/schemas/ChartRequest'
         - type: object
-          required: [horizon]
+          description: >
+            Horizon may be:
+            • a label: 'short' | 'medium' | 'long'
+            • a duration: {'days': N}
+            • a string like '30d' or 'P30D'
           properties:
-            horizon: { type: string, enum: [short, medium, long] }
+            horizon:
+              oneOf:
+                - type: string
+                  enum: [short, medium, long]
+                - type: object
+                  properties:
+                    days: { type: integer, minimum: 1, maximum: 3650 }
+                  required: [days]
+                - type: string
+                  pattern: "^(?:P)?\\d{1,4}D$"
+                  example: "30D"
             hc_overrides:
               type: object
               properties:
-                tau: { type: number }
+                tau:   { type: number }
                 delta: { type: number }
                 floor: { type: number }
+          required: [horizon]
+
     RectificationRequest:
       allOf:
         - $ref: '#/components/schemas/ChartRequest'
         - type: object
           properties:
-            window_minutes: { type: integer, default: 30 }
+            window_minutes:
+              type: integer
+              minimum: 5
+              maximum: 10080
+              default: 120
+
+    # ───────── response schemas ─────────
+    HealthResponse:
+      type: object
+      properties:
+        ok: { type: boolean }
+        status: { type: string, example: "up" }
+        version: { type: string }
+
+    Timescales:
+      type: object
+      properties:
+        jd_utc:   { type: number, format: double }
+        jd_tt:    { type: number, format: double }
+        jd_ut1:   { type: number, format: double }
+        delta_t:  { type: number, format: double, description: "TT−UT1 (s)" }
+        delta_at: { type: number, format: double, description: "TAI−UTC (s)" }
+        dut1:     { type: number, format: double, description: "UT1−UTC (s)" }
+        warnings:
+          type: array
+          items: { type: string }
+
+    ChartResponse:
+      type: object
+      properties:
+        ok: { type: boolean }
+        chart:
+          type: object
+          description: Engine-specific chart payload
+        houses:
+          type: object
+          description: House results (shape depends on engine)
+        meta:
+          type: object
+          properties:
+            timescales:
+              $ref: '#/components/schemas/Timescales'
+
+    ReportResponse:
+      type: object
+      properties:
+        ok: { type: boolean }
+        chart: { type: object }
+        houses: { type: object }
+        narrative: { type: string }
+        meta:
+          type: object
+          properties:
+            timescales:
+              $ref: '#/components/schemas/Timescales'
+
+    PredictionsResponse:
+      type: object
+      properties:
+        ok: { type: boolean }
+        predictions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Prediction'
+        meta:
+          type: object
+          properties:
+            timescales:
+              $ref: '#/components/schemas/Timescales'
+
+    Prediction:
+      type: object
+      properties:
+        prediction_id: { type: string }
+        domain: { type: string }
+        horizon:
+          oneOf:
+            - type: string
+            - type: object
+        interval_start_utc: { type: string, format: date-time }
+        interval_end_utc:   { type: string, format: date-time }
+        probability_calibrated: { type: number, format: double }
+        hc_flag: { type: boolean }
+        abstained: { type: boolean }
+        evidence: { type: object }
+        mode: { type: string }
+        ayanamsa_deg: { type: number, format: double }
+        notes: { type: string }
+
+    RectificationResponse:
+      type: object
+      properties:
+        ok: { type: boolean }
+        best_time: { type: string, description: "ISO civil time guess in local tz" }
+        composite_scores:
+          type: array
+          items: { type: object }
+        features_at_peak:
+          type: array
+          items: { type: string }
+        margin_delta: { type: number, description: "Score gap vs. 2nd-best" }
+
+    ConfigResponse:
+      type: object
+      properties:
+        ok: { type: boolean }
+        mode: { type: string, enum: [sidereal, tropical] }
+        ayanamsa: { type: string, nullable: true }
+        rate_limits_per_hour: { type: integer, nullable: true }
+        pro_features_enabled: { type: boolean, nullable: true }
+        calibrators_version: { type: string, nullable: true }
+        hc_thresholds_summary:
+          type: object
+          nullable: true
+        timescale_sample:
+          oneOf:
+            - $ref: '#/components/schemas/Timescales'
+            - type: "null"
+        leap_policy: { type: string }
+        version: { type: string }
+
+    SystemValidationResponse:
+      type: object
+      properties:
+        ok: { type: boolean }
+        astronomy_accuracy: { type: string }
+        performance_slo:
+          type: object
+          properties:
+            calculate_p95_ms: { type: integer }
+            rect_quick_p95_s: { type: integer }
+        mode_consistency:
+          type: object
+          properties:
+            sidereal_default: { type: boolean }
+            ayanamsa: { type: string, nullable: true }
+        policy:
+          type: object
+          properties:
+            leap_policy: { type: string }
+            dut1_broadcast: { type: boolean }
+            houses_engine: { type: string, enum: [policy, legacy] }
+            polar_policy:
+              type: object
+              properties:
+                soft_fallback_lat_gt: { type: number }
+                hard_reject_lat_ge: { type: number }
+        leap_seconds:
+          nullable: true
+          description: "Best-effort leap seconds status"
+        version: { type: string }
+
+    ErrorResponse:
+      type: object
+      properties:
+        ok: { type: boolean, example: false }
+        error: { type: string }
+        details:
+          oneOf:
+            - type: array
+              items:
+                type: object
+                properties:
+                  loc: { type: array, items: { type: string } }
+                  msg: { type: string }
+                  type: { type: string }
+            - type: string
