@@ -1,64 +1,24 @@
 {
   "entropy_H": 1.2,
   "defaults": {
-    "tau": 0.88,
+    "tau": 0.23,
     "delta": 0.08,
-    "floor": 0.6
+    "floor": 0.20
   },
   "by_domain_horizon": {
     "short": {
-      "Career/Education": {
-        "tau": 0.89,
-        "delta": 0.08,
-        "floor": 0.6
-      },
-      "Relationships": {
-        "tau": 0.88,
-        "delta": 0.08,
-        "floor": 0.6
-      },
-      "Relocation": {
-        "tau": 0.88,
-        "delta": 0.09,
-        "floor": 0.6
-      },
-      "Health": {
-        "tau": 0.91,
-        "delta": 0.1,
-        "floor": 0.65
-      },
-      "Finance": {
-        "tau": 0.88,
-        "delta": 0.08,
-        "floor": 0.6
-      }
+      "Career/Education": { "tau": 0.235, "delta": 0.08, "floor": 0.20 },
+      "Relationships":    { "tau": 0.235, "delta": 0.08, "floor": 0.20 },
+      "Relocation":       { "tau": 0.230, "delta": 0.08, "floor": 0.20 },
+      "Health":           { "tau": 0.230, "delta": 0.10, "floor": 0.20 },
+      "Finance":          { "tau": 0.235, "delta": 0.08, "floor": 0.20 }
     },
     "medium": {
-      "Career/Education": {
-        "tau": 0.86,
-        "delta": 0.07,
-        "floor": 0.6
-      },
-      "Relationships": {
-        "tau": 0.85,
-        "delta": 0.07,
-        "floor": 0.6
-      },
-      "Relocation": {
-        "tau": 0.87,
-        "delta": 0.08,
-        "floor": 0.6
-      },
-      "Health": {
-        "tau": 0.9,
-        "delta": 0.1,
-        "floor": 0.65
-      },
-      "Finance": {
-        "tau": 0.86,
-        "delta": 0.07,
-        "floor": 0.6
-      }
+      "Career/Education": { "tau": 0.35, "delta": 0.08, "floor": 0.25 },
+      "Relationships":    { "tau": 0.34, "delta": 0.08, "floor": 0.25 },
+      "Relocation":       { "tau": 0.35, "delta": 0.09, "floor": 0.25 },
+      "Health":           { "tau": 0.38, "delta": 0.10, "floor": 0.28 },
+      "Finance":          { "tau": 0.34, "delta": 0.08, "floor": 0.25 }
     }
   }
 }
