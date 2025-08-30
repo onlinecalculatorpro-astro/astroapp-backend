@@ -3,7 +3,12 @@ services:
     name: astroapp-backend
     env: python
     plan: free
-    buildCommand: pip install --upgrade pip wheel setuptools && pip install -r requirements.txt
+    buildCommand: |
+      python --version
+      pip --version
+      pip install --upgrade pip wheel setuptools
+      pip install --only-binary=:all: numpy==1.26.4 pandas==2.2.2
+      pip install -r requirements.txt
     startCommand: gunicorn app.main:app --preload --workers=2 --threads=4 --timeout=120
     healthCheckPath: /api/health-check
     autoDeploy: true
@@ -13,7 +18,34 @@ services:
       - key: TZ
         value: Asia/Kolkata
       - key: NETLIFY_ORIGIN
-        value: "*"  # lock to your Netlify URL later
+        value: "*"
+      - key: ASTRO_CONFIG
+        value: config/defaults.yaml
+      - key: ASTRO_CALIBRATORS
+        value: config/calibrators.json
+      - key: ASTRO_HC_THRESHOLDS
+        value: config/hc_thresholds.json
+services:
+  - type: web
+    name: astroapp-backend
+    env: python
+    plan: free
+    buildCommand: |
+      python --version
+      pip --version
+      pip install --upgrade pip wheel setuptools
+      pip install --only-binary=:all: numpy==1.26.4 pandas==2.2.2
+      pip install -r requirements.txt
+    startCommand: gunicorn app.main:app --preload --workers=2 --threads=4 --timeout=120
+    healthCheckPath: /api/health-check
+    autoDeploy: true
+    envVars:
+      - key: FLASK_ENV
+        value: production
+      - key: TZ
+        value: Asia/Kolkata
+      - key: NETLIFY_ORIGIN
+        value: "*"
       - key: ASTRO_CONFIG
         value: config/defaults.yaml
       - key: ASTRO_CALIBRATORS
