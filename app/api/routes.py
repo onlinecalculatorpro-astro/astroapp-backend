@@ -10,6 +10,7 @@ from typing import Any, Dict
 
 from flask import Blueprint, jsonify, request
 from pydantic import ValidationError
+from app.core.validators import parse_chart_payload, ValidationError
 
 from app.version import VERSION
 from app.utils.validation import (
