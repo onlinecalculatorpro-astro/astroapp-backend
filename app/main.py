@@ -17,12 +17,13 @@ def create_app():
     # Register API blueprint
     app.register_blueprint(api)
 
-    # Health endpoints (used by Render + smoke tests)
+    # Health endpoints (Render + smoke tests)
     @app.get("/api/health-check")
     def api_health_check():
         return jsonify(ok=True), 200
 
     @app.get("/health")
+    @app.get("/healthz")
     def health():
         return jsonify(status="ok"), 200
 
@@ -31,7 +32,7 @@ def create_app():
 
 app = create_app()
 
-# CORS: start permissive; later set NETLIFY_ORIGIN to your exact Netlify URL
+# CORS: start permissive; we’ll lock to Netlify origin after frontend is live
 allowed_origin = os.environ.get("NETLIFY_ORIGIN", "*")
 CORS(
     app,
