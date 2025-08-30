@@ -7,23 +7,21 @@ import inspect
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Dict
-from types import SimpleNamespace
 
 from flask import Blueprint, jsonify, request
-from pydantic import ValidationError as PydanticError
 
-from app.core.validators import parse_chart_payload, InputValidationError
 from app.version import VERSION
-from app.utils.validation import (
-    ChartRequest,
-    PredictionRequest,
-    RectificationRequest,  # kept for compatibility (not used in minimal rectification)
-)
 from app.utils.metrics import metrics
 from app.utils.ratelimit import rate_limit
 from app.utils.hc import flag_predictions
 from app.utils.config import load_config
 
+from app.core.validators import (
+    ValidationError,
+    parse_chart_payload,
+    parse_prediction_payload,
+    parse_rectification_payload,
+)
 from app.core.astronomy import compute_chart, compute_houses
 from app.core.predict import predict
 from app.core.rectify import rectification_candidates
@@ -50,7 +48,7 @@ def _jd_ut_from_local(date_str: str, time_str: str, tz_name: str) -> float:
     return jdn + day_frac - 0.5
 
 
-def _call_compute_chart(payload: ChartRequest | PredictionRequest | SimpleNamespace) -> Dict[str, Any]:
+def _call_compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Call compute_chart with whatever signature the current implementation expects.
     Ensures 'jd_ut' is present in the returned dict.
@@ -58,34 +56,32 @@ def _call_compute_chart(payload: ChartRequest | PredictionRequest | SimpleNamesp
     # Try (date, time, lat, lon, mode, place_tz)
     try:
         chart = compute_chart(
-            payload.date,
-            payload.time,
-            payload.latitude,
-            payload.longitude,
-            payload.mode,
-            getattr(payload, "place_tz", None),
+            payload["date"],
+            payload["time"],
+            payload["latitude"],
+            payload["longitude"],
+            payload["mode"],
+            payload.get("place_tz", None),
         )
     except TypeError:
         # Fallback: (date, time, lat, lon, mode)
         chart = compute_chart(
-            payload.date,
-            payload.time,
-            payload.latitude,
-            payload.longitude,
-            payload.mode,
+            payload["date"],
+            payload["time"],
+            payload["latitude"],
+            payload["longitude"],
+            payload["mode"],
         )
 
     if "jd_ut" not in chart:
-        tz = getattr(payload, "place_tz", "UTC")
-        chart["jd_ut"] = _jd_ut_from_local(payload.date, payload.time, tz)
+        tz = payload.get("place_tz", "UTC")
+        chart["jd_ut"] = _jd_ut_from_local(payload["date"], payload["time"], tz)
 
     return chart
 
 
 def _call_compute_houses(lat: float, lon: float, mode: str, jd_ut: float | None) -> Any:
-    """
-    Call compute_houses; pass jd_ut if the implementation accepts it.
-    """
+    """Call compute_houses; pass jd_ut if implementation accepts it."""
     sig = inspect.signature(compute_houses)
     if "jd_ut" in sig.parameters and jd_ut is not None:
         return compute_houses(lat, lon, mode, jd_ut=jd_ut)
@@ -103,30 +99,27 @@ def health():
 @api.post("/api/calculate")
 def calculate():
     try:
-        payload = ChartRequest(**(request.get_json(force=True) or {}))
-    except PydanticError as e:
+        body = request.get_json(force=True) or {}
+        payload = parse_chart_payload(body)
+    except ValidationError as e:
         return jsonify({"error": "validation_error", "details": e.errors()}), 400
 
     chart = _call_compute_chart(payload)
-    houses = _call_compute_houses(payload.latitude, payload.longitude, payload.mode, chart.get("jd_ut"))
+    houses = _call_compute_houses(payload["latitude"], payload["longitude"], payload["mode"], chart.get("jd_ut"))
 
     return jsonify({"chart": chart, "houses": houses}), 200
 
 
 @api.post("/api/report")
 def report():
-    body = request.get_json(force=True) or {}
     try:
-        # Accepts minimal: date, time, place_tz, latitude, longitude (+ defaults like mode)
-        base = parse_chart_payload(body)
-    except InputValidationError as e:
-        return jsonify({"error": "validation_error", "details": [e.as_dict()]}), 400
+        body = request.get_json(force=True) or {}
+        payload = parse_chart_payload(body)
+    except ValidationError as e:
+        return jsonify({"error": "validation_error", "details": e.errors()}), 400
 
-    # compute with normalized payload
-    shim = SimpleNamespace(**base)
-    chart = _call_compute_chart(shim)
-    houses = _call_compute_houses(base["latitude"], base["longitude"], base["mode"], chart.get("jd_ut"))
-
+    chart = _call_compute_chart(payload)
+    houses = _call_compute_houses(payload["latitude"], payload["longitude"], payload["mode"], chart.get("jd_ut"))
     narrative = (
         "This is a placeholder narrative aligned to your mode and computed houses. "
         "Evidence chips will explain predictions in /predictions."
@@ -137,17 +130,16 @@ def report():
 
 @api.post("/predictions")  # keeping the original path for compatibility
 def predictions():
-    # Read body once so we can pick up optional overrides
     body = request.get_json(force=True) or {}
     try:
-        payload = PredictionRequest(**body)
-    except PydanticError as e:
+        payload, horizon = parse_prediction_payload(body)
+    except ValidationError as e:
         return jsonify({"error": "validation_error", "details": e.errors()}), 400
 
     chart = _call_compute_chart(payload)
-    houses = _call_compute_houses(payload.latitude, payload.longitude, payload.mode, chart.get("jd_ut"))
+    houses = _call_compute_houses(payload["latitude"], payload["longitude"], payload["mode"], chart.get("jd_ut"))
 
-    preds_raw = predict(chart, houses, payload.horizon)
+    preds_raw = predict(chart, houses, horizon)
 
     # Load HC thresholds (with sensible defaults)
     th_path = os.environ.get("ASTRO_HC_THRESHOLDS", "config/hc_thresholds.json")
@@ -191,7 +183,7 @@ def predictions():
             {
                 "prediction_id": f"pred_{i}",
                 "domain": pr.get("domain"),
-                "horizon": payload.horizon,
+                "horizon": horizon,
                 "interval_start_utc": pr.get("interval", {}).get("start"),
                 "interval_end_utc": pr.get("interval", {}).get("end"),
                 "probability_calibrated": p,
@@ -207,34 +199,20 @@ def predictions():
 
     # Only run file-driven per-domain/horizon adjustments if no explicit overrides were used
     if not overrides and not os.environ.get("ASTRO_HC_DEBUG_OVERRIDES"):
-        preds = flag_predictions(preds, payload.horizon, th_path)
+        preds = flag_predictions(preds, horizon, th_path)
 
     return jsonify({"predictions": preds}), 200
 
 
 @api.post("/rectification/quick")
 def rect_quick():
-    body = request.get_json(force=True) or {}
     try:
-        # Minimal accepted; adds sane defaults (e.g., mode)
-        base = parse_chart_payload(body)
-    except InputValidationError as e:
-        return jsonify({"error": "validation_error", "details": [e.as_dict()]}), 400
+        body = request.get_json(force=True) or {}
+        payload, window_minutes = parse_rectification_payload(body)
+    except ValidationError as e:
+        return jsonify({"error": "validation_error", "details": e.errors()}), 400
 
-    # default window if not supplied; validate it's an int
-    try:
-        window_minutes = int(body.get("window_minutes", 60))
-    except Exception:
-        return jsonify(
-            {
-                "error": "validation_error",
-                "details": [
-                    {"loc": ["window_minutes"], "msg": "must be integer", "type": "type_error.integer"}
-                ],
-            }
-        ), 400
-
-    result = rectification_candidates(base, window_minutes)
+    result = rectification_candidates(payload, window_minutes)
     return jsonify(result), 200
 
 
