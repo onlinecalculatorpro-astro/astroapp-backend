@@ -2,203 +2,158 @@
 from __future__ import annotations
 
 from datetime import datetime, date, time
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Tuple, List
 from zoneinfo import ZoneInfo
+import os
 
 
-# -----------------------------------------------------------------------------
-# Error type compatible with `e.errors()` that routes expect to jsonify
-# -----------------------------------------------------------------------------
 class ValidationError(ValueError):
-    def __init__(self, errors: List[Dict[str, Any]] | None = None):
-        super().__init__("validation_error")
-        self._errors = errors or []
+    """Structured validator error compatible with routes.py (has .errors())."""
 
-    def add(self, field: str, msg: str, err_type: str = "value_error") -> None:
-        self._errors.append({"loc": [field], "msg": msg, "type": err_type})
-
-    def extend(self, items: List[Dict[str, Any]]) -> None:
-        self._errors.extend(items)
+    def __init__(self, details: str | Dict[str, Any] | List[Dict[str, Any]]):
+        if isinstance(details, str):
+            self._details = [{"loc": [], "msg": details, "type": "value_error"}]
+            super().__init__(details)
+        elif isinstance(details, dict):
+            self._details = [details]
+            super().__init__(details.get("msg", "validation_error"))
+        else:
+            self._details = details
+            super().__init__(self._details[0]["msg"] if self._details else "validation_error")
 
     def errors(self) -> List[Dict[str, Any]]:
-        return list(self._errors)
+        return self._details
 
 
-# -----------------------------------------------------------------------------
-# Primitive validators
-# -----------------------------------------------------------------------------
-def _require(data: Dict[str, Any], *keys: str) -> List[Dict[str, Any]]:
+def _require(data: Dict[str, Any], *keys: str) -> None:
     missing = [k for k in keys if k not in data]
-    return [{"loc": [k], "msg": "field required", "type": "missing"} for k in missing]
+    if missing:
+        raise ValidationError(
+            [{"loc": [k], "msg": "field required", "type": "missing"} for k in missing]
+        )
 
 
-def parse_date(s: Any) -> date:
-    if not isinstance(s, str):
-        raise ValidationError([{"loc": ["date"], "msg": "must be a string 'YYYY-MM-DD'", "type": "type_error"}])
+def parse_date(s: str) -> date:
     try:
-        # Strict YYYY-MM-DD
         return datetime.strptime(s, "%Y-%m-%d").date()
     except Exception:
-        raise ValidationError([{"loc": ["date"], "msg": "must be 'YYYY-MM-DD'", "type": "value_error.date"}])
+        raise ValidationError({"loc": ["date"], "msg": "date must be 'YYYY-MM-DD'", "type": "value_error"})
 
 
-def parse_time(s: Any) -> time:
-    if not isinstance(s, str):
-        raise ValidationError([{"loc": ["time"], "msg": "must be a string 'HH:MM' (24-hour)", "type": "type_error"}])
+def parse_time(s: str) -> time:
     try:
         hh, mm = s.split(":")
-        hh_i, mm_i = int(hh), int(mm)
-        if not (0 <= hh_i <= 23):
+        hh, mm = int(hh), int(mm)
+        if not (0 <= hh <= 23) or not (0 <= mm <= 59):
             raise ValueError
-        if not (0 <= mm_i <= 59):
-            raise ValueError
-        return time(hh_i, mm_i)
+        return time(hh, mm)
     except Exception:
-        raise ValidationError([{"loc": ["time"], "msg": "must be 'HH:MM' in 24-hour time", "type": "value_error.time"}])
+        raise ValidationError({"loc": ["time"], "msg": "time must be 'HH:MM' 24-hour", "type": "value_error"})
 
 
-def validate_iana_timezone(tz_str: Any) -> str:
-    """
-    Accept only:
-      • 'UTC' exactly, or
-      • IANA names with a slash (e.g., 'America/New_York', 'Europe/London') that resolve in tzdb.
-    Reject:
-      • Abbreviations (EST, PST, IST, etc.)
-      • Offset formats (+05:30, -0700)
-      • Empty / non-string
-    """
-    if not isinstance(tz_str, str) or not tz_str:
-        raise ValidationError([{"loc": ["place_tz"], "msg": "must be a non-empty string", "type": "type_error"}])
-
-    if tz_str == "UTC":
-        return tz_str
-
-    if "/" not in tz_str:
-        # Force IANA style only
-        raise ValidationError([{
+def parse_tz(tz: str) -> ZoneInfo:
+    # Reject abbreviations like "EST", "PST", "IST" etc.; allow "UTC"
+    if tz.upper() != "UTC" and "/" not in tz:
+        raise ValidationError({
             "loc": ["place_tz"],
-            "msg": "must be an IANA timezone like 'Area/City' (e.g., 'America/New_York')",
+            "msg": "place_tz must be a valid IANA timezone (e.g., 'Asia/Kolkata')",
             "type": "value_error.timezone"
-        }])
-
+        })
     try:
-        ZoneInfo(tz_str)  # ensure it exists
+        return ZoneInfo(tz)
     except Exception:
-        raise ValidationError([{"loc": ["place_tz"], "msg": "unknown timezone", "type": "value_error.timezone"}])
-
-    return tz_str
+        raise ValidationError({
+            "loc": ["place_tz"],
+            "msg": "place_tz must be a valid IANA timezone (e.g., 'Asia/Kolkata')",
+            "type": "value_error.timezone"
+        })
 
 
 def parse_latlon(lat: Any, lon: Any) -> Tuple[float, float]:
     try:
-        lat_f = float(lat)
-        lon_f = float(lon)
+        lat_f, lon_f = float(lat), float(lon)
     except Exception:
-        raise ValidationError([{
+        raise ValidationError({
             "loc": ["latitude", "longitude"],
-            "msg": "must be numbers",
+            "msg": "latitude/longitude must be numbers",
             "type": "type_error.float"
-        }])
-
-    errs: List[Dict[str, Any]] = []
+        })
     if not (-90.0 <= lat_f <= 90.0):
-        errs.append({"loc": ["latitude"], "msg": "must be between -90 and 90", "type": "value_error.number.not_in_range"})
+        raise ValidationError({"loc": ["latitude"], "msg": "latitude must be between -90 and 90", "type": "value_error"})
     if not (-180.0 <= lon_f <= 180.0):
-        errs.append({"loc": ["longitude"], "msg": "must be between -180 and 180", "type": "value_error.number.not_in_range"})
-    if errs:
-        raise ValidationError(errs)
-
+        raise ValidationError({"loc": ["longitude"], "msg": "longitude must be between -180 and 180", "type": "value_error"})
     return lat_f, lon_f
 
 
 def parse_mode(mode: Any | None) -> str:
-    """
-    Normalize mode; default 'sidereal'. Accept only 'sidereal' or 'tropical'.
-    """
-    if mode is None:
-        return "sidereal"
-    if not isinstance(mode, str):
-        raise ValidationError([{"loc": ["mode"], "msg": "must be 'sidereal' or 'tropical'", "type": "type_error"}])
-    m = mode.strip().lower()
+    m = (mode or os.environ.get("ASTRO_MODE") or "sidereal").strip().lower()
     if m not in ("sidereal", "tropical"):
-        raise ValidationError([{"loc": ["mode"], "msg": "must be 'sidereal' or 'tropical'", "type": "value_error"}])
+        raise ValidationError({"loc": ["mode"], "msg": "mode must be 'sidereal' or 'tropical'", "type": "value_error"})
     return m
 
 
-# -----------------------------------------------------------------------------
-# High-level payload parser used by endpoints
-# -----------------------------------------------------------------------------
+def parse_horizon(value: Any | None) -> str:
+    h = (value or "short").strip().lower()
+    if h not in ("short", "medium", "long"):
+        raise ValidationError({"loc": ["horizon"], "msg": "horizon must be 'short', 'medium', or 'long'", "type": "value_error"})
+    return h
+
+
 def parse_chart_payload(data: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Uniform parser for chart-like payloads used by /api/calculate, /predictions,
-    /rectification/quick, and /api/report.
-
-    Returns normalized dict:
-        {
-          "date": "YYYY-MM-DD",
-          "time": "HH:MM",
-          "place_tz": "Area/City" | "UTC",
-          "latitude": float,
-          "longitude": float,
-          "mode": "sidereal" | "tropical",
-          "dt": timezone-aware datetime with tzinfo
-        }
-    Raises ValidationError(errors=[...]) with .errors() details for 400s.
+    Normalizes input for chart/predictions/report/rectification endpoints.
+    Returns:
+      {
+        "date": "YYYY-MM-DD",
+        "time": "HH:MM",
+        "place_tz": "<IANA tz>",
+        "latitude": float,
+        "longitude": float,
+        "mode": "sidereal|tropical",
+        "dt": aware datetime in local tz
+      }
     """
-    errors = _require(data, "date", "time", "place_tz", "latitude", "longitude")
-    if errors:
-        raise ValidationError(errors)
+    _require(data, "date", "time", "place_tz", "latitude", "longitude")
 
-    # Field-by-field validation (collect as many as possible before raising)
-    d_val = t_val = tz_val = None
-    lat_val = lon_val = None
-    mode_val = None
-
-    field_errors: List[Dict[str, Any]] = []
-
-    # date
-    try:
-        d_val = parse_date(data["date"])
-    except ValidationError as e:
-        field_errors.extend(e.errors())
-
-    # time
-    try:
-        t_val = parse_time(data["time"])
-    except ValidationError as e:
-        field_errors.extend(e.errors())
-
-    # tz
-    try:
-        tz_name = validate_iana_timezone(data["place_tz"])
-        tz_val = ZoneInfo(tz_name if tz_name != "UTC" else "UTC")
-    except ValidationError as e:
-        field_errors.extend(e.errors())
-
-    # lat/lon
-    try:
-        lat_val, lon_val = parse_latlon(data["latitude"], data["longitude"])
-    except ValidationError as e:
-        field_errors.extend(e.errors())
-
-    # mode (optional)
-    try:
-        mode_val = parse_mode(data.get("mode"))
-    except ValidationError as e:
-        field_errors.extend(e.errors())
-
-    if field_errors:
-        raise ValidationError(field_errors)
-
-    # Construct aware local datetime
-    dt_local = datetime.combine(d_val, t_val).replace(tzinfo=tz_val)
+    d = parse_date(str(data["date"]))
+    t = parse_time(str(data["time"]))
+    tzinfo = parse_tz(str(data["place_tz"]))
+    lat, lon = parse_latlon(data["latitude"], data["longitude"])
+    mode = parse_mode(data.get("mode"))
 
     return {
-        "date": data["date"],
-        "time": data["time"],
-        "place_tz": "UTC" if tz_val.key == "UTC" else tz_val.key,  # normalized
-        "latitude": lat_val,
-        "longitude": lon_val,
-        "mode": mode_val,
-        "dt": dt_local,
+        "date": d.strftime("%Y-%m-%d"),
+        "time": f"{t.hour:02d}:{t.minute:02d}",
+        "place_tz": str(data["place_tz"]),
+        "latitude": lat,
+        "longitude": lon,
+        "mode": mode,
+        "dt": datetime.combine(d, t).replace(tzinfo=tzinfo),
     }
+
+
+def parse_prediction_payload(data: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+    chart = parse_chart_payload(data)
+    horizon = parse_horizon(data.get("horizon"))
+    return chart, horizon
+
+
+def parse_rectification_payload(data: Dict[str, Any]) -> Tuple[Dict[str, Any], int]:
+    chart = parse_chart_payload(data)
+    # window_minutes optional, default sane; keep strict integer and range to avoid abuse
+    wm = data.get("window_minutes", 120)
+    try:
+        wm = int(wm)
+    except Exception:
+        raise ValidationError({"loc": ["window_minutes"], "msg": "window_minutes must be an integer", "type": "type_error.integer"})
+    if not (5 <= wm <= 7 * 24 * 60):
+        raise ValidationError({"loc": ["window_minutes"], "msg": "window_minutes must be between 5 and 10080", "type": "value_error"})
+    return chart, wm
+
+
+__all__ = [
+    "ValidationError",
+    "parse_chart_payload",
+    "parse_prediction_payload",
+    "parse_rectification_payload",
+]
