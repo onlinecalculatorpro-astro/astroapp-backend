@@ -7,8 +7,14 @@ class ChartRequest(BaseModel):
     place_tz: str
     latitude: float
     longitude: float
-    mode: str = Field("sidereal", regex=r"^(sidereal|tropical)$")
+    mode: str = Field("sidereal")
     ayanamsa: Optional[str] = "lahiri"
+    
+    @validator('mode')
+    def validate_mode(cls, v):
+        if v not in ['sidereal', 'tropical']:
+            raise ValueError('mode must be sidereal or tropical')
+        return v
 
 class Body(BaseModel):
     name: str
@@ -33,7 +39,13 @@ class Houses(BaseModel):
     warnings: List[str] = []
 
 class PredictionRequest(ChartRequest):
-    horizon: Optional[str] = Field("short", regex=r"^(short|medium|long)$") 
+    horizon: Optional[str] = Field("short")
+    
+    @validator('horizon')
+    def validate_horizon(cls, v):
+        if v and v not in ['short', 'medium', 'long']:
+            raise ValueError('horizon must be short, medium, or long')
+        return v
 
 class Evidence(BaseModel):
     dasha: float
@@ -61,9 +73,15 @@ class RectificationRequest(BaseModel):
     place_tz: str
     latitude: float
     longitude: float
-    mode: str = Field("sidereal", regex=r"^(sidereal|tropical)$")
+    mode: str = Field("sidereal")
     ayanamsa: Optional[str] = "lahiri"
     window_minutes: int = 90
+    
+    @validator('mode')
+    def validate_mode(cls, v):
+        if v not in ['sidereal', 'tropical']:
+            raise ValueError('mode must be sidereal or tropical')
+        return v
 
 class RectificationResult(BaseModel):
     best_time: str
