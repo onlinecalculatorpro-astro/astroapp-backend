@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, List, Optional, Tuple, Final
 
-# ── Supported public systems (keep in sync with engine) ───────────────────────
+# ── Public systems (keep in sync with houses_advanced) ────────────────────────
 SUPPORTED_HOUSE_SYSTEMS: Final[Tuple[str, ...]] = (
     "placidus",
     "whole",        # public enum; engine uses "whole_sign"
@@ -19,23 +19,20 @@ SUPPORTED_HOUSE_SYSTEMS: Final[Tuple[str, ...]] = (
 )
 
 # Public → engine-internal aliases
-_ALIAS_TO_ENGINE: Final[Dict[str, str]] = {
-    "whole": "whole_sign",
-}
+_ALIAS_TO_ENGINE: Final[Dict[str, str]] = {"whole": "whole_sign"}
 _ENGINE_TO_PUBLIC: Final[Dict[str, str]] = {v: k for k, v in _ALIAS_TO_ENGINE.items()}
 
 # ── Polar policy knobs (env-tunable) ──────────────────────────────────────────
 POLAR_SOFT_LIMIT_DEG: Final[float] = float(os.getenv("ASTRO_POLAR_SOFT_LAT", 66.0))
 POLAR_HARD_LIMIT_DEG: Final[float] = float(os.getenv("ASTRO_POLAR_HARD_LAT", 80.0))
 POLAR_ABSOLUTE_LIMIT_DEG: Final[float] = 89.999999  # absolute pole guard
-# Policy: "fallback_to_equal_above_66deg" | "reject_above_66deg"
+# "fallback_to_equal_above_66deg" | "reject_above_66deg"
 POLAR_POLICY: Final[str] = os.getenv("ASTRO_POLAR_POLICY", "fallback_to_equal_above_66deg")
 
-# Time-division systems that blow up near the poles (hard-reject ≥ HARD limit)
-_HARD_REJECT_AT_POLAR: Final[set[str]] = {
-    "placidus", "koch", "topocentric", "alcabitius",
-}
-# Systems that are risky above SOFT limit (soft-fallback or early reject)
+# Time-division systems that break near the poles (hard-reject ≥ HARD limit)
+_HARD_REJECT_AT_POLAR: Final[set[str]] = {"placidus", "koch", "topocentric", "alcabitius"}
+
+# Systems that are risky above the SOFT limit (soft fallback or early reject)
 _RISKY_AT_POLAR: Final[set[str]] = {
     "placidus", "koch", "regiomontanus", "campanus",
     "topocentric", "alcabitius", "morinus",
@@ -82,7 +79,7 @@ def _needs_polar_fallback(system: str, latitude: float, limit: float) -> bool:
 
 def compute_houses_with_policy(
     *,
-    # Preferred modern names
+    # Preferred modern names (used by routes)
     lat: Optional[float] = None,
     lon: Optional[float] = None,
     system: Optional[str] = None,
@@ -95,7 +92,7 @@ def compute_houses_with_policy(
     longitude: Optional[float] = None,
     requested_house_system: Optional[str] = None,
     enable_diagnostics: Optional[bool] = None,
-    # Policy overrides (mainly for tests)
+    # Policy overrides (useful in tests)
     polar_policy: Optional[str] = None,
     polar_soft_limit: Optional[float] = None,
     polar_hard_limit: Optional[float] = None,
@@ -104,11 +101,11 @@ def compute_houses_with_policy(
     Policy façade for house computation.
 
     - Validates latitude (absolute pole guard).
-    - Normalizes the requested system (public enum ⮕ engine name).
+    - Normalizes requested system (public enum ⮕ engine name).
     - Enforces polar policy:
         * hard reject time-division systems at |lat| >= HARD limit
         * soft fallback to 'equal' above SOFT limit when policy demands
-    - Requires strict timescales: jd_tt & jd_ut1.
+    - Requires strict timescales: jd_tt & jd_ut1 (no UT≈UTC shortcuts).
     - Delegates to PreciseHouseCalculator(require_strict_timescales=True).
     - Returns a compat-friendly payload (angles, houses, *deg fields, warnings, policy).
     """
