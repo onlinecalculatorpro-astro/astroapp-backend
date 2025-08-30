@@ -7,17 +7,20 @@ services:
       python --version
       pip --version
       pip install --upgrade pip wheel setuptools
+      pip install --only-binary=:all: numpy==1.26.4 pandas==2.2.2
       pip install -r requirements.txt
-    startCommand: python main.py
-    healthCheckPath: /api/health
+    startCommand: gunicorn app.main:app --preload --workers=2 --threads=4 --timeout=120
+    healthCheckPath: /api/health-check
     autoDeploy: true
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
       - key: FLASK_ENV
         value: production
-      - key: PORT
-        value: 5000
-      - key: PYTHONPATH
-        value: .
+      - key: TZ
+        value: Asia/Kolkata
+      - key: NETLIFY_ORIGIN
+        value: "*"
       - key: ASTRO_CONFIG
         value: config/defaults.yaml
       - key: ASTRO_CALIBRATORS
