@@ -24,7 +24,6 @@ Leap-seconds strategy (maintenance-light):
 
 DUT1 (UT1−UTC):
   - Default from env ASTRO_DUT1_BROADCAST (seconds), clamped to [-0.9, +0.9]; else 0.0.
-  - This keeps errors within ~0.004° if unset.
 
 Pre-1972 handling:
   - No official TAI−UTC; we infer TT−UTC = ΔT + DUT1 (as standard practice).
@@ -32,10 +31,9 @@ Pre-1972 handling:
 
 from __future__ import annotations
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
-from typing import Optional, List
-import math
+from typing import Optional, List, Dict, Any
 import os
 
 from app.core.leapseconds import delta_at as resolve_delta_at, LeapInfo
@@ -50,8 +48,8 @@ class Timescales:
     jd_tt: float
     jd_ut1: float
     delta_t_sec: float            # TT - UT1 (Espenak–Meeus)
-    delta_at_sec: Optional[float] # TAI - UTC (None when pre-1961/1972 path used)
-    tt_minus_utc_sec: float       # TT - UTC seconds actually applied
+    delta_at_sec: Optional[float] # TAI - UTC (None when pre-1972 path used)
+    tt_minus_utc_sec: float       # TT - UTC actually applied
     dut1_applied_sec: float       # UT1 - UTC (env override or 0.0), clamped to [-0.9, 0.9]
     y_decimal: float              # decimal year used for ΔT
     mjd_utc: float
@@ -280,9 +278,7 @@ def compute_timescales_from_payload(
     dut1_override_sec: Optional[float] = None,
     leap_policy: Optional[str] = None,
 ) -> Timescales:
-    """
-    Convenience wrapper for your validators’ payload shape.
-    """
+    """Convenience wrapper for your validators’ payload shape."""
     dt_utc = utc_from_local(date, time, place_tz)
     return compute_timescales_from_utc(
         dt_utc,
@@ -291,9 +287,55 @@ def compute_timescales_from_payload(
     )
 
 
+# ------------------------------------------------------------------------------
+# Public adapter expected by routes.py (JD_UTC -> dict of timescales)
+# ------------------------------------------------------------------------------
+def jd_utc_to_timescales(jd_utc: float) -> Dict[str, Any]:
+    """
+    Canonical adapter used by the API: given JD(UTC), return a dict with
+    jd_tt, jd_ut1, delta_t, delta_at, dut1, warnings, policy.
+    """
+    # Convert JD -> UTC datetime via ERFA to avoid our own inverse JD math.
+    import erfa  # PyERFA
+    iy, im, id, fd = erfa.jd2cal(jd_utc, 0.0)  # fd = fractional day
+    dt_utc = datetime(iy, im, id, tzinfo=timezone.utc) + timedelta(seconds=float(fd) * 86400.0)
+
+    ts = compute_timescales_from_utc(dt_utc)
+    # Build a flat dict for the API layer (avoid exposing every internal field)
+    out: Dict[str, Any] = {
+        "jd_tt": float(ts.jd_tt),
+        "jd_ut1": float(ts.jd_ut1),
+        "delta_t": float(ts.delta_t_sec),
+        # Pre-1972: delta_at_sec is None; return 0.0 but keep a warning in ts.warnings.
+        "delta_at": 0.0 if ts.delta_at_sec is None else float(ts.delta_at_sec),
+        "dut1": float(ts.dut1_applied_sec),
+        "warnings": ts.warnings or [],
+        "policy": {
+            "leap_policy": os.getenv("ASTRO_LEAP_POLICY", "warn"),
+            "dut1_source": "env:ASTRO_DUT1_BROADCAST",
+        },
+    }
+    return out
+
+# Provide the alternate name the API also accepts
+utc_jd_to_timescales = jd_utc_to_timescales
+
+
+# Optional OO surface
+class TimeKernel:
+    def from_jd_utc(self, jd_utc: float) -> Dict[str, Any]:
+        return jd_utc_to_timescales(jd_utc)
+
+    def utc_jd_to_timescales(self, jd_utc: float) -> Dict[str, Any]:  # pragma: no cover
+        return jd_utc_to_timescales(jd_utc)
+
+
 __all__ = [
     "Timescales",
     "utc_from_local",
     "compute_timescales_from_utc",
     "compute_timescales_from_payload",
+    "jd_utc_to_timescales",
+    "utc_jd_to_timescales",
+    "TimeKernel",
 ]
