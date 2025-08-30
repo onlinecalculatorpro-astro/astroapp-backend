@@ -1,21 +1,21 @@
 # app/api/routes.py
 from __future__ import annotations
 
+import inspect
 import json
 import os
-import inspect
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
+from typing import Any, Callable, Dict, Optional
 from zoneinfo import ZoneInfo
-from typing import Any, Dict, Callable, Optional
 
 from flask import Blueprint, jsonify, request
 
 from app.version import VERSION
+from app.utils.config import load_config
+from app.utils.hc import flag_predictions
 from app.utils.metrics import metrics
 from app.utils.ratelimit import rate_limit
-from app.utils.hc import flag_predictions
-from app.utils.config import load_config
 
 from app.core.validators import (
     ValidationError,
@@ -24,7 +24,12 @@ from app.core.validators import (
     parse_rectification_payload,
 )
 
-# Prefer the policy façade if available
+# engine bits
+from app.core.astronomy import compute_chart  # canonical chart call
+from app.core.predict import predict
+from app.core.rectify import rectification_candidates
+
+# houses: prefer policy façade if present
 try:
     from app.core.house import compute_houses_with_policy as _houses_fn  # type: ignore
     _HOUSES_KIND = "policy"
@@ -32,29 +37,23 @@ except Exception:
     from app.core.astronomy import compute_houses as _houses_fn  # type: ignore
     _HOUSES_KIND = "legacy"
 
-from app.core.astronomy import compute_chart  # still the canonical chart call
+# time kernel (required)
+from app.core import time_kernel as _tk
 
-# Optional helpers (best-effort — code is resilient if absent)
+# optional leap-seconds helper (best-effort)
 try:
     from app.core import leapseconds as _leaps
 except Exception:  # pragma: no cover
     _leaps = None  # type: ignore
 
-# Time kernel is required (but we adapt to several surfaces)
-from app.core import time_kernel as _tk  # raises if missing
-
 api = Blueprint("api", __name__)
+DEBUG_VERBOSE = os.getenv("ASTRO_DEBUG_VERBOSE", "0") in ("1", "true", "True")
 
-DEBUG_VERBOSE = bool(int(os.environ.get("ASTRO_DEBUG_VERBOSE", "0")))
 
-
-# ------------------------------------------------------------------------------
-# Timescale plumbing
-# ------------------------------------------------------------------------------
-
+# ─────────────────────────────── timescales ────────────────────────────────
 def _datetime_to_jd_utc(dt_utc: datetime) -> float:
     """Meeus-style Gregorian JD from an aware UTC datetime."""
-    if dt_utc.tzinfo is None:
+    if dt_utc.tzinfo is None or dt_utc.tzinfo is not timezone.utc:
         raise ValueError("dt_utc must be timezone-aware UTC")
     y = dt_utc.year
     m = dt_utc.month
@@ -73,12 +72,11 @@ def _datetime_to_jd_utc(dt_utc: datetime) -> float:
 def _find_kernel_callable() -> Callable[[float], Dict[str, Any]]:
     """
     Locate a JD_UTC -> timescales callable on app.core.time_kernel.
-    Returns a function taking (jd_utc: float) and returning dict-like with:
-    jd_tt, jd_ut1, delta_t, delta_at, dut1, warnings?, policy?
+    Must return a dict-like with jd_tt, jd_ut1, delta_t, delta_at, dut1, warnings?, policy?
     """
     candidates = (
-        "utc_jd_to_timescales",
         "jd_utc_to_timescales",
+        "utc_jd_to_timescales",
         "timescales_from_jd_utc",
         "compute_from_jd_utc",
         "derive_timescales",
@@ -95,7 +93,7 @@ def _find_kernel_callable() -> Callable[[float], Dict[str, Any]]:
                 return dict(out)
             return _wrap
 
-    # Class API fallback: TimeKernel().from_jd_utc(...)
+    # Class API fallback
     TK = getattr(_tk, "TimeKernel", None)
     if TK is not None:
         inst = TK()  # type: ignore
@@ -119,25 +117,22 @@ _JD_TO_TS = _find_kernel_callable()
 
 def _compute_timescales_from_local(date_str: str, time_str: str, tz_name: str) -> Dict[str, Any]:
     """
-    Convert local date/time/tz to jd_utc, then expand to jd_tt/jd_ut1 with time_kernel.
+    Convert local date/time/tz to JD(UTC), then expand to jd_tt/jd_ut1 with time_kernel.
     Returns a dict safe for JSON.
     """
-    # Robust parsing: allow “HH:MM[:SS]”
-    if len(time_str.split(":")) == 2:
-        fmt = "%Y-%m-%d %H:%M"
-    else:
-        fmt = "%Y-%m-%d %H:%M:%S"
+    # allow “HH:MM[:SS]”
+    fmt = "%Y-%m-%d %H:%M" if time_str.count(":") == 1 else "%Y-%m-%d %H:%M:%S"
 
     try:
         tz = ZoneInfo(tz_name)
     except Exception:
-        raise ValidationError({"timezone": "must be a valid IANA zone like 'Asia/Kolkata'"})
+        raise ValidationError({"place_tz": "must be a valid IANA zone like 'Asia/Kolkata'"})
 
     dt_local = datetime.strptime(f"{date_str} {time_str}", fmt).replace(tzinfo=tz)
     dt_utc = dt_local.astimezone(timezone.utc)
     jd_utc = _datetime_to_jd_utc(dt_utc)
 
-    ts = _JD_TO_TS(jd_utc)  # may add warnings/policy
+    ts = _JD_TO_TS(jd_utc)
     tz_offset_seconds = int(dt_local.utcoffset().total_seconds()) if dt_local.utcoffset() else 0
 
     out = {
@@ -156,10 +151,7 @@ def _compute_timescales_from_local(date_str: str, time_str: str, tz_name: str) -
     return out
 
 
-# ------------------------------------------------------------------------------
-# Engine call adapters (signature-safe)
-# ------------------------------------------------------------------------------
-
+# ─────────────────────── engine call adapters ───────────────────────
 def _sig_accepts(fn: Callable, *names: str) -> Dict[str, bool]:
     """Map of param -> accepted by fn."""
     try:
@@ -184,12 +176,11 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
     for key in ("date", "time", "latitude", "longitude", "mode"):
         if accepts.get(key):
             kwargs[key] = payload[key]
-    # tz field name may vary between payloads
-    tz_key = "place_tz" if accepts.get("place_tz") else None
-    if tz_key:
-        kwargs[tz_key] = payload.get("timezone") or payload.get("place_tz")
 
-    # Pass timescales if supported
+    if accepts.get("place_tz"):
+        kwargs["place_tz"] = payload.get("place_tz") or payload.get("timezone")
+
+    # pass timescales if supported
     if accepts.get("jd_ut"):
         kwargs["jd_ut"] = ts["jd_utc"]
     if accepts.get("jd_tt"):
@@ -199,11 +190,8 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
 
     chart = compute_chart(**kwargs)
 
-    # Guarantee jd_ut for downstream code
-    if "jd_ut" not in chart:
-        chart["jd_ut"] = ts["jd_utc"]
-
-    # Make mode explicit if engine didn’t echo it
+    # guarantee jd_ut / mode in response
+    chart.setdefault("jd_ut", ts["jd_utc"])
     if "mode" not in chart and "mode" in payload:
         chart["mode"] = payload["mode"]
 
@@ -214,23 +202,29 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
     """
     Prefer policy façade if available; pass jd_tt/jd_ut1 when accepted.
     Fallback to legacy compute_houses(lat, lon, mode[, jd_ut]).
+    NOTE:
+      • chart 'mode' is 'sidereal'/'tropical' (NOT a house system).
+      • if the new façade is used, we take house system from payload['house_system']
+        (default is handled inside the façade, typically 'placidus').
     """
     lat = float(payload["latitude"])
     lon = float(payload["longitude"])
 
-    accepts = _sig_accepts(_houses_fn, "lat", "lon", "system", "mode", "jd_ut", "jd_tt", "jd_ut1", "diagnostics")
+    accepts = _sig_accepts(
+        _houses_fn, "lat", "lon", "system", "mode", "jd_ut", "jd_tt", "jd_ut1", "diagnostics"
+    )
 
-    kwargs: Dict[str, Any] = {}
-    # Param naming differs (system vs mode)
+    kwargs: Dict[str, Any] = {"lat": lat, "lon": lon}
+
     if accepts.get("system"):
-        kwargs["system"] = payload["mode"]
+        # new façade → use explicit house_system if provided; else let façade default
+        if "house_system" in payload and payload["house_system"]:
+            kwargs["system"] = str(payload["house_system"]).lower()
     elif accepts.get("mode"):
+        # legacy engine signature
         kwargs["mode"] = payload["mode"]
 
-    kwargs["lat"] = lat
-    kwargs["lon"] = lon
-
-    # Timescales (prefer jd_tt/jd_ut1; legacy may accept jd_ut)
+    # timescales
     if accepts.get("jd_tt"):
         kwargs["jd_tt"] = ts["jd_tt"]
     if accepts.get("jd_ut1"):
@@ -238,17 +232,14 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
     if accepts.get("jd_ut") and "jd_tt" not in kwargs and "jd_ut1" not in kwargs:
         kwargs["jd_ut"] = ts["jd_utc"]
 
-    # Diagnostics passthrough if requested by client
+    # diagnostics passthrough
     if accepts.get("diagnostics") and "diagnostics" in payload:
         kwargs["diagnostics"] = bool(payload["diagnostics"])
 
     return _houses_fn(**kwargs)
 
 
-# ------------------------------------------------------------------------------
-# Error helpers
-# ------------------------------------------------------------------------------
-
+# ───────────────────────────── error helpers ─────────────────────────────
 def _json_error(code: str, details: Any = None, http: int = 400):
     out: Dict[str, Any] = {"ok": False, "error": code}
     if details is not None:
@@ -256,10 +247,7 @@ def _json_error(code: str, details: Any = None, http: int = 400):
     return jsonify(out), http
 
 
-# ------------------------------------------------------------------------------
-# Endpoints
-# ------------------------------------------------------------------------------
-
+# ───────────────────────────── endpoints ─────────────────────────────
 @api.get("/api/health")
 def health():
     return jsonify({"ok": True, "status": "up", "version": VERSION}), 200
@@ -269,19 +257,15 @@ def health():
 def calculate():
     try:
         body = request.get_json(force=True) or {}
-        payload = parse_chart_payload(body)
+        payload = parse_chart_payload(body)  # expects: date, time, place_tz, latitude, longitude, mode
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
     except Exception as e:
-        if DEBUG_VERBOSE:
-            return _json_error("bad_request", str(e), 400)
-        return _json_error("bad_request", None, 400)
+        return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
 
-    # Build timescales from payload
-    tz_name = payload.get("timezone") or payload.get("place_tz") or "UTC"
+    tz_name = payload.get("place_tz") or payload.get("timezone") or "UTC"
     ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name)
 
-    # Compute
     chart = _call_compute_chart(payload, ts)
     houses = _call_compute_houses(payload, ts)
 
@@ -296,7 +280,7 @@ def report():
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
 
-    tz_name = payload.get("timezone") or payload.get("place_tz") or "UTC"
+    tz_name = payload.get("place_tz") or payload.get("timezone") or "UTC"
     ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name)
 
     chart = _call_compute_chart(payload, ts)
@@ -312,15 +296,15 @@ def report():
     ), 200
 
 
-@api.post("/predictions")  # keeping the original path for compatibility
-def predictions():
+@api.post("/predictions")
+def predictions_route():
     body = request.get_json(force=True) or {}
     try:
         payload, horizon = parse_prediction_payload(body)
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
 
-    tz_name = payload.get("timezone") or payload.get("place_tz") or "UTC"
+    tz_name = payload.get("place_tz") or payload.get("timezone") or "UTC"
     ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name)
 
     chart = _call_compute_chart(payload, ts)
@@ -328,7 +312,7 @@ def predictions():
 
     preds_raw = predict(chart, houses, horizon)
 
-    # Load HC thresholds (with sensible defaults)
+    # thresholds (with sensible defaults)
     th_path = os.environ.get("ASTRO_HC_THRESHOLDS", "config/hc_thresholds.json")
     try:
         with open(th_path, "r", encoding="utf-8") as f:
@@ -340,7 +324,7 @@ def predictions():
     tau = float(defaults.get("tau", 0.88))
     floor = float(defaults.get("floor", 0.60))
 
-    # Optional one-off overrides for testing via request body
+    # request-body overrides (test only)
     overrides = body.get("hc_overrides") or {}
     if isinstance(overrides, dict):
         if "tau" in overrides:
@@ -348,7 +332,7 @@ def predictions():
         if "floor" in overrides:
             floor = float(overrides["floor"])
 
-    # (Optional) environment-level debug overrides
+    # env debug overrides
     env_over = os.environ.get("ASTRO_HC_DEBUG_OVERRIDES")
     if env_over:
         try:
@@ -404,7 +388,6 @@ def rect_quick():
 
 @api.get("/api/openapi")
 def openapi_spec():
-    # Try local app/openapi.yaml first, then project root
     import yaml
     base = os.path.dirname(__file__)
     candidates = [
@@ -425,7 +408,7 @@ def openapi_spec():
 def system_validation():
     cfg = load_config(os.environ.get("ASTRO_CONFIG", "config/defaults.yaml"))
 
-    # Kernel & leap-second policy status (best-effort)
+    # leap status (best-effort)
     leap_status: Optional[Dict[str, Any]] = None
     if _leaps:
         for name in ("get_status", "status", "summary"):
@@ -444,11 +427,11 @@ def system_validation():
                     pass
 
     policy = {
-        "leap_policy": os.environ.get("ASTRO_LEAP_POLICY", "warn"),
-        "dut1_broadcast": os.environ.get("ASTRO_DUT1_BROADCAST", "0") in ("1", "true", "True"),
+        "leap_policy": os.getenv("ASTRO_LEAP_POLICY", "warn"),
+        "dut1_broadcast": os.getenv("ASTRO_DUT1_BROADCAST", "0") in ("1", "true", "True"),
         "houses_engine": _HOUSES_KIND,
         "polar_policy": {
-            "soft_fallback_lat_gt": 66.0,  # façade default (docs)
+            "soft_fallback_lat_gt": 66.0,
             "hard_reject_lat_ge": 80.0,
         },
     }
@@ -487,7 +470,7 @@ def config_info():
     calib_ver = None
     th_summary = None
 
-    # Timescale sample for "now" (debug aid)
+    # timescale sample for "now" (debug aid)
     try:
         now_utc = datetime.now(timezone.utc)
         jd_now = _datetime_to_jd_utc(now_utc)
@@ -526,7 +509,7 @@ def config_info():
             "calibrators_version": calib_ver,
             "hc_thresholds_summary": th_summary,
             "timescale_sample": ts_sample,
-            "leap_policy": os.environ.get("ASTRO_LEAP_POLICY", "warn"),
+            "leap_policy": os.getenv("ASTRO_LEAP_POLICY", "warn"),
             "version": VERSION,
         }
     ), 200
