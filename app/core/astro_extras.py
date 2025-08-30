@@ -82,19 +82,20 @@ BRIGHT_STARS = {
 
 def fixed_star_ecliptics(jd_tt: float) -> Dict[str, Dict[str, float]]:
     if not SKYFIELD_AVAILABLE:
-        # Return empty dict if Skyfield not available
         return {}
     
     try:
         ts = load.timescale()
         eph = load("de421.bsp")
-        t = ts.tdb_jd(jd_tt)
+        t = ts.tdb(jd=jd_tt)
         out = {}
         
         for name, (rah, decd) in BRIGHT_STARS.items():
             star = Star(ra_hours=rah, dec_degrees=decd)
-            ast = eph["earth"].at(t).observe(star)
-            apparent = ast.apparent()
+            earth = eph["earth"]
+            observer = earth.at(t)
+            astrometric = observer.observe(star)
+            apparent = astrometric.apparent()
             
             try:
                 lon, lat, _ = apparent.ecliptic_latlon(epoch="date")
@@ -126,27 +127,23 @@ def star_conjunctions(
                 })
     return out
 
-# ---------- Enhanced prediction features ----------
 def lunar_phases(jd_tt: float) -> Dict[str, Any]:
-    """Calculate lunar phase information"""
     if not SKYFIELD_AVAILABLE:
         return {"phase_angle": 0.0, "illumination": 0.5}
     
     try:
         ts = load.timescale()
         eph = load("de421.bsp")
-        t = ts.tdb_jd(jd_tt)
+        t = ts.tdb(jd=jd_tt)
         
         earth = eph['earth']
         sun = eph['sun']
         moon = eph['moon']
         
-        # Calculate phase angle
-        e = earth.at(t)
-        s = e.observe(sun).apparent()
-        m = e.observe(moon).apparent()
+        observer = earth.at(t)
+        s = observer.observe(sun).apparent()
+        m = observer.observe(moon).apparent()
         
-        # Simple phase calculation
         phase_angle = s.separation_from(m).degrees
         illumination = (1 + (-1) * (phase_angle / 180)) / 2
         
@@ -158,7 +155,6 @@ def lunar_phases(jd_tt: float) -> Dict[str, Any]:
         return {"phase_angle": 0.0, "illumination": 0.5}
 
 def planetary_speeds(planet_positions: List[Dict[str, Any]]) -> Dict[str, float]:
-    """Extract planetary speeds for retrograde analysis"""
     speeds = {}
     for planet in planet_positions:
         name = planet.get("name", "")
