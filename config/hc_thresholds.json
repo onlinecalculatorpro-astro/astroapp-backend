@@ -1,19 +1,18 @@
 {
   "entropy_H": 1.2,
-  "defaults": {
-    "tau": 0.23,
-    "delta": 0.08,
-    "floor": 0.20
-  },
+  "defaults": { "tau": 0.30, "delta": 0.05, "floor": 0.20 },
   "by_domain_horizon": {
     "short": {
-      "Career/Education": { "tau": 0.235, "delta": 0.08, "floor": 0.20 },
-      "Relationships":    { "tau": 0.235, "delta": 0.08, "floor": 0.20 },
-      "Relocation":       { "tau": 0.230, "delta": 0.08, "floor": 0.20 },
-      "Health":           { "tau": 0.230, "delta": 0.10, "floor": 0.20 },
-      "Finance":          { "tau": 0.235, "delta": 0.08, "floor": 0.20 }
-    },
-    "medium": {
+      "Career/Education": { "tau": 0.30, "delta": 0.05, "floor": 0.20 },
+      "Relationships":    { "tau": 0.30, "delta": 0.05, "floor": 0.20 },
+      "Relocation":       { "tau": 0.30, "delta": 0.05, "floor": 0.20 },
+      "Health":           { "tau": 0.30, "delta": 0.05, "floor": 0.20 },
+      "Finance":          { "tau": 0.30, "delta": 0.05, "floor": 0.20 }
+    }
+  }
+}
+
+"medium": {
       "Career/Education": { "tau": 0.35, "delta": 0.08, "floor": 0.25 },
       "Relationships":    { "tau": 0.34, "delta": 0.08, "floor": 0.25 },
       "Relocation":       { "tau": 0.35, "delta": 0.09, "floor": 0.25 },
