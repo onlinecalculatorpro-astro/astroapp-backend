@@ -1,9 +1,15 @@
 flask==3.0.2
 gunicorn==21.2.0
-pydantic==1.10.12
-PyYAML==6.0.2
 flask-cors==4.0.0
+
+pydantic==1.10.12
+typing_extensions>=4.8.0
+PyYAML==6.0.2
+
 numpy==1.26.4
+pyerfa>=2.0.1
+
 skyfield==1.48
 jplephem==2.22
+
 tzdata==2024.1
