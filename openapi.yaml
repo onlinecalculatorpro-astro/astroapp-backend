@@ -1,0 +1,77 @@
+openapi: 3.0.3
+info:
+  title: AstroApp Backend
+  version: 1.0.0
+servers:
+  - url: /
+paths:
+  /api/health-check:
+    get:
+      summary: Health check
+      responses:
+        "200": { description: OK }
+  /api/calculate:
+    post:
+      summary: Compute chart and houses
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChartRequest'
+      responses:
+        "200":
+          description: Chart & houses
+  /predictions:
+    post:
+      summary: Predictions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PredictionRequest'
+      responses:
+        "200": { description: Predictions response }
+  /rectification/quick:
+    post:
+      summary: Quick rectification
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RectificationRequest'
+      responses:
+        "200": { description: Rectification candidates }
+components:
+  schemas:
+    ChartRequest:
+      type: object
+      required: [date, time, place_tz, latitude, longitude, mode]
+      properties:
+        date: { type: string, example: "1992-11-04" }
+        time: { type: string, example: "05:25" }
+        place_tz: { type: string, example: "Asia/Kolkata" }
+        latitude: { type: number, example: 13.0827 }
+        longitude: { type: number, example: 80.2707 }
+        mode: { type: string, enum: [sidereal, tropical] }
+    PredictionRequest:
+      allOf:
+        - $ref: '#/components/schemas/ChartRequest'
+        - type: object
+          required: [horizon]
+          properties:
+            horizon: { type: string, enum: [short, medium, long] }
+            hc_overrides:
+              type: object
+              properties:
+                tau: { type: number }
+                delta: { type: number }
+                floor: { type: number }
+    RectificationRequest:
+      allOf:
+        - $ref: '#/components/schemas/ChartRequest'
+        - type: object
+          properties:
+            window_minutes: { type: integer, default: 30 }
