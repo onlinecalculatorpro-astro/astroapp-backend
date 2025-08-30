@@ -215,18 +215,13 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
     Fallback to legacy compute_houses(lat, lon, mode[, jd_ut]).
 
     IMPORTANT: chart 'mode' is 'sidereal'/'tropical' (NOT a house system).
-               We pass user's requested house system via payload['house_system']
-               (or 'system' if the client used that name). If omitted, the façade
-               uses its own default (typically 'placidus').
+               We pass user's requested house system via payload['house_system'].
+               If omitted, the façade uses its own default (typically 'placidus').
     """
     lat = float(payload["latitude"])
     lon = float(payload["longitude"])
 
-    requested_system = (
-        payload.get("house_system") or
-        payload.get("system") or
-        None
-    )
+    requested_system = payload.get("house_system") or None
 
     accepts = _sig_accepts(
         _houses_fn,
@@ -285,6 +280,10 @@ def calculate():
     try:
         body = request.get_json(force=True) or {}
         payload = parse_chart_payload(body)  # expects: date, time, place_tz, latitude, longitude, mode
+        # pass-through: optional house_system (validator does not keep unknown keys)
+        hs = str(body.get("house_system", "")).strip().lower()
+        if hs:
+            payload["house_system"] = hs
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
     except Exception as e:
@@ -304,6 +303,9 @@ def report():
     try:
         body = request.get_json(force=True) or {}
         payload = parse_chart_payload(body)
+        hs = str(body.get("house_system", "")).strip().lower()
+        if hs:
+            payload["house_system"] = hs
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
 
@@ -328,6 +330,9 @@ def predictions_route():
     body = request.get_json(force=True) or {}
     try:
         payload, horizon = parse_prediction_payload(body)
+        hs = str(body.get("house_system", "")).strip().lower()
+        if hs:
+            payload["house_system"] = hs
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
 
