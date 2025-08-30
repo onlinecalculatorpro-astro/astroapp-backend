@@ -55,7 +55,14 @@ class Prediction(BaseModel):
     ayanamsa_deg: float
     notes: Optional[str] = ""
 
-class RectificationRequest(ChartRequest):
+class RectificationRequest(BaseModel):
+    date: str
+    time: str
+    place_tz: str
+    latitude: float
+    longitude: float
+    mode: str = Field("sidereal", regex=r"^(sidereal|tropical)$")
+    ayanamsa: Optional[str] = "lahiri"
     window_minutes: int = 90
 
 class RectificationResult(BaseModel):
