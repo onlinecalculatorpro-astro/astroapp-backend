@@ -3,14 +3,16 @@ services:
     name: astroapp-backend
     env: python
     plan: free
-    branch: released          # ⬅️ deploy from your release branch (not main)
+    branch: released
     buildCommand: |
       python --version
       pip --version
       pip install --upgrade pip
+      # Pre-install binary deps to avoid build hiccups
+      pip install "numpy==1.26.4" "pyerfa>=2.0.1"
       pip install -r requirements.txt
     startCommand: gunicorn app.main:app --bind 0.0.0.0:$PORT --workers=2 --threads=4 --timeout=120
-    healthCheckPath: /api/health   # ⬅️ your routes expose /api/health (not /api/health-check)
+    healthCheckPath: /api/health
     autoDeploy: true
     envVars:
       - key: FLASK_ENV
@@ -23,10 +25,12 @@ services:
         value: config/calibrators.json
       - key: ASTRO_HC_THRESHOLDS
         value: config/hc_thresholds.json
-      # (optional) make timescale policy explicit
       - key: ASTRO_LEAP_POLICY
         value: warn
       - key: ASTRO_DUT1_BROADCAST
         value: "0"
       - key: ASTRO_DEBUG_VERBOSE
         value: "0"
+      # (optional) make logs flush immediately
+      - key: PYTHONUNBUFFERED
+        value: "1"
