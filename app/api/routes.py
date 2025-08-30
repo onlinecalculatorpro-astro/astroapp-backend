@@ -160,42 +160,53 @@ def _sig_accepts(fn: Callable, *names: str) -> Dict[str, bool]:
         return {n: False for n in names}
     return {n: (n in params) for n in names}
 
-
 def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Call compute_chart with signature introspection.
-    Supplies jd_ut / jd_tt / jd_ut1 when supported.
-    Ensures returned dict has jd_ut.
+    Call compute_chart with signature introspection. Supports alternate names like
+    time_s/lat/lon/date_s. Supplies jd_ut/jd_tt/jd_ut1 when supported. Ensures 'jd_ut'.
     """
-    accepts = _sig_accepts(
-        compute_chart, "date", "time", "latitude", "longitude", "mode", "place_tz",
-        "jd_ut", "jd_tt", "jd_ut1"
-    )
+    params = inspect.signature(compute_chart).parameters
+
+    def pick(*cands: str) -> Optional[str]:
+        for c in cands:
+            if c in params:
+                return c
+        return None
+
+    # Map payload fields to the function's parameter names
+    name_date = pick("date", "date_s", "date_str")
+    name_time = pick("time", "time_s", "time_str")
+    name_lat  = pick("latitude", "lat")
+    name_lon  = pick("longitude", "lon")
+    name_mode = pick("mode", "system")        # some codebases say 'system'
+    name_tz   = pick("place_tz", "timezone", "tz_name")
 
     kwargs: Dict[str, Any] = {}
-    for key in ("date", "time", "latitude", "longitude", "mode"):
-        if accepts.get(key):
-            kwargs[key] = payload[key]
+    if name_date: kwargs[name_date] = payload["date"]
+    if name_time: kwargs[name_time] = payload["time"]
+    if name_lat:  kwargs[name_lat]  = payload["latitude"]
+    if name_lon:  kwargs[name_lon]  = payload["longitude"]
+    if name_mode: kwargs[name_mode] = payload["mode"]
+    if name_tz:   kwargs[name_tz]   = payload.get("timezone") or payload.get("place_tz")
 
-    if accepts.get("place_tz"):
-        kwargs["place_tz"] = payload.get("place_tz") or payload.get("timezone")
-
-    # pass timescales if supported
-    if accepts.get("jd_ut"):
+    # Timescales passthrough (only if the function accepts them)
+    if "jd_ut" in params:
         kwargs["jd_ut"] = ts["jd_utc"]
-    if accepts.get("jd_tt"):
+    if "jd_tt" in params:
         kwargs["jd_tt"] = ts["jd_tt"]
-    if accepts.get("jd_ut1"):
+    if "jd_ut1" in params:
         kwargs["jd_ut1"] = ts["jd_ut1"]
 
     chart = compute_chart(**kwargs)
 
-    # guarantee jd_ut / mode in response
-    chart.setdefault("jd_ut", ts["jd_utc"])
+    # Guarantee jd_ut for downstream code
+    if "jd_ut" not in chart:
+        chart["jd_ut"] = ts["jd_utc"]
     if "mode" not in chart and "mode" in payload:
         chart["mode"] = payload["mode"]
 
     return chart
+
 
 
 def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
