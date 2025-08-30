@@ -1,194 +1,79 @@
-# app/core/ephemeris_adapter.py
-# Robust Skyfield adapter with safe fallbacks for environments where
-# binaries are restricted or Skyfield data isn't available.
+# --- Enhanced, version-safe ecliptic calculations -------------------
+from typing import Dict, Any, List, Optional
+from math import fmod
+from skyfield.api import load, wgs84
 
-from __future__ import annotations
+def _wrap360(x: float) -> float:
+    return fmod(fmod(x, 360.0) + 360.0, 360.0)
 
-from typing import Any, Dict, List, Tuple, Optional
-
-__all__ = [
-    "load_kernel",
-    "ecliptic_longitudes",
-]
-
-# ---------------------------------------------------------------------
-# Internal helpers & lightweight caching
-# ---------------------------------------------------------------------
-
-_TS = None          # cached Timescale
-_EPH = {}           # cached ephemerides by kernel name
-
-
-def _skyfield_available() -> bool:
-    """Return True if Skyfield is importable in this environment."""
-    try:
-        import skyfield  # noqa: F401
-        return True
-    except Exception:
-        return False
-
-
-def _get_ts_and_eph(kernel_name: str = "de421"):
-    """Get (timescale, ephemeris) with simple in-process caching."""
-    global _TS, _EPH
-
-    if not _skyfield_available():
-        return None, None
-
-    from skyfield.api import load
-
-    if _TS is None:
-        _TS = load.timescale()
-
-    key = kernel_name.lower()
-    if key not in _EPH:
-        # Only de421 is referenced here; map others to de421 to keep things simple & reliable.
-        eph_file = "de421.bsp"
-        _EPH[key] = load(eph_file)  # downloads once, then cached on disk by Skyfield
-
-    return _TS, _EPH[key]
-
-
-def load_kernel(kernel_name: str = "de421") -> Tuple[Optional[Any], Optional[Any]]:
-    """
-    Public helper in case other modules want a handle to (timescale, ephemeris).
-    Returns (None, None) if Skyfield is not available.
-    """
-    return _get_ts_and_eph(kernel_name)
-
-
-# ---------------------------------------------------------------------
-# Core API
-# ---------------------------------------------------------------------
-
-def ecliptic_longitudes(
+def enhanced_ecliptic_longitudes(
     jd_tt: float,
     lat: float,
     lon: float,
-    kernel: str = "de421",
-) -> List[Dict[str, Any]]:
+    temperature_C: Optional[float] = None,
+    pressure_mbar: Optional[float] = None,
+) -> Dict[str, Any]:
     """
-    Compute ecliptic longitudes/latitudes and simple daily speed for
-    Sun, Moon, Mercury, Venus, Mars, Jupiter, Saturn. Also returns
-    simplified lunar nodes (Rahu/Ketu) based on Moon’s longitude.
+    Returns 'mean' (J2000) vs 'true' (of-date, includes nutation) ecliptic coords,
+    and 'apparent' (includes light-time + annual aberration). Topocentric.
 
-    When Skyfield (or its binaries) are unavailable, falls back to a
-    deterministic approximation so callers still receive a consistent
-    structure.
-
-    Returns a list of dicts with keys:
-      - name  (str)
-      - lon   (float, degrees 0..360)
-      - lat   (float, degrees)
-      - speed (float, deg/day)
-      - retro (bool)
+    Refraction: provided in Alt/Az only (if temperature/pressure given).
     """
-    # ----------------------------
-    # Fallback path (no Skyfield)
-    # ----------------------------
-    if not _skyfield_available():
-        seed = int((jd_tt % 1.0) * 1_000_000)
-        names = ["Sun", "Moon", "Mercury", "Venus", "Mars", "Jupiter", "Saturn"]
-        out: List[Dict[str, Any]] = []
-        for i, n in enumerate(names):
-            # Simple deterministic modulus to get an angle; good enough for a placeholder.
-            ang = (seed * (i + 3) % 36000) / 100.0
-            out.append(
-                {"name": n, "lon": ang, "lat": 0.0, "speed": 1.0 + 0.1 * i, "retro": False}
-            )
-        # Nodes from Moon longitude
-        moon_lon = out[1]["lon"]
-        out.append({"name": "Rahu", "lon": (moon_lon + 180.0) % 360.0, "lat": 0.0, "speed": 0.0, "retro": True})
-        out.append({"name": "Ketu", "lon": moon_lon, "lat": 0.0, "speed": 0.0, "retro": True})
-        return out
+    ts = load.timescale()
+    eph = load("de421.bsp")
+    t  = ts.tdb(jd=jd_tt)
 
-    # ----------------------------
-    # Skyfield path (version-robust)
-    # ----------------------------
-    try:
-        from skyfield.api import wgs84
+    topo = wgs84.latlon(latitude_degrees=lat, longitude_degrees=lon, elevation_m=0.0)
+    obs_t = (eph["earth"] + topo).at(t)
 
-        ts, eph = _get_ts_and_eph(kernel)
-        if ts is None or eph is None:
-            # Shouldn’t happen, but keep parity with fallback just in case.
-            return ecliptic_longitudes(jd_tt, lat, lon, kernel="fallback")
+    keys = {
+        "Sun": "sun",
+        "Moon": "moon",
+        "Mercury": "mercury",
+        "Venus": "venus",
+        "Mars": "mars",
+        "Jupiter": "jupiter barycenter",
+        "Saturn": "saturn barycenter",
+    }
 
-        # Time (TT/TDB). `ts.tdb(jd=...)` is widely supported across versions.
-        t = ts.tdb(jd=jd_tt)
-        t_next = ts.tdb(jd=jd_tt + 1.0)  # for daily speed
+    out: List[Dict[str, Any]] = []
 
-        # Build an Earth + topocentric observer and evaluate at times.
-        topo = wgs84.latlon(latitude_degrees=lat, longitude_degrees=lon, elevation_m=0.0)
-        observer = (eph["earth"] + topo).at(t)
-        observer_next = (eph["earth"] + topo).at(t_next)
+    for name, key in keys.items():
+        body = eph[key]
 
-        bodies = {
-            "Sun": "sun",
-            "Moon": "moon",
-            "Mercury": "mercury",
-            "Venus": "venus",
-            "Mars": "mars",
-            "Jupiter": "jupiter barycenter",
-            "Saturn": "saturn barycenter",
+        # Astrometric (geometric) topocentric
+        ast = body.at(t).observe_from(obs_t)
+
+        # True ecliptic of date (nutation)
+        try:
+            lon_true, lat_true, _ = ast.apparent().ecliptic_latlon(epoch="date")
+        except TypeError:
+            lon_true, lat_true, _ = ast.apparent().ecliptic_latlon()
+
+        # Mean ecliptic (J2000) — no nutation
+        lon_mean, lat_mean, _ = ast.apparent().ecliptic_latlon()
+
+        # Apparent = apparent true-of-date in ecliptic. Already includes aberration/light-time.
+        lon_app = lon_true
+        lat_app = lat_true
+
+        entry: Dict[str, Any] = {
+            "name": name,
+            "mean": {"lon": _wrap360(lon_mean.degrees), "lat": float(lat_mean.degrees)},
+            "true": {"lon": _wrap360(lon_true.degrees), "lat": float(lat_true.degrees)},
+            "apparent": {"lon": _wrap360(lon_app.degrees), "lat": float(lat_app.degrees)},
         }
 
-        def _ecliptic_latlon(astrometric):
-            # Some versions accept an epoch argument, some don’t—handle both.
-            try:
-                return astrometric.ecliptic_latlon(epoch="date")
-            except TypeError:
-                return astrometric.ecliptic_latlon()
-
-        results: List[Dict[str, Any]] = []
-
-        for human_name, eph_key in bodies.items():
-            body = eph[eph_key]
-
-            # Version-safe: observe_from(observer)
-            ast = body.at(t).observe_from(observer).apparent()
-            lon_a, lat_a, _ = _ecliptic_latlon(ast)
-            lon_deg = (lon_a.degrees % 360.0)
-            lat_deg = float(lat_a.degrees)
-
-            ast2 = body.at(t_next).observe_from(observer_next).apparent()
-            lon_b, _, _ = _ecliptic_latlon(ast2)
-
-            # Daily speed with wrap-around handling
-            speed = ((lon_b.degrees - lon_a.degrees + 540.0) % 360.0) - 180.0
-
-            results.append(
-                {
-                    "name": human_name,
-                    "lon": lon_deg,
-                    "lat": lat_deg,
-                    "speed": speed,
-                    "retro": speed < 0.0,
-                }
+        # Optional: refraction in Alt/Az (cannot directly refract ecliptic).
+        if temperature_C is not None and pressure_mbar is not None:
+            alt, az, _ = ast.apparent().altaz(
+                temperature_C=temperature_C, pressure_mbar=pressure_mbar
             )
+            entry["topocentric_altaz_refracted"] = {
+                "alt_deg": float(alt.degrees),
+                "az_deg": float(az.degrees),
+            }
 
-        # Simplified nodes from Moon longitude
-        moon_lon = next(b["lon"] for b in results if b["name"] == "Moon")
-        results.append(
-            {"name": "Rahu", "lon": (moon_lon + 180.0) % 360.0, "lat": 0.0, "speed": 0.0, "retro": True}
-        )
-        results.append(
-            {"name": "Ketu", "lon": moon_lon, "lat": 0.0, "speed": 0.0, "retro": True}
-        )
+        out.append(entry)
 
-        return results
-
-    except Exception:
-        # If anything in the Skyfield path explodes (binary missing, corrupted cache, etc.),
-        # fall back to the deterministic structure so the API remains responsive.
-        seed = int((jd_tt % 1.0) * 1_000_000)
-        names = ["Sun", "Moon", "Mercury", "Venus", "Mars", "Jupiter", "Saturn"]
-        out: List[Dict[str, Any]] = []
-        for i, n in enumerate(names):
-            ang = (seed * (i + 3) % 36000) / 100.0
-            out.append(
-                {"name": n, "lon": ang, "lat": 0.0, "speed": 1.0 + 0.1 * i, "retro": False}
-            )
-        moon_lon = out[1]["lon"]
-        out.append({"name": "Rahu", "lon": (moon_lon + 180.0) % 360.0, "lat": 0.0, "speed": 0.0, "retro": True})
-        out.append({"name": "Ketu", "lon": moon_lon, "lat": 0.0, "speed": 0.0, "retro": True})
-        return out
+    return {"bodies": out, "kernel": "de421", "jd_tt": jd_tt}
