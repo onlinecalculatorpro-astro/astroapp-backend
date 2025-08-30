@@ -5,19 +5,17 @@ services:
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app.main:app --preload --workers=2 --threads=4 --timeout=120
-    healthCheckPath: /health
+    healthCheckPath: /api/health-check   # use the route you already expose
     autoDeploy: true
     envVars:
-      # --- Runtime / deployment ---
       - key: FLASK_ENV
         value: production
       - key: TZ
         value: Asia/Kolkata
-      # Keep '*' for smoke; after frontend is live, change to your exact Netlify URL.
       - key: NETLIFY_ORIGIN
-        value: "*"
+        value: "*"   # we'll lock to Netlify later
 
-      # --- App config files (paths relative to repo root) ---
+      # existing config files you already reference
       - key: ASTRO_CONFIG
         value: config/defaults.yaml
       - key: ASTRO_CALIBRATORS
