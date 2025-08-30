@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: astroapp-backend
+    env: python
+    plan: free
+    buildCommand: ""
+    startCommand: gunicorn app.main:app
+    envVars:
+      - key: ASTRO_CONFIG
+        value: config/defaults.yaml
+      - key: ASTRO_CALIBRATORS
+        value: config/calibrators.json
+      - key: ASTRO_HC_THRESHOLDS
+        value: config/hc_thresholds.json
