@@ -1,0 +1,200 @@
+openapi: 3.0.3
+info:
+  title: AstroApp API
+  version: "1.0.0"
+servers:
+  - url: https://example.com
+paths:
+  /api/health:
+    get:
+      summary: Health check
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  version: { type: string }
+  /api/calculate:
+    post:
+      summary: Compute chart (planets + houses)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChartRequest'
+      responses:
+        '200':
+          description: Chart response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Chart'
+  /api/report:
+    post:
+      summary: Chart + narrative
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChartRequest'
+      responses:
+        '200':
+          description: Report with narrative
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  chart: { $ref: '#/components/schemas/Chart' }
+                  houses: { $ref: '#/components/schemas/Houses' }
+                  narrative: { type: string }
+  /predictions:
+    post:
+      summary: Prediction intervals and probabilities
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PredictionRequest'
+      responses:
+        '200':
+          description: Predictions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  predictions:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Prediction'
+  /rectification/quick:
+    post:
+      summary: Quick rectification (free mode)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RectificationRequest'
+      responses:
+        '200':
+          description: Best birth time estimate and top candidates
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RectificationResult'
+  /system-validation:
+    get:
+      summary: System validation badge and metrics
+      responses:
+        '200':
+          description: Validation summary
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  astronomy_accuracy: { type: string }
+                  performance_slo: { type: string }
+                  mode_consistency: { type: string }
+components:
+  schemas:
+    ChartRequest:
+      type: object
+      required: [date, time, place_tz, latitude, longitude, mode]
+      properties:
+        date: { type: string, example: "1992-11-04" }
+        time: { type: string, example: "05:25" }
+        place_tz: { type: string, example: "Asia/Kolkata" }
+        latitude: { type: number, example: 13.0827 }
+        longitude: { type: number, example: 80.2707 }
+        mode: { type: string, enum: ["sidereal","tropical"], example: "sidereal" }
+        ayanamsa: { type: string, example: "lahiri" }
+    PredictionRequest:
+      type: object
+      allOf:
+        - $ref: '#/components/schemas/ChartRequest'
+        - type: object
+          properties:
+            horizon: { type: string, enum: ["short","medium","long"] }
+    RectificationRequest:
+      type: object
+      allOf:
+        - $ref: '#/components/schemas/ChartRequest'
+        - type: object
+          properties:
+            window_minutes: { type: integer, example: 90 }
+    Chart:
+      type: object
+      required: [mode, jd_ut, jd_tt, bodies]
+      properties:
+        mode: { type: string }
+        ayanamsa_deg: { type: number }
+        jd_ut: { type: number }
+        jd_tt: { type: number }
+        bodies:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              longitude_deg: { type: number }
+              latitude_deg: { type: number }
+              speed_deg_per_day: { type: number }
+              retrograde: { type: boolean }
+    Houses:
+      type: object
+      properties:
+        house_system: { type: string }
+        asc_deg: { type: number }
+        mc_deg: { type: number }
+        cusps_deg:
+          type: array
+          items: { type: number }
+        high_lat_fallback: { type: boolean }
+        warnings:
+          type: array
+          items: { type: string }
+    Prediction:
+      type: object
+      required: [prediction_id, domain, interval_start_utc, interval_end_utc, probability_calibrated]
+      properties:
+        prediction_id: { type: string }
+        domain: { type: string, enum: ["Career/Education","Relationships","Relocation","Health","Finance"] }
+        horizon: { type: string, enum: ["short","medium","long"] }
+        interval_start_utc: { type: string, format: date-time }
+        interval_end_utc: { type: string, format: date-time }
+        probability_calibrated: { type: number }
+        hc_flag: { type: boolean }
+        abstained: { type: boolean }
+        evidence:
+          type: object
+          properties:
+            dasha: { type: number }
+            transit: { type: number }
+            varga: { type: number }
+            yoga: { type: number }
+        mode: { type: string }
+        ayanamsa_deg: { type: number }
+        notes: { type: string }
+    RectificationResult:
+      type: object
+      properties:
+        best_time: { type: string, format: date-time }
+        top3_times:
+          type: array
+          items: { type: string, format: date-time }
+        composite_scores:
+          type: array
+          items: { type: number }
+        confidence_band: { type: string }
+        margin_delta: { type: number }
+        features_at_peak: { type: string }
