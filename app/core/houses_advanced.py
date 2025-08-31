@@ -1,6 +1,6 @@
 # app/core/houses_advanced.py
 """
-Professional House System Calculations — v4 (research-grade)
+Professional House System Calculations — v6 (research-grade; 18 declared)
 
 Targets ≤ 0.01° agreement vs SwissEph/Solar Fire (1900–2650) with NO shortcuts:
 - Apparent sidereal time (GAST) via IAU 2006/2000A (PyERFA)
@@ -9,10 +9,17 @@ Targets ≤ 0.01° agreement vs SwissEph/Solar Fire (1900–2650) with NO shortc
 - Exact angle formulas (Asc/MC/Eastpoint/Vertex)
 - Exact house engines (Placidus numeric; Koch/Regio/Campanus/Morinus/Alcabitius closed forms)
 - Correct Porphyry quadrant trisection
+- Sripati (Madhya Bhava): midpoints of Porphyry boundaries (all 12, wrapped)
+- Vehlow Equal (SwissEph 'V'): Asc is the center of House 1 (cusp1 = Asc−15°)
 - Strict domain checks (raise ValueError on invalid math)
 - Optional Placidus diagnostics (iteration count / residual / last step)
 
 Policy choices (fallbacks/lat gating) live in app/core/house.py.
+
+NOTE on declared-but-gated systems:
+- Ambiguous vendor variants (no single public spec): horizon, carter_pe, sunshine, pullen_sd
+- Research claims without gold vectors/spec: meridian, krusinski
+These raise NotImplementedError (map to HTTP 501).
 """
 
 from __future__ import annotations
@@ -59,6 +66,15 @@ def _split_jd(jd: float) -> Tuple[float, float]:
     d = math.floor(jd)
     return d, jd - d
 
+def _midpoint_wrap(a: float, b: float) -> float:
+    """
+    Circular midpoint on [0,360): the point halfway from a to b moving
+    forward along the zodiac. Works correctly across the 0/360 boundary.
+    """
+    a = _norm_deg(a); b = _norm_deg(b)
+    d = _norm_deg(b - a)  # forward arc a->b in [0,360)
+    return _norm_deg(a + 0.5 * d)
+
 # --------------------------- ERFA / fundamental angles ---------------------------
 
 def _gast_deg(jd_ut1: float, jd_tt: float) -> float:
@@ -72,7 +88,7 @@ def _true_obliquity_deg(jd_tt: float) -> float:
     """True obliquity ε = ε_mean(IAU2006) + Δε(IAU2000A)."""
     d1, d2 = _split_jd(jd_tt)
     eps0 = erfa.obl06(d1, d2)
-    dpsi, deps = erfa.nut06a(d1, d2)
+    _dpsi, deps = erfa.nut06a(d1, d2)
     return math.degrees(eps0 + deps)
 
 def _ramc_deg(jd_ut1: float, jd_tt: float, lon_deg: float) -> float:
@@ -102,7 +118,6 @@ def _vertex_longitude_deg(phi: float, ramc: float, eps: float) -> float:
     Exact Vertex (intersection of ecliptic & prime vertical in the west), arccot form:
     VTX = arccot( - ( cot φ * sin ε - sin RAMC * cos ε ) / cos RAMC )
     """
-    # handle exact equator (tan 0 = 0 => cot inf → use large number)
     tphi = _tand(phi)
     cot_phi = (1.0 / tphi) if abs(tphi) > 1e-15 else 1e15
     num = -((cot_phi * _sind(eps)) - (_sind(ramc) * _cosd(eps)))
@@ -123,7 +138,7 @@ def _fill_opposites(cusps: List[Optional[float]]) -> List[float]:
             cusps[a] = _norm_deg(cusps[b] + 180.0)
     return [float(_norm_deg(c)) for c in cusps]  # type: ignore
 
-# --------------------------- exact house engines ---------------------------
+# --------------------------- exact house engines (original 10) ---------------------------
 
 def _equal(asc: float) -> List[float]:
     return [_norm_deg(asc + 30.0 * i) for i in range(12)]
@@ -186,7 +201,6 @@ def _morinus(ramc: float, eps: float) -> List[float]:
 def _regiomontanus(phi: float, ramc: float, eps: float, asc: float, mc: float) -> List[float]:
     def block(H: float) -> float:
         F = _norm_deg(ramc + H)
-        # House pole P per quadrant selection
         if H in (30.0, 60.0):
             P = math.degrees(math.atan(_tand(phi) * _sind(H)))
         else:
@@ -278,7 +292,6 @@ def _placidus(phi: float, eps: float, ramc: float, asc: float, mc: float, *,
     def sda(decl: float) -> float:
         # semi-diurnal hour angle H0 = acos(-tan φ tan δ) in degrees (0..180)
         t = -_tand(phi) * _tand(decl)
-        # detect pathological cases; at high-lat this can be outside [-1,1]
         if t < -1.0 - EPS_NUM or t > 1.0 + EPS_NUM:
             raise ValueError(f"placidus: circumpolar condition tan terms out of range (t={t})")
         return _acos_strict_deg(t, "placidus:sda")
@@ -301,13 +314,12 @@ def _placidus(phi: float, eps: float, ramc: float, asc: float, mc: float, *,
         dra  = _norm_deg(ra - ramc)
         if side == 'pre':
             if dra > 180.0:
-                dra -= 360.0      # (-180, 0]
+                dra -= 360.0
         else:
             if dra > 180.0:
-                dra -= 360.0      # (-180, 180] but we want (0, 180] logically
+                dra -= 360.0
         return dra - sign * (half * frac)
 
-    # Tunables
     MAX_ITERS = 30
     TOL_F     = 1e-10   # function residual tolerance (deg)
     TOL_STEP  = 1e-9    # last step tolerance (deg)
@@ -325,20 +337,17 @@ def _placidus(phi: float, eps: float, ramc: float, asc: float, mc: float, *,
             it += 1
             denom = (f1 - f0)
             if abs(denom) < 1e-15:
-                # tiny slope — nudge x1 to avoid division blow-up
                 x1 = _norm_deg(x1 + 1e-7)
                 f1 = eq(x1, frac, side)
                 continue
             x2 = _norm_deg((x0 * f1 - x1 * f0) / denom)
             f2 = eq(x2, frac, side)
             step = abs(_norm_deg(x2 - x1))
-            # convergence checks
             if abs(f2) < TOL_F or step < TOL_STEP:
                 x1, f1 = x2, f2
                 last_step = step
                 converged = True
                 break
-            # advance
             x0, f0, x1, f1 = x1, f1, x2, f2
             last_step = step
 
@@ -358,8 +367,7 @@ def _placidus(phi: float, eps: float, ramc: float, asc: float, mc: float, *,
 
         return _norm_deg(x1)
 
-    # Robust seeds from Porphyry thirds
-    por = _porphyry(asc, mc)
+    por = _porphyry(asc, mc)  # seeds
     C11 = solve(1.0/3.0, 'pre',  por[10], "C11")
     C12 = solve(2.0/3.0, 'pre',  por[11], "C12")
     C2  = solve(2.0/3.0, 'post', por[1],  "C2")
@@ -370,6 +378,42 @@ def _placidus(phi: float, eps: float, ramc: float, asc: float, mc: float, *,
     cusps[10], cusps[11] = C11, C12
     cusps[1],  cusps[2]  = C2,  C3
     return _fill_opposites(cusps)
+
+# --------------------------- NEW exact engines kept / tightened ---------------------------
+
+def _vehlow_equal(asc: float) -> List[float]:
+    """
+    Vehlow Equal (SwissEph 'V'): equal houses with the Ascendant at the
+    *center* of House 1. Therefore the 1st house cusp line is 15° BEFORE
+    the Ascendant degree, and cusps proceed every 30° from there.
+    (NOT the same as Whole Sign.)
+    """
+    start = _norm_deg(asc - 15.0)
+    return [_norm_deg(start + 30.0 * i) for i in range(12)]
+
+def _sripati(_phi: float, _eps: float, asc: float, mc: float) -> List[float]:
+    """
+    Sripati (Madhya Bhava): take Porphyry *boundaries* and define the house
+    *cusps* as the midpoints between successive Porphyry boundaries, with
+    correct circular wrap. All 12 cusps are computed directly.
+    """
+    por = _porphyry(asc, mc)  # Porphyry cusp-lines treated as boundaries
+    cusps = [0.0]*12
+    for i in range(12):
+        prev_i = (i - 1) % 12
+        cusps[i] = _midpoint_wrap(por[prev_i], por[i])
+    return _fill_opposites(cusps)
+
+# --------------------------- declared but intentionally gated ---------------------------
+
+_GATED_VENDOR_VARIANTS = {"horizon", "carter_pe", "sunshine", "pullen_sd"}
+_GATED_RESEARCH = {"meridian", "krusinski"}
+
+def _raise_gated(name: str) -> None:
+    raise NotImplementedError(
+        f"House system '{name}' is declared but intentionally not implemented yet "
+        f"(awaiting unambiguous public spec and gold vectors)."
+    )
 
 # --------------------------- data model & main calculator ---------------------------
 
@@ -388,16 +432,27 @@ class HouseData:
         if self.warnings is None:
             self.warnings = []
 
+# All 18 declared
 SUPPORTED_HOUSE_SYSTEMS = [
     "placidus", "koch", "regiomontanus", "campanus",
     "equal", "whole_sign", "porphyry", "alcabitius",
-    "morinus", "topocentric",
+    "morinus", "topocentric", "meridian", "horizon",
+    "carter_pe", "sunshine", "vehlow_equal", "sripati",
+    "krusinski", "pullen_sd",
 ]
+
+# Subset implemented in this build (12)
+IMPLEMENTED_HOUSE_SYSTEMS = {
+    "placidus", "koch", "regiomontanus", "campanus",
+    "equal", "whole_sign", "porphyry", "alcabitius",
+    "morinus", "topocentric", "vehlow_equal", "sripati",
+}
 
 class PreciseHouseCalculator:
     """
     Exact house computations with apparent sidereal time and true obliquity.
     STRICT by default: both jd_tt and jd_ut1 are required.
+    Declares 18 systems; 12 implemented; 6 gated with NotImplementedError.
     """
 
     def __init__(self, require_strict_timescales: bool = True, enable_diagnostics: bool = False):
@@ -415,7 +470,7 @@ class PreciseHouseCalculator:
         jd_ut1: Optional[float] = None,
     ) -> HouseData:
 
-        # ---- strict latitude bounds (poles undefined for houses) ----
+        # ---- strict latitude bounds ----
         if not (latitude > -90.0 and latitude < 90.0):
             raise ValueError(
                 "Latitude must be strictly between -90 and 90 degrees; poles are undefined for house systems."
@@ -426,8 +481,14 @@ class PreciseHouseCalculator:
         sys_name = house_system.lower().strip()
         if sys_name == "whole":
             sys_name = "whole_sign"
+        if sys_name == "azimuthal":
+            sys_name = "horizon"
         if sys_name not in SUPPORTED_HOUSE_SYSTEMS:
             raise ValueError(f"Unsupported house system: {house_system}")
+
+        # Gate ambiguous / research systems explicitly
+        if sys_name in _GATED_VENDOR_VARIANTS or sys_name in _GATED_RESEARCH:
+            _raise_gated(sys_name)
 
         # ---- timescales ----
         if self.require_strict_timescales:
@@ -435,7 +496,6 @@ class PreciseHouseCalculator:
                 raise ValueError("Strict mode requires jd_tt and jd_ut1 (no UT≈UTC shortcuts).")
             tt, ut1 = jd_tt, jd_ut1
         else:
-            # back-compat path (not for parity claims)
             tt  = jd_tt  or jd_ut
             ut1 = jd_ut1 or jd_ut
             if tt is None or ut1 is None:
@@ -468,9 +528,12 @@ class PreciseHouseCalculator:
             cusps = _koch(latitude, eps, ramc, mc)
         elif sys_name == "alcabitius":
             cusps = _alcabitius(latitude, eps, asc, mc)
+        elif sys_name == "vehlow_equal":
+            cusps = _vehlow_equal(asc)
+        elif sys_name == "sripati":
+            cusps = _sripati(latitude, eps, asc, mc)
         elif sys_name == "topocentric":
             # Polich–Page: use Placidus engine on topocentric angles;
-            # (parallax of angles is typically neglected; if added, inject here)
             diag = {} if self.enable_diagnostics else None
             cusps = _placidus(latitude, eps, ramc, asc, mc, _diag=diag)
             if solver_stats is not None and diag is not None:
@@ -481,7 +544,7 @@ class PreciseHouseCalculator:
             if solver_stats is not None and diag is not None:
                 solver_stats["placidus"] = diag
 
-        # add compact human lines to warnings only if diagnostics enabled
+        # add compact solver lines to warnings only if diagnostics enabled
         if self.enable_diagnostics and solver_stats:
             for key in ("placidus", "topocentric"):
                 d = solver_stats.get(key)
@@ -522,6 +585,9 @@ def compute_house_system(
     """
     Back-compat wrapper used elsewhere in the app.
     Strict mode: requires jd_tt and jd_ut1; raises if missing.
+
+    NOTE: For declared-but-gated systems this will raise NotImplementedError
+    (API layer should map to HTTP 501 Not Implemented).
     """
     calc = PreciseHouseCalculator(require_strict_timescales=True, enable_diagnostics=False)
     hd = calc.calculate_houses(
