@@ -21,6 +21,7 @@ from prometheus_client import (
     CONTENT_TYPE_LATEST,
     CollectorRegistry,
     multiprocess,
+    REGISTRY,
 )
 
 # Request/Domain metrics (global so other modules can import)
@@ -28,11 +29,14 @@ MET_REQUESTS: Final = Counter(
     "astro_api_requests_total", "API requests", ["route"]
 )
 MET_FALLBACKS: Final = Counter(
-    "astro_house_fallback_total", "House fallbacks at high latitude", ["requested", "fallback"]
+    "astro_house_fallback_total",
+    "House fallbacks at high latitude",
+    ["requested", "fallback"],
 )
 MET_WARNINGS: Final = Counter(
     "astro_warning_total", "Non-fatal warnings", ["kind"]
 )
+
 # Gauge aggregated across workers
 GAUGE_DUT1: Final = Gauge(
     "astro_dut1_broadcast_seconds",
@@ -47,7 +51,6 @@ MET_FALLBACKS.labels(requested="placidus", fallback="equal").inc(0)
 MET_WARNINGS.labels(kind="polar_soft_fallback").inc(0)
 MET_WARNINGS.labels(kind="polar_reject_strict").inc(0)
 MET_WARNINGS.labels(kind="leap_policy_warn").inc(0)
-
 
 # ───────────────────────── Internals ──────────────────────────────────────────
 def _configure_logging(app: Flask) -> None:
@@ -122,6 +125,10 @@ def _register_metrics(app: Flask) -> None:
                 registry = CollectorRegistry()
                 multiprocess.MultiProcessCollector(registry)
                 data = generate_latest(registry)
+
+                # If no shards yet, fall back to default registry so scrape isn't blank
+                if not data:
+                    data = generate_latest(REGISTRY)
             else:
                 data = generate_latest()
 
@@ -152,6 +159,12 @@ def create_app() -> Flask:
     _register_health_endpoints(app)
     _register_error_handlers(app)
     _register_metrics(app)
+
+    # Ensure a shard exists so /metrics isn't blank on first scrape
+    try:
+        MET_REQUESTS.labels(route="__boot__").inc()
+    except Exception:
+        pass
 
     app.logger.info("App initialized with config path %s", cfg_path)
     return app
