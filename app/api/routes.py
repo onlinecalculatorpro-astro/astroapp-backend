@@ -6,7 +6,7 @@ import json
 import os
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from flask import Blueprint, jsonify, request
@@ -31,10 +31,15 @@ from app.core.rectify import rectification_candidates
 
 # houses: prefer policy façade if present
 try:
-    from app.core.house import compute_houses_with_policy as _houses_fn  # type: ignore
+    from app.core.house import (
+        compute_houses_with_policy as _houses_fn,   # type: ignore
+        list_supported_house_systems as _list_house_systems,  # type: ignore
+    )
     _HOUSES_KIND = "policy"
 except Exception:
     from app.core.astronomy import compute_houses as _houses_fn  # type: ignore
+    def _list_house_systems() -> list[str]:  # legacy minimal
+        return ["placidus", "koch", "regiomontanus", "campanus", "equal", "porphyry"]
     _HOUSES_KIND = "legacy"
 
 # time kernel (required)
@@ -50,7 +55,21 @@ api = Blueprint("api", __name__)
 DEBUG_VERBOSE = os.getenv("ASTRO_DEBUG_VERBOSE", "0").lower() in ("1", "true", "yes", "on")
 
 
-# ─────────────────────────────── timescales ────────────────────────────────
+# ───────────────────────────── helpers ─────────────────────────────
+
+def _get_bool(source: Dict[str, Any], key: str, default: bool) -> bool:
+    val = source.get(key, default)
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes", "on")
+    return default
+
+
+# ───────────────────────────── timescales ─────────────────────────────
+
 def _datetime_to_jd_utc(dt_utc: datetime) -> float:
     """Return Julian Date (UTC). Prefer ERFA; fallback to safe Meeus form."""
     if dt_utc.tzinfo is None or dt_utc.tzinfo is not timezone.utc:
@@ -157,6 +176,7 @@ def _compute_timescales_from_local(date_str: str, time_str: str, tz_name: str) -
 
 
 # ─────────────────────── engine call adapters ───────────────────────
+
 def _sig_accepts(fn: Callable, *names: str) -> Dict[str, bool]:
     """Map of param -> accepted by fn."""
     try:
@@ -191,15 +211,12 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
     if name_time: kwargs[name_time] = payload["time"]
     if name_lat:  kwargs[name_lat]  = payload["latitude"]
     if name_lon:  kwargs[name_lon]  = payload["longitude"]
-    if name_mode: kwargs[name_mode] = payload["mode"]
+    if name_mode and "mode" in payload: kwargs[name_mode] = payload["mode"]
     if name_tz:   kwargs[name_tz]   = payload.get("timezone") or payload.get("place_tz")
 
-    if "jd_ut" in params:
-        kwargs["jd_ut"] = ts["jd_utc"]
-    if "jd_tt" in params:
-        kwargs["jd_tt"] = ts["jd_tt"]
-    if "jd_ut1" in params:
-        kwargs["jd_ut1"] = ts["jd_ut1"]
+    if "jd_ut" in params:  kwargs["jd_ut"]  = ts["jd_utc"]
+    if "jd_tt" in params:  kwargs["jd_tt"]  = ts["jd_tt"]
+    if "jd_ut1" in params: kwargs["jd_ut1"] = ts["jd_ut1"]
 
     chart = compute_chart(**kwargs)
 
@@ -214,18 +231,23 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
 def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
     """
     Prefer policy façade if available; pass jd_tt/jd_ut1 when accepted.
+    Also passes diagnostics/validation flags when supported by the target.
     """
     lat = float(payload["latitude"])
     lon = float(payload["longitude"])
-
     requested_system = (payload.get("house_system") or "").strip().lower() or None
 
     accepts = _sig_accepts(
         _houses_fn,
         "lat", "lon",
         "system", "requested_house_system", "house_system",
-        "mode", "jd_ut", "jd_tt", "jd_ut1", "diagnostics"
+        "mode", "jd_ut", "jd_tt", "jd_ut1",
+        "diagnostics", "validation"
     )
+
+    # merge body + query flags
+    diagnostics = _get_bool({**request.args, **payload}, "diagnostics", os.getenv("ASTRO_HOUSES_DEBUG", "").lower() in ("1","true","yes","on"))
+    validation  = _get_bool({**request.args, **payload}, "validation", os.getenv("ASTRO_HOUSES_VALIDATE", "").lower() in ("1","true","yes","on"))
 
     kwargs: Dict[str, Any] = {"lat": lat, "lon": lon}
 
@@ -241,24 +263,23 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
     if accepts.get("mode") and "mode" in payload:
         kwargs["mode"] = payload["mode"]
 
-    if accepts.get("jd_tt"):
-        kwargs["jd_tt"] = ts["jd_tt"]
-    if accepts.get("jd_ut1"):
-        kwargs["jd_ut1"] = ts["jd_ut1"]
+    if accepts.get("jd_tt"):  kwargs["jd_tt"]  = ts["jd_tt"]
+    if accepts.get("jd_ut1"): kwargs["jd_ut1"] = ts["jd_ut1"]
     if accepts.get("jd_ut") and "jd_tt" not in kwargs and "jd_ut1" not in kwargs:
         kwargs["jd_ut"] = ts["jd_utc"]
 
-    if accepts.get("diagnostics") and "diagnostics" in payload:
-        kwargs["diagnostics"] = bool(payload["diagnostics"])
+    if accepts.get("diagnostics"):
+        kwargs["diagnostics"] = bool(diagnostics)
+    if accepts.get("validation"):
+        kwargs["validation"] = bool(validation)
 
     houses = _houses_fn(**kwargs)
 
-    # Normalize structure + echo requested system for clients
+    # Normalize shape + echo requested system for clients
     houses = _normalize_houses_payload(houses)
     if isinstance(houses, dict):
         if requested_system:
             houses.setdefault("requested_house_system", requested_system)
-        # prefer effective name in both keys
         if "house_system" in houses:
             houses.setdefault("system", houses["house_system"])
         elif "system" in houses:
@@ -268,6 +289,7 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
 
 
 # ───────────────────────────── error helpers ─────────────────────────────
+
 def _json_error(code: str, details: Any = None, http: int = 400):
     out: Dict[str, Any] = {"ok": False, "error": code}
     if details is not None:
@@ -294,9 +316,20 @@ def _normalize_houses_payload(houses: Any) -> Any:
 
 
 # ───────────────────────────── endpoints ─────────────────────────────
+
 @api.get("/api/health")
 def health():
     return jsonify({"ok": True, "status": "up", "version": VERSION}), 200
+
+
+@api.get("/api/houses/systems")
+def houses_systems():
+    """Discoverable list of accepted public names (incl. aliases)."""
+    try:
+        systems = _list_house_systems()
+    except Exception:
+        systems = []
+    return jsonify({"ok": True, "engine": _HOUSES_KIND, "systems": systems}), 200
 
 
 @api.post("/api/calculate")
@@ -333,7 +366,16 @@ def calculate():
     except Exception as e:
         return _json_error("houses_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
-    return jsonify({"ok": True, "chart": chart, "houses": _normalize_houses_payload(houses), "meta": {"timescales": ts}}), 200
+    resp = {
+        "ok": True,
+        "chart": chart,
+        "houses": _normalize_houses_payload(houses),
+        "meta": {
+            "timescales": ts,
+            "houses_engine": _HOUSES_KIND,
+        },
+    }
+    return jsonify(resp), 200
 
 
 @api.post("/api/report")
@@ -372,9 +414,17 @@ def report():
         "This is a placeholder narrative aligned to your mode and computed houses. "
         "Evidence chips will explain predictions in /predictions."
     )
-    return jsonify(
-        {"ok": True, "chart": chart, "houses": houses, "narrative": narrative, "meta": {"timescales": ts}}
-    ), 200
+    resp = {
+        "ok": True,
+        "chart": chart,
+        "houses": houses,
+        "narrative": narrative,
+        "meta": {
+            "timescales": ts,
+            "houses_engine": _HOUSES_KIND,
+        },
+    }
+    return jsonify(resp), 200
 
 
 @api.post("/predictions")
@@ -467,7 +517,7 @@ def predictions_route():
     if not overrides and not os.environ.get("ASTRO_HC_DEBUG_OVERRIDES"):
         preds = flag_predictions(preds, horizon, th_path)
 
-    return jsonify({"ok": True, "predictions": preds, "meta": {"timescales": ts}}), 200
+    return jsonify({"ok": True, "predictions": preds, "meta": {"timescales": ts, "houses_engine": _HOUSES_KIND}}), 200
 
 
 @api.post("/rectification/quick")
