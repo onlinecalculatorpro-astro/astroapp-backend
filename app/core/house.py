@@ -68,6 +68,32 @@ except Exception as _e:  # pragma: no cover
     ) from _e
 
 
+# ───────────────────────── Metrics (lazy, no import cycles) ─────────────────────────
+
+def _met_warn(kind: str) -> None:
+    """
+    Increment astro_warning_total{kind=...} if metrics are available.
+    Lazy import avoids a main↔routes↔house circular import at module load time.
+    """
+    try:
+        from app.main import MET_WARNINGS  # type: ignore
+        MET_WARNINGS.labels(kind=kind).inc()
+    except Exception:
+        # Metrics are optional; never break domain logic.
+        pass
+
+
+def _met_fallback(requested: str, fallback: str) -> None:
+    """
+    Increment astro_house_fallback_total{requested=...,fallback=...} if available.
+    """
+    try:
+        from app.main import MET_FALLBACKS  # type: ignore
+        MET_FALLBACKS.labels(requested=requested, fallback=fallback).inc()
+    except Exception:
+        pass
+
+
 # ───────────────────────── Utilities ─────────────────────────
 
 def list_supported_house_systems() -> List[str]:
@@ -238,9 +264,11 @@ def compute_houses_with_policy(
             f"Requested '{requested_public}' is undefined/unstable at latitude {lat_f:.2f}° (≥ hard limit {hard_lim}°). "
             "Will try fallbacks."
         )
+        _met_warn("polar_hard_limit")
 
     if polar_policy == "reject_above_66deg" and _needs_polar_fallback(requested_public, lat_f, soft_lim):
         # In strict-reject policy, don't attempt chain for risky systems above soft limit.
+        _met_warn("polar_reject_strict")
         raise ValueError(f"house_system '{requested_public}' is unstable above |lat|>{soft_lim}°")
 
     # Build the chain and filter out candidates not allowed at this latitude
@@ -260,6 +288,7 @@ def compute_houses_with_policy(
             f"Soft polar policy: '{requested_public}' is risky at |lat|>{soft_lim}°. "
             f"Reordered fallback priority to robust systems first: {chain[:3]}..."
         )
+        _met_warn("polar_soft_fallback")
 
     # ---- compute with numeric safety net and multi-step fallback
     calc = PreciseHouseCalculator(require_strict_timescales=True, enable_diagnostics=bool(diagnostics))
@@ -287,6 +316,7 @@ def compute_houses_with_policy(
             used_public = _engine_to_public(hd.system)
             if sys_public != requested_public:
                 warnings.append(f"Fallback to '{sys_public}' applied.")
+                _met_fallback(requested=requested_public, fallback=sys_public)
             break
         except Exception as e:
             last_err = e
