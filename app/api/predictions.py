@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import uuid, logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from flask import Blueprint, request, jsonify
 from app.core.validate_prediction import validate_prediction_payload, ValidationError
@@ -11,7 +11,7 @@ log = logging.getLogger(__name__)
 predictions_bp = Blueprint("predictions", __name__)
 
 API_VERSION = "predictions_v1"
-SCHEMA_VERSION = "1.1.0"  # bumped: Phase-1 engine selection metadata
+SCHEMA_VERSION = "1.1.1"  # engine selection + null fallback
 
 # ───────────────────────────── metrics (optional) ─────────────────────────────
 try:
@@ -23,23 +23,35 @@ except Exception:
 # ───────────────────────────── engine imports (layered) ───────────────────────
 # Phase-1 (outers + extended aspects)
 try:
-    from app.core.professional_astro_phase1 import ProfessionalAstrologyEnginePhase1 as Phase1Engine  # type: ignore
-except Exception:
+    from app.core.professional_astro_phase1 import (
+        ProfessionalAstrologyEnginePhase1 as Phase1Engine
+    )  # type: ignore
+    log.info("Phase1Engine import OK")
+except Exception as e:
+    log.warning("Phase1Engine import failed: %s", e)
     Phase1Engine = None  # type: ignore
 
 # v2 (stable baseline)
 try:
-    from app.core.professional_astro_v2 import ProfessionalAstrologyEngine as V2Engine  # type: ignore
-except Exception:
+    from app.core.professional_astro_v2 import (
+        ProfessionalAstrologyEngine as V2Engine
+    )  # type: ignore
+    log.info("V2Engine import OK")
+except Exception as e:
+    log.warning("V2Engine import failed: %s", e)
     V2Engine = None  # type: ignore
 
 # legacy (ultimate fallback)
 try:
-    from app.core.professional_astro import ProfessionalAstrologyEngine as LegacyEngine  # type: ignore
-except Exception:
+    from app.core.professional_astro import (
+        ProfessionalAstrologyEngine as LegacyEngine
+    )  # type: ignore
+    log.info("LegacyEngine import OK")
+except Exception as e:
+    log.warning("LegacyEngine import failed: %s", e)
     LegacyEngine = None  # type: ignore
 
-# Ephemeris capability probe (optional; only used to pick Phase-1)
+# Ephemeris capability probe (optional; informational only)
 try:
     from app.core.ephemeris_adapter import _skyfield_available as _eph_ok  # type: ignore
 except Exception:
@@ -134,33 +146,38 @@ def _summarize(predictions: List[Dict[str, Any]]) -> str:
         for p in top
     )
 
+# ───────────────────────────── selection + fallback ─────────────────────────────
+class _NullEngine:
+    """Non-throwing placeholder so the API always returns 200 with empty predictions."""
+    name = "NullEngine"
+    precision_mode = "STANDARD"
+    def get_transit_predictions(self, *args, **kwargs) -> List[Dict[str, Any]]:
+        return []
+
 def _choose_engine(prefer: Optional[str] = None):
     """
     Engine selection:
-      - prefer='phase1' forces Phase-1 if available
-      - prefer='v2' forces v2 if available
-      - default: Phase-1 when ephemeris available, else v2, else legacy
+      - prefer='phase1' forces Phase-1 if importable
+      - prefer='v2' forces v2 if importable
+      - default: Phase-1 if importable; else v2; else legacy; else null
     Returns (engine_instance, engine_meta_dict)
     """
-    # Forced selections first
+    # Forced
     if prefer == "phase1" and Phase1Engine is not None:
         return Phase1Engine(), {"selected": "phase1", "reason": "forced", "ephemeris_ready": _eph_ok()}
     if prefer == "v2" and V2Engine is not None:
         return V2Engine(), {"selected": "v2", "reason": "forced"}
 
-    # Auto selection
-    if Phase1Engine is not None and _eph_ok():
-        eng = Phase1Engine()
-        return eng, {"selected": "phase1", "reason": "ephemeris_available"}
-
+    # Auto (Phase-1 even if ephemeris is not ready; it will degrade gracefully)
+    if Phase1Engine is not None:
+        return Phase1Engine(), {"selected": "phase1", "reason": "available", "ephemeris_ready": _eph_ok()}
     if V2Engine is not None:
         return V2Engine(), {"selected": "v2", "reason": "fallback_v2"}
-
     if LegacyEngine is not None:
         return LegacyEngine(), {"selected": "legacy", "reason": "fallback_legacy"}
 
-    raise RuntimeError("No prediction engine available")
-
+    log.warning("No prediction engine importable; using NullEngine fallback.")
+    return _NullEngine(), {"selected": "null", "reason": "no_engine_available"}
 
 # ───────────────────────────── endpoint ─────────────────────────────
 @predictions_bp.post("/predictions")
@@ -214,9 +231,11 @@ def predictions_endpoint():
             )
 
         if not isinstance(results, list):
-            raise RuntimeError("Engine returned non-list predictions")
+            log.warning("Engine returned non-list; coercing to []")
+            results = []
 
     except Exception as e:
+        # With NullEngine the above should never throw, but keep a safe 502 path.
         if _PRED_REQS: _PRED_REQS.labels(outcome="engine_error").inc()
         log.exception("Prediction engine failure: %s", e)
         return jsonify({
