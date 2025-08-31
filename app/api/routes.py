@@ -530,12 +530,6 @@ def system_validation():
     ), 200
 
 
-@api.get("/metrics")
-def metrics_export():
-    from flask import Response
-    return Response(metrics.export_prometheus(), mimetype="text/plain")
-
-
 @api.get("/api/config")
 @metrics.middleware("config")
 @rate_limit(1)
