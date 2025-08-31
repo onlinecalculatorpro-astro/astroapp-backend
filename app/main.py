@@ -40,22 +40,12 @@ MET_WARNINGS: Final = Counter(
 # Gauges aggregated across workers
 GAUGE_DUT1: Final = Gauge(
     "astro_dut1_broadcast_seconds",
-    "DUT1 broadcast seconds",
-    multiprocess_mode="livesum",
+    "DUT1 broadcast seconds"
 )
 GAUGE_APP_UP: Final = Gauge(
     "astro_app_up",
-    "1 if app is running",
-    multiprocess_mode="livesum",
+    "1 if app is running"
 )
-
-# Seed series so first scrape isn't empty
-MET_REQUESTS.labels(route="/api/health-check").inc(1)
-MET_REQUESTS.labels(route="/api/calculate").inc(1)
-MET_FALLBACKS.labels(requested="placidus", fallback="equal").inc(0)
-MET_WARNINGS.labels(kind="polar_soft_fallback").inc(0)
-MET_WARNINGS.labels(kind="polar_reject_strict").inc(0)
-MET_WARNINGS.labels(kind="leap_policy_warn").inc(0)
 
 
 # ── App plumbing ──────────────────────────────────────────────────────────────
@@ -98,33 +88,56 @@ def _register_health(app: Flask) -> None:
         return jsonify(status="ok"), 200
 
 
+def _initialize_metrics():
+    """Force initialize all metrics so they appear in output"""
+    try:
+        # Initialize counters with actual values
+        MET_REQUESTS.labels(route="/api/health-check").inc()
+        MET_REQUESTS.labels(route="/api/calculate").inc()
+        MET_FALLBACKS.labels(requested="placidus", fallback="equal")._value._value = 0
+        MET_WARNINGS.labels(kind="polar_soft_fallback")._value._value = 0
+        
+        # Set gauges
+        GAUGE_APP_UP.set(1)
+        GAUGE_DUT1.set(0)
+        
+        print("DEBUG: Metrics initialized successfully")
+    except Exception as e:
+        print(f"DEBUG: Failed to initialize metrics: {e}")
+
+
 def _register_metrics(app: Flask) -> None:
+    # Initialize metrics when the app starts
+    _initialize_metrics()
+    
     @app.before_request
     def _count_req():
-        # never let metrics affect the request path
         try:
             MET_REQUESTS.labels(route=request.path).inc()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"DEBUG: Metrics increment failed: {e}")
 
     @app.get("/metrics")
     def metrics():
         try:
-            # heartbeat + broadcast every scrape
-            GAUGE_APP_UP.set(1.0)
+            # Update gauges on each scrape
+            GAUGE_APP_UP.set(1)
             GAUGE_DUT1.set(float(os.environ.get("ASTRO_DUT1_BROADCAST", "0.0")))
-
-            # Always use default registry - multiprocess can cause issues
+            
+            # Generate metrics data
             data = generate_latest(REGISTRY)
             
-            if not data:
-                # Force some data if registry is empty
-                MET_REQUESTS.labels(route="/fallback").inc()
+            print(f"DEBUG: Generated {len(data)} bytes of metrics data")
+            
+            if len(data) < 10:
+                print("DEBUG: Metrics data too short, forcing initialization")
+                _initialize_metrics()
                 data = generate_latest(REGISTRY)
-
+            
             return Response(data, mimetype=CONTENT_TYPE_LATEST)
+            
         except Exception as ex:
-            # never fail scraping
+            print(f"DEBUG: Metrics endpoint error: {ex}")
             return Response(f"# metrics error: {ex}\n", mimetype="text/plain")
 
 
@@ -144,12 +157,6 @@ def create_app() -> Flask:
     _register_health(app)
     _register_errors(app)
     _register_metrics(app)
-
-    # touch a series at boot to ensure a shard exists
-    try:
-        MET_REQUESTS.labels(route="__boot__").inc()
-    except Exception:
-        pass
 
     app.logger.info("App initialized with config path %s", cfg_path)
     return app
