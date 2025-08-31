@@ -17,6 +17,3 @@ tzdata==2024.1
 
 # --- Monitoring ---
 prometheus-client==0.20.0
-
-# --- Ephemeris kernel (bundle de421) ---
-de421==1.0
