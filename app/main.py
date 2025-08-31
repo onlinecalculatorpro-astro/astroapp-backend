@@ -5,13 +5,23 @@ import logging
 import os
 from typing import Tuple
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, Response, request
 from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from app.api.routes import api
 from app.utils.config import load_config
+
+# --- Prometheus metrics (global so other modules can import and increment) ---
+from prometheus_client import Counter, Gauge, generate_latest, CONTENT_TYPE_LATEST
+
+# Requests by path (labelled)
+MET_REQUESTS  = Counter("astro_api_requests_total", "API requests", ["route"])
+# Domain-specific counters you can increment from house/time code:
+MET_FALLBACKS = Counter("astro_house_fallback_total", "House fallbacks at high latitude", ["requested", "fallback"])
+MET_WARNINGS  = Counter("astro_warning_total", "Non-fatal warnings", ["kind"])
+GAUGE_DUT1    = Gauge("astro_dut1_broadcast_seconds", "DUT1 broadcast seconds")
 
 
 def _configure_logging(app: Flask) -> None:
@@ -55,6 +65,28 @@ def _register_health_endpoints(app: Flask) -> None:
         return jsonify(status="ok"), 200
 
 
+def _register_metrics(app: Flask) -> None:
+    """Expose /metrics for Prometheus and count requests."""
+    # Count every request by path (never fail requests if metrics hiccup)
+    @app.before_request
+    def _count_req():
+        try:
+            MET_REQUESTS.labels(route=request.path).inc()
+        except Exception:
+            pass
+
+    @app.get("/metrics")
+    def metrics():
+        try:
+            # Optional broadcast value for dashboards
+            dut1 = float(os.environ.get("ASTRO_DUT1_BROADCAST", "0.0"))
+            GAUGE_DUT1.set(dut1)
+            return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
+        except Exception as ex:
+            # Never break scraping: return minimal text if something odd happens
+            return Response(f"# metrics error: {ex}\n", mimetype="text/plain")
+
+
 def create_app() -> Flask:
     app = Flask(__name__)
     app.config["JSON_SORT_KEYS"] = False
@@ -71,9 +103,10 @@ def create_app() -> Flask:
     # Blueprints
     app.register_blueprint(api)
 
-    # Health + errors
+    # Health + errors + metrics
     _register_health_endpoints(app)
     _register_error_handlers(app)
+    _register_metrics(app)
 
     app.logger.info("App initialized with config path %s", cfg_path)
     return app
@@ -104,6 +137,7 @@ CORS(
 )
 
 # -----------------------------------------------------------------------------
+
 
 if __name__ == "__main__":
     # Useful for local dev; Render/Gunicorn will ignore this
