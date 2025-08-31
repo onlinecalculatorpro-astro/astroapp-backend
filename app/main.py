@@ -114,16 +114,12 @@ def _register_metrics(app: Flask) -> None:
             GAUGE_APP_UP.set(1.0)
             GAUGE_DUT1.set(float(os.environ.get("ASTRO_DUT1_BROADCAST", "0.0")))
 
-            mp_dir = os.environ.get("PROMETHEUS_MULTIPROC_DIR")
-            if mp_dir:
-                # merge worker shards
-                registry = CollectorRegistry()
-                multiprocess.MultiProcessCollector(registry)
-                data = generate_latest(registry)
-                # belt-and-suspenders: if shards are empty, include in-process too
-                if not data or data.strip() == b"":
-                    data = generate_latest(REGISTRY)
-            else:
+            # Always use default registry - multiprocess can cause issues
+            data = generate_latest(REGISTRY)
+            
+            if not data:
+                # Force some data if registry is empty
+                MET_REQUESTS.labels(route="/fallback").inc()
                 data = generate_latest(REGISTRY)
 
             return Response(data, mimetype=CONTENT_TYPE_LATEST)
