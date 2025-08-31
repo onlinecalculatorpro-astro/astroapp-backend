@@ -8,13 +8,10 @@ from typing import Any, Dict, List, Optional, Tuple, Final
 # ───────────────────────── Public ↔ Engine names ─────────────────────────
 
 # Public names we accept from the API/client. Include common aliases.
+# We list all 18 so the API never 400's for a declared name.
 SUPPORTED_HOUSE_SYSTEMS: Final[Tuple[str, ...]] = (
+    # canonical classical/modern
     "placidus",
-    "equal",
-    "whole",        # alias family for whole-sign
-    "whole_sign",
-    "whole-sign",
-    "whole sign",
     "koch",
     "regiomontanus",
     "campanus",
@@ -22,6 +19,22 @@ SUPPORTED_HOUSE_SYSTEMS: Final[Tuple[str, ...]] = (
     "alcabitius",
     "morinus",
     "topocentric",
+    "equal",
+    # whole-sign & aliases
+    "whole",
+    "whole_sign",
+    "whole-sign",
+    "whole sign",
+    # additional implemented
+    "vehlow_equal",
+    "sripati",
+    # vendor-variant / research (gated → 501 Not Implemented)
+    "meridian",
+    "horizon",
+    "carter_pe",
+    "sunshine",
+    "krusinski",
+    "pullen_sd",
 )
 
 # Map public/alias → engine canonical
@@ -32,10 +45,16 @@ _ALIAS_TO_ENGINE: Final[Dict[str, str]] = {
     "whole sign": "whole_sign",
 }
 
-# Map engine canonical → public preferred label
+# Map engine canonical → public preferred label (display)
 _ENGINE_TO_PUBLIC: Final[Dict[str, str]] = {
     "whole_sign": "whole",
 }
+
+# Systems intentionally not implemented yet (return 501 via routes.py)
+GATED_NOT_IMPLEMENTED: Final[frozenset[str]] = frozenset({
+    "horizon", "carter_pe", "sunshine", "pullen_sd",  # vendor-variant (ambiguous specs)
+    "meridian", "krusinski",                           # research-claimed (awaiting gold vectors)
+})
 
 # ───────────────────────── Polar policy knobs ─────────────────────────
 
@@ -44,10 +63,11 @@ POLAR_HARD_LIMIT_DEG: Final[float] = float(os.getenv("ASTRO_POLAR_HARD_LAT", "80
 POLAR_ABSOLUTE_LIMIT_DEG: Final[float] = 89.999999  # hard guard near poles
 POLAR_POLICY: Final[str] = os.getenv("ASTRO_POLAR_POLICY", "fallback_to_equal_above_66deg")
 
-# Systems known to be problematic near the poles
+# Systems known to be problematic near the poles (numeric failure/instability)
 _HARD_REJECT_AT_POLAR: Final[set[str]] = {"placidus", "koch", "topocentric", "alcabitius"}
 _RISKY_AT_POLAR: Final[set[str]] = {
     "placidus", "koch", "regiomontanus", "campanus", "topocentric", "alcabitius", "morinus",
+    # note: vehlow_equal / equal / whole / porphyry are robust and thus omitted
 }
 
 # Numeric fallback enabled?
@@ -73,16 +93,13 @@ except Exception as _e:  # pragma: no cover
 # ───────────────────────── Metrics (lazy, no import cycles) ─────────────────────────
 
 def _met_warn(kind: str) -> None:
-    """Increment astro_warning_total{kind=...} if metrics are available."""
     try:
         from app.main import MET_WARNINGS  # type: ignore
         MET_WARNINGS.labels(kind=kind).inc()
     except Exception:
-        pass  # metrics are optional; never break domain logic
-
+        pass
 
 def _met_fallback(requested: str, fallback: str) -> None:
-    """Increment astro_house_fallback_total{requested=...,fallback=...} if available."""
     try:
         from app.main import MET_FALLBACKS  # type: ignore
         MET_FALLBACKS.labels(requested=requested, fallback=fallback).inc()
@@ -96,7 +113,6 @@ def list_supported_house_systems() -> List[str]:
     """Public list (includes aliases we accept)."""
     return list(SUPPORTED_HOUSE_SYSTEMS)
 
-
 def _normalize_system(s: Optional[str]) -> str:
     """Normalize a user-facing house-system name to our public label (still public, not engine)."""
     if not s:
@@ -109,27 +125,22 @@ def _normalize_system(s: Optional[str]) -> str:
         return "whole"
     return key
 
-
 def _public_to_engine(system: str) -> str:
     """Convert a normalized public system name to the engine canonical name."""
     return _ALIAS_TO_ENGINE.get(system, system)
-
 
 def _engine_to_public(system: str) -> str:
     """Convert engine canonical name back to a preferred public label."""
     return _ENGINE_TO_PUBLIC.get(system, system)
 
-
 def _needs_polar_fallback(system: str, latitude: float, limit: float) -> bool:
     return abs(latitude) > limit and system in _RISKY_AT_POLAR
-
 
 def _allowed_at_lat(public_system: str, lat: float, hard_lim: float) -> bool:
     """True if we should attempt this system at the given latitude."""
     if abs(lat) >= hard_lim and public_system in _HARD_REJECT_AT_POLAR:
         return False
     return True
-
 
 def _dedupe(seq: List[str]) -> List[str]:
     seen = set()
@@ -139,7 +150,6 @@ def _dedupe(seq: List[str]) -> List[str]:
             seen.add(s)
             out.append(s)
     return out
-
 
 def _default_fallback_chain_for(requested_public: str) -> List[str]:
     """
@@ -157,9 +167,11 @@ def _default_fallback_chain_for(requested_public: str) -> List[str]:
         "porphyry":      ["equal", "whole"],
         "equal":         ["porphyry", "whole"],
         "whole":         ["equal", "porphyry"],
+        "vehlow_equal":  ["equal", "whole"],    # robust angular group
+        "sripati":       ["porphyry", "equal", "whole"],  # based on Porphyry thirds
+        # gated systems intentionally exclude fallbacks here (we raise 501)
     }
     return chains.get(requested_public, ["equal", "whole"])
-
 
 def _fallback_chain(requested_public: str) -> List[str]:
     """
@@ -216,6 +228,9 @@ def compute_houses_with_policy(
       • polar safety (fallback/reject per policy),
       • multi-step numeric fallback chain,
       • stable, API-friendly payload (includes `cusps_deg` for compatibility).
+
+    NOTE: If the requested system is in GATED_NOT_IMPLEMENTED, we raise NotImplementedError
+          immediately so the HTTP layer can return 501 Not Implemented.
     """
     # ---- inputs & normalization
     latitude = lat if lat is not None else latitude
@@ -233,6 +248,13 @@ def compute_houses_with_policy(
 
     requested_public = system if system is not None else requested_house_system
     requested_public = _normalize_system(requested_public)
+
+    # Gate vendor-variant / research systems to return 501 upstream
+    if requested_public in GATED_NOT_IMPLEMENTED:
+        raise NotImplementedError(
+            f"house_system '{requested_public}' is declared but intentionally not implemented yet "
+            f"(awaiting gold vectors/specs)."
+        )
 
     polar_policy = (polar_policy or POLAR_POLICY).strip()
     soft_lim = float(polar_soft_limit if polar_soft_limit is not None else POLAR_SOFT_LIMIT_DEG)
@@ -254,7 +276,6 @@ def compute_houses_with_policy(
         diagnostics = os.getenv("ASTRO_HOUSES_DEBUG", "").lower() in ("1", "true", "yes", "on")
 
     # ---- polar rules
-    # Hard rejection only blocks specific systems; we can still try safer ones from the chain.
     if abs(lat_f) >= hard_lim and requested_public in _HARD_REJECT_AT_POLAR:
         warnings.append(
             f"Requested '{requested_public}' is undefined/unstable at latitude {lat_f:.2f}° (≥ hard limit {hard_lim}°). "
@@ -263,7 +284,6 @@ def compute_houses_with_policy(
         _met_warn("polar_hard_limit")
 
     if polar_policy == "reject_above_66deg" and _needs_polar_fallback(requested_public, lat_f, soft_lim):
-        # In strict-reject policy, don't attempt chain for risky systems above soft limit.
         _met_warn("polar_reject_strict")
         raise ValueError(f"house_system '{requested_public}' is unstable above |lat|>{soft_lim}°")
 
@@ -274,7 +294,6 @@ def compute_houses_with_policy(
 
     # If soft-policy and requested is risky, prefer robust systems first by reordering:
     if polar_policy == "fallback_to_equal_above_66deg" and _needs_polar_fallback(chain[0], lat_f, soft_lim):
-        # Move robust angular systems to the front while keeping relative order
         def robust_rank(s: str) -> int:
             if s in ("equal", "whole"): return 0
             if s == "porphyry": return 1
@@ -304,7 +323,6 @@ def compute_houses_with_policy(
         )
 
     for sys_public in chain:
-        # If numeric fallback is disabled and this is not the very first attempt, stop.
         if sys_public != chain[0] and not NUMERIC_FALLBACK_ENABLED:
             break
         try:
@@ -319,12 +337,11 @@ def compute_houses_with_policy(
             continue
 
     if hd is None or used_public is None:
-        # Everything failed
         if last_err:
             raise RuntimeError(f"houses engine failed for all fallbacks (last: {type(last_err).__name__}: {last_err})")
         raise RuntimeError("houses engine failed and no fallback succeeded")
 
-    # ---- build payload (compat: include asc/mc and asc_deg/mc_deg and cusps_deg)
+    # ---- build payload
     all_warnings = list(warnings) + list(hd.warnings or [])
 
     payload: Dict[str, Any] = {
@@ -332,12 +349,12 @@ def compute_houses_with_policy(
         "system": used_public,                        # public label used after policy/fallback
         "engine_system": hd.system,                   # engine canonical actually used
         "cusps": hd.cusps,                            # list[12] degrees
-        "cusps_deg": hd.cusps,                        # ← compatibility with existing clients/tests
+        "cusps_deg": hd.cusps,                        # compatibility
         "asc": hd.ascendant,
         "mc": hd.midheaven,
-        "asc_deg": hd.ascendant,                      # compatibility helpers
+        "asc_deg": hd.ascendant,
         "mc_deg": hd.midheaven,
-        "angles": {                                   # optional rich angles
+        "angles": {
             "ASC": {"deg": hd.ascendant},
             "MC":  {"deg": hd.midheaven},
         },
@@ -368,4 +385,5 @@ __all__ = [
     "POLAR_SOFT_LIMIT_DEG",
     "POLAR_HARD_LIMIT_DEG",
     "POLAR_ABSOLUTE_LIMIT_DEG",
+    "GATED_NOT_IMPLEMENTED",
 ]
