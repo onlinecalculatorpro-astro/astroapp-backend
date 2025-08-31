@@ -6,7 +6,7 @@ pydantic==1.10.12
 typing_extensions==4.12.2
 PyYAML==6.0.2
 
-numpy==1.26.4
+numpy>=2.1
 pyerfa==2.0.1
 
 skyfield==1.48
