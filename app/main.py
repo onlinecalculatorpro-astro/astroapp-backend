@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import os
 from typing import Final
+from time import perf_counter
 
 from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
@@ -17,6 +18,7 @@ from app.utils.config import load_config
 from prometheus_client import (
     Counter,
     Gauge,
+    Histogram,
     CONTENT_TYPE_LATEST,
     REGISTRY,
     generate_latest,
@@ -30,7 +32,7 @@ MET_FALLBACKS: Final = Counter(
 MET_WARNINGS: Final = Counter("astro_warning_total", "Non-fatal warnings", ["kind"])
 GAUGE_DUT1: Final = Gauge("astro_dut1_broadcast_seconds", "DUT1 broadcast seconds")
 GAUGE_APP_UP: Final = Gauge("astro_app_up", "1 if app is running")
-
+REQ_LATENCY: Final = Histogram("astro_request_seconds", "API request latency", ["route"])
 
 # ───────────────────────────── helpers ─────────────────────────────
 def _configure_logging(app: Flask) -> None:
@@ -79,10 +81,9 @@ def _metrics_auth_ok() -> bool:
         and auth.type == "basic"
         and auth.username == user
         and auth.password == pw
-        and user  # ensure not empty creds
+        and user
         and pw
     )
-
 
 # ───────────────────────────── app factory ─────────────────────────────
 def create_app() -> Flask:
@@ -97,23 +98,35 @@ def create_app() -> Flask:
     cfg_path = os.environ.get("ASTRO_CONFIG", "config/defaults.yaml")
     app.cfg = load_config(cfg_path)
 
-    # Initialize metric label sets (avoid "missing label" on first update)
+    # Initialize metric label sets
     for route in ("/api/health-check", "/api/calculate", "/health", "/healthz", "/metrics"):
         MET_REQUESTS.labels(route=route).inc(0)
+        REQ_LATENCY.labels(route=route).observe(0.0)
     MET_FALLBACKS.labels(requested="placidus", fallback="equal").inc(0)
     MET_WARNINGS.labels(kind="polar_soft_fallback").inc(0)
     GAUGE_APP_UP.set(1.0)
 
-    # Request counting (API/health/metrics only)
+    # Request counting + timing
     @app.before_request
-    def _count_requests():
+    def _before():
         try:
             p = (request.path or "")
             if p.startswith("/api/") or p in ("/health", "/healthz", "/metrics"):
                 MET_REQUESTS.labels(route=p).inc()
+                request._t0 = perf_counter()
         except Exception:
-            # metrics must never break requests
             pass
+
+    @app.after_request
+    def _after(resp):
+        try:
+            p = (request.path or "")
+            if (p.startswith("/api/") or p in ("/health", "/healthz")) and hasattr(request, "_t0"):
+                dt = perf_counter() - request._t0
+                REQ_LATENCY.labels(route=p).observe(dt)
+        except Exception:
+            pass
+        return resp
 
     # Register components
     app.register_blueprint(api)
@@ -124,15 +137,12 @@ def create_app() -> Flask:
     @app.route("/metrics", methods=["GET"])
     def metrics_endpoint():
         if not _metrics_auth_ok():
-            # challenge so Hosted Collector can send Basic creds
             return Response("Unauthorized", 401, {"WWW-Authenticate": 'Basic realm="metrics"'})
 
-        # keep gauges fresh on scrape
         GAUGE_APP_UP.set(1.0)
         try:
             GAUGE_DUT1.set(float(os.environ.get("ASTRO_DUT1_BROADCAST", "0.0")))
         except Exception:
-            # don't let bad env crash the scrape
             pass
 
         data = generate_latest(REGISTRY)
@@ -140,7 +150,6 @@ def create_app() -> Flask:
 
     app.logger.info("App initialized with config path %s", cfg_path)
     return app
-
 
 # ───────────────────────────── app instance ─────────────────────────────
 app = create_app()
