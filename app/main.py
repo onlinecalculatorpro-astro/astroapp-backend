@@ -24,27 +24,23 @@ from prometheus_client import (
     REGISTRY,
 )
 
-# Request/Domain metrics (global so other modules can import)
-MET_REQUESTS: Final = Counter(
-    "astro_api_requests_total", "API requests", ["route"]
-)
+# Request/Domain metrics (globals so other modules can import)
+MET_REQUESTS: Final = Counter("astro_api_requests_total", "API requests", ["route"])
 MET_FALLBACKS: Final = Counter(
-    "astro_house_fallback_total",
-    "House fallbacks at high latitude",
-    ["requested", "fallback"],
+    "astro_house_fallback_total", "House fallbacks at high latitude", ["requested", "fallback"]
 )
-MET_WARNINGS: Final = Counter(
-    "astro_warning_total", "Non-fatal warnings", ["kind"]
-)
+MET_WARNINGS: Final = Counter("astro_warning_total", "Non-fatal warnings", ["kind"])
 
-# Gauge aggregated across workers
+# Gauges aggregated across workers
 GAUGE_DUT1: Final = Gauge(
-    "astro_dut1_broadcast_seconds",
-    "DUT1 broadcast seconds",
-    multiprocess_mode="livesum",
+    "astro_dut1_broadcast_seconds", "DUT1 broadcast seconds", multiprocess_mode="livesum"
+)
+# Always-on heartbeat so /metrics is never empty
+MET_APP_UP: Final = Gauge(
+    "astro_app_up", "1 if Astro backend is running", multiprocess_mode="livesum"
 )
 
-# Optional: make series appear at 0 on first scrape
+# Pre-create some time series (so first scrape shows the metric names)
 MET_REQUESTS.labels(route="/api/health-check").inc(0)
 MET_REQUESTS.labels(route="/api/calculate").inc(0)
 MET_FALLBACKS.labels(requested="placidus", fallback="equal").inc(0)
@@ -81,14 +77,7 @@ def _register_error_handlers(app: Flask) -> None:
     @app.errorhandler(Exception)
     def handle_any(e: Exception):
         app.logger.exception(e)
-        return (
-            jsonify(
-                error="internal_error",
-                type=e.__class__.__name__,
-                message=str(e),
-            ),
-            500,
-        )
+        return jsonify(error="internal_error", type=e.__class__.__name__, message=str(e)), 500
 
 
 def _register_health_endpoints(app: Flask) -> None:
@@ -110,31 +99,26 @@ def _register_metrics(app: Flask) -> None:
         try:
             MET_REQUESTS.labels(route=request.path).inc()
         except Exception:
-            # Metrics should never block the request path
-            pass
+            pass  # metrics must never block requests
 
     @app.get("/metrics")
     def metrics():
         try:
-            # Keep DUT1 gauge up to date on each scrape
+            # Heartbeat + broadcast gauge on every scrape
+            MET_APP_UP.set(1.0)
             dut1 = float(os.environ.get("ASTRO_DUT1_BROADCAST", "0.0"))
             GAUGE_DUT1.set(dut1)
 
-            # Aggregate across workers if PROMETHEUS_MULTIPROC_DIR is set
+            # Aggregate across workers if multiprocess is enabled
             if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
                 registry = CollectorRegistry()
                 multiprocess.MultiProcessCollector(registry)
-                data = generate_latest(registry)
-
-                # If no shards yet, fall back to default registry so scrape isn't blank
-                if not data:
-                    data = generate_latest(REGISTRY)
+                data = generate_latest(registry) or generate_latest(REGISTRY)
             else:
                 data = generate_latest(REGISTRY)
 
             return Response(data, mimetype=CONTENT_TYPE_LATEST)
         except Exception as ex:
-            # Never fail the scrape
             return Response(f"# metrics error: {ex}\n", mimetype="text/plain")
 
 
@@ -160,7 +144,7 @@ def create_app() -> Flask:
     _register_error_handlers(app)
     _register_metrics(app)
 
-    # Ensure a shard exists so /metrics isn't blank on first scrape
+    # Touch a series at boot so a shard exists
     try:
         MET_REQUESTS.labels(route="__boot__").inc()
     except Exception:
