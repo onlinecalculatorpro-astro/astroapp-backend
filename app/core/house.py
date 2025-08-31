@@ -44,14 +44,16 @@ POLAR_HARD_LIMIT_DEG: Final[float] = float(os.getenv("ASTRO_POLAR_HARD_LAT", "80
 POLAR_ABSOLUTE_LIMIT_DEG: Final[float] = 89.999999  # hard guard near poles
 POLAR_POLICY: Final[str] = os.getenv("ASTRO_POLAR_POLICY", "fallback_to_equal_above_66deg")
 
-# Sets of systems that are known to be problematic near the poles
+# Systems known to be problematic near the poles
 _HARD_REJECT_AT_POLAR: Final[set[str]] = {"placidus", "koch", "topocentric", "alcabitius"}
 _RISKY_AT_POLAR: Final[set[str]] = {
     "placidus", "koch", "regiomontanus", "campanus", "topocentric", "alcabitius", "morinus",
 }
 
 # Numeric fallback enabled?
-NUMERIC_FALLBACK_ENABLED: Final[bool] = os.getenv("ASTRO_HOUSES_NUMERIC_FALLBACK", "1").lower() in ("1", "true", "yes", "on")
+NUMERIC_FALLBACK_ENABLED: Final[bool] = os.getenv("ASTRO_HOUSES_NUMERIC_FALLBACK", "1").lower() in (
+    "1", "true", "yes", "on"
+)
 
 # Optional JSON to override chains:
 #   ASTRO_HOUSES_FALLBACK_JSON='{"placidus":["koch","regiomontanus","campanus","porphyry","equal","whole"]}'
@@ -71,22 +73,16 @@ except Exception as _e:  # pragma: no cover
 # ───────────────────────── Metrics (lazy, no import cycles) ─────────────────────────
 
 def _met_warn(kind: str) -> None:
-    """
-    Increment astro_warning_total{kind=...} if metrics are available.
-    Lazy import avoids a main↔routes↔house circular import at module load time.
-    """
+    """Increment astro_warning_total{kind=...} if metrics are available."""
     try:
         from app.main import MET_WARNINGS  # type: ignore
         MET_WARNINGS.labels(kind=kind).inc()
     except Exception:
-        # Metrics are optional; never break domain logic.
-        pass
+        pass  # metrics are optional; never break domain logic
 
 
 def _met_fallback(requested: str, fallback: str) -> None:
-    """
-    Increment astro_house_fallback_total{requested=...,fallback=...} if available.
-    """
+    """Increment astro_house_fallback_total{requested=...,fallback=...} if available."""
     try:
         from app.main import MET_FALLBACKS  # type: ignore
         MET_FALLBACKS.labels(requested=requested, fallback=fallback).inc()
