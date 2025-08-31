@@ -2,40 +2,59 @@
 from __future__ import annotations
 
 import uuid, logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Blueprint, request, jsonify
 from app.core.validate_prediction import validate_prediction_payload, ValidationError
-
-# ───────────────────────────── metrics (optional) ─────────────────────────────
-try:
-    from prometheus_client import Counter
-    _PRED_REQS = Counter("predictions_requests_total", "Prediction requests", ["outcome"])
-except Exception:  # Prometheus not installed
-    _PRED_REQS = None  # type: ignore
-
-# ───────────────────────────── engine import ─────────────────────────────
-try:
-    from app.core.professional_astro import ProfessionalAstrologyEngine  # type: ignore
-except Exception:
-    ProfessionalAstrologyEngine = None  # type: ignore
 
 log = logging.getLogger(__name__)
 predictions_bp = Blueprint("predictions", __name__)
 
 API_VERSION = "predictions_v1"
-SCHEMA_VERSION = "1.0.0"
+SCHEMA_VERSION = "1.1.0"  # bumped: Phase-1 engine selection metadata
+
+# ───────────────────────────── metrics (optional) ─────────────────────────────
+try:
+    from prometheus_client import Counter
+    _PRED_REQS = Counter("predictions_requests_total", "Prediction requests", ["outcome"])
+except Exception:
+    _PRED_REQS = None  # type: ignore
+
+# ───────────────────────────── engine imports (layered) ───────────────────────
+# Phase-1 (outers + extended aspects)
+try:
+    from app.core.professional_astro_phase1 import ProfessionalAstrologyEnginePhase1 as Phase1Engine  # type: ignore
+except Exception:
+    Phase1Engine = None  # type: ignore
+
+# v2 (stable baseline)
+try:
+    from app.core.professional_astro_v2 import ProfessionalAstrologyEngine as V2Engine  # type: ignore
+except Exception:
+    V2Engine = None  # type: ignore
+
+# legacy (ultimate fallback)
+try:
+    from app.core.professional_astro import ProfessionalAstrologyEngine as LegacyEngine  # type: ignore
+except Exception:
+    LegacyEngine = None  # type: ignore
+
+# Ephemeris capability probe (optional; only used to pick Phase-1)
+try:
+    from app.core.ephemeris_adapter import _skyfield_available as _eph_ok  # type: ignore
+except Exception:
+    def _eph_ok() -> bool:  # type: ignore
+        return False
+
 
 # ───────────────────────────── helpers ─────────────────────────────
 def _label_for_conf(v: float) -> str:
-    if v >= 0.75:
-        return "high"
-    if v >= 0.50:
-        return "medium"
+    if v >= 0.75: return "high"
+    if v >= 0.50: return "medium"
     return "low"
 
 def _compute_confidence(item: Dict[str, Any]) -> Dict[str, Any]:
-    """Heuristic confidence computation from score + signals."""
+    """Heuristic confidence from score + signals (count/strength/orb)."""
     signals = item.get("signals") or []
     try:
         base = float(item.get("score", 0.5))
@@ -55,9 +74,9 @@ def _compute_confidence(item: Dict[str, Any]) -> Dict[str, Any]:
                 pass
         avg_strength = total_strength / max(n, 1)
 
-    w_count = min(n / 4.0, 1.0) * 0.40
+    w_count    = min(n / 4.0, 1.0) * 0.40
     w_strength = min(max(avg_strength, 0.0), 1.0) * 0.40
-    w_orb = max(0.0, (3.0 - min_orb) / 3.0) * 0.20
+    w_orb      = max(0.0, (3.0 - min_orb) / 3.0) * 0.20
 
     conf = min(1.0, max(0.0, 0.15 + 0.35 * base + w_count + w_strength + w_orb))
     return {"value": round(conf, 3), "label": _label_for_conf(conf)}
@@ -107,7 +126,6 @@ def _shape_prediction(item: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 def _summarize(predictions: List[Dict[str, Any]]) -> str:
-    """Return a compact summary of top predictions."""
     if not predictions:
         return "No significant events detected in the requested window."
     top = sorted(predictions, key=lambda p: p["score"] * p["confidence"]["value"], reverse=True)[:3]
@@ -115,6 +133,34 @@ def _summarize(predictions: List[Dict[str, Any]]) -> str:
         f"{p['date']}: {p['topic'].capitalize()} ({int(round(p['confidence']['value']*100))}% confidence)"
         for p in top
     )
+
+def _choose_engine(prefer: Optional[str] = None):
+    """
+    Engine selection:
+      - prefer='phase1' forces Phase-1 if available
+      - prefer='v2' forces v2 if available
+      - default: Phase-1 when ephemeris available, else v2, else legacy
+    Returns (engine_instance, engine_meta_dict)
+    """
+    # Forced selections first
+    if prefer == "phase1" and Phase1Engine is not None:
+        return Phase1Engine(), {"selected": "phase1", "reason": "forced", "ephemeris_ready": _eph_ok()}
+    if prefer == "v2" and V2Engine is not None:
+        return V2Engine(), {"selected": "v2", "reason": "forced"}
+
+    # Auto selection
+    if Phase1Engine is not None and _eph_ok():
+        eng = Phase1Engine()
+        return eng, {"selected": "phase1", "reason": "ephemeris_available"}
+
+    if V2Engine is not None:
+        return V2Engine(), {"selected": "v2", "reason": "fallback_v2"}
+
+    if LegacyEngine is not None:
+        return LegacyEngine(), {"selected": "legacy", "reason": "fallback_legacy"}
+
+    raise RuntimeError("No prediction engine available")
+
 
 # ───────────────────────────── endpoint ─────────────────────────────
 @predictions_bp.post("/predictions")
@@ -135,18 +181,17 @@ def predictions_endpoint():
         if _PRED_REQS: _PRED_REQS.labels(outcome="validation_error").inc()
         return jsonify({"error": "validation_error", "errors": e.errors(), "request_id": rid}), 422
 
-    # Engine call
-    engine_info: Dict[str, Any] = {}
+    # Engine choice (optional override via ?engine=phase1|v2)
+    prefer = request.args.get("engine")
     try:
-        if ProfessionalAstrologyEngine is None:
-            raise RuntimeError("ProfessionalAstrologyEngine unavailable")
-
-        engine = ProfessionalAstrologyEngine()
-        engine_info = {
-            "name": getattr(engine, "name", "ProfessionalAstrologyEngine"),
+        engine, choice_meta = _choose_engine(prefer=prefer)
+        engine_info: Dict[str, Any] = {
+            "name": getattr(engine, "name", engine.__class__.__name__),
             "mode": getattr(engine, "precision_mode", "STANDARD"),
+            **choice_meta,
         }
 
+        # Call engine with modern signature, fall back if needed
         try:
             results = engine.get_transit_predictions(
                 birth_dt=valid.birth.as_aware_datetime(),
@@ -160,8 +205,7 @@ def predictions_endpoint():
                 max_events=valid.max_events,
             )
         except TypeError:
-            # fallback to older signature
-            results = engine.get_transit_predictions(
+            results = engine.get_transit_predictions(  # legacy signature
                 birth_dt=valid.birth.as_aware_datetime(),
                 lat=valid.birth.lat,
                 lon=valid.birth.lon,
