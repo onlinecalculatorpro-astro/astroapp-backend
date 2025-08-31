@@ -51,11 +51,12 @@ GAUGE_APP_UP: Final = Gauge(
 
 # Seed series so first scrape isn't empty
 MET_REQUESTS.labels(route="/api/health-check").inc(1)
-MET_REQUESTS.labels(route="/api/calculate").inc(1) 
+MET_REQUESTS.labels(route="/api/calculate").inc(1)
 MET_FALLBACKS.labels(requested="placidus", fallback="equal").inc(0)
 MET_WARNINGS.labels(kind="polar_soft_fallback").inc(0)
 MET_WARNINGS.labels(kind="polar_reject_strict").inc(0)
 MET_WARNINGS.labels(kind="leap_policy_warn").inc(0)
+
 
 # ── App plumbing ──────────────────────────────────────────────────────────────
 def _configure_logging(app: Flask) -> None:
