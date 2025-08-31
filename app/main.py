@@ -22,23 +22,17 @@ from prometheus_client import (
     generate_latest,
 )
 
-# Custom metrics
-MET_REQUESTS: Final = Counter(
-    "astro_api_requests_total", "API requests", ["route"]
-)
+# ───────────────────────────── metrics ─────────────────────────────
+MET_REQUESTS: Final = Counter("astro_api_requests_total", "API requests", ["route"])
 MET_FALLBACKS: Final = Counter(
     "astro_house_fallback_total", "House fallbacks at high latitude", ["requested", "fallback"]
 )
-MET_WARNINGS: Final = Counter(
-    "astro_warning_total", "Non-fatal warnings", ["kind"]
-)
-GAUGE_DUT1: Final = Gauge(
-    "astro_dut1_broadcast_seconds", "DUT1 broadcast seconds"
-)
-GAUGE_APP_UP: Final = Gauge(
-    "astro_app_up", "1 if app is running"
-)
+MET_WARNINGS: Final = Counter("astro_warning_total", "Non-fatal warnings", ["kind"])
+GAUGE_DUT1: Final = Gauge("astro_dut1_broadcast_seconds", "DUT1 broadcast seconds")
+GAUGE_APP_UP: Final = Gauge("astro_app_up", "1 if app is running")
 
+
+# ───────────────────────────── helpers ─────────────────────────────
 def _configure_logging(app: Flask) -> None:
     gerr = logging.getLogger("gunicorn.error")
     if gerr.handlers:
@@ -46,6 +40,7 @@ def _configure_logging(app: Flask) -> None:
         app.logger.setLevel(gerr.level)
     else:
         logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
+
 
 def _register_errors(app: Flask) -> None:
     @app.errorhandler(HTTPException)
@@ -62,6 +57,7 @@ def _register_errors(app: Flask) -> None:
         app.logger.exception(e)
         return jsonify(error="internal_error", type=type(e).__name__, message=str(e)), 500
 
+
 def _register_health(app: Flask) -> None:
     @app.route("/api/health-check", methods=["GET"])
     def api_health():
@@ -72,35 +68,51 @@ def _register_health(app: Flask) -> None:
     def health():
         return jsonify(status="ok"), 200
 
+
+def _metrics_auth_ok() -> bool:
+    """Validate Basic Auth credentials for /metrics using env vars."""
+    auth = request.authorization
+    user = os.getenv("METRICS_USER", "")
+    pw = os.getenv("METRICS_PASS", "")
+    return bool(
+        auth
+        and auth.type == "basic"
+        and auth.username == user
+        and auth.password == pw
+        and user  # ensure not empty creds
+        and pw
+    )
+
+
+# ───────────────────────────── app factory ─────────────────────────────
 def create_app() -> Flask:
     app = Flask(__name__)
     app.config["JSON_SORT_KEYS"] = False
-    
+
+    # honor reverse proxy headers (Render/Cloudflare)
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
-    
+
     _configure_logging(app)
 
     cfg_path = os.environ.get("ASTRO_CONFIG", "config/defaults.yaml")
     app.cfg = load_config(cfg_path)
 
-    # Initialize metrics
-    MET_REQUESTS.labels(route="/api/health-check").inc(0)
-    MET_REQUESTS.labels(route="/api/calculate").inc(0)
-    MET_REQUESTS.labels(route="/health").inc(0)
-    MET_REQUESTS.labels(route="/healthz").inc(0)
-    MET_REQUESTS.labels(route="/metrics").inc(0)
+    # Initialize metric label sets (avoid "missing label" on first update)
+    for route in ("/api/health-check", "/api/calculate", "/health", "/healthz", "/metrics"):
+        MET_REQUESTS.labels(route=route).inc(0)
     MET_FALLBACKS.labels(requested="placidus", fallback="equal").inc(0)
     MET_WARNINGS.labels(kind="polar_soft_fallback").inc(0)
     GAUGE_APP_UP.set(1.0)
 
-    # Request counting
+    # Request counting (API/health/metrics only)
     @app.before_request
     def _count_requests():
         try:
-            p = request.path or ""
+            p = (request.path or "")
             if p.startswith("/api/") or p in ("/health", "/healthz", "/metrics"):
                 MET_REQUESTS.labels(route=p).inc()
         except Exception:
+            # metrics must never break requests
             pass
 
     # Register components
@@ -108,19 +120,32 @@ def create_app() -> Flask:
     _register_health(app)
     _register_errors(app)
 
-    # Metrics endpoint
+    # ── /metrics with Basic Auth ─────────────────────────────────────
     @app.route("/metrics", methods=["GET"])
     def metrics_endpoint():
+        if not _metrics_auth_ok():
+            # challenge so Hosted Collector can send Basic creds
+            return Response("Unauthorized", 401, {"WWW-Authenticate": 'Basic realm="metrics"'})
+
+        # keep gauges fresh on scrape
         GAUGE_APP_UP.set(1.0)
-        GAUGE_DUT1.set(float(os.environ.get("ASTRO_DUT1_BROADCAST", "0.0")))
+        try:
+            GAUGE_DUT1.set(float(os.environ.get("ASTRO_DUT1_BROADCAST", "0.0")))
+        except Exception:
+            # don't let bad env crash the scrape
+            pass
+
         data = generate_latest(REGISTRY)
         return Response(data, mimetype=CONTENT_TYPE_LATEST)
 
     app.logger.info("App initialized with config path %s", cfg_path)
     return app
 
+
+# ───────────────────────────── app instance ─────────────────────────────
 app = create_app()
 
+# CORS (not used by Prometheus, but useful for browser UIs)
 _allowed_origin = (
     os.environ.get("CORS_ALLOW_ORIGIN")
     or os.environ.get("NETLIFY_ORIGIN")
