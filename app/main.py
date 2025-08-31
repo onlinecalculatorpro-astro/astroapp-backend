@@ -33,7 +33,7 @@ MET_WARNINGS: Final = Counter(
     "astro_warning_total", "Non-fatal warnings", ["kind"]
 )
 
-# Gauges - standard mode (no multiprocess)
+# Gauges - standard mode
 GAUGE_DUT1: Final = Gauge(
     "astro_dut1_broadcast_seconds", "DUT1 broadcast seconds"
 )
@@ -41,24 +41,7 @@ GAUGE_APP_UP: Final = Gauge(
     "astro_app_up", "1 if app is running"
 )
 
-def _initialize_metrics() -> None:
-    """Initialize metrics with starter values"""
-    try:
-        MET_REQUESTS.labels(route="/api/health-check").inc(0)
-        MET_REQUESTS.labels(route="/api/calculate").inc(0)
-        MET_REQUESTS.labels(route="/health").inc(0)
-        MET_REQUESTS.labels(route="/healthz").inc(0)
-        MET_REQUESTS.labels(route="/metrics").inc(0)
-        MET_FALLBACKS.labels(requested="placidus", fallback="equal").inc(0)
-        MET_WARNINGS.labels(kind="polar_soft_fallback").inc(0)
-        MET_WARNINGS.labels(kind="polar_reject_strict").inc(0)
-        MET_WARNINGS.labels(kind="leap_policy_warn").inc(0)
-        GAUGE_APP_UP.set(1.0)
-        print("DEBUG: Metrics initialized successfully")
-    except Exception as e:
-        print(f"DEBUG: Metrics initialization failed: {e}")
-
-# ── App plumbing ──────────────────────────────────────────────────────────────
+# ── App setup functions ──────────────────────────────────────────────────────
 def _configure_logging(app: Flask) -> None:
     gerr = logging.getLogger("gunicorn.error")
     if gerr.handlers:
@@ -83,29 +66,74 @@ def _register_errors(app: Flask) -> None:
         return jsonify(error="internal_error", type=type(e).__name__, message=str(e)), 500
 
 def _register_health(app: Flask) -> None:
-    @app.get("/api/health-check")
+    @app.route("/api/health-check", methods=["GET"])
     def api_health():
         return jsonify(ok=True), 200
 
-    @app.get("/health")
-    @app.get("/healthz")
+    @app.route("/health", methods=["GET"])
+    @app.route("/healthz", methods=["GET"])
     def health():
         return jsonify(status="ok"), 200
 
-def _register_metrics(app: Flask) -> None:
-    """Register metrics endpoints and request counting"""
+def create_app() -> Flask:
+    app = Flask(__name__)
+    app.config["JSON_SORT_KEYS"] = False
     
+    # Trust Render/Proxy headers
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
+    
+    _configure_logging(app)
+
+    # Load app config
+    cfg_path = os.environ.get("ASTRO_CONFIG", "config/defaults.yaml")
+    app.cfg = load_config(cfg_path)
+
+    # Initialize metrics with starter values
+    try:
+        MET_REQUESTS.labels(route="/api/health-check").inc(0)
+        MET_REQUESTS.labels(route="/api/calculate").inc(0)
+        MET_REQUESTS.labels(route="/health").inc(0)
+        MET_REQUESTS.labels(route="/healthz").inc(0)
+        MET_REQUESTS.labels(route="/metrics").inc(0)
+        MET_FALLBACKS.labels(requested="placidus", fallback="equal").inc(0)
+        MET_WARNINGS.labels(kind="polar_soft_fallback").inc(0)
+        GAUGE_APP_UP.set(1.0)
+        app.logger.info("DEBUG: Metrics initialized successfully")
+    except Exception as e:
+        app.logger.error(f"DEBUG: Metrics initialization failed: {e}")
+
+    # Request counting middleware
     @app.before_request
-    def _count_req():
+    def _count_requests():
         try:
             p = request.path or ""
             if p.startswith("/api/") or p in ("/health", "/healthz", "/metrics"):
                 MET_REQUESTS.labels(route=p).inc()
-        except Exception as e:
-            app.logger.error(f"Metrics increment failed: {e}")
+        except Exception:
+            pass
 
+    # Register main application routes
+    try:
+        app.register_blueprint(api)
+        app.logger.info("API blueprint registered successfully")
+    except Exception as e:
+        app.logger.exception(f"Failed to register API blueprint: {e}")
+
+    try:
+        _register_health(app)
+        app.logger.info("Health endpoints registered successfully")
+    except Exception as e:
+        app.logger.exception(f"Failed to register health endpoints: {e}")
+
+    try:
+        _register_errors(app)
+        app.logger.info("Error handlers registered successfully")
+    except Exception as e:
+        app.logger.exception(f"Failed to register error handlers: {e}")
+
+    # Metrics endpoints - defined directly in create_app to avoid route conflicts
     @app.route("/metrics", methods=["GET"])
-    def metrics():
+    def metrics_endpoint():
         """Prometheus metrics endpoint"""
         try:
             app.logger.info("DEBUG: Metrics endpoint called")
@@ -132,57 +160,21 @@ def _register_metrics(app: Flask) -> None:
         except Exception as ex:
             app.logger.exception(f"DEBUG: Metrics endpoint failed: {ex}")
             return Response(f"# metrics error: {ex}\n", mimetype="text/plain")
-    
+
     @app.route("/test-debug", methods=["GET"])
-    def test_debug():
+    def test_debug_endpoint():
         """Test endpoint to verify routing works"""
         app.logger.info("DEBUG: Test debug endpoint called successfully")
         return "Debug endpoint working", 200
 
-def create_app() -> Flask:
-    app = Flask(__name__)
-    app.config["JSON_SORT_KEYS"] = False
-    
-    # Trust Render/Proxy headers
-    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
-    
-    _configure_logging(app)
-
-    # Load app config
-    cfg_path = os.environ.get("ASTRO_CONFIG", "config/defaults.yaml")
-    app.cfg = load_config(cfg_path)
-
-    # Initialize metrics first
-    _initialize_metrics()
-
-    # Register components with error handling
-    try:
-        app.register_blueprint(api)
-        app.logger.info("API blueprint registered successfully")
-    except Exception as e:
-        app.logger.exception(f"Failed to register API blueprint: {e}")
-
-    try:
-        _register_health(app)
-        app.logger.info("Health endpoints registered successfully")
-    except Exception as e:
-        app.logger.exception(f"Failed to register health endpoints: {e}")
-
-    try:
-        _register_errors(app)
-        app.logger.info("Error handlers registered successfully")
-    except Exception as e:
-        app.logger.exception(f"Failed to register error handlers: {e}")
-
-    try:
-        _register_metrics(app)
-        app.logger.info("Metrics endpoints registered successfully")
-    except Exception as e:
-        app.logger.exception(f"Failed to register metrics endpoints: {e}")
-        # Fallback basic metrics endpoint
-        @app.route("/metrics")
-        def fallback_metrics():
-            return "# Fallback metrics endpoint\nastro_app_up 0\n", 200
+    @app.route("/debug-routes", methods=["GET"])
+    def debug_routes_endpoint():
+        """Show all registered Flask routes"""
+        routes = []
+        for rule in app.url_map.iter_rules():
+            methods = ','.join(rule.methods - {'HEAD', 'OPTIONS'})
+            routes.append(f"{rule.rule} [{methods}] -> {rule.endpoint}")
+        return "<br>".join(sorted(routes))
 
     app.logger.info("App initialized with config path %s", cfg_path)
     return app
