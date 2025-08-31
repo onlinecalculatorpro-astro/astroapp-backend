@@ -57,7 +57,6 @@ def _datetime_to_jd_utc(dt_utc: datetime) -> float:
         raise ValueError("dt_utc must be timezone-aware UTC")
     try:
         import erfa  # PyERFA
-        # eraDtf2d('UTC', ...) → two-part JD in UTC
         iy, im, id_ = dt_utc.year, dt_utc.month, dt_utc.day
         ih, iv = dt_utc.hour, dt_utc.minute
         sf = dt_utc.second + dt_utc.microsecond / 1e6
@@ -127,7 +126,6 @@ def _compute_timescales_from_local(date_str: str, time_str: str, tz_name: str) -
     Convert local date/time/tz to JD(UTC), then expand to jd_tt/jd_ut1 with time_kernel.
     Returns a dict safe for JSON.
     """
-    # allow “HH:MM[:SS]”
     fmt = "%Y-%m-%d %H:%M" if time_str.count(":") == 1 else "%Y-%m-%d %H:%M:%S"
 
     try:
@@ -181,12 +179,11 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
                 return c
         return None
 
-    # Map payload fields to the function's parameter names
     name_date = pick("date", "date_s", "date_str")
     name_time = pick("time", "time_s", "time_str")
     name_lat  = pick("latitude", "lat")
     name_lon  = pick("longitude", "lon")
-    name_mode = pick("mode", "system")        # some codebases say 'system'
+    name_mode = pick("mode", "system")
     name_tz   = pick("place_tz", "timezone", "tz_name")
 
     kwargs: Dict[str, Any] = {}
@@ -197,7 +194,6 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
     if name_mode: kwargs[name_mode] = payload["mode"]
     if name_tz:   kwargs[name_tz]   = payload.get("timezone") or payload.get("place_tz")
 
-    # Timescales passthrough (only if the function accepts them)
     if "jd_ut" in params:
         kwargs["jd_ut"] = ts["jd_utc"]
     if "jd_tt" in params:
@@ -207,7 +203,6 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
 
     chart = compute_chart(**kwargs)
 
-    # Guarantee jd_ut for downstream code
     if "jd_ut" not in chart:
         chart["jd_ut"] = ts["jd_utc"]
     if "mode" not in chart and "mode" in payload:
@@ -219,29 +214,23 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
 def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
     """
     Prefer policy façade if available; pass jd_tt/jd_ut1 when accepted.
-    Fallback to legacy compute_houses(lat, lon, mode[, jd_ut]).
-
-    IMPORTANT: chart 'mode' is 'sidereal'/'tropical' (NOT a house system).
-               We pass user's requested house system via payload['house_system'].
-               If omitted, the façade uses its own default (typically 'placidus').
     """
     lat = float(payload["latitude"])
     lon = float(payload["longitude"])
 
-    requested_system = payload.get("house_system") or None
+    requested_system = (payload.get("house_system") or "").strip().lower() or None
 
     accepts = _sig_accepts(
         _houses_fn,
         "lat", "lon",
-        "system", "requested_house_system", "house_system",  # different APIs
+        "system", "requested_house_system", "house_system",
         "mode", "jd_ut", "jd_tt", "jd_ut1", "diagnostics"
     )
 
     kwargs: Dict[str, Any] = {"lat": lat, "lon": lon}
 
-    # Map requested system to whatever the target supports
     if requested_system:
-        rs = str(requested_system).lower()
+        rs = requested_system
         if accepts.get("system"):
             kwargs["system"] = rs
         elif accepts.get("requested_house_system"):
@@ -249,11 +238,9 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
         elif accepts.get("house_system"):
             kwargs["house_system"] = rs
 
-    # Legacy engines sometimes expect 'mode' (sidereal/tropical)
     if accepts.get("mode") and "mode" in payload:
         kwargs["mode"] = payload["mode"]
 
-    # Timescales (prefer jd_tt/jd_ut1; legacy may accept jd_ut)
     if accepts.get("jd_tt"):
         kwargs["jd_tt"] = ts["jd_tt"]
     if accepts.get("jd_ut1"):
@@ -261,11 +248,23 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
     if accepts.get("jd_ut") and "jd_tt" not in kwargs and "jd_ut1" not in kwargs:
         kwargs["jd_ut"] = ts["jd_utc"]
 
-    # Diagnostics passthrough
     if accepts.get("diagnostics") and "diagnostics" in payload:
         kwargs["diagnostics"] = bool(payload["diagnostics"])
 
-    return _houses_fn(**kwargs)
+    houses = _houses_fn(**kwargs)
+
+    # Normalize structure + echo requested system for clients
+    houses = _normalize_houses_payload(houses)
+    if isinstance(houses, dict):
+        if requested_system:
+            houses.setdefault("requested_house_system", requested_system)
+        # prefer effective name in both keys
+        if "house_system" in houses:
+            houses.setdefault("system", houses["house_system"])
+        elif "system" in houses:
+            houses.setdefault("house_system", houses["system"])
+
+    return houses
 
 
 # ───────────────────────────── error helpers ─────────────────────────────
@@ -279,17 +278,14 @@ def _json_error(code: str, details: Any = None, http: int = 400):
 def _normalize_houses_payload(houses: Any) -> Any:
     """Ensure houses payload has both 'cusps' and 'cusps_deg' and consistent system fields."""
     if isinstance(houses, dict):
-        # cusps/cusps_deg compatibility
         if "cusps" not in houses and "cusps_deg" in houses:
             houses["cusps"] = houses["cusps_deg"]
         if "cusps_deg" not in houses and "cusps" in houses:
             houses["cusps_deg"] = houses["cusps"]
-        # system name compatibility
         if "house_system" not in houses and "system" in houses:
             houses["house_system"] = houses["system"]
         if "system" not in houses and "house_system" in houses:
             houses["system"] = houses["house_system"]
-        # angles compatibility
         if "asc_deg" not in houses and "asc" in houses:
             houses["asc_deg"] = houses["asc"]
         if "mc_deg" not in houses and "mc" in houses:
@@ -308,7 +304,6 @@ def calculate():
     try:
         body = request.get_json(force=True) or {}
         payload = parse_chart_payload(body)  # expects: date, time, place_tz, latitude, longitude, mode
-        # pass-through: optional house_system (validator does not keep unknown keys)
         hs = str(body.get("house_system", "")).strip().lower()
         if hs:
             payload["house_system"] = hs
@@ -323,13 +318,22 @@ def calculate():
     chart = _call_compute_chart(payload, ts)
     try:
         houses = _call_compute_houses(payload, ts)
-        houses = _normalize_houses_payload(houses)
+    except NotImplementedError as e:
+        # Intentional gap: map to HTTP 501
+        details = {
+            "reason": "declared_but_not_implemented",
+            "note": str(e) or "Awaiting gold vectors / formal spec",
+            "requested_house_system": (payload.get("house_system") or "").lower() or None,
+        }
+        return _json_error("houses_not_implemented", details, 501)
+    except ValidationError as e:
+        return _json_error("houses_error", e.errors(), 400)
     except ValueError as e:
         return _json_error("houses_error", str(e), 400)
     except Exception as e:
         return _json_error("houses_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
-    return jsonify({"ok": True, "chart": chart, "houses": houses, "meta": {"timescales": ts}}), 200
+    return jsonify({"ok": True, "chart": chart, "houses": _normalize_houses_payload(houses), "meta": {"timescales": ts}}), 200
 
 
 @api.post("/api/report")
@@ -349,17 +353,25 @@ def report():
     chart = _call_compute_chart(payload, ts)
     try:
         houses = _call_compute_houses(payload, ts)
-        houses = _normalize_houses_payload(houses)
+    except NotImplementedError as e:
+        details = {
+            "reason": "declared_but_not_implemented",
+            "note": str(e) or "Awaiting gold vectors / formal spec",
+            "requested_house_system": (payload.get("house_system") or "").lower() or None,
+        }
+        return _json_error("houses_not_implemented", details, 501)
+    except ValidationError as e:
+        return _json_error("houses_error", e.errors(), 400)
     except ValueError as e:
         return _json_error("houses_error", str(e), 400)
     except Exception as e:
         return _json_error("houses_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
+    houses = _normalize_houses_payload(houses)
     narrative = (
         "This is a placeholder narrative aligned to your mode and computed houses. "
         "Evidence chips will explain predictions in /predictions."
     )
-
     return jsonify(
         {"ok": True, "chart": chart, "houses": houses, "narrative": narrative, "meta": {"timescales": ts}}
     ), 200
@@ -382,15 +394,23 @@ def predictions_route():
     chart = _call_compute_chart(payload, ts)
     try:
         houses = _call_compute_houses(payload, ts)
-        houses = _normalize_houses_payload(houses)
+    except NotImplementedError as e:
+        details = {
+            "reason": "declared_but_not_implemented",
+            "note": str(e) or "Awaiting gold vectors / formal spec",
+            "requested_house_system": (payload.get("house_system") or "").lower() or None,
+        }
+        return _json_error("houses_not_implemented", details, 501)
+    except ValidationError as e:
+        return _json_error("houses_error", e.errors(), 400)
     except ValueError as e:
         return _json_error("houses_error", str(e), 400)
     except Exception as e:
         return _json_error("houses_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
+    houses = _normalize_houses_payload(houses)
     preds_raw = predict(chart, houses, horizon)
 
-    # thresholds (with sensible defaults)
     th_path = os.environ.get("ASTRO_HC_THRESHOLDS", "config/hc_thresholds.json")
     try:
         with open(th_path, "r", encoding="utf-8") as f:
@@ -402,7 +422,6 @@ def predictions_route():
     tau = float(defaults.get("tau", 0.88))
     floor = float(defaults.get("floor", 0.60))
 
-    # request-body overrides (test only)
     overrides = body.get("hc_overrides") or {}
     if isinstance(overrides, dict):
         if "tau" in overrides:
@@ -410,7 +429,6 @@ def predictions_route():
         if "floor" in overrides:
             floor = float(overrides["floor"])
 
-    # env debug overrides
     env_over = os.environ.get("ASTRO_HC_DEBUG_OVERRIDES")
     if env_over:
         try:
