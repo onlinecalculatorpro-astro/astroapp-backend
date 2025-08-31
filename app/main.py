@@ -12,6 +12,7 @@ from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from app.api.routes import api
+from app.api.predictions import predictions_bp          # ✅ NEW: predictions blueprint
 from app.utils.config import load_config
 
 # Prometheus metrics (standard mode)
@@ -91,15 +92,23 @@ def create_app() -> Flask:
     app.config["JSON_SORT_KEYS"] = False
 
     # honor reverse proxy headers (Render/Cloudflare)
-    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)  # type: ignore
 
     _configure_logging(app)
 
     cfg_path = os.environ.get("ASTRO_CONFIG", "config/defaults.yaml")
-    app.cfg = load_config(cfg_path)
+    app.cfg = load_config(cfg_path)  # type: ignore[attr-defined]
 
-    # Initialize metric label sets
-    for route in ("/api/health-check", "/api/calculate", "/health", "/healthz", "/metrics"):
+    # Initialize metric label sets (preseed so time series appear immediately)
+    seeded_routes = (
+        "/api/health-check",
+        "/api/calculate",
+        "/api/predictions",   # ✅ NEW
+        "/health",
+        "/healthz",
+        "/metrics",
+    )
+    for route in seeded_routes:
         MET_REQUESTS.labels(route=route).inc(0)
         REQ_LATENCY.labels(route=route).observe(0.0)
     MET_FALLBACKS.labels(requested="placidus", fallback="equal").inc(0)
@@ -129,7 +138,8 @@ def create_app() -> Flask:
         return resp
 
     # Register components
-    app.register_blueprint(api)
+    app.register_blueprint(api)                                  # existing routes
+    app.register_blueprint(predictions_bp, url_prefix="/api")    # ✅ expose /api/predictions
     _register_health(app)
     _register_errors(app)
 
