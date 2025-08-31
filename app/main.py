@@ -130,7 +130,7 @@ def _register_metrics(app: Flask) -> None:
                 if not data:
                     data = generate_latest(REGISTRY)
             else:
-                data = generate_latest()
+                data = generate_latest(REGISTRY)
 
             return Response(data, mimetype=CONTENT_TYPE_LATEST)
         except Exception as ex:
