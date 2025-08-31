@@ -33,33 +33,25 @@ except Exception:
     eph_lons = None
     def _skyfield_available(): return False
 
-# Optional add-ons (placeholders for later phases)
-try:
-    from app.core.arabic_parts import calculate_arabic_parts  # noqa
-except Exception:
-    def calculate_arabic_parts(sun, moon, asc, planets): return {}
-try:
-    from app.core.eclipse_calculator import find_eclipses, eclipse_impact  # noqa
-except Exception:
-    def find_eclipses(start, end): return []
-    def eclipse_impact(eclipse, natal_chart): return 0.0
-try:
-    from app.core.returns_calculator import calculate_solar_return, calculate_lunar_return  # noqa
-except Exception:
-    def calculate_solar_return(birth_dt, year, lat, lon): return {}
-    def calculate_lunar_return(birth_dt, target_dt, lat, lon): return {}
-
 # -----------------------------------
-# Constants for Phase-1
+# Constants / helpers
 # -----------------------------------
 ALL_BODIES = {
     "Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn",
     "Uranus","Neptune","Pluto","Rahu","Ketu"
 }
+ALIASES = {
+    "uranus": "Uranus",
+    "neptune": "Neptune",
+    "pluto": "Pluto",
+    "true node": "Rahu",
+    "mean node": "Rahu",
+    "rahu": "Rahu",
+    "ketu": "Ketu",
+}
+
 ASPECT_ANGLES: Dict[str, float] = {
-    # majors
     "conjunction": 0.0, "sextile": 60.0, "square": 90.0, "trine": 120.0, "opposition": 180.0,
-    # minors (Phase-1 extension)
     "semisextile": 30.0, "quintile": 72.0, "sesquiquadrate": 135.0, "biquintile": 144.0, "quincunx": 150.0,
 }
 DEFAULT_ORBS_MAJOR = {
@@ -69,24 +61,35 @@ DEFAULT_ORBS_MINOR = {
     "semisextile": 1.5, "quintile": 1.5, "sesquiquadrate": 2.0, "biquintile": 1.5, "quincunx": 2.0,
 }
 DEFAULT_ORBS = {**DEFAULT_ORBS_MAJOR, **DEFAULT_ORBS_MINOR}
-
 OUTER_ORBS = {
     "Uranus":   {**DEFAULT_ORBS, "conjunction": 3.0, "square": 2.5, "trine": 2.5, "opposition": 3.0, "sextile": 2.0},
     "Neptune":  {**DEFAULT_ORBS, "conjunction": 2.5, "square": 2.0, "trine": 2.0, "opposition": 2.5, "sextile": 1.5},
     "Pluto":    {**DEFAULT_ORBS, "conjunction": 2.0, "square": 1.5, "trine": 1.5, "opposition": 2.0, "sextile": 1.0},
 }
 
+def _canon(name: str) -> str:
+    n = (name or "").strip()
+    lower = n.lower()
+    if lower in ALIASES:
+        return ALIASES[lower]
+    # Title() handles URANUS/uranus → Uranus
+    return lower[:1].upper() + lower[1:] if n else n
+
+def dt_utc(d: datetime) -> datetime:
+    return d.replace(tzinfo=timezone.utc) if d.tzinfo is None else d.astimezone(timezone.utc)
+
+def angular_sep(a: float, b: float) -> float:
+    return abs((a - b + 180.0) % 360.0 - 180.0)
+
 # ===================================================================
 #   ProfessionalAstrologyEnginePhase1
-#   (Outer planets + extended aspects + prediction wiring)
 # ===================================================================
 class ProfessionalAstrologyEnginePhase1(BaseEngine):
     """
-    Phase-1 upgrade:
+    Phase-1:
     - Adds Uranus, Neptune, Pluto via ephemeris_adapter
-    - Extends aspects (30°, 72°, 135°, 144°, 150°)
-    - Detects applying/separating via look-ahead sampling
-    - Wires outer-planet transits into predictions
+    - Extended aspects (30°, 72°, 135°, 144°, 150°)
+    - Applying/separating via look-ahead sampling
     - Falls back to BaseEngine when ephemeris is unavailable
     """
     name: str = "ProfessionalAstrologyEnginePhase1"
@@ -94,13 +97,7 @@ class ProfessionalAstrologyEnginePhase1(BaseEngine):
 
     def __init__(self):
         super().__init__()
-        self.enable_outer_planets = True
-        self.enable_returns = False
-        self.enable_eclipses = False
-        self.enable_arabic_parts = False
-        self.enable_advanced_time_lords = False
-        self.enable_fixed_stars = False
-        self.enable_midpoints = False
+        self._last_diag: Optional[Dict[str, Any]] = None
 
     # --------------- Public API ---------------
     def get_transit_predictions(
@@ -127,11 +124,16 @@ class ProfessionalAstrologyEnginePhase1(BaseEngine):
         jd_birth_tt = self._to_jd_tt(dt_utc(birth_dt))
         natal = self._complete_natal_chart(jd_birth_tt, lat, lon, cfg)
 
-        start_utc = dt_utc(window[0])
-        end_utc   = dt_utc(window[1])
+        start_utc = dt_utc(window[0]); end_utc = dt_utc(window[1])
+
+        # diagnostics probe
+        try:
+            self._last_diag = self._diag_probe(jd_birth_tt, self._to_jd_tt(start_utc), lat, lon)
+        except Exception:
+            self._last_diag = None
 
         events: List[Dict[str, Any]] = []
-        events.extend(self._outer_planet_transits(natal, start_utc, end_utc, cfg))
+        events.extend(self._outer_planet_transits(natal, start_utc, end_utc, cfg, lat, lon))
 
         if topics:
             need = {t.lower() for t in topics}
@@ -145,7 +147,7 @@ class ProfessionalAstrologyEnginePhase1(BaseEngine):
         bodies = eph_lons(jd_tt, lat, lon) if eph_lons else []
         planets: Dict[str, Dict[str, float]] = {}
         for b in bodies or []:
-            name = str(b.get("name","")).strip().title()
+            name = _canon(b.get("name",""))
             if name in ALL_BODIES:
                 lonf = float(b.get("lon", 0.0)) % 360.0
                 planets[name] = {
@@ -155,12 +157,13 @@ class ProfessionalAstrologyEnginePhase1(BaseEngine):
                     "sign": int(lonf // 30),
                     "degree": lonf % 30.0,
                 }
-
         angles, cusps = self._angles_and_cusps_safe(jd_tt, lat, lon, cfg)
         return {"planets": planets, "angles": angles, "cusps": cusps, "jd_tt": jd_tt}
 
     # --------------- Transits ---------------
-    def _outer_planet_transits(self, natal: Dict[str, Any], start_dt: datetime, end_dt: datetime, cfg: EngineConfig) -> List[Dict[str, Any]]:
+    def _outer_planet_transits(
+        self, natal: Dict[str, Any], start_dt: datetime, end_dt: datetime, cfg: EngineConfig, lat: float, lon: float
+    ) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         natal_planets: Dict[str, Dict[str, float]] = natal.get("planets", {})
         natal_angles: Dict[str, float] = natal.get("angles", {})
@@ -168,16 +171,16 @@ class ProfessionalAstrologyEnginePhase1(BaseEngine):
         if not natal_planets:
             return out
 
-        step = timedelta(days=7)
+        step = timedelta(days=7)  # weekly sampling fits slow movers
         t = start_dt
         while t <= end_dt:
             jd_now  = self._to_jd_tt(t)
             jd_prev = self._to_jd_tt(t - step)
             jd_next = self._to_jd_tt(t + step)
 
-            tr_now  = self._planet_lons_extended(jd_now,  0.0, 0.0)
-            tr_prev = self._planet_lons_extended(jd_prev, 0.0, 0.0)
-            tr_next = self._planet_lons_extended(jd_next, 0.0, 0.0)
+            tr_now  = self._planet_lons_extended(jd_now,  lat, lon)
+            tr_prev = self._planet_lons_extended(jd_prev, lat, lon)
+            tr_next = self._planet_lons_extended(jd_next, lat, lon)
 
             for outer in ("Uranus","Neptune","Pluto"):
                 if outer not in tr_now:
@@ -206,7 +209,7 @@ class ProfessionalAstrologyEnginePhase1(BaseEngine):
                                 }],
                             })
 
-                # (B) to angles
+                # (B) to angles (if present)
                 for angle_name, angle_lon in natal_angles.items():
                     if angle_lon is None:
                         continue
@@ -236,7 +239,7 @@ class ProfessionalAstrologyEnginePhase1(BaseEngine):
         try:
             out: Dict[str, Dict[str, float]] = {}
             for b in eph_lons(jd_tt, lat, lon) or []:
-                name = str(b.get("name","")).strip().title()
+                name = _canon(b.get("name",""))
                 if name in ALL_BODIES:
                     out[name] = {
                         "lon": float(b.get("lon", 0.0)) % 360.0,
@@ -267,7 +270,7 @@ class ProfessionalAstrologyEnginePhase1(BaseEngine):
             "semisextile": 0.45, "quintile": 0.50, "sesquiquadrate": 0.55, "biquintile": 0.50, "quincunx": 0.55,
         }.get(aspect, 0.50)
         max_orb = OUTER_ORBS.get(outer, DEFAULT_ORBS).get(aspect, 1.5)
-        orb_factor = max(0.0, 1.0 - (orb / max_orb))
+        orb_factor = max(0.0, 1.0 - (orb / max_orb))  # tighter = stronger
         target_factor = 1.20 if natal_body in {"Sun","Moon","Asc","MC"} else 1.00
         return base * orb_factor * target_factor
 
@@ -278,31 +281,6 @@ class ProfessionalAstrologyEnginePhase1(BaseEngine):
         if sep_next < sep_now:  return "applying"
         if sep_prev < sep_now:  return "separating"
         return "culminating" if sep_now <= min(sep_prev, sep_next) else "stationary"
-
-    # --------------- Topic mapping ---------------
-    def _outer_planet_topic_mapping(self, outer_planet: str, natal_body: str, aspect: str) -> str:
-        if outer_planet == "Uranus":
-            if natal_body in {"MC","Sun"}: return "career"
-            if natal_body == "Venus": return "relationships"
-            if natal_body == "Moon": return "relocation"
-            return "innovation"
-        if outer_planet == "Neptune":
-            if natal_body in {"MC","Sun"}: return "career"
-            if natal_body in {"Venus","Moon"}: return "relationships"
-            if natal_body == "Mercury": return "creativity"
-            return "spirituality"
-        if outer_planet == "Pluto":
-            if natal_body in {"MC","Sun"}: return "career"
-            if natal_body == "Mars": return "health"
-            if natal_body in {"Venus","Moon"}: return "relationships"
-            return "transformation"
-        return "general"
-
-    def _outer_planet_angle_topic(self, outer: str, angle: str, aspect: str) -> str:
-        return "major_life_changes"
-
-    def _outer_planet_meaning(self, outer: str, natal_body: str, aspect: str) -> str:
-        return "Significant transformation indicated"
 
     # --------------- Angles / JD fallbacks ---------------
     def _angles_and_cusps_safe(self, jd_tt: float, lat: float, lon: float, cfg: EngineConfig) -> Tuple[Dict[str, float], Dict[int, float]]:
@@ -320,24 +298,23 @@ class ProfessionalAstrologyEnginePhase1(BaseEngine):
             y, m = dt.year, dt.month
             D = dt.day + (dt.hour + (dt.minute + (dt.second + dt.microsecond/1e6)/60.0)/60.0)/24.0
             if m <= 2:
-                y -= 1
-                m += 12
+                y -= 1; m += 12
             A = y // 100
             B = 2 - A + (A // 25)
             jd_ut = int(365.25 * (y + 4716)) + int(30.6001 * (m + 1)) + D + B - 1524.5
             return jd_ut + (69.0 / 86400.0)  # rough ΔT → TT
 
-# ---------- small utilities ----------
-def dt_utc(d: datetime) -> datetime:
-    if d.tzinfo is None:
-        return d.replace(tzinfo=timezone.utc)
-    return d.astimezone(timezone.utc)
-
-def norm360(x: float) -> float:
-    return x % 360.0
-
-def angular_sep(a: float, b: float) -> float:
-    """Smallest angular separation in degrees [0..180]."""
-    return abs((a - b + 180.0) % 360.0 - 180.0)
+    # --- diagnostics ---
+    def _diag_probe(self, birth_jd_tt: float, start_jd_tt: float, lat: float, lon: float) -> Dict[str, Any]:
+        birth = self._planet_lons_extended(birth_jd_tt, lat, lon)
+        start = self._planet_lons_extended(start_jd_tt, lat, lon)
+        return {
+            "has_eph": bool(eph_lons),
+            "skyfield_available": bool(_skyfield_available()),
+            "birth_keys": sorted(birth.keys()),
+            "start_keys": sorted(start.keys()),
+            "has_outers_birth": any(k in birth for k in ("Uranus","Neptune","Pluto")),
+            "has_outers_start": any(k in start for k in ("Uranus","Neptune","Pluto")),
+        }
 
 __all__ = ["ProfessionalAstrologyEnginePhase1"]
