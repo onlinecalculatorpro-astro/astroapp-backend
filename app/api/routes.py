@@ -33,7 +33,7 @@ from app.core.rectify import rectification_candidates
 try:
     from app.core.house import compute_houses_with_policy as _houses_fn  # type: ignore
     _HOUSES_KIND = "policy"
-except Exception:
+except Exception:  # pragma: no cover
     from app.core.astronomy import compute_houses as _houses_fn  # type: ignore
     _HOUSES_KIND = "legacy"
 
@@ -57,14 +57,12 @@ def _datetime_to_jd_utc(dt_utc: datetime) -> float:
         raise ValueError("dt_utc must be timezone-aware UTC")
     try:
         import erfa  # PyERFA
-        # eraDtf2d('UTC', ...) → two-part JD in UTC
         iy, im, id_ = dt_utc.year, dt_utc.month, dt_utc.day
         ih, iv = dt_utc.hour, dt_utc.minute
         sf = dt_utc.second + dt_utc.microsecond / 1e6
         d1, d2 = erfa.dtf2d("UTC", iy, im, id_, ih, iv, sf)
         return float(d1 + d2)
     except Exception:
-        # Pure-Python fallback (Meeus) — matches time_kernel implementation.
         Y, M, D = dt_utc.year, dt_utc.month, dt_utc.day
         h, m = dt_utc.hour, dt_utc.minute
         s = dt_utc.second + dt_utc.microsecond / 1_000_000.0
@@ -100,7 +98,6 @@ def _find_kernel_callable() -> Callable[[float], Dict[str, Any]]:
                 return dict(out)
             return _wrap
 
-    # Class API fallback
     TK = getattr(_tk, "TimeKernel", None)
     if TK is not None:
         inst = TK()  # type: ignore
@@ -123,25 +120,17 @@ _JD_TO_TS = _find_kernel_callable()
 
 
 def _compute_timescales_from_local(date_str: str, time_str: str, tz_name: str) -> Dict[str, Any]:
-    """
-    Convert local date/time/tz to JD(UTC), then expand to jd_tt/jd_ut1 with time_kernel.
-    Returns a dict safe for JSON.
-    """
-    # allow “HH:MM[:SS]”
+    """Convert local date/time/tz to JD(UTC), then expand to jd_tt/jd_ut1 with time_kernel."""
     fmt = "%Y-%m-%d %H:%M" if time_str.count(":") == 1 else "%Y-%m-%d %H:%M:%S"
-
     try:
         tz = ZoneInfo(tz_name)
     except Exception:
         raise ValidationError({"place_tz": "must be a valid IANA zone like 'Asia/Kolkata'"})
-
     dt_local = datetime.strptime(f"{date_str} {time_str}", fmt).replace(tzinfo=tz)
     dt_utc = dt_local.astimezone(timezone.utc)
     jd_utc = _datetime_to_jd_utc(dt_utc)
-
     ts = _JD_TO_TS(jd_utc)
     tz_offset_seconds = int(dt_local.utcoffset().total_seconds()) if dt_local.utcoffset() else 0
-
     out = {
         "jd_utc": float(jd_utc),
         "jd_tt": float(ts.get("jd_tt")),
@@ -170,8 +159,8 @@ def _sig_accepts(fn: Callable, *names: str) -> Dict[str, bool]:
 
 def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Call compute_chart with signature introspection. Supports alternate names like
-    time_s/lat/lon/date_s. Supplies jd_ut/jd_tt/jd_ut1 when supported. Ensures 'jd_ut'.
+    Call compute_chart with signature introspection. Supplies jd_ut/jd_tt/jd_ut1 when supported.
+    On older ephemerides that omit 'retro', retry with a compatibility shim (retro := speed<0).
     """
     params = inspect.signature(compute_chart).parameters
 
@@ -181,12 +170,11 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
                 return c
         return None
 
-    # Map payload fields to the function's parameter names
     name_date = pick("date", "date_s", "date_str")
     name_time = pick("time", "time_s", "time_str")
     name_lat  = pick("latitude", "lat")
     name_lon  = pick("longitude", "lon")
-    name_mode = pick("mode", "system")        # some codebases say 'system'
+    name_mode = pick("mode", "system")
     name_tz   = pick("place_tz", "timezone", "tz_name")
 
     kwargs: Dict[str, Any] = {}
@@ -197,7 +185,6 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
     if name_mode: kwargs[name_mode] = payload["mode"]
     if name_tz:   kwargs[name_tz]   = payload.get("timezone") or payload.get("place_tz")
 
-    # Timescales passthrough (only if the function accepts them)
     if "jd_ut" in params:
         kwargs["jd_ut"] = ts["jd_utc"]
     if "jd_tt" in params:
@@ -205,9 +192,33 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
     if "jd_ut1" in params:
         kwargs["jd_ut1"] = ts["jd_ut1"]
 
-    chart = compute_chart(**kwargs)
+    def _compute_with_optional_shim(first_try: bool = True) -> Dict[str, Any]:
+        try:
+            return compute_chart(**kwargs)
+        except KeyError as e:
+            # Retro-compat patch: add 'retro' when ephemeris only provides 'speed'
+            if first_try and (len(e.args) and str(e.args[0]) == "retro"):
+                try:
+                    import app.core.ephemeris_adapter as EA  # type: ignore
+                    orig = getattr(EA, "ecliptic_longitudes", None)
+                    if callable(orig):
+                        def _shim(*a, **k):
+                            arr = orig(*a, **k) or []
+                            for b in arr:
+                                if isinstance(b, dict) and "retro" not in b:
+                                    try:
+                                        b["retro"] = bool(float(b.get("speed", 0.0)) < 0.0)
+                                    except Exception:
+                                        b["retro"] = False
+                            return arr
+                        EA.ecliptic_longitudes = _shim  # type: ignore
+                        return _compute_with_optional_shim(False)
+                except Exception:
+                    pass
+            raise
 
-    # Guarantee jd_ut for downstream code
+    chart = _compute_with_optional_shim(True)
+
     if "jd_ut" not in chart:
         chart["jd_ut"] = ts["jd_utc"]
     if "mode" not in chart and "mode" in payload:
@@ -220,10 +231,6 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
     """
     Prefer policy façade if available; pass jd_tt/jd_ut1 when accepted.
     Fallback to legacy compute_houses(lat, lon, mode[, jd_ut]).
-
-    IMPORTANT: chart 'mode' is 'sidereal'/'tropical' (NOT a house system).
-               We pass user's requested house system via payload['house_system'].
-               If omitted, the façade uses its own default (typically 'placidus').
     """
     lat = float(payload["latitude"])
     lon = float(payload["longitude"])
@@ -233,13 +240,12 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
     accepts = _sig_accepts(
         _houses_fn,
         "lat", "lon",
-        "system", "requested_house_system", "house_system",  # different APIs
+        "system", "requested_house_system", "house_system",
         "mode", "jd_ut", "jd_tt", "jd_ut1", "diagnostics"
     )
 
     kwargs: Dict[str, Any] = {"lat": lat, "lon": lon}
 
-    # Map requested system to whatever the target supports
     if requested_system:
         rs = str(requested_system).lower()
         if accepts.get("system"):
@@ -249,11 +255,9 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
         elif accepts.get("house_system"):
             kwargs["house_system"] = rs
 
-    # Legacy engines sometimes expect 'mode' (sidereal/tropical)
     if accepts.get("mode") and "mode" in payload:
         kwargs["mode"] = payload["mode"]
 
-    # Timescales (prefer jd_tt/jd_ut1; legacy may accept jd_ut)
     if accepts.get("jd_tt"):
         kwargs["jd_tt"] = ts["jd_tt"]
     if accepts.get("jd_ut1"):
@@ -261,7 +265,6 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
     if accepts.get("jd_ut") and "jd_tt" not in kwargs and "jd_ut1" not in kwargs:
         kwargs["jd_ut"] = ts["jd_utc"]
 
-    # Diagnostics passthrough
     if accepts.get("diagnostics") and "diagnostics" in payload:
         kwargs["diagnostics"] = bool(payload["diagnostics"])
 
@@ -279,17 +282,14 @@ def _json_error(code: str, details: Any = None, http: int = 400):
 def _normalize_houses_payload(houses: Any) -> Any:
     """Ensure houses payload has both 'cusps' and 'cusps_deg' and consistent system fields."""
     if isinstance(houses, dict):
-        # cusps/cusps_deg compatibility
         if "cusps" not in houses and "cusps_deg" in houses:
             houses["cusps"] = houses["cusps_deg"]
         if "cusps_deg" not in houses and "cusps" in houses:
             houses["cusps_deg"] = houses["cusps"]
-        # system name compatibility
         if "house_system" not in houses and "system" in houses:
             houses["house_system"] = houses["system"]
         if "system" not in houses and "house_system" in houses:
             houses["system"] = houses["house_system"]
-        # angles compatibility
         if "asc_deg" not in houses and "asc" in houses:
             houses["asc_deg"] = houses["asc"]
         if "mc_deg" not in houses and "mc" in houses:
@@ -308,7 +308,6 @@ def calculate():
     try:
         body = request.get_json(force=True) or {}
         payload = parse_chart_payload(body)  # expects: date, time, place_tz, latitude, longitude, mode
-        # pass-through: optional house_system (validator does not keep unknown keys)
         hs = str(body.get("house_system", "")).strip().lower()
         if hs:
             payload["house_system"] = hs
@@ -320,7 +319,15 @@ def calculate():
     tz_name = payload.get("place_tz") or payload.get("timezone") or "UTC"
     ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name)
 
-    chart = _call_compute_chart(payload, ts)
+    # chart with defensive handling
+    try:
+        chart = _call_compute_chart(payload, ts)
+    except KeyError as e:
+        # still bubbled up after shim (or different key)
+        return _json_error("chart_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+    except Exception as e:
+        return _json_error("chart_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+
     try:
         houses = _call_compute_houses(payload, ts)
         houses = _normalize_houses_payload(houses)
@@ -346,7 +353,11 @@ def report():
     tz_name = payload.get("place_tz") or payload.get("timezone") or "UTC"
     ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name)
 
-    chart = _call_compute_chart(payload, ts)
+    try:
+        chart = _call_compute_chart(payload, ts)
+    except Exception as e:
+        return _json_error("chart_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+
     try:
         houses = _call_compute_houses(payload, ts)
         houses = _normalize_houses_payload(houses)
@@ -379,7 +390,11 @@ def predictions_route():
     tz_name = payload.get("place_tz") or payload.get("timezone") or "UTC"
     ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name)
 
-    chart = _call_compute_chart(payload, ts)
+    try:
+        chart = _call_compute_chart(payload, ts)
+    except Exception as e:
+        return _json_error("chart_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+
     try:
         houses = _call_compute_houses(payload, ts)
         houses = _normalize_houses_payload(houses)
@@ -390,7 +405,6 @@ def predictions_route():
 
     preds_raw = predict(chart, houses, horizon)
 
-    # thresholds (with sensible defaults)
     th_path = os.environ.get("ASTRO_HC_THRESHOLDS", "config/hc_thresholds.json")
     try:
         with open(th_path, "r", encoding="utf-8") as f:
@@ -402,7 +416,6 @@ def predictions_route():
     tau = float(defaults.get("tau", 0.88))
     floor = float(defaults.get("floor", 0.60))
 
-    # request-body overrides (test only)
     overrides = body.get("hc_overrides") or {}
     if isinstance(overrides, dict):
         if "tau" in overrides:
@@ -410,7 +423,6 @@ def predictions_route():
         if "floor" in overrides:
             floor = float(overrides["floor"])
 
-    # env debug overrides
     env_over = os.environ.get("ASTRO_HC_DEBUG_OVERRIDES")
     if env_over:
         try:
@@ -508,10 +520,7 @@ def system_validation():
         "leap_policy": os.getenv("ASTRO_LEAP_POLICY", "warn"),
         "dut1_broadcast": os.getenv("ASTRO_DUT1_BROADCAST", "0") in ("1", "true", "True"),
         "houses_engine": _HOUSES_KIND,
-        "polar_policy": {
-            "soft_fallback_lat_gt": 66.0,
-            "hard_reject_lat_ge": 80.0,
-        },
+        "polar_policy": {"soft_fallback_lat_gt": 66.0, "hard_reject_lat_ge": 80.0},
     }
 
     return jsonify(
@@ -548,7 +557,6 @@ def config_info():
     calib_ver = None
     th_summary = None
 
-    # timescale sample for "now" (debug aid)
     try:
         now_utc = datetime.now(timezone.utc)
         jd_now = _datetime_to_jd_utc(now_utc)
