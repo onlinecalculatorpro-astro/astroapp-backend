@@ -10,7 +10,8 @@ from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-from app.api.routes import api
+from app.api.routes import api                           # existing API blueprint(s)
+from app.api.predictions import predictions_bp           # ⬅️ NEW: predictions blueprint
 from app.utils.config import load_config
 
 # ── Prometheus (STANDARD mode: no multiprocess) ───────────────────────────────
@@ -50,10 +51,15 @@ GAUGE_APP_UP: Final = Gauge(
 
 # Seed series so names appear on first scrape (values start at 0)
 def _initialize_metrics() -> None:
+    # Common app routes
     MET_REQUESTS.labels(route="/api/health-check").inc(0)
     MET_REQUESTS.labels(route="/api/calculate").inc(0)
     MET_REQUESTS.labels(route="/health").inc(0)
+    MET_REQUESTS.labels(route="/healthz").inc(0)
     MET_REQUESTS.labels(route="/metrics").inc(0)
+    # ⬅️ NEW: seed predictions route so it’s visible immediately
+    MET_REQUESTS.labels(route="/api/predictions").inc(0)
+
     MET_FALLBACKS.labels(requested="placidus", fallback="equal").inc(0)
     MET_WARNINGS.labels(kind="polar_soft_fallback").inc(0)
     MET_WARNINGS.labels(kind="polar_reject_strict").inc(0)
@@ -140,8 +146,9 @@ def create_app() -> Flask:
     cfg_path = os.environ.get("ASTRO_CONFIG", "config/defaults.yaml")
     app.cfg = load_config(cfg_path)  # type: ignore[attr-defined]
 
-    # Routes / health / errors / metrics
-    app.register_blueprint(api)
+    # ── Routes / health / errors / metrics ────────────────────────────────────
+    app.register_blueprint(api)                                  # existing routes
+    app.register_blueprint(predictions_bp, url_prefix="/api")    # ⬅️ NEW: /api/predictions
     _register_health_endpoints(app)
     _register_error_handlers(app)
     _register_metrics(app)
@@ -170,7 +177,6 @@ CORS(
     allow_headers=["Content-Type", "Authorization"],
     max_age=600,
 )
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
