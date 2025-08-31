@@ -1,16 +1,22 @@
+# --- Web stack ---
 flask==3.0.2
 gunicorn==21.2.0
 flask-cors==4.0.0
 
+# --- Validation / config ---
 pydantic==1.10.12
 typing_extensions==4.12.2
 PyYAML==6.0.2
 
+# --- Numerics / astronomy ---
 numpy==1.26.4
 pyerfa==2.0.1
-
 skyfield==1.48
 jplephem==2.22
 tzdata==2024.1
 
+# --- Monitoring ---
 prometheus-client==0.20.0
+
+# --- Ephemeris kernel (bundle de421) ---
+de421==1.0
