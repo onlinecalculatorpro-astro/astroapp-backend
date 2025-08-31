@@ -12,10 +12,10 @@ from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from app.api.routes import api
-from app.api.predictions import predictions_bp          # ✅ NEW: predictions blueprint
+from app.api.predictions import predictions_bp
 from app.utils.config import load_config
 
-# Prometheus metrics (standard mode)
+# Prometheus metrics
 from prometheus_client import (
     Counter,
     Gauge,
@@ -37,6 +37,7 @@ REQ_LATENCY: Final = Histogram("astro_request_seconds", "API request latency", [
 
 # ───────────────────────────── helpers ─────────────────────────────
 def _configure_logging(app: Flask) -> None:
+    """Unify logging with Gunicorn or fall back to std logging."""
     gerr = logging.getLogger("gunicorn.error")
     if gerr.handlers:
         app.logger.handlers = gerr.handlers
@@ -46,6 +47,7 @@ def _configure_logging(app: Flask) -> None:
 
 
 def _register_errors(app: Flask) -> None:
+    """Consistent JSON error payloads."""
     @app.errorhandler(HTTPException)
     def _http(e: HTTPException):
         return jsonify(
@@ -62,6 +64,7 @@ def _register_errors(app: Flask) -> None:
 
 
 def _register_health(app: Flask) -> None:
+    """Health endpoints for Render/CF probes."""
     @app.route("/api/health-check", methods=["GET"])
     def api_health():
         return jsonify(ok=True), 200
@@ -73,7 +76,7 @@ def _register_health(app: Flask) -> None:
 
 
 def _metrics_auth_ok() -> bool:
-    """Validate Basic Auth credentials for /metrics using env vars."""
+    """Basic Auth guard for /metrics, using METRICS_USER + METRICS_PASS env vars."""
     auth = request.authorization
     user = os.getenv("METRICS_USER", "")
     pw = os.getenv("METRICS_PASS", "")
@@ -91,19 +94,20 @@ def create_app() -> Flask:
     app = Flask(__name__)
     app.config["JSON_SORT_KEYS"] = False
 
-    # honor reverse proxy headers (Render/Cloudflare)
+    # Trust proxy headers (Render/Cloudflare)
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)  # type: ignore
 
     _configure_logging(app)
 
+    # Config file
     cfg_path = os.environ.get("ASTRO_CONFIG", "config/defaults.yaml")
     app.cfg = load_config(cfg_path)  # type: ignore[attr-defined]
 
-    # Initialize metric label sets (preseed so time series appear immediately)
+    # Pre-seed metrics
     seeded_routes = (
         "/api/health-check",
         "/api/calculate",
-        "/api/predictions",   # ✅ NEW
+        "/api/predictions",
         "/health",
         "/healthz",
         "/metrics",
@@ -115,7 +119,7 @@ def create_app() -> Flask:
     MET_WARNINGS.labels(kind="polar_soft_fallback").inc(0)
     GAUGE_APP_UP.set(1.0)
 
-    # Request counting + timing
+    # Request metrics
     @app.before_request
     def _before():
         try:
@@ -137,13 +141,13 @@ def create_app() -> Flask:
             pass
         return resp
 
-    # Register components
-    app.register_blueprint(api)                                  # existing routes
-    app.register_blueprint(predictions_bp, url_prefix="/api")    # ✅ expose /api/predictions
+    # Register routes
+    app.register_blueprint(api)
+    app.register_blueprint(predictions_bp, url_prefix="/api")
     _register_health(app)
     _register_errors(app)
 
-    # ── /metrics with Basic Auth ─────────────────────────────────────
+    # /metrics protected endpoint
     @app.route("/metrics", methods=["GET"])
     def metrics_endpoint():
         if not _metrics_auth_ok():
@@ -164,7 +168,7 @@ def create_app() -> Flask:
 # ───────────────────────────── app instance ─────────────────────────────
 app = create_app()
 
-# CORS (not used by Prometheus, but useful for browser UIs)
+# CORS for browser UIs (Netlify frontend, etc.)
 _allowed_origin = (
     os.environ.get("CORS_ALLOW_ORIGIN")
     or os.environ.get("NETLIFY_ORIGIN")
