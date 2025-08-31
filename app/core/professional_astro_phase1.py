@@ -12,7 +12,7 @@ log = logging.getLogger(__name__)
 try:
     from app.core.professional_astro_v2 import ProfessionalAstrologyEngine as BaseEngine
     from app.core.professional_astro_v2 import EngineConfig
-except ImportError:
+except ImportError:  # very defensive fallback so imports never explode
     class BaseEngine:
         def __init__(self): ...
         def get_transit_predictions(self, *a, **k): return []
@@ -72,7 +72,6 @@ def _canon(name: str) -> str:
     lower = n.lower()
     if lower in ALIASES:
         return ALIASES[lower]
-    # Title() handles URANUS/uranus → Uranus
     return lower[:1].upper() + lower[1:] if n else n
 
 def dt_utc(d: datetime) -> datetime:
@@ -126,7 +125,7 @@ class ProfessionalAstrologyEnginePhase1(BaseEngine):
 
         start_utc = dt_utc(window[0]); end_utc = dt_utc(window[1])
 
-        # diagnostics probe
+        # diagnostics probe (optional)
         try:
             self._last_diag = self._diag_probe(jd_birth_tt, self._to_jd_tt(start_utc), lat, lon)
         except Exception:
@@ -198,7 +197,7 @@ class ProfessionalAstrologyEnginePhase1(BaseEngine):
                         strength = self._outer_planet_strength(outer, n_name, asp, orb)
                         if strength >= 0.30:
                             out.append({
-                                "topic": self._outer_planet_topic_mapping(outer, n_name, asp),
+                                "topic": self._topic_for_outer(outer, n_name, asp),  # stable helper
                                 "date": t.date().isoformat(),
                                 "score": round(strength, 3),
                                 "narrative": f"{outer} {asp} {n_name} (orb {orb:.2f}°): {self._outer_planet_meaning(outer, n_name, asp)}",
@@ -231,6 +230,41 @@ class ProfessionalAstrologyEnginePhase1(BaseEngine):
                             })
             t += step
         return out
+
+    # --------------- Topic / meaning helpers ---------------
+    def _topic_for_outer(self, outer_planet: str, natal_body: str, aspect: str) -> str:
+        """Stable helper for topic mapping (used internally)."""
+        if outer_planet == "Uranus":
+            if natal_body in {"MC","Sun"}: return "career"
+            if natal_body == "Venus": return "relationships"
+            if natal_body == "Moon": return "relocation"
+            return "innovation"
+        if outer_planet == "Neptune":
+            if natal_body in {"MC","Sun"}: return "career"
+            if natal_body in {"Venus","Moon"}: return "relationships"
+            if natal_body == "Mercury": return "creativity"
+            return "spirituality"
+        if outer_planet == "Pluto":
+            if natal_body in {"MC","Sun"}: return "career"
+            if natal_body == "Mars": return "health"
+            if natal_body in {"Venus","Moon"}: return "relationships"
+            return "transformation"
+        return "general"
+
+    # Back-compat alias so any stale import calling the old name doesn't crash:
+    def _outer_planet_topic_mapping(self, outer_planet: str, natal_body: str, aspect: str) -> str:
+        return self._topic_for_outer(outer_planet, natal_body, aspect)
+
+    def _outer_planet_angle_topic(self, outer: str, angle: str, aspect: str) -> str:
+        return "major_life_changes"
+
+    def _outer_planet_meaning(self, outer: str, natal_body: str, aspect: str) -> str:
+        base = {
+            "Uranus": "breakthroughs, surprises, new directions",
+            "Neptune": "visions, ideals, dissolving of old forms",
+            "Pluto": "deep transformation, power shifts, renewal",
+        }.get(outer, "significant developments")
+        return base
 
     # --------------- Math / helpers ---------------
     def _planet_lons_extended(self, jd_tt: float, lat: float, lon: float) -> Dict[str, Dict[str, float]]:
@@ -304,7 +338,7 @@ class ProfessionalAstrologyEnginePhase1(BaseEngine):
             jd_ut = int(365.25 * (y + 4716)) + int(30.6001 * (m + 1)) + D + B - 1524.5
             return jd_ut + (69.0 / 86400.0)  # rough ΔT → TT
 
-    # --- diagnostics ---
+    # --- diagnostics (optional) ---
     def _diag_probe(self, birth_jd_tt: float, start_jd_tt: float, lat: float, lon: float) -> Dict[str, Any]:
         birth = self._planet_lons_extended(birth_jd_tt, lat, lon)
         start = self._planet_lons_extended(start_jd_tt, lat, lon)
