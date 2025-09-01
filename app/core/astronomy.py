@@ -21,20 +21,20 @@ class AstronomyError(ValueError):
 # ───────────────────────────── Resilient imports ─────────────────────
 try:
     from app.core import ephemeris_adapter as eph
-except Exception as e:
+except Exception as e:  # pragma: no cover
     eph = None
     _EPH_IMPORT_ERROR = e
 
 try:
     # Single source of truth for JD conversions when jd_* aren't provided
     from app.core import time_kernel as _tk  # type: ignore
-except Exception:
+except Exception:  # pragma: no cover
     _tk = None
 
-# Optional civil→JD helper you provided
+# Optional civil→JD helper
 try:
     from app.core import timescales as _ts  # type: ignore
-except Exception:
+except Exception:  # pragma: no cover
     _ts = None
 
 # Optional high-precision sidereal/obliquity helpers
@@ -64,7 +64,7 @@ _ELEV_MAX         = float(os.getenv("OCP_GEO_ELEV_MAX", "10000.0"))
 _ELEV_WARN        = float(os.getenv("OCP_GEO_ELEV_WARN", "3000.0"))
 _ANTIMER_WARN_LON = float(os.getenv("OCP_GEO_ANTI_WARN", "179.9"))
 
-# UT1 offset (UT1−UTC) seconds; set this if you want high-fidelity UT1
+# UT1 offset (UT1−UTC) seconds
 _DUT1_SECONDS     = float(os.getenv("OCP_DUT1_SECONDS", "0.0"))
 
 
@@ -177,7 +177,7 @@ def _ensure_timescales(payload: Dict[str, Any]) -> Tuple[float, float, float]:
             tzinfo = ZoneInfo("UTC")
         dt_local = dt_local.replace(tzinfo=tzinfo)
         dt_utc = dt_local.astimezone(timezone.utc)
-        # Meeus JD
+        # Meeus JD (UTC)
         Y = dt_utc.year; M = dt_utc.month; D = dt_utc.day
         h = dt_utc.hour + dt_utc.minute/60 + dt_utc.second/3600 + dt_utc.microsecond/3.6e9
         if M <= 2:
@@ -516,10 +516,11 @@ def _longitudes_and_speeds(
     longitude: Optional[float],
     elevation_m: Optional[float],
     speed_step_days: float,
-) -> Tuple[Dict[str, Tuple[float, float]], str]:
+) -> Tuple[Dict[str, Tuple[float, Optional[float]]], str]:
     """
     Get (lon, speed) per body.
     Prefer adapter speeds when available; otherwise compute via FD using cached positions at jd±step.
+    Never raises KeyError if a body is missing — that body is simply omitted (caller will warn).
     """
     names_key = tuple(names)
     jd_tt_q = _q(jd_tt, _JD_QUANT)
@@ -529,28 +530,38 @@ def _longitudes_and_speeds(
 
     now_lon, now_spd, source = _cached_positions(jd_tt_q, names_key, topocentric, lat_q, lon_q, elev_q)
 
-    # If all speeds are provided by adapter
-    if all(now_spd.get(nm) is not None for nm in names_key):
-        return {nm: (_norm360(float(now_lon[nm])), float(now_spd[nm])) for nm in names_key}, source
+    out: Dict[str, Tuple[float, Optional[float]]] = {}
 
-    # Else compute symmetric FD
-    if speed_step_days and speed_step_days > 0:
-        jm = _q(jd_tt - speed_step_days, _JD_QUANT)
-        jp = _q(jd_tt + speed_step_days, _JD_QUANT)
+    # If all requested names are present and have speeds
+    if all(nm in now_lon for nm in names_key) and all(now_spd.get(nm) is not None for nm in names_key):
+        for nm in names_key:
+            out[nm] = (_norm360(float(now_lon[nm])), float(now_spd[nm]))
+        return out, source
+
+    # Some speeds or bodies missing → compute FD where possible
+    jm = _q(jd_tt - speed_step_days, _JD_QUANT) if speed_step_days and speed_step_days > 0 else None
+    jp = _q(jd_tt + speed_step_days, _JD_QUANT) if speed_step_days and speed_step_days > 0 else None
+    minus_lon: Dict[str, float] = {}
+    plus_lon:  Dict[str, float] = {}
+    if jm is not None and jp is not None:
         minus_lon, _, _ = _cached_positions(jm, names_key, topocentric, lat_q, lon_q, elev_q)
         plus_lon,  _, _ = _cached_positions(jp, names_key, topocentric, lat_q, lon_q, elev_q)
-        dt = (speed_step_days * 2.0)
-    else:
-        minus_lon = plus_lon = now_lon
-        dt = 1.0
 
-    out: Dict[str, Tuple[float, float]] = {}
     for nm in names_key:
+        if nm not in now_lon:
+            # adapter omitted this body
+            continue
         l0 = _norm360(float(now_lon[nm]))
-        l_m = _norm360(float(minus_lon[nm]))
-        l_p = _norm360(float(plus_lon[nm]))
-        spd = _shortest_signed_delta_deg(l_p, l_m) / dt
+        spd: Optional[float] = None
+        if now_spd.get(nm) is not None:
+            spd = float(now_spd[nm])
+        elif jm is not None and jp is not None and (nm in minus_lon) and (nm in plus_lon):
+            dt = (speed_step_days * 2.0)
+            l_m = _norm360(float(minus_lon[nm]))
+            l_p = _norm360(float(plus_lon[nm]))
+            spd = _shortest_signed_delta_deg(l_p, l_m) / dt
         out[nm] = (l0, spd)
+
     return out, source
 
 
@@ -561,7 +572,6 @@ def _split_jd(jd: float) -> Tuple[float, float]:
 
 def _atan2d(y: float, x: float) -> float:
     if x == 0.0 and y == 0.0:
-        # match houses_advanced strictness
         raise ValueError("atan2(0,0) undefined")
     return _norm360(math.degrees(math.atan2(y, x)))
 
@@ -576,7 +586,7 @@ def _acotd(x: float) -> float:
 def _gast_deg(jd_ut1: float, jd_tt: float) -> float:
     """
     Apparent sidereal time (GAST) in degrees using IAU 2006/2000A if ERFA is present;
-    otherwise fall back to GMST-like approximation (less precise).
+    otherwise fall back to GMST-like approximation.
     """
     if erfa is not None:  # high precision path
         d1u, d2u = _split_jd(jd_ut1)
@@ -584,7 +594,7 @@ def _gast_deg(jd_ut1: float, jd_tt: float) -> float:
         gst_rad = erfa.gst06a(d1u, d2u, d1t, d2t)
         return _norm360(math.degrees(gst_rad))
 
-    # Fallback GMST approximation (adequate but not sub-arcmin)
+    # Fallback GMST approximation
     T = (float(jd_ut1) - 2451545.0) / 36525.0
     theta = 280.46061837 + 360.98564736629 * (float(jd_ut1) - 2451545.0) \
             + 0.000387933*(T**2) - (T**3)/38710000.0
@@ -616,7 +626,7 @@ def _mc_longitude_deg(ramc: float, eps: float) -> float:
 
 def _asc_longitude_deg(phi: float, ramc: float, eps: float) -> float:
     """
-    Exact Ascendant (arccot form; quadrant-safe) — matches houses_advanced:
+    Exact Ascendant (arccot form; quadrant-safe).
     ASC = arccot( - ( tan φ * sin ε + sin RAMC * cos ε ) / cos RAMC )
     """
     num = -((_tand(phi) * _sind(eps)) + (_sind(ramc) * _cosd(eps)))
@@ -632,9 +642,9 @@ def _compute_angles_parity(
     *,
     mode: str,
     ayanamsa_deg: Optional[float],
-) -> Optional[Tuple[float, float]]:
+) -> Optional[Tuple[float, float]]:  # (asc, mc)
     """
-    Strict Asc/MC computation with the same conventions as houses_advanced:
+    Strict Asc/MC computation:
       - GAST (IAU 2006/2000A) when ERFA available
       - True obliquity (mean 2006 + nutation 2000A)
       - RAMC = GAST + λ (east-positive)
@@ -660,8 +670,8 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
     Planetary chart computation (ecliptic-of-date).
     - Planets at JD_TT.
     - Sidereal = tropical − ayanamsa (pluggable; explicit degrees or named model).
-    - Adapter speeds preferred; FD speeds as fallback.
-    - Angles (Asc/MC) computed with ERFA GAST + true obliquity (parity with houses_advanced).
+    - Adapter speeds preferred; FD speeds as fallback (or None when impossible).
+    - Angles (Asc/MC) computed with ERFA GAST + true obliquity (fallback otherwise).
     - Strict validation, robust geo handling for topocentric, friendly errors.
     """
     if eph is None:
@@ -671,7 +681,7 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
     mode, bodies = _validate_payload(payload)
 
     # Timescales (TT for planets, UT1 for angles/LST)
-    jd_ut, jd_tt, jd_ut1 = _ensure_timescales(payload)  # noqa: F841
+    jd_ut, jd_tt, jd_ut1 = _ensure_timescales(payload)
 
     # Geometry (topocentric handling for planets; angles need lat/lon regardless)
     topocentric = _coerce_bool(payload.get("topocentric"), False)
@@ -695,7 +705,7 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
         lon = float(payload.get("longitude")) if _is_finite(payload.get("longitude")) else None
         elev = None
 
-    # Ephemeris (longitudes + speeds)
+    # Ephemeris (longitudes + speeds; tolerant to omissions)
     results, source_tag = _longitudes_and_speeds(
         jd_tt, bodies,
         topocentric=topocentric,
@@ -723,12 +733,12 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
         out_bodies.append({
             "name": nm,
             "longitude_deg": float(_norm360(lon_deg)),
-            "speed_deg_per_day": float(speed),
+            "speed_deg_per_day": (float(speed) if speed is not None else None),
         })
     if missing:
         warnings.append(f"adapter_missing_bodies({', '.join(missing)})")
 
-    # Angles (Asc/MC) — strict parity with houses_advanced
+    # Angles (Asc/MC)
     asc_mc = _compute_angles_parity(
         jd_ut1=jd_ut1, jd_tt=jd_tt, latitude=lat, longitude=lon,
         mode=mode, ayanamsa_deg=ay_deg
@@ -748,7 +758,7 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
     if warnings:
         meta["warnings"] = warnings
-    if ay_note and "fallback" in ay_note:
+    if ay_note and "fallback" in (ay_note or ""):
         meta.setdefault("warnings", []).append(ay_note)
 
     out: Dict[str, Any] = {
