@@ -182,7 +182,8 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
     """
     Call compute_chart (primary or fallback), passing flexible inputs.
     Supports engines that accept a single 'payload' dict OR granular kwargs.
-    Always supplies jd_ut/jd_tt/jd_ut1 when supported.
+    Always supplies jd_ut/jd_tt/jd_ut1 from the SAME kernel to guarantee parity
+    with the houses engine.
     """
     if _compute_chart is None:
         raise RuntimeError("chart_engine_unavailable")
@@ -192,14 +193,17 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
     # --- engines that accept a single 'payload' dict (e.g., app.core.astronomy.compute_chart) ---
     if "payload" in params:
         merged = dict(payload)
-        merged.setdefault("jd_ut", ts["jd_utc"])
-        merged.setdefault("jd_tt", ts["jd_tt"])
-        merged.setdefault("jd_ut1", ts["jd_ut1"])
+        # HARD-ASSIGN (no setdefault): force a single source of truth for timescales
+        merged["jd_ut"] = ts["jd_utc"]
+        merged["jd_tt"] = ts["jd_tt"]
+        merged["jd_ut1"] = ts["jd_ut1"]
         chart = _compute_chart(merged)
         chart.setdefault("meta", {})
         chart["meta"]["engine"] = _CHART_ENGINE_NAME or "unknown"
-        if "jd_ut" not in chart:
-            chart["jd_ut"] = ts["jd_utc"]
+        # Enforce parity in the returned chart object too
+        chart["jd_ut"] = ts["jd_utc"]
+        chart["jd_tt"] = ts["jd_tt"]
+        chart["jd_ut1"] = ts["jd_ut1"]
         if "mode" not in chart and "mode" in payload:
             chart["mode"] = payload["mode"]
         return chart
@@ -235,6 +239,7 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
     if name_topo and "topocentric" in payload: kwargs[name_topo] = bool(payload["topocentric"])
     if name_elev and "elevation_m" in payload: kwargs[name_elev] = payload["elevation_m"]
 
+    # Force identical timescales
     if "jd_ut" in params:  kwargs["jd_ut"]  = ts["jd_utc"]
     if "jd_tt" in params:  kwargs["jd_tt"]  = ts["jd_tt"]
     if "jd_ut1" in params: kwargs["jd_ut1"] = ts["jd_ut1"]
@@ -242,8 +247,10 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
 
     chart = _compute_chart(**kwargs)
 
-    if "jd_ut" not in chart:
-        chart["jd_ut"] = ts["jd_utc"]
+    # Enforce parity in the returned chart object as well
+    chart["jd_ut"] = ts["jd_utc"]
+    chart["jd_tt"] = ts["jd_tt"]
+    chart["jd_ut1"] = ts["jd_ut1"]
     if "mode" not in chart and "mode" in payload:
         chart["mode"] = payload["mode"]
 
@@ -292,7 +299,7 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
         elif accepts.get("house_system"):
             kwargs["house_system"] = requested_system
 
-    # timescales
+    # timescales (force same source as chart)
     if accepts.get("jd_tt"):
         kwargs["jd_tt"] = ts["jd_tt"]
     if accepts.get("jd_ut1"):
@@ -404,7 +411,13 @@ def calculate():
     try:
         chart = _call_compute_chart(payload, ts)
     except Exception as e:
-        chart = {"mode": payload.get("mode"), "jd_ut": ts["jd_utc"], "meta": {"engine": _CHART_ENGINE_NAME}}
+        chart = {
+            "mode": payload.get("mode"),
+            "jd_ut": ts["jd_utc"],
+            "jd_tt": ts["jd_tt"],
+            "jd_ut1": ts["jd_ut1"],
+            "meta": {"engine": _CHART_ENGINE_NAME, "warnings": ["chart_failed"]},
+        }
         chart_warnings.append("chart_failed")
         if DEBUG_VERBOSE:
             chart["error"] = str(e)
@@ -423,7 +436,12 @@ def calculate():
     if chart_warnings:
         chart["warnings"] = chart.get("warnings", []) + chart_warnings
 
-    meta = {"timescales": ts, "chart_engine": _CHART_ENGINE_NAME, "houses_engine": _HOUSES_KIND}
+    meta = {
+        "timescales": ts,
+        "timescales_locked": True,
+        "chart_engine": _CHART_ENGINE_NAME,
+        "houses_engine": _HOUSES_KIND,
+    }
     return jsonify({"ok": True, "chart": chart, "houses": houses, "meta": meta}), 200
 
 
@@ -450,7 +468,13 @@ def report():
     try:
         chart = _call_compute_chart(payload, ts)
     except Exception as e:
-        chart = {"mode": payload.get("mode"), "jd_ut": ts["jd_utc"], "meta": {"engine": _CHART_ENGINE_NAME}}
+        chart = {
+            "mode": payload.get("mode"),
+            "jd_ut": ts["jd_utc"],
+            "jd_tt": ts["jd_tt"],
+            "jd_ut1": ts["jd_ut1"],
+            "meta": {"engine": _CHART_ENGINE_NAME, "warnings": ["chart_failed"]},
+        }
         chart_warnings.append("chart_failed")
         if DEBUG_VERBOSE:
             chart["error"] = str(e)
@@ -473,7 +497,12 @@ def report():
         "Evidence will accompany predictions in /predictions."
     )
 
-    meta = {"timescales": ts, "chart_engine": _CHART_ENGINE_NAME, "houses_engine": _HOUSES_KIND}
+    meta = {
+        "timescales": ts,
+        "timescales_locked": True,
+        "chart_engine": _CHART_ENGINE_NAME,
+        "houses_engine": _HOUSES_KIND,
+    }
     return jsonify({"ok": True, "chart": chart, "houses": houses, "narrative": narrative, "meta": meta}), 200
 
 
@@ -591,7 +620,12 @@ def predictions_route():
                 log.warning("flag_predictions failed: %r", e)
             # leave `preds` unmodified
 
-    meta = {"timescales": ts, "chart_engine": _CHART_ENGINE_NAME, "houses_engine": _HOUSES_KIND}
+    meta = {
+        "timescales": ts,
+        "timescales_locked": True,
+        "chart_engine": _CHART_ENGINE_NAME,
+        "houses_engine": _HOUSES_KIND,
+    }
     return jsonify({"ok": True, "predictions": preds, "meta": meta}), 200
 
 
