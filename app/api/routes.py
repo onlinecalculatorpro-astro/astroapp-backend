@@ -23,6 +23,14 @@ from app.core.validators import (
     parse_prediction_payload,
     parse_rectification_payload,
 )
+def _wrap360(x: float) -> float:
+    """Normalize degrees to [0, 360). Safe for any float-like."""
+    try:
+        v = float(x) % 360.0
+        # collapse -0.0 to 0.0 for pretty output
+        return 0.0 if abs(v) < 1e-12 else v
+    except Exception:
+        return x  # leave non-numerics untouched
 
 log = logging.getLogger(__name__)
 api = Blueprint("api", __name__)
