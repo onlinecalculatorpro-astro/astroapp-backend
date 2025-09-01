@@ -3,17 +3,34 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Final
 from time import perf_counter
+from typing import Any, Dict, Final, Optional
 
 from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-from app.api.routes import api
-from app.api.predictions import predictions_bp
-from app.utils.config import load_config
+# Optional blueprints (won't crash app if absent)
+try:
+    from app.api.routes import api as _routes_bp  # type: ignore
+except Exception:  # pragma: no cover
+    _routes_bp = None
+
+try:
+    from app.api.predictions import predictions_bp as _pred_bp  # type: ignore
+except Exception:  # pragma: no cover
+    _pred_bp = None
+
+# Config loader (optional)
+try:
+    from app.utils.config import load_config  # type: ignore
+except Exception:  # pragma: no cover
+    load_config = None  # type: ignore
+
+# Core engines
+from app.core.astronomy import compute_chart
+from app.core import timescales as _ts
 
 # Prometheus metrics
 from prometheus_client import (
@@ -34,6 +51,7 @@ MET_WARNINGS: Final = Counter("astro_warning_total", "Non-fatal warnings", ["kin
 GAUGE_DUT1: Final = Gauge("astro_dut1_broadcast_seconds", "DUT1 broadcast seconds")
 GAUGE_APP_UP: Final = Gauge("astro_app_up", "1 if app is running")
 REQ_LATENCY: Final = Histogram("astro_request_seconds", "API request latency", ["route"])
+
 
 # ───────────────────────────── helpers ─────────────────────────────
 def _configure_logging(app: Flask) -> None:
@@ -65,6 +83,10 @@ def _register_errors(app: Flask) -> None:
 
 def _register_health(app: Flask) -> None:
     """Health endpoints for Render/CF probes."""
+    @app.route("/", methods=["GET"])
+    def root():
+        return jsonify(ok=True, service="astro-backend", health="/health"), 200
+
     @app.route("/api/health-check", methods=["GET"])
     def api_health():
         return jsonify(ok=True), 200
@@ -89,6 +111,105 @@ def _metrics_auth_ok() -> bool:
         and pw
     )
 
+
+def _body_json() -> Dict[str, Any]:
+    try:
+        data = request.get_json(force=True, silent=False)  # raise if invalid JSON
+        if not isinstance(data, dict):
+            raise ValueError("JSON body must be an object")
+        return data
+    except Exception as e:
+        raise HTTPException(description=f"Invalid JSON: {e}", response=None, code=400)  # type: ignore[arg-type]
+
+
+def _compute_timescales_payload(date: str, time_s: str, tz: str) -> Dict[str, Any]:
+    """
+    Convert civil date/time/tz → {jd_ut, jd_tt, jd_ut1, utc}.
+    Uses app.core.timescales; UT1 is UT + DUT1 (env) seconds.
+    """
+    # Build UTC ISO and JD(UT)
+    utc_iso = _ts.to_utc_iso(date, time_s, tz)
+    jd_ut = _ts.julian_day_utc(date, time_s, tz)
+
+    # TT from UT via ΔT poly
+    # Get a UTC datetime again to extract year/month for ΔT
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    dt_utc = datetime.fromisoformat(f"{date}T{time_s}:00").replace(tzinfo=ZoneInfo(tz)).astimezone(ZoneInfo("UTC"))
+    jd_tt = _ts.jd_tt_from_utc_jd(jd_ut, dt_utc.year, dt_utc.month)
+
+    # UT1 = UT + DUT1 (seconds) / 86400
+    dut1 = float(os.getenv("ASTRO_DUT1_BROADCAST", os.getenv("ASTRO_DUT1", "0.0")))
+    jd_ut1 = jd_ut + (dut1 / 86400.0)
+
+    return {
+        "utc": utc_iso,
+        "jd_ut": float(jd_ut),
+        "jd_tt": float(jd_tt),
+        "jd_ut1": float(jd_ut1),
+        "dut1": float(dut1),
+    }
+
+
+def _register_core_api(app: Flask) -> None:
+    """Minimal, stable endpoints used by your browser console tests."""
+
+    # ---- timescales ----
+    def _timescales_handler():
+        data = _body_json()
+        date = data.get("date")
+        time_s = data.get("time")
+        tz = data.get("tz") or data.get("place_tz")
+        if not (isinstance(date, str) and isinstance(time_s, str) and isinstance(tz, str)):
+            return jsonify(error="invalid_input", message="Provide 'date', 'time', and 'tz' (IANA)"), 400
+        out = _compute_timescales_payload(date, time_s, tz)
+        return jsonify(out), 200
+
+    # Canonical
+    app.add_url_rule("/api/time/timescales", "timescales", _timescales_handler, methods=["POST"])
+    # Friendly aliases (your console code probes many of these)
+    for alias in (
+        "/api/timescales",
+        "/time/timescales",
+        "/timescales",
+        "/api/time/convert",
+    ):
+        app.add_url_rule(alias, f"timescales_alias_{alias}", _timescales_handler, methods=["POST"])
+
+    # ---- chart ----
+    def _chart_handler():
+        payload = _body_json()
+
+        # If caller passed civil inputs but not jd_*, compute them here
+        have_all_jd = all(k in payload for k in ("jd_ut", "jd_tt", "jd_ut1"))
+        if not have_all_jd:
+            date = payload.get("date"); time_s = payload.get("time")
+            tz = payload.get("tz") or payload.get("place_tz")
+            if isinstance(date, str) and isinstance(time_s, str) and isinstance(tz, str):
+                ts = _compute_timescales_payload(date, time_s, tz)
+                payload.update({k: ts[k] for k in ("jd_ut", "jd_tt", "jd_ut1")})
+
+        # Default mode if not provided
+        payload.setdefault("mode", "tropical")
+
+        res = compute_chart(payload)
+        return jsonify(res), 200
+
+    # Canonical
+    app.add_url_rule("/api/chart", "chart", _chart_handler, methods=["POST"])
+    # Aliases probed by your tests
+    for alias in (
+        "/chart",
+        "/api/compute_chart",
+        "/compute_chart",
+        "/api/astronomy/chart",
+        "/astronomy/chart",
+        "/api/astro/chart",
+    ):
+        app.add_url_rule(alias, f"chart_alias_{alias}", _chart_handler, methods=["POST"])
+
+
 # ───────────────────────────── app factory ─────────────────────────────
 def create_app() -> Flask:
     app = Flask(__name__)
@@ -99,15 +220,20 @@ def create_app() -> Flask:
 
     _configure_logging(app)
 
-    # Config file
+    # Config file (optional)
     cfg_path = os.environ.get("ASTRO_CONFIG", "config/defaults.yaml")
-    app.cfg = load_config(cfg_path)  # type: ignore[attr-defined]
+    if load_config:
+        try:
+            app.cfg = load_config(cfg_path)  # type: ignore[attr-defined]
+        except Exception:
+            app.cfg = {}  # type: ignore[attr-defined]
 
     # Pre-seed metrics
     seeded_routes = (
+        "/",
         "/api/health-check",
-        "/api/calculate",
-        "/api/predictions",
+        "/api/chart",
+        "/api/time/timescales",
         "/health",
         "/healthz",
         "/metrics",
@@ -124,7 +250,7 @@ def create_app() -> Flask:
     def _before():
         try:
             p = (request.path or "")
-            if p.startswith("/api/") or p in ("/health", "/healthz", "/metrics"):
+            if p.startswith("/api/") or p in ("/", "/health", "/healthz", "/metrics"):
                 MET_REQUESTS.labels(route=p).inc()
                 request._t0 = perf_counter()
         except Exception:
@@ -134,20 +260,27 @@ def create_app() -> Flask:
     def _after(resp):
         try:
             p = (request.path or "")
-            if (p.startswith("/api/") or p in ("/health", "/healthz")) and hasattr(request, "_t0"):
+            if (p.startswith("/api/") or p in ("/", "/health", "/healthz")) and hasattr(request, "_t0"):
                 dt = perf_counter() - request._t0
                 REQ_LATENCY.labels(route=p).observe(dt)
         except Exception:
             pass
         return resp
 
-    # Register routes
-    app.register_blueprint(api)
-    app.register_blueprint(predictions_bp, url_prefix="/api")
+    # Register health/errors first
     _register_health(app)
     _register_errors(app)
 
-    # /metrics protected endpoint
+    # Core minimal API (timescales + chart)
+    _register_core_api(app)
+
+    # Optional feature blueprints
+    if _routes_bp is not None:
+        app.register_blueprint(_routes_bp)
+    if _pred_bp is not None:
+        app.register_blueprint(_pred_bp, url_prefix="/api")
+
+    # /metrics (Basic Auth)
     @app.route("/metrics", methods=["GET"])
     def metrics_endpoint():
         if not _metrics_auth_ok():
@@ -155,15 +288,16 @@ def create_app() -> Flask:
 
         GAUGE_APP_UP.set(1.0)
         try:
-            GAUGE_DUT1.set(float(os.environ.get("ASTRO_DUT1_BROADCAST", "0.0")))
+            GAUGE_DUT1.set(float(os.environ.get("ASTRO_DUT1_BROADCAST", os.environ.get("ASTRO_DUT1", "0.0"))))
         except Exception:
             pass
 
         data = generate_latest(REGISTRY)
         return Response(data, mimetype=CONTENT_TYPE_LATEST)
 
-    app.logger.info("App initialized with config path %s", cfg_path)
+    app.logger.info("App initialized; core endpoints ready")
     return app
+
 
 # ───────────────────────────── app instance ─────────────────────────────
 app = create_app()
