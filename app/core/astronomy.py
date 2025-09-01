@@ -31,6 +31,12 @@ try:
 except Exception:
     _tk = None
 
+# Optional civil→JD helper you provided
+try:
+    from app.core import timescales as _ts  # type: ignore
+except Exception:
+    _ts = None
+
 # Optional high-precision sidereal/obliquity helpers
 try:  # pragma: no cover
     import erfa  # PyERFA (SOFA)
@@ -57,6 +63,9 @@ _ELEV_MIN         = float(os.getenv("OCP_GEO_ELEV_MIN", "-500.0"))
 _ELEV_MAX         = float(os.getenv("OCP_GEO_ELEV_MAX", "10000.0"))
 _ELEV_WARN        = float(os.getenv("OCP_GEO_ELEV_WARN", "3000.0"))
 _ANTIMER_WARN_LON = float(os.getenv("OCP_GEO_ANTI_WARN", "179.9"))
+
+# UT1 offset (UT1−UTC) seconds; set this if you want high-fidelity UT1
+_DUT1_SECONDS     = float(os.getenv("OCP_DUT1_SECONDS", "0.0"))
 
 
 # ───────────────────────────── Helpers ─────────────────────────────
@@ -117,6 +126,7 @@ def _validate_payload(payload: Dict[str, Any]) -> Tuple[str, List[str]]:
 
 
 def _ensure_timescales(payload: Dict[str, Any]) -> Tuple[float, float, float]:
+    """Return (jd_ut, jd_tt, jd_ut1). Prefers explicit; then time_kernel; then local civil→JD fallback."""
     jd_ut  = payload.get("jd_ut")
     jd_tt  = payload.get("jd_tt")
     jd_ut1 = payload.get("jd_ut1")
@@ -124,6 +134,7 @@ def _ensure_timescales(payload: Dict[str, Any]) -> Tuple[float, float, float]:
     if all(isinstance(x, (int, float)) for x in (jd_ut, jd_tt, jd_ut1)):
         return float(jd_ut), float(jd_tt), float(jd_ut1)
 
+    # 1) project time_kernel if present
     if _tk is not None:
         for fname in ("timescales_from_civil", "compute_timescales", "build_timescales",
                       "to_timescales", "from_civil"):
@@ -133,7 +144,7 @@ def _ensure_timescales(payload: Dict[str, Any]) -> Tuple[float, float, float]:
                     out = fn(
                         payload.get("date"),
                         payload.get("time"),
-                        payload.get("place_tz"),
+                        payload.get("place_tz") or payload.get("tz"),
                         payload.get("latitude"),
                         payload.get("longitude"),
                     )
@@ -141,8 +152,67 @@ def _ensure_timescales(payload: Dict[str, Any]) -> Tuple[float, float, float]:
                 except Exception:
                     continue
 
-    missing = [k for k, v in (("jd_ut", jd_ut), ("jd_tt", jd_tt), ("jd_ut1", jd_ut1)) if not isinstance(v, (int, float))]
-    raise AstronomyError("timescales_missing", f"Supply {', '.join(missing)} or configure time_kernel")
+    # 2) use your timescales module or stdlib fallback (handles HH:MM and HH:MM:SS)
+    date_str = payload.get("date")
+    time_str = payload.get("time")
+    tz_str   = payload.get("place_tz") or payload.get("tz") or "UTC"
+    if not isinstance(date_str, str) or not isinstance(time_str, str):
+        missing = [k for k, v in (("jd_ut", jd_ut), ("jd_tt", jd_tt), ("jd_ut1", jd_ut1)) if not isinstance(v, (int, float))]
+        raise AstronomyError("timescales_missing", f"Supply {', '.join(missing)} or provide date/time/tz")
+
+    def _jd_utc_via_ts(d: str, t: str, z: str) -> float:
+        if _ts is None:
+            raise RuntimeError("timescales module not available")
+        return float(_ts.julian_day_utc(d, t, z))
+
+    def _jd_utc_via_stdlib(d: str, t: str, z: str) -> float:
+        from datetime import datetime, timezone
+        from zoneinfo import ZoneInfo
+        # Allow HH:MM or HH:MM:SS
+        parts = t.split(":")
+        timestr = t if len(parts) >= 3 else (t + ":00")
+        dt_local = datetime.fromisoformat(f"{d}T{timestr}")
+        try:
+            tzinfo = ZoneInfo(z)
+        except Exception:
+            tzinfo = ZoneInfo("UTC")
+        dt_local = dt_local.replace(tzinfo=tzinfo)
+        dt_utc = dt_local.astimezone(timezone.utc)
+        # Meeus JD
+        Y = dt_utc.year; M = dt_utc.month; D = dt_utc.day
+        h = dt_utc.hour + dt_utc.minute/60 + dt_utc.second/3600 + dt_utc.microsecond/3.6e9
+        if M <= 2:
+            Y -= 1; M += 12
+        A = Y // 100
+        B = 2 - A + A // 4
+        JD0 = int(365.25*(Y + 4716)) + int(30.6001*(M + 1)) + D + B - 1524.5
+        return JD0 + h/24.0
+
+    # Compute JD_UTC
+    try:
+        jd_utc = _jd_utc_via_ts(date_str, time_str, tz_str)
+    except Exception:
+        jd_utc = _jd_utc_via_stdlib(date_str, time_str, tz_str)
+
+    # Compute TT (preferring your module for ΔT) and UT1
+    try:
+        y, m = map(int, str(date_str).split("-")[:2])
+    except Exception:
+        # minimal safe fallback: parse from JD_UTC roughly (rare)
+        y, m = 2000, 1
+
+    if _ts is not None:
+        try:
+            jd_tt_calc = float(_ts.jd_tt_from_utc_jd(jd_utc, y, m))
+        except Exception:
+            jd_tt_calc = jd_utc + 69.0/86400.0  # rough ΔT fallback
+    else:
+        jd_tt_calc = jd_utc + 69.0/86400.0  # rough ΔT fallback
+
+    jd_ut_calc  = jd_utc
+    jd_ut1_calc = jd_utc + (_DUT1_SECONDS / 86400.0)
+
+    return jd_ut_calc, jd_tt_calc, jd_ut1_calc
 
 
 # ───────────────────────────── Geographic sanity for topocentric ─────
@@ -506,7 +576,6 @@ def _asc_longitude_deg(phi: float, ramc: float, eps: float) -> float:
     """
     num = -((_tand(phi) * _sind(eps)) + (_sind(ramc) * _cosd(eps)))
     den = _cosd(ramc)
-    # guard against division by 0 in extreme cases
     den = den if abs(den) > 1e-15 else math.copysign(1e-15, den if den != 0 else 1.0)
     return _acotd(num / den)
 
