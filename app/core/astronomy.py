@@ -26,10 +26,16 @@ except Exception as e:
     _EPH_IMPORT_ERROR = e
 
 try:
-    # single SoT for JD conversions (only used when payload doesn't pass jd_* directly)
+    # Single source of truth for JD conversions when jd_* aren't provided
     from app.core import time_kernel as _tk  # type: ignore
 except Exception:
     _tk = None
+
+# Optional high-precision sidereal/obliquity helpers
+try:  # pragma: no cover
+    import erfa  # PyERFA (SOFA)
+except Exception:  # pragma: no cover
+    erfa = None
 
 
 # ───────────────────────────── Config & constants ─────────────────────
@@ -408,9 +414,11 @@ def _longitudes_and_speeds(
 
     now_lon, now_spd, source = _cached_positions(jd_tt_q, names_key, topocentric, lat_q, lon_q, elev_q)
 
+    # If all speeds are provided by adapter
     if all(now_spd.get(nm) is not None for nm in names_key):
         return {nm: (_norm360(float(now_lon[nm])), float(now_spd[nm])) for nm in names_key}, source
 
+    # Else compute symmetric FD
     if speed_step_days and speed_step_days > 0:
         jm = _q(jd_tt - speed_step_days, _JD_QUANT)
         jp = _q(jd_tt + speed_step_days, _JD_QUANT)
@@ -431,46 +439,78 @@ def _longitudes_and_speeds(
     return out, source
 
 
-# ───────────────────────────── Angles (Asc/MC) ────────────────────────
-def _mean_obliquity_deg(jd_tt: float) -> float:
-    """IAU 2006/2000A mean obliquity (arcsec poly trimmed; accurate to ~mas scale)."""
-    T = (float(jd_tt) - 2451545.0) / 36525.0
-    # Meeus 2000, Eq. 22.3 (sufficient here)
-    eps_arcsec = 84381.448 - 46.8150*T - 0.00059*(T**2) + 0.001813*(T**3)
-    return eps_arcsec / 3600.0
+# ───────────────────────────── Angles (Asc/MC) — strict parity ────────
+def _split_jd(jd: float) -> Tuple[float, float]:
+    d = math.floor(jd)
+    return d, jd - d
 
-def _gmst_deg_from_jd_ut1(jd_ut1: float) -> float:
-    """Greenwich Mean Sidereal Time in degrees (IAU 1982-ish, good to <0.1s for our use)."""
+def _atan2d(y: float, x: float) -> float:
+    if x == 0.0 and y == 0.0:
+        # match houses_advanced strictness
+        raise ValueError("atan2(0,0) undefined")
+    return _norm360(math.degrees(math.atan2(y, x)))
+
+def _sind(a: float) -> float: return math.sin(math.radians(a))
+def _cosd(a: float) -> float: return math.cos(math.radians(a))
+def _tand(a: float) -> float: return math.tan(math.radians(a))
+
+def _acotd(x: float) -> float:
+    # quadrant-safe arccot using atan2(1, x)
+    return _norm360(math.degrees(math.atan2(1.0, x)))
+
+def _gast_deg(jd_ut1: float, jd_tt: float) -> float:
+    """
+    Apparent sidereal time (GAST) in degrees using IAU 2006/2000A if ERFA is present;
+    otherwise fall back to GMST-like approximation (less precise).
+    """
+    if erfa is not None:  # high precision path
+        d1u, d2u = _split_jd(jd_ut1)
+        d1t, d2t = _split_jd(jd_tt)
+        gst_rad = erfa.gst06a(d1u, d2u, d1t, d2t)
+        return _norm360(math.degrees(gst_rad))
+
+    # Fallback GMST approximation (adequate but not sub-arcmin)
     T = (float(jd_ut1) - 2451545.0) / 36525.0
     theta = 280.46061837 + 360.98564736629 * (float(jd_ut1) - 2451545.0) \
             + 0.000387933*(T**2) - (T**3)/38710000.0
     return _norm360(theta)
 
-def _asc_mc_from_sidereal(lst_deg: float, lat_deg: float, eps_deg: float) -> Tuple[float, float]:
+def _true_obliquity_deg(jd_tt: float) -> float:
     """
-    Compute (Asc, MC) ecliptic longitudes from local sidereal angle, latitude and obliquity.
-    Formulas follow standard spherical astronomy identities.
+    True obliquity ε = mean(IAU 2006) + nutation in obliquity (IAU 2000A) with ERFA;
+    fallback to mean obliquity if ERFA missing.
     """
-    # convert to radians
-    th  = math.radians(_norm360(lst_deg))
-    phi = math.radians(max(-90.0, min(90.0, float(lat_deg))))
-    eps = math.radians(float(eps_deg))
+    if erfa is not None:
+        d1, d2 = _split_jd(jd_tt)
+        eps0 = erfa.obl06(d1, d2)
+        _dpsi, deps = erfa.nut06a(d1, d2)
+        return math.degrees(eps0 + deps)
 
-    # Midheaven: λ_MC = atan2(sin θ, cos θ * cos ε)
-    num_mc = math.sin(th)
-    den_mc = math.cos(th) * math.cos(eps)
-    lam_mc = math.degrees(math.atan2(num_mc, den_mc))
-    lam_mc = _norm360(lam_mc)
+    # Meeus 2000 Eq. 22.3 mean obliquity (arcseconds polynomial)
+    T = (float(jd_tt) - 2451545.0) / 36525.0
+    eps_arcsec = 84381.448 - 46.8150*T - 0.00059*(T**2) + 0.001813*(T**3)
+    return eps_arcsec / 3600.0
 
-    # Ascendant: λ_ASC = atan2(-cos θ, sin θ * cos ε + tan φ * sin ε)
-    num_asc = -math.cos(th)
-    den_asc = (math.sin(th) * math.cos(eps)) + (math.tan(phi) * math.sin(eps))
-    lam_asc = math.degrees(math.atan2(num_asc, den_asc))
-    lam_asc = _norm360(lam_asc)
+def _ramc_deg(jd_ut1: float, jd_tt: float, lon_east_deg: float) -> float:
+    """Right Ascension of the MC = GAST + longitude (east-positive)."""
+    return _norm360(_gast_deg(jd_ut1, jd_tt) + float(lon_east_deg))
 
-    return lam_asc, lam_mc
+def _mc_longitude_deg(ramc: float, eps: float) -> float:
+    """λ_MC = atan2( sin(RAMC) * cos ε, cos(RAMC) )."""
+    return _atan2d(_sind(ramc) * _cosd(eps), _cosd(ramc))
 
-def _compute_angles_best_effort(
+def _asc_longitude_deg(phi: float, ramc: float, eps: float) -> float:
+    """
+    Exact Ascendant (arccot form; quadrant-safe) — matches houses_advanced:
+    ASC = arccot( - ( tan φ * sin ε + sin RAMC * cos ε ) / cos RAMC )
+    """
+    num = -((_tand(phi) * _sind(eps)) + (_sind(ramc) * _cosd(eps)))
+    den = _cosd(ramc)
+    # guard against division by 0 in extreme cases
+    den = den if abs(den) > 1e-15 else math.copysign(1e-15, den if den != 0 else 1.0)
+    return _acotd(num / den)
+
+def _compute_angles_parity(
     jd_ut1: float,
     jd_tt: float,
     latitude: Optional[float],
@@ -480,71 +520,34 @@ def _compute_angles_best_effort(
     ayanamsa_deg: Optional[float],
 ) -> Optional[Tuple[float, float]]:
     """
-    Best-effort Asc/MC computation.
-    1) Pure-Python fallback (GMST+ε) → preferred (no extra deps).
-    2) As a last resort, attempt houses engine to read asc/mc (kept lazy to avoid cycles).
-    Returns angles in the chart's zodiac (tropical or sidereal), or None on failure.
+    Strict Asc/MC computation with the same conventions as houses_advanced:
+      - GAST (IAU 2006/2000A) when ERFA available
+      - True obliquity (mean 2006 + nutation 2000A)
+      - RAMC = GAST + λ (east-positive)
+      - Exact arccot/atan2 forms for ASC/MC
+      - Rotate angles by ayanamsa for sidereal output
+    Returns (asc_deg, mc_deg) or None if lat/lon are missing.
     """
-    try:
-        if latitude is None or longitude is None:
-            return None
-
-        # Local sidereal angle (degrees)
-        gmst = _gmst_deg_from_jd_ut1(jd_ut1)     # Greenwich
-        lst  = _norm360(gmst + float(longitude)) # Local (east positive)
-
-        eps  = _mean_obliquity_deg(jd_tt)
-        asc, mc = _asc_mc_from_sidereal(lst, float(latitude), eps)
-
-        # Rotate for sidereal charts
-        if mode == "sidereal" and ayanamsa_deg is not None:
-            asc = _norm360(asc - float(ayanamsa_deg))
-            mc  = _norm360(mc  - float(ayanamsa_deg))
-        return float(asc), float(mc)
-    except Exception:
-        pass
-
-    # Last resort: borrow angles from houses engine (only for numbers, not ideal for parity)
-    try:
-        # local import to avoid import cycles on module load
-        try:
-            from app.core.house import compute_houses_with_policy as _houses_fn  # type: ignore
-        except Exception:
-            from app.core.houses_advanced import compute_house_system as _houses_fn  # type: ignore
-
-        kwargs: Dict[str, Any] = {}
-        # use whatever args the function accepts
-        pars = inspect.signature(_houses_fn).parameters
-        if "lat" in pars: kwargs["lat"] = float(latitude)
-        if "lon" in pars: kwargs["lon"] = float(longitude)
-        if "latitude" in pars: kwargs["latitude"] = float(latitude)
-        if "longitude" in pars: kwargs["longitude"] = float(longitude)
-        if "jd_tt" in pars: kwargs["jd_tt"] = float(jd_tt)
-        if "jd_ut1" in pars: kwargs["jd_ut1"] = float(jd_ut1)
-        if "jd_ut" in pars and "jd_tt" not in pars and "jd_ut1" not in pars:
-            kwargs["jd_ut"] = float(jd_ut1)  # close enough for engines expecting UT as UT1
-        if "mode" in pars: kwargs["mode"] = mode
-
-        H = _houses_fn(**kwargs)
-        if isinstance(H, dict):
-            asc = H.get("asc_deg", H.get("asc"))
-            mc  = H.get("mc_deg", H.get("mc"))
-            if isinstance(asc, (int,float)) and isinstance(mc, (int,float)):
-                return float(asc), float(mc)
-    except Exception:
-        pass
-
-    return None
+    if latitude is None or longitude is None:
+        return None
+    eps = _true_obliquity_deg(jd_tt)
+    ramc = _ramc_deg(jd_ut1, jd_tt, float(longitude))
+    mc = _mc_longitude_deg(ramc, eps)
+    asc = _asc_longitude_deg(float(latitude), ramc, eps)
+    if mode == "sidereal" and ayanamsa_deg is not None:
+        asc = _norm360(asc - float(ayanamsa_deg))
+        mc  = _norm360(mc  - float(ayanamsa_deg))
+    return float(asc), float(mc)
 
 
 # ───────────────────────────── Main API ───────────────────────────────
 def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Gold-standard planetary chart computation.
-    - Planets at JD_TT (ecliptic-of-date).
+    Planetary chart computation (ecliptic-of-date).
+    - Planets at JD_TT.
     - Sidereal = tropical − ayanamsa (pluggable; explicit degrees or named model).
     - Adapter speeds preferred; FD speeds as fallback.
-    - Emits angles (Asc/MC) with a pure-python fallback.
+    - Angles (Asc/MC) computed with ERFA GAST + true obliquity (parity with houses_advanced).
     - Strict validation, robust geo handling for topocentric, friendly errors.
     """
     if eph is None:
@@ -554,7 +557,7 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
     mode, bodies = _validate_payload(payload)
 
     # Timescales (TT for planets, UT1 for angles/LST)
-    jd_ut, jd_tt, jd_ut1 = _ensure_timescales(payload)  # noqa: F841 (jd_ut kept for completeness)
+    jd_ut, jd_tt, jd_ut1 = _ensure_timescales(payload)  # noqa: F841
 
     # Geometry (topocentric handling for planets; angles need lat/lon regardless)
     topocentric = _coerce_bool(payload.get("topocentric"), False)
@@ -573,10 +576,10 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
             topocentric = False
             lat = lon = elev = None
     else:
-        # still keep raw lat/lon for angles (not quantized), if present
+        # Retain raw lat/lon for angles (geocentric planetary calc ignores elevation)
         lat = float(payload.get("latitude")) if _is_finite(payload.get("latitude")) else None
         lon = float(payload.get("longitude")) if _is_finite(payload.get("longitude")) else None
-        elev = None  # not used for planetary calc when geocentric
+        elev = None
 
     # Ephemeris (longitudes + speeds)
     results, source_tag = _longitudes_and_speeds(
@@ -604,8 +607,8 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
             "speed_deg_per_day": float(speed),
         })
 
-    # Angles (Asc/MC) — try best-effort computation
-    asc_mc = _compute_angles_best_effort(
+    # Angles (Asc/MC) — strict parity with houses_advanced
+    asc_mc = _compute_angles_parity(
         jd_ut1=jd_ut1, jd_tt=jd_tt, latitude=lat, longitude=lon,
         mode=mode, ayanamsa_deg=ay_deg
     )
@@ -620,6 +623,7 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
         "frame": "ecliptic-of-date",
         "observer": "topocentric" if topocentric else "geocentric",
         "source": str(source_tag),
+        "angles_engine": "ERFA gst06a + true_obliquity" if erfa is not None else "GMST(mean) fallback",
     }
     if warnings:
         meta["warnings"] = warnings
