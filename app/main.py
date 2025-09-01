@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime
 from time import perf_counter
-from typing import Any, Dict, Final, Optional
+from typing import Any, Dict, Final
 
 from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
-from werkzeug.exceptions import HTTPException
+from werkzeug.exceptions import HTTPException, BadRequest
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 # Optional blueprints (won't crash app if absent)
@@ -65,20 +66,30 @@ def _configure_logging(app: Flask) -> None:
 
 
 def _register_errors(app: Flask) -> None:
-    """Consistent JSON error payloads."""
+    """Consistent JSON error payloads (and visible 500 bodies for DevTools)."""
+    import traceback
+
     @app.errorhandler(HTTPException)
     def _http(e: HTTPException):
+        app.logger.warning("HTTP %s at %s %s: %s", e.code, request.method, request.path, e.description)
         return jsonify(
             error="http_error",
             code=e.code,
             name=e.name,
-            description=e.description,
+            message=e.description,
+            path=request.path,
         ), e.code
 
     @app.errorhandler(Exception)
     def _any(e: Exception):
-        app.logger.exception(e)
-        return jsonify(error="internal_error", type=type(e).__name__, message=str(e)), 500
+        tb = traceback.format_exc()
+        app.logger.error("UNHANDLED %s at %s %s\n%s", type(e).__name__, request.method, request.path, tb)
+        return jsonify(
+            error="internal_error",
+            type=type(e).__name__,
+            message=str(e),
+            path=request.path,
+        ), 500
 
 
 def _register_health(app: Flask) -> None:
@@ -113,13 +124,23 @@ def _metrics_auth_ok() -> bool:
 
 
 def _body_json() -> Dict[str, Any]:
-    try:
-        data = request.get_json(force=True, silent=False)  # raise if invalid JSON
-        if not isinstance(data, dict):
-            raise ValueError("JSON body must be an object")
-        return data
-    except Exception as e:
-        raise HTTPException(description=f"Invalid JSON: {e}", response=None, code=400)  # type: ignore[arg-type]
+    """Strict JSON object parser with nice 400s."""
+    data = request.get_json(force=True, silent=False)
+    if not isinstance(data, dict):
+        raise BadRequest("JSON body must be an object")
+    return data
+
+
+def _normalize_time_hms(s: str) -> str:
+    """Accept 'HH:MM' or 'HH:MM:SS'; normalize to HH:MM:SS."""
+    s = s.strip()
+    if len(s.split(":")) == 2:
+        hh, mm = s.split(":")
+        return f"{int(hh):02d}:{int(mm):02d}:00"
+    elif len(s.split(":")) == 3:
+        hh, mm, ss = s.split(":")
+        return f"{int(hh):02d}:{int(mm):02d}:{int(ss):02d}"
+    raise BadRequest("time must be 'HH:MM' or 'HH:MM:SS'")
 
 
 def _compute_timescales_payload(date: str, time_s: str, tz: str) -> Dict[str, Any]:
@@ -127,19 +148,19 @@ def _compute_timescales_payload(date: str, time_s: str, tz: str) -> Dict[str, An
     Convert civil date/time/tz → {jd_ut, jd_tt, jd_ut1, utc}.
     Uses app.core.timescales; UT1 is UT + DUT1 (env) seconds.
     """
-    # Build UTC ISO and JD(UT)
-    utc_iso = _ts.to_utc_iso(date, time_s, tz)
-    jd_ut = _ts.julian_day_utc(date, time_s, tz)
-
-    # TT from UT via ΔT poly
-    # Get a UTC datetime again to extract year/month for ΔT
-    from datetime import datetime
     from zoneinfo import ZoneInfo
 
-    dt_utc = datetime.fromisoformat(f"{date}T{time_s}:00").replace(tzinfo=ZoneInfo(tz)).astimezone(ZoneInfo("UTC"))
+    time_norm = _normalize_time_hms(time_s)
+
+    # UTC ISO and JD(UT) via your timescale helpers
+    utc_iso = _ts.to_utc_iso(date, time_norm, tz)
+    jd_ut = _ts.julian_day_utc(date, time_norm, tz)
+
+    # For ΔT polynomial we need UTC year/month
+    dt_utc = datetime.fromisoformat(f"{date}T{time_norm}").replace(tzinfo=ZoneInfo(tz)).astimezone(ZoneInfo("UTC"))
     jd_tt = _ts.jd_tt_from_utc_jd(jd_ut, dt_utc.year, dt_utc.month)
 
-    # UT1 = UT + DUT1 (seconds) / 86400
+    # UT1 = UT + DUT1 (seconds)/86400
     dut1 = float(os.getenv("ASTRO_DUT1_BROADCAST", os.getenv("ASTRO_DUT1", "0.0")))
     jd_ut1 = jd_ut + (dut1 / 86400.0)
 
@@ -153,7 +174,7 @@ def _compute_timescales_payload(date: str, time_s: str, tz: str) -> Dict[str, An
 
 
 def _register_core_api(app: Flask) -> None:
-    """Minimal, stable endpoints used by your browser console tests."""
+    """Minimal, stable endpoints used by browser console tests."""
 
     # ---- timescales ----
     def _timescales_handler():
@@ -162,19 +183,12 @@ def _register_core_api(app: Flask) -> None:
         time_s = data.get("time")
         tz = data.get("tz") or data.get("place_tz")
         if not (isinstance(date, str) and isinstance(time_s, str) and isinstance(tz, str)):
-            return jsonify(error="invalid_input", message="Provide 'date', 'time', and 'tz' (IANA)"), 400
+            raise BadRequest("Provide 'date', 'time', and 'tz' (IANA)")
         out = _compute_timescales_payload(date, time_s, tz)
         return jsonify(out), 200
 
-    # Canonical
     app.add_url_rule("/api/time/timescales", "timescales", _timescales_handler, methods=["POST"])
-    # Friendly aliases (your console code probes many of these)
-    for alias in (
-        "/api/timescales",
-        "/time/timescales",
-        "/timescales",
-        "/api/time/convert",
-    ):
+    for alias in ("/api/timescales", "/time/timescales", "/timescales", "/api/time/convert"):
         app.add_url_rule(alias, f"timescales_alias_{alias}", _timescales_handler, methods=["POST"])
 
     # ---- chart ----
@@ -189,24 +203,17 @@ def _register_core_api(app: Flask) -> None:
             if isinstance(date, str) and isinstance(time_s, str) and isinstance(tz, str):
                 ts = _compute_timescales_payload(date, time_s, tz)
                 payload.update({k: ts[k] for k in ("jd_ut", "jd_tt", "jd_ut1")})
+            else:
+                raise BadRequest("Provide either jd_ut/jd_tt/jd_ut1 or civil 'date'+'time'+'tz'")
 
-        # Default mode if not provided
+        # Defaults
         payload.setdefault("mode", "tropical")
 
-        res = compute_chart(payload)
+        res = compute_chart(payload)  # astronomy.py should handle normalization & warnings
         return jsonify(res), 200
 
-    # Canonical
     app.add_url_rule("/api/chart", "chart", _chart_handler, methods=["POST"])
-    # Aliases probed by your tests
-    for alias in (
-        "/chart",
-        "/api/compute_chart",
-        "/compute_chart",
-        "/api/astronomy/chart",
-        "/astronomy/chart",
-        "/api/astro/chart",
-    ):
+    for alias in ("/chart", "/api/compute_chart", "/compute_chart", "/api/astronomy/chart", "/astronomy/chart", "/api/astro/chart"):
         app.add_url_rule(alias, f"chart_alias_{alias}", _chart_handler, methods=["POST"])
 
 
@@ -229,15 +236,7 @@ def create_app() -> Flask:
             app.cfg = {}  # type: ignore[attr-defined]
 
     # Pre-seed metrics
-    seeded_routes = (
-        "/",
-        "/api/health-check",
-        "/api/chart",
-        "/api/time/timescales",
-        "/health",
-        "/healthz",
-        "/metrics",
-    )
+    seeded_routes = ("/", "/api/health-check", "/api/chart", "/api/time/timescales", "/health", "/healthz", "/metrics")
     for route in seeded_routes:
         MET_REQUESTS.labels(route=route).inc(0)
         REQ_LATENCY.labels(route=route).observe(0.0)
@@ -267,7 +266,7 @@ def create_app() -> Flask:
             pass
         return resp
 
-    # Register health/errors first
+    # Register health/errors first (so probes always work)
     _register_health(app)
     _register_errors(app)
 
