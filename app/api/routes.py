@@ -23,12 +23,12 @@ from app.core.validators import (
     parse_prediction_payload,
     parse_rectification_payload,
 )
+
 def _wrap360(x: float) -> float:
     """Normalize degrees to [0, 360). Safe for any float-like."""
     try:
         v = float(x) % 360.0
-        # collapse -0.0 to 0.0 for pretty output
-        return 0.0 if abs(v) < 1e-12 else v
+        return 0.0 if abs(v) < 1e-12 else v  # collapse -0.0
     except Exception:
         return x  # leave non-numerics untouched
 
@@ -336,13 +336,8 @@ def _rotate_sidereal_houses(h: Any, ay_deg: Optional[float]) -> Any:
     def rot(v: Optional[float]) -> Optional[float]:
         if v is None:
             return None
-        x = float(v) % 360.0
-        x -= float(ay_deg)
-        if x < 0.0:
-            x += 360.0
-        if x >= 360.0:
-            x -= 360.0
-        return x
+        x = (float(v) - float(ay_deg)) % 360.0
+        return 0.0 if abs(x) < 1e-12 else x
 
     # rotate angles
     for k in ("asc", "asc_deg", "mc", "mc_deg", "vertex", "eastpoint"):
@@ -385,20 +380,40 @@ def _json_error(code: str, details: Any = None, http: int = 400):
 
 
 def _normalize_houses_payload(h: Any) -> Any:
-    """Ensure houses payload has both 'cusps' and 'cusps_deg' and consistent system fields."""
-    if isinstance(h, dict):
-        if "cusps" not in h and "cusps_deg" in h:
-            h["cusps"] = h["cusps_deg"]
-        if "cusps_deg" not in h and "cusps" in h:
-            h["cusps_deg"] = h["cusps"]
-        if "house_system" not in h and "system" in h:
-            h["house_system"] = h["system"]
-        if "system" not in h and "house_system" in h:
-            h["system"] = h["house_system"]
-        if "asc_deg" not in h and "asc" in h:
-            h["asc_deg"] = h["asc"]
-        if "mc_deg" not in h and "mc" in h:
-            h["mc_deg"] = h["mc"]
+    """
+    Normalize/standardize houses payload:
+      • ensure 'cusps' and 'cusps_deg' mirror each other,
+      • mirror 'system' and 'house_system',
+      • ensure 'asc_deg'/'mc_deg' are present,
+      • normalize all angles/cusps to [0, 360).
+    """
+    if not isinstance(h, dict):
+        return h
+
+    # Mirror fields
+    if "cusps" not in h and "cusps_deg" in h:
+        h["cusps"] = h["cusps_deg"]
+    if "cusps_deg" not in h and "cusps" in h:
+        h["cusps_deg"] = h["cusps"]
+    if "house_system" not in h and "system" in h:
+        h["house_system"] = h["system"]
+    if "system" not in h and "house_system" in h:
+        h["system"] = h["house_system"]
+    if "asc_deg" not in h and "asc" in h:
+        h["asc_deg"] = h["asc"]
+    if "mc_deg" not in h and "mc" in h:
+        h["mc_deg"] = h["mc"]
+
+    # Normalize scalar angles
+    for k in ("asc", "asc_deg", "mc", "mc_deg", "vertex", "eastpoint", "armc", "ramc"):
+        if k in h and isinstance(h[k], (int, float)):
+            h[k] = _wrap360(h[k])
+
+    # Normalize cusp arrays
+    for key in ("cusps", "cusps_deg"):
+        if isinstance(h.get(key), list):
+            h[key] = [_wrap360(c) if isinstance(c, (int, float)) else c for c in h[key]]
+
     return h
 
 
@@ -499,6 +514,7 @@ def calculate():
         ay = _extract_ayanamsa_from_chart(chart)
         if isinstance(ay, (int, float)):
             houses = _rotate_sidereal_houses(houses, ay)
+            houses = _normalize_houses_payload(houses)  # re-normalize after rotation
 
     if chart_warnings:
         chart["warnings"] = chart.get("warnings", []) + chart_warnings
@@ -562,6 +578,7 @@ def report():
         ay = _extract_ayanamsa_from_chart(chart)
         if isinstance(ay, (int, float)):
             houses = _rotate_sidereal_houses(houses, ay)
+            houses = _normalize_houses_payload(houses)  # re-normalize after rotation
 
     if chart_warnings:
         chart["warnings"] = chart.get("warnings", []) + chart_warnings
@@ -623,6 +640,7 @@ def predictions_route():
         ay = _extract_ayanamsa_from_chart(chart)
         if isinstance(ay, (int, float)):
             houses = _rotate_sidereal_houses(houses, ay)
+            houses = _normalize_houses_payload(houses)  # re-normalize after rotation
 
     # Normalize chart for predictors that expect a mapping at chart["bodies"]
     chart_for_predict = _prepare_chart_for_predict(chart)
@@ -632,7 +650,6 @@ def predictions_route():
         from app.core.predict import predict  # local import to avoid import cycles
         preds_raw = predict(chart_for_predict, houses, horizon)
     except Exception as e:
-        # Give more actionable debugging info during development
         return jsonify({"ok": False, "error": "internal_error", "message": str(e), "type": type(e).__name__}), 500
 
     # thresholds (with sensible defaults)
