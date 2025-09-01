@@ -7,6 +7,9 @@ import logging
 
 log = logging.getLogger(__name__)
 
+# Public marker used by callers for metadata
+EPHEMERIS_NAME = "de421"
+
 # ---------------------------
 # Public capability check
 # ---------------------------
@@ -69,6 +72,7 @@ def _resolve_kernel_path() -> Optional[str]:
     # 3) None => ask Skyfield to load by name (may download)
     return None
 
+
 def _get_timescale():
     global _TS
     if _TS is not None:
@@ -80,6 +84,7 @@ def _get_timescale():
     except Exception as e:
         log.warning("Timescale unavailable: %s", e)
         return None
+
 
 def _get_ephemeris():
     """
@@ -112,7 +117,7 @@ def _get_ephemeris():
         return None
 
 # ---------------------------
-# Public helpers
+# Public helpers / metadata
 # ---------------------------
 def load_kernel(kernel_name: str = "de421"):
     """
@@ -121,6 +126,10 @@ def load_kernel(kernel_name: str = "de421"):
     """
     eph = _get_ephemeris()
     return eph, _EPH_PATH
+
+def current_kernel_name() -> str:
+    """Human-friendly kernel identifier for meta/debug."""
+    return _EPH_PATH or EPHEMERIS_NAME
 
 def _to_tts(jd_tt: float):
     ts = _get_timescale()
@@ -138,9 +147,16 @@ def _frame_latlon(geo, ecliptic_frame):
     # Skyfield returns angles; convert to degrees
     return float(lon.degrees) % 360.0, float(lat.degrees)
 
-def _deg_speed(jd_tt: float, body, ecliptic_frame, delta_days: float = 1.0) -> float:
+def _deg_speed(
+    jd_tt: float,
+    body,
+    observer,
+    ecliptic_frame,
+    delta_days: float = 1.0,
+) -> float:
     """
-    Approx angular speed (deg/day) using central difference.
+    Approx angular speed (deg/day) using central difference for the SAME observer
+    (geocentric or topocentric).
     """
     ts = _get_timescale()
     if ts is None:
@@ -148,71 +164,182 @@ def _deg_speed(jd_tt: float, body, ecliptic_frame, delta_days: float = 1.0) -> f
     try:
         t0 = ts.tt_jd(jd_tt - delta_days)
         t1 = ts.tt_jd(jd_tt + delta_days)
-        earth = _EPH["earth"]
-        lon0, _ = _frame_latlon(earth.at(t0).observe(body).apparent(), ecliptic_frame)
-        lon1, _ = _frame_latlon(earth.at(t1).observe(body).apparent(), ecliptic_frame)
+        lon0, _ = _frame_latlon(observer.at(t0).observe(body).apparent(), ecliptic_frame)
+        lon1, _ = _frame_latlon(observer.at(t1).observe(body).apparent(), ecliptic_frame)
         d = (lon1 - lon0 + 540.0) % 360.0 - 180.0  # wrap to [-180,180]
         return d / (2.0 * delta_days)
     except Exception:
         return 0.0
 
 # ---------------------------
-# Main API
+# Main APIs
 # ---------------------------
-def ecliptic_longitudes(jd_tt: float, lat: float = 0.0, lon: float = 0.0) -> List[Dict[str, Any]]:
+def ecliptic_longitudes(
+    jd_tt: float,
+    names: Optional[List[str]] = None,
+    *,
+    frame: str = "ecliptic-of-date",
+    topocentric: bool = False,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    elevation_m: Optional[float] = None,
+) -> Any:
     """
-    Return list of dicts:
-      { "name": <str>, "lon": <deg>, "lat": <deg>, "speed": <deg/day> }
-    for Sun..Pluto (barycenters where applicable). Ignores observer lat/lon for Phase-1.
+    If `names` is provided: returns {name: longitude_deg} for those names.
+    If `names` is None: returns list of dicts:
+       [{ "name": <str>, "lon": <deg>, "lat": <deg>, "speed": <deg/day> }, ...]
+    Supports topocentric when topocentric=True and lat/lon are provided.
 
-    If ephemeris is unavailable, returns [] (never raises).
+    If ephemeris is unavailable, returns {} or [] accordingly (never raises).
     """
     # Load lazily
     eph = _get_ephemeris()
     if eph is None:
-        return []
+        return {} if names else []
 
     # Build Skyfield time
     t = _to_tts(jd_tt)
     if t is None:
-        return []
+        return {} if names else []
 
-    # Import frame lazily to avoid import-time failures if Skyfield absent
+    # Import frames lazily to avoid import-time failures if Skyfield absent
     try:
         from skyfield.framelib import ecliptic_frame
+        from skyfield.api import wgs84
     except Exception as e:
         log.warning("Ecliptic frame unavailable: %s", e)
-        return []
+        return {} if names else []
 
-    out: List[Dict[str, Any]] = []
-
+    # Build observer: geocentric or topocentric
     try:
-        earth = eph["earth"]
+        if topocentric and latitude is not None and longitude is not None:
+            elev = float(elevation_m or 0.0)
+            observer = wgs84.latlon(float(latitude), float(longitude), elevation_m=elev)
+        else:
+            observer = eph["earth"]
+    except Exception as e:
+        log.debug("Observer build failed (%s); falling back to geocentric.", e)
+        observer = eph["earth"]
+
+    if names:
+        # Dict form for requested names
+        out: Dict[str, float] = {}
+        # Build a reverse map once to avoid lookups on each name
+        key_by_name = _PLANET_KEYS
+        for public_name in names:
+            key = key_by_name.get(str(public_name))
+            if not key:
+                continue
+            try:
+                body = eph[key]
+                geo = observer.at(t).observe(body).apparent()
+                lon_deg, _lat_deg = _frame_latlon(geo, ecliptic_frame)
+                out[str(public_name)] = float(lon_deg)
+            except Exception as be:
+                log.debug("Failed computing %s: %s", public_name, be)
+        return out
+
+    # Legacy list-of-dicts form (Sun..Pluto)
+    rows: List[Dict[str, Any]] = []
+    try:
         for public_name, key in _PLANET_KEYS.items():
             try:
                 body = eph[key]
-                geo = earth.at(t).observe(body).apparent()
+                geo = observer.at(t).observe(body).apparent()
                 lon_deg, lat_deg = _frame_latlon(geo, ecliptic_frame)
-
-                # Estimate speed (deg/day) via +/- 1 day central difference
-                spd = _deg_speed(jd_tt, body, ecliptic_frame, delta_days=1.0)
-
-                out.append({
+                spd = _deg_speed(jd_tt, body, observer, ecliptic_frame, delta_days=1.0)
+                rows.append({
                     "name": public_name,
                     "lon": lon_deg,
                     "lat": lat_deg,
                     "speed": spd,
                 })
             except KeyError:
-                # Body key not present in this kernel
                 log.debug("Body %s (%s) not in kernel; skipping.", public_name, key)
             except Exception as be:
                 log.debug("Failed computing %s: %s", public_name, be)
-
-        return out
+        return rows
     except Exception as e:
         log.warning("Ephemeris computation failed: %s", e)
         return []
+
+def ecliptic_longitudes_and_velocities(
+    jd_tt: float,
+    names: List[str],
+    *,
+    frame: str = "ecliptic-of-date",
+    topocentric: bool = False,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    elevation_m: Optional[float] = None,
+) -> Dict[str, Dict[str, float]]:
+    """
+    Return {"longitudes": {name: deg}, "velocities": {name: deg/day}}
+    for the requested names. Uses the same observer for speed FD.
+    """
+    eph = _get_ephemeris()
+    if eph is None:
+        return {"longitudes": {}, "velocities": {}}
+
+    t = _to_tts(jd_tt)
+    if t is None:
+        return {"longitudes": {}, "velocities": {}}
+
+    try:
+        from skyfield.framelib import ecliptic_frame
+        from skyfield.api import wgs84
+    except Exception as e:
+        log.warning("Ecliptic frame unavailable: %s", e)
+        return {"longitudes": {}, "velocities": {}}
+
+    try:
+        if topocentric and latitude is not None and longitude is not None:
+            elev = float(elevation_m or 0.0)
+            observer = wgs84.latlon(float(latitude), float(longitude), elevation_m=elev)
+        else:
+            observer = eph["earth"]
+    except Exception as e:
+        log.debug("Observer build failed (%s); falling back to geocentric.", e)
+        observer = eph["earth"]
+
+    lon_map: Dict[str, float] = {}
+    vel_map: Dict[str, float] = {}
+
+    for nm in names:
+        key = _PLANET_KEYS.get(str(nm))
+        if not key:
+            continue
+        try:
+            body = eph[key]
+            geo = observer.at(t).observe(body).apparent()
+            lon_deg, _lat_deg = _frame_latlon(geo, ecliptic_frame)
+            lon_map[str(nm)] = float(lon_deg)
+            vel_map[str(nm)] = float(_deg_speed(jd_tt, body, observer, ecliptic_frame, delta_days=1.0))
+        except Exception as be:
+            log.debug("Failed computing %s: %s", nm, be)
+
+    return {"longitudes": lon_map, "velocities": vel_map}
+
+# Convenience alias for engines that expect just a {name: lon} mapping
+def get_ecliptic_longitudes(
+    jd_tt: float,
+    names: List[str],
+    *,
+    frame: str = "ecliptic-of-date",
+    topocentric: bool = False,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    elevation_m: Optional[float] = None,
+) -> Dict[str, float]:
+    return ecliptic_longitudes(
+        jd_tt,
+        names=names,
+        frame=frame,
+        topocentric=topocentric,
+        latitude=latitude,
+        longitude=longitude,
+        elevation_m=elevation_m,
+    )
 
 # ---------------------------
 # Utility (optional)
