@@ -335,6 +335,34 @@ def _normalize_houses_payload(h: Any) -> Any:
     return h
 
 
+# NEW: normalize chart.bodies for predictors that expect a mapping
+def _prepare_chart_for_predict(chart: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Ensure `chart['bodies']` is a mapping {name: body_dict} for downstream
+    predictors, while preserving the original list (if any) at `bodies_list`.
+    Safe no-op if bodies is already a mapping.
+    """
+    ch = dict(chart)  # shallow copy to avoid mutating engine output
+    bodies = ch.get("bodies")
+
+    # If already a dict-like mapping, keep as-is.
+    if isinstance(bodies, dict):
+        return ch
+
+    # If it's a list of dicts, build a name->dict map.
+    if isinstance(bodies, list):
+        name_map: Dict[str, Any] = {}
+        for b in bodies:
+            if isinstance(b, dict):
+                nm = b.get("name")
+                if isinstance(nm, str) and nm:
+                    name_map[nm] = b
+        if name_map:
+            ch["bodies_list"] = bodies
+            ch["bodies"] = name_map
+    return ch
+
+
 # ───────────────────────────── endpoints ─────────────────────────────
 @api.get("/api/health")
 def health():
@@ -477,8 +505,16 @@ def predictions_route():
     if chart is None:
         return _json_error("chart_internal", chart_error or "internal_error", 500)
 
-    from app.core.predict import predict  # local import to avoid import cycles
-    preds_raw = predict(chart, houses, horizon)
+    # Normalize chart for predictors that expect a mapping at chart["bodies"]
+    chart_for_predict = _prepare_chart_for_predict(chart)
+
+    # Run predictor
+    try:
+        from app.core.predict import predict  # local import to avoid import cycles
+        preds_raw = predict(chart_for_predict, houses, horizon)
+    except Exception as e:
+        # Give more actionable debugging info during development
+        return jsonify({"ok": False, "error": "internal_error", "message": str(e), "type": type(e).__name__}), 500
 
     # thresholds (with sensible defaults)
     th_path = os.environ.get("ASTRO_HC_THRESHOLDS", "config/hc_thresholds.json")
