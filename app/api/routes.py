@@ -579,8 +579,16 @@ def predictions_route():
             }
         )
 
-    if not overrides and not os.environ.get("ASTRO_HC_DEBUG_OVERRIDES"):
+    # Final HC flagging (safe)
+if not overrides and not os.environ.get("ASTRO_HC_DEBUG_OVERRIDES"):
+    try:
         preds = flag_predictions(preds, _freeze_horizon(horizon), th_path)
+    except Exception as e:
+        # Don't 500 the endpoint if flagging logic hiccups
+        if DEBUG_VERBOSE:
+            log.warning("flag_predictions failed: %r", e)
+        # leave `preds` unmodified
+
 
     meta = {"timescales": ts, "chart_engine": _CHART_ENGINE_NAME, "houses_engine": _HOUSES_KIND}
     return jsonify({"ok": True, "predictions": preds, "meta": meta}), 200
