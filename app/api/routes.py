@@ -361,6 +361,8 @@ def _prepare_chart_for_predict(chart: Dict[str, Any]) -> Dict[str, Any]:
             ch["bodies_list"] = bodies
             ch["bodies"] = name_map
     return ch
+
+
 # Make horizon JSON-safe input hashable for caching/keys
 def _freeze_horizon(h: Any) -> Any:
     if isinstance(h, dict):
@@ -580,15 +582,14 @@ def predictions_route():
         )
 
     # Final HC flagging (safe)
-if not overrides and not os.environ.get("ASTRO_HC_DEBUG_OVERRIDES"):
-    try:
-        preds = flag_predictions(preds, _freeze_horizon(horizon), th_path)
-    except Exception as e:
-        # Don't 500 the endpoint if flagging logic hiccups
-        if DEBUG_VERBOSE:
-            log.warning("flag_predictions failed: %r", e)
-        # leave `preds` unmodified
-
+    if not overrides and not os.environ.get("ASTRO_HC_DEBUG_OVERRIDES"):
+        try:
+            preds = flag_predictions(preds, _freeze_horizon(horizon), th_path)
+        except Exception as e:
+            # Don't 500 the endpoint if flagging logic hiccups
+            if DEBUG_VERBOSE:
+                log.warning("flag_predictions failed: %r", e)
+            # leave `preds` unmodified
 
     meta = {"timescales": ts, "chart_engine": _CHART_ENGINE_NAME, "houses_engine": _HOUSES_KIND}
     return jsonify({"ok": True, "predictions": preds, "meta": meta}), 200
