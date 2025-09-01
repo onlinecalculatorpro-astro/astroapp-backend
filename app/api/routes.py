@@ -361,6 +361,13 @@ def _prepare_chart_for_predict(chart: Dict[str, Any]) -> Dict[str, Any]:
             ch["bodies_list"] = bodies
             ch["bodies"] = name_map
     return ch
+# Make horizon JSON-safe input hashable for caching/keys
+def _freeze_horizon(h: Any) -> Any:
+    if isinstance(h, dict):
+        return tuple(sorted((k, _freeze_horizon(v)) for k, v in h.items()))
+    if isinstance(h, (list, tuple)):
+        return tuple(_freeze_horizon(v) for v in h)
+    return h
 
 
 # ───────────────────────────── endpoints ─────────────────────────────
