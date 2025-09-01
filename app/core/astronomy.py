@@ -1,7 +1,59 @@
 # app/core/astronomy.py
+# -*- coding: utf-8 -*-
+"""
+High-precision planetary chart computation (ecliptic-of-date).
+
+Design goals
+------------
+- Single source of truth for timescales: prefer `app.core.time_kernel`; fall back to
+  `app.core.timescales`; ultimately a local UTC→JD routine (flagged with warnings).
+- Planet positions and velocities delegated to `app.core.ephemeris_adapter`
+  (Skyfield + DE kernels + optional small-body SPKs). We accept the adapter's
+  native velocities when available; otherwise we compute finite-difference speeds.
+- Ascendant/MC angles computed in a strictly "parity" way with ERFA/IAU 2006/2000A:
+  GAST (gst06a) + true obliquity (obl06 + nut06a). Sidereal mode rotates all
+  longitudes (planets + angles) by the ayanāṁśa.
+- Sidereal ayanāṁśa: pluggable resolver via `app.core.ayanamsa` or
+  `app.core.astro_extras`. If not available, a linearized fallback is used and
+  clearly warned in metadata.
+- Topocentric handling for planets is supported; angles computation requires lat/lon.
+- "Math‑pure" policy: we do not force Placidus cusp1≈ASC. Houses are not handled
+  here; routes orchestrate houses separately with `houses_advanced` module.
+- Robust I/O validation with clear error codes and human-friendly messages.
+- Predictable output schema, forward-compatible fields, and concise debug meta.
+
+Public API
+----------
+compute_chart(payload: dict) -> dict
+
+Payload keys (subset; see below for full validation rules):
+- mode: "tropical" | "sidereal"  (default=tropical)
+- bodies: list of names (subset of ALLOWED_BODIES). Default = the 10 classical bodies.
+- topocentric: bool (default=False). If True, require lat/lon (and optionally elevation).
+- latitude, longitude, elevation_m
+- date, time, place_tz           (used only when jd_* not supplied)
+- jd_ut, jd_tt, jd_ut1           (preferred, if already computed by routes/time_kernel)
+- ayanamsa: str | float          (sidereal only)
+- options: dict (reserved; ignored here)
+
+Return schema (stable keys):
+- jd_ut: float
+- jd_tt: float
+- meta: { ... }
+- bodies: [ { name, longitude_deg, speed_deg_per_day (or None), is_point? } ]
+- angles: { asc_deg, mc_deg }
+- asc_deg, mc_deg  (mirrors for parity with earlier API users)
+
+Notes
+-----
+- "is_point": True is set for abstract, non-physical points (e.g., lunar nodes) where
+  velocity is either undefined or intentionally omitted.
+- Warnings are additive in meta["warnings"]. They never block results.
+- This module intentionally does not compute houses. Keep separation-of-concerns.
+"""
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional, Callable
 import math
 import os
 import inspect
@@ -40,22 +92,31 @@ except Exception:  # pragma: no cover
 # High-precision sidereal/obliquity helpers — **mandatory** for certified angles
 try:
     import erfa  # PyERFA (SOFA)
-except Exception as e:
+except Exception as e:  # pragma: no cover
     erfa = None
     _ERFA_IMPORT_ERROR = e
 
 
 # ───────────────────────────── Config & constants ─────────────────────
-ALLOWED_BODIES = {
+# Classical ten (default)
+_CLASSIC_10 = (
     "Sun", "Moon", "Mercury", "Venus", "Mars",
     "Jupiter", "Saturn", "Uranus", "Neptune", "Pluto",
-}
-_DEF_BODIES: Tuple[str, ...] = tuple(ALLOWED_BODIES)
+)
+# Extended set we support *if requested* (does not disturb defaults)
+_EXTRA_POINTS = (
+    "Ceres", "Pallas", "Juno", "Vesta", "Chiron",
+    "North Node", "South Node",
+)
+
+ALLOWED_BODIES = set(_CLASSIC_10) | set(_EXTRA_POINTS)
+_DEF_BODIES: Tuple[str, ...] = _CLASSIC_10
 
 _JD_QUANT       = float(os.getenv("OCP_ASTRO_JD_QUANT", "1e-7"))     # ~0.009 s
 _LATLON_QUANT   = float(os.getenv("OCP_ASTRO_LL_QUANT", "1e-6"))     # ~0.11 m
-_ELEV_QUANT     = float(os.getenv("OCP_ASTRO_ELEV_QUANT", "0.1"))    # 10 cm
-_SPEED_STEP     = float(os.getenv("OCP_SPEED_FD_STEP_DAYS", "0.5"))  # ±12h
+_ELEV_QUANT     = float(os.getenv("OCP_GEO_ELEV_QUANT", "0.1"))      # 10 cm
+# For speed fallback if adapter doesn't supply velocities (Moon may need smaller step)
+_SPEED_STEP_DEF = float(os.getenv("OCP_SPEED_FD_STEP_DAYS", "0.25")) # ±6 h (safer for Moon)
 _DEF_AYANAMSA   = os.getenv("OCP_AYANAMSA_DEFAULT", "lahiri").strip().lower()
 
 _GEO_SOFT_LAT     = float(os.getenv("OCP_GEO_SOFT_LAT", "89.5"))
@@ -71,6 +132,9 @@ _DUT1_SECONDS = float(
               os.getenv("OCP_DUT1_SECONDS", "0.0"))
 )
 
+# Used by validators and meta
+_PROJECT_SOURCE_TAG = "astronomy(core)"
+
 
 # ───────────────────────────── Helpers ─────────────────────────────
 def _norm360(x: float) -> float:
@@ -78,6 +142,9 @@ def _norm360(x: float) -> float:
     if r < 0.0:
         r += 360.0
     return r
+
+def _wrap180(x: float) -> float:
+    return ((float(x) + 180.0) % 360.0) - 180.0
 
 def _shortest_signed_delta_deg(a2: float, a1: float) -> float:
     d = (a2 - a1 + 540.0) % 360.0 - 180.0
@@ -105,7 +172,7 @@ def _is_finite(x: Any) -> bool:
         return False
 
 def _normalize_lon180(lon: float) -> float:
-    return ((float(lon) + 180.0) % 360.0) - 180.0
+    return _wrap180(lon)
 
 
 # ───────────────────────────── Validation ─────────────────────────────
@@ -129,15 +196,19 @@ def _validate_payload(payload: Dict[str, Any]) -> Tuple[str, List[str]]:
     return mode, bodies_list
 
 
-def _ensure_timescales(payload: Dict[str, Any]) -> Tuple[float, float, float]:
-    """Return (jd_ut, jd_tt, jd_ut1). Prefers explicit; then time_kernel; then local civil→JD fallback."""
+def _ensure_timescales(payload: Dict[str, Any]) -> Tuple[float, float, float, List[str]]:
+    """
+    Return (jd_ut, jd_tt, jd_ut1, warnings). Prefers explicit; then time_kernel; then timescales; then local fallback.
+    """
+    warnings: List[str] = []
+
     jd_ut  = payload.get("jd_ut")
     jd_tt  = payload.get("jd_tt")
     jd_ut1 = payload.get("jd_ut1")
 
     # If caller provided all three, accept verbatim
     if all(isinstance(x, (int, float)) for x in (jd_ut, jd_tt, jd_ut1)):
-        return float(jd_ut), float(jd_tt), float(jd_ut1)
+        return float(jd_ut), float(jd_tt), float(jd_ut1), warnings
 
     # 1) project time_kernel if present
     if _tk is not None:
@@ -152,9 +223,9 @@ def _ensure_timescales(payload: Dict[str, Any]) -> Tuple[float, float, float]:
                     payload.get("latitude"),
                     payload.get("longitude"),
                 )
-                return float(out["jd_ut"]), float(out["jd_tt"]), float(out["jd_ut1"])
+                return float(out["jd_ut"]), float(out["jd_tt"]), float(out["jd_ut1"]), warnings
 
-    # 2) minimal local fallback (UTC JD + rough TT, UT1 by env)
+    # 2) use timescales helper if available
     date_str = payload.get("date"); time_str = payload.get("time")
     tz_str   = payload.get("place_tz") or payload.get("tz") or "UTC"
     if not isinstance(date_str, str) or not isinstance(time_str, str):
@@ -183,12 +254,15 @@ def _ensure_timescales(payload: Dict[str, Any]) -> Tuple[float, float, float]:
         JD0 = int(365.25*(Y + 4716)) + int(30.6001*(M + 1)) + D + B - 1524.5
         return JD0 + h/24.0
 
+    used_stdlib = False
     try:
         jd_utc = _jd_utc_via_ts(date_str, time_str, tz_str)
     except Exception:
         jd_utc = _jd_utc_via_stdlib(date_str, time_str, tz_str)
+        used_stdlib = True
+        warnings.append("timescales_fallback_local_utc_jd")
 
-    # Prefer timescales module for ΔT; otherwise rough fallback
+    # Prefer timescales module for ΔT if available
     try:
         y, m = map(int, str(date_str).split("-")[:2])
     except Exception:
@@ -197,14 +271,18 @@ def _ensure_timescales(payload: Dict[str, Any]) -> Tuple[float, float, float]:
         try:
             jd_tt_calc = float(_ts.jd_tt_from_utc_jd(jd_utc, y, m))
         except Exception:
+            # conservative fallback 69s; flag warning
             jd_tt_calc = jd_utc + 69.0/86400.0
+            warnings.append("deltaT_fallback_69s")
     else:
         jd_tt_calc = jd_utc + 69.0/86400.0
+        if not used_stdlib:
+            warnings.append("deltaT_fallback_69s")
 
     jd_ut_calc  = jd_utc
     jd_ut1_calc = jd_utc + (_DUT1_SECONDS / 86400.0)
 
-    return jd_ut_calc, jd_tt_calc, jd_ut1_calc
+    return jd_ut_calc, jd_tt_calc, jd_ut1_calc, warnings
 
 
 # ───────────────────────────── Geographic sanity for topocentric ─────
@@ -236,7 +314,7 @@ def _validate_and_normalize_geo_for_topo(
     if abs(lonf) >= _ANTIMER_WARN_LON:
         warnings.append("near_antimeridian_longitude")
 
-    if elev is None or (isinstance(elev, str) and elev.strip() == ""):
+    if elev is None or (isinstance(elev, str) and str(elev).strip() == ""):
         elev_m: Optional[float] = None
     else:
         if not _is_finite(elev):
@@ -255,6 +333,14 @@ def _validate_and_normalize_geo_for_topo(
 # ───────────────────────────── Ayanāṁśa resolver ─────────────────────
 @lru_cache(maxsize=4096)
 def _ayanamsa_deg_cached(jd_tt_q: float, ay_key: str) -> Tuple[float, str]:
+    """
+    Resolve ayanāṁśa degrees for sidereal mode.
+
+    Resolution order:
+    1) app.core.ayanamsa.get_ayanamsa_deg(jd_tt, key) or (key, jd_tt)
+    2) app.core.astro_extras.get_ayanamsa_deg(...)
+    3) Linearized fallback near J2000 (warned)
+    """
     # Project-level resolvers first
     for modpath, fn in (("app.core.ayanamsa", "get_ayanamsa_deg"),
                         ("app.core.astro_extras", "get_ayanamsa_deg")):
@@ -271,7 +357,7 @@ def _ayanamsa_deg_cached(jd_tt_q: float, ay_key: str) -> Tuple[float, str]:
         except Exception:
             pass
 
-    # Fallback: linearized model near J2000 for common variants
+    # Fallback: linearized model near J2000 for common variants (warned later)
     name = (ay_key or _DEF_AYANAMSA or "lahiri").lower()
     AY_J2000_DEG       = (23 + 51/60 + 26.26/3600)      # ≈ 23.857294444°
     RATE_AS_PER_YEAR   = 50.290966                      # arcsec/year
@@ -288,23 +374,26 @@ def _ayanamsa_deg_cached(jd_tt_q: float, ay_key: str) -> Tuple[float, str]:
     return base, f"ayanamsa_fallback_to_lahiri({name})"
 
 
-def _resolve_ayanamsa(jd_tt: float, ayanamsa: Any) -> Tuple[Optional[float], Optional[str]]:
-    if ayanamsa is None or (isinstance(ayanamsa, str) and not ayanamsa.strip()):
+def _resolve_ayanamsa(jd_tt: float, ayanamsa: Any, warnings: List[str]) -> Tuple[Optional[float], Optional[str]]:
+    if ayanamsa is None or (isinstance(ayanamsa, str) and not str(ayanamsa).strip()):
         key = _DEF_AYANAMSA
     elif isinstance(ayanamsa, (int, float)):
         return float(ayanamsa), "explicit"
     else:
         key = str(ayanamsa).strip().lower()
-    jd_q = _q(jd_tt, _JD_QUANT)
+    jd_q = _q(jd_tt, _JD_QUANT) or jd_tt
     ay, note = _ayanamsa_deg_cached(jd_q, key)
+    if note and "fallback" in note:
+        warnings.append(note)
     return float(ay), note
 
 
 # ───────────────────────────── Ephemeris adapter calls (cached) ───────
 def _adapter_source_tag() -> str:
-    return getattr(eph, "current_kernel_name", None) or getattr(eph, "EPHEMERIS_NAME", None) or "adapter"
+    tag = getattr(eph, "current_kernel_name", None) or getattr(eph, "EPHEMERIS_NAME", None) or "adapter"
+    return str(tag)
 
-def _adapter_callable(*names: str):
+def _adapter_callable(*names: str) -> Optional[Callable[..., Any]]:
     for n in names:
         fn = getattr(eph, n, None)
         if callable(fn):
@@ -423,15 +512,17 @@ def _cached_positions(
     if eph is None:
         raise AstronomyError("ephemeris_unavailable", f"ephemeris_adapter import failed: {_EPH_IMPORT_ERROR!r}")
 
+    # Prefer function with velocities
     fn = _adapter_callable(
+        "ecliptic_longitudes_and_velocities",
+        "get_ecliptic_longitudes_and_velocities",
+        "ecliptic_longitudes",  # fallback
         "get_ecliptic_longitudes",
-        "ecliptic_longitudes",
-        "planetary_longitudes",
     )
     if fn is None:
         raise AstronomyError(
             "adapter_api_mismatch",
-            "ephemeris_adapter missing any of: get_ecliptic_longitudes/ecliptic_longitudes/planetary_longitudes",
+            "ephemeris_adapter missing longitudes API"
         )
 
     sig = inspect.signature(fn)
@@ -471,11 +562,9 @@ def _cached_positions(
             try:
                 res = fn(**kwargs)
             except TypeError:
+                # Some adapters accept only jd_tt positional
                 res = fn(jd_tt_q)
             break
-        except (KeyError, ValueError) as e:
-            last_err = e
-            continue
         except Exception as e:
             last_err = e
             continue
@@ -488,6 +577,14 @@ def _cached_positions(
 
     lon_map, spd_map = _normalize_adapter_output_to_maps(res, names_key)
     return lon_map, spd_map, _adapter_source_tag()
+
+
+def _adaptive_speed_step(name: str, default_step: float) -> float:
+    """Use a smaller FD step for fast bodies; keep a sane default otherwise."""
+    fast = {"Moon"}
+    if name in fast:
+        return min(0.125, default_step)  # ±3 h for Moon
+    return default_step
 
 
 def _longitudes_and_speeds(
@@ -505,7 +602,7 @@ def _longitudes_and_speeds(
     Prefer adapter speeds when available; otherwise compute via FD using cached positions at jd±step.
     """
     names_key = tuple(names)
-    jd_tt_q = _q(jd_tt, _JD_QUANT)
+    jd_tt_q = _q(jd_tt, _JD_QUANT) or jd_tt
     lat_q = _q(latitude, _LATLON_QUANT) if topocentric else None
     lon_q = _q(longitude, _LATLON_QUANT) if topocentric else None
     elev_q = _q(elevation_m, _ELEV_QUANT) if topocentric else None
@@ -521,13 +618,18 @@ def _longitudes_and_speeds(
         return out, source
 
     # Some speeds or bodies missing → compute FD where possible
-    jm = _q(jd_tt - speed_step_days, _JD_QUANT) if speed_step_days and speed_step_days > 0 else None
-    jp = _q(jd_tt + speed_step_days, _JD_QUANT) if speed_step_days and speed_step_days > 0 else None
-    minus_lon: Dict[str, float] = {}
-    plus_lon:  Dict[str, float] = {}
-    if jm is not None and jp is not None:
-        minus_lon, _, _ = _cached_positions(jm, names_key, topocentric, lat_q, lon_q, elev_q)
-        plus_lon,  _, _ = _cached_positions(jp, names_key, topocentric, lat_q, lon_q, elev_q)
+    minus_lon_cache: Dict[float, Dict[str, float]] = {}
+    plus_lon_cache:  Dict[float, Dict[str, float]] = {}
+
+    def _get_cached(jd_q: float) -> Dict[str, float]:
+        if jd_q in minus_lon_cache:
+            return minus_lon_cache[jd_q]
+        if jd_q in plus_lon_cache:
+            return plus_lon_cache[jd_q]
+        lon_m, _spd_m, _ = _cached_positions(jd_q, names_key, topocentric, lat_q, lon_q, elev_q)
+        # store in both to simplify lookups
+        minus_lon_cache[jd_q] = lon_m; plus_lon_cache[jd_q] = lon_m
+        return lon_m
 
     for nm in names_key:
         if nm not in now_lon:
@@ -536,11 +638,17 @@ def _longitudes_and_speeds(
         spd: Optional[float] = None
         if now_spd.get(nm) is not None:
             spd = float(now_spd[nm])
-        elif jm is not None and jp is not None and (nm in minus_lon) and (nm in plus_lon):
-            dt = (speed_step_days * 2.0)
-            l_m = _norm360(float(minus_lon[nm]))
-            l_p = _norm360(float(plus_lon[nm]))
-            spd = _shortest_signed_delta_deg(l_p, l_m) / dt
+        else:
+            step = _adaptive_speed_step(nm, speed_step_days)
+            if step and step > 0:
+                jm = _q(jd_tt - step, _JD_QUANT) or (jd_tt - step)
+                jp = _q(jd_tt + step, _JD_QUANT) or (jd_tt + step)
+                l_m_map = _get_cached(jm)
+                l_p_map = _get_cached(jp)
+                if nm in l_m_map and nm in l_p_map:
+                    l_m = _norm360(float(l_m_map[nm]))
+                    l_p = _norm360(float(l_p_map[nm]))
+                    spd = _shortest_signed_delta_deg(l_p, l_m) / (2.0 * step)
         out[nm] = (l0, spd)
 
     return out, source
@@ -646,6 +754,10 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
     - Sidereal = tropical − ayanamsa (pluggable; explicit degrees or named model).
     - Adapter speeds preferred; FD speeds as fallback (or None when impossible).
     - Angles (Asc/MC): ERFA GAST + true obliquity (mandatory).
+
+    This function is intentionally agnostic of houses. It is orchestrated by routes,
+    which compute timescales and call both astronomy and houses engines with the
+    same JD inputs to maintain strict parity.
     """
     if eph is None:
         raise AstronomyError("ephemeris_unavailable", f"ephemeris_adapter import failed: {_EPH_IMPORT_ERROR!r}")
@@ -654,11 +766,11 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
     mode, bodies = _validate_payload(payload)
 
     # Timescales (TT for planets, UT1 for angles/LST)
-    jd_ut, jd_tt, jd_ut1 = _ensure_timescales(payload)
+    jd_ut, jd_tt, jd_ut1, ts_warnings = _ensure_timescales(payload)
 
     # Geometry (topocentric handling for planets; angles need lat/lon regardless)
     topocentric = _coerce_bool(payload.get("topocentric"), False)
-    warnings: List[str] = []
+    warnings: List[str] = list(ts_warnings)
 
     lat: Optional[float]
     lon: Optional[float]
@@ -682,35 +794,60 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
         jd_tt, bodies,
         topocentric=topocentric,
         latitude=lat, longitude=lon, elevation_m=elev,
-        speed_step_days=_SPEED_STEP,
+        speed_step_days=_SPEED_STEP_DEF,
     )
+
+    # Nodes: if asked but adapter omitted them, compute via adapter helper if present
+    missing_for_nodes: List[str] = []
+    for nd in ("North Node", "South Node"):
+        if nd in bodies and nd not in results:
+            get_node = getattr(eph, "get_node_longitude", None)
+            if callable(get_node):
+                try:
+                    nd_lon = float(get_node(jd_tt, nd, latitude=lat, longitude=lon))
+                    results[nd] = (_norm360(nd_lon), None)  # speed undefined
+                except Exception:
+                    missing_for_nodes.append(nd)
+            else:
+                missing_for_nodes.append(nd)
+    if missing_for_nodes:
+        warnings.append(f"adapter_missing_nodes({', '.join(missing_for_nodes)})")
 
     # Ayanāṁśa (if sidereal)
     ay_deg: Optional[float] = None
     ay_note: Optional[str] = None
     if mode == "sidereal":
-        ay_deg, ay_note = _resolve_ayanamsa(jd_tt, payload.get("ayanamsa"))
+        ay_deg, ay_note = _resolve_ayanamsa(jd_tt, payload.get("ayanamsa"), warnings)
 
     # Build bodies output (apply ayanāṁśa if needed), tolerant to adapter omissions
     out_bodies: List[Dict[str, Any]] = []
-    missing: List[str] = []
+    missing_bodies: List[str] = []
     for nm in bodies:
         tup = results.get(nm)
         if not tup:
-            missing.append(nm)
+            missing_bodies.append(nm)
             continue
         lon_deg, speed = tup
         if mode == "sidereal" and ay_deg is not None:
             lon_deg = _norm360(lon_deg - float(ay_deg))
-        out_bodies.append({
+
+        row: Dict[str, Any] = {
             "name": nm,
             "longitude_deg": float(_norm360(lon_deg)),
             "speed_deg_per_day": (float(speed) if speed is not None else None),
-        })
-    if missing:
-        warnings.append(f"adapter_missing_bodies({', '.join(missing)})")
+        }
+        if nm in ("North Node", "South Node"):
+            row["is_point"] = True
+            # Leave speed as None (points)
+        out_bodies.append(row)
+
+    if missing_bodies:
+        warnings.append(f"adapter_missing_bodies({', '.join(missing_bodies)})")
 
     # Angles (Asc/MC) — ERFA mandatory
+    asc_deg: float
+    mc_deg: float
+    dbg: Dict[str, float]
     asc_deg, mc_deg, dbg = _compute_angles_parity(
         jd_ut1=jd_ut1, jd_tt=jd_tt, latitude=lat, longitude=lon,
         mode=mode, ayanamsa_deg=ay_deg
@@ -724,6 +861,7 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
         "observer": "topocentric" if topocentric else "geocentric",
         "source": str(source_tag),
         "angles_engine": "ERFA gst06a + true_obliquity (mandatory)",
+        "module": _PROJECT_SOURCE_TAG,
         **dbg,  # eps_true_deg, gast_deg, ramc_deg
     }
     if warnings:
@@ -737,6 +875,7 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
         "meta": meta,
         "bodies": out_bodies,
         "angles": {"asc_deg": float(asc_deg), "mc_deg": float(mc_deg)},
+        # mirrors for parity with older clients
         "asc_deg": float(asc_deg),
         "mc_deg": float(mc_deg),
     }
