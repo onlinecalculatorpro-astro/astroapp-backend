@@ -193,7 +193,7 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
     # --- engines that accept a single 'payload' dict (e.g., app.core.astronomy.compute_chart) ---
     if "payload" in params:
         merged = dict(payload)
-        # HARD-ASSIGN (no setdefault): force a single source of truth for timescales
+        # HARD-ASSIGN: single source of truth for timescales
         merged["jd_ut"] = ts["jd_utc"]
         merged["jd_tt"] = ts["jd_tt"]
         merged["jd_ut1"] = ts["jd_ut1"]
@@ -316,6 +316,58 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
     return _houses_fn(**kwargs)
 
 
+# ───────────────────────────── helpers: sidereal rotation ─────────────────────────────
+def _rotate_sidereal_houses(h: Any, ay_deg: Optional[float]) -> Any:
+    """
+    Rotate a tropical houses payload to sidereal by subtracting ayanamsa degrees.
+    Modifies angle keys and cusp arrays if present.
+    """
+    if ay_deg is None or not isinstance(h, dict):
+        return h
+
+    def rot(v: Optional[float]) -> Optional[float]:
+        if v is None:
+            return None
+        x = float(v) % 360.0
+        x -= float(ay_deg)
+        if x < 0.0:
+            x += 360.0
+        if x >= 360.0:
+            x -= 360.0
+        return x
+
+    # rotate angles
+    for k in ("asc", "asc_deg", "mc", "mc_deg", "vertex", "eastpoint"):
+        if k in h and isinstance(h[k], (int, float)):
+            h[k] = rot(h[k])
+
+    # rotate cusps
+    if "cusps" in h and isinstance(h["cusps"], list):
+        h["cusps"] = [rot(c) for c in h["cusps"]]
+    if "cusps_deg" in h and isinstance(h["cusps_deg"], list):
+        h["cusps_deg"] = [rot(c) for c in h["cusps_deg"]]
+
+    # tag system
+    sys = h.get("system") or h.get("house_system")
+    if isinstance(sys, str) and not sys.endswith("_sidereal"):
+        sys = f"{sys}_sidereal"
+        h["system"] = sys
+        h["house_system"] = sys
+
+    return h
+
+
+def _extract_ayanamsa_from_chart(chart: Dict[str, Any]) -> Optional[float]:
+    if not isinstance(chart, dict):
+        return None
+    meta = chart.get("meta") or {}
+    ay = meta.get("ayanamsa_deg")
+    if isinstance(ay, (int, float)):
+        return float(ay)
+    ay2 = chart.get("ayanamsa_deg")
+    return float(ay2) if isinstance(ay2, (int, float)) else None
+
+
 # ───────────────────────────── error helpers ─────────────────────────────
 def _json_error(code: str, details: Any = None, http: int = 400):
     out: Dict[str, Any] = {"ok": False, "error": code}
@@ -433,6 +485,13 @@ def calculate():
     except Exception as e:
         return _json_error("houses_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
+    # If sidereal, rotate houses by the same ayanamsa used by the chart
+    mode = (payload.get("mode") or "tropical").lower()
+    if mode == "sidereal":
+        ay = _extract_ayanamsa_from_chart(chart)
+        if isinstance(ay, (int, float)):
+            houses = _rotate_sidereal_houses(houses, ay)
+
     if chart_warnings:
         chart["warnings"] = chart.get("warnings", []) + chart_warnings
 
@@ -489,6 +548,13 @@ def report():
     except Exception as e:
         return _json_error("houses_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
+    # If sidereal, rotate houses by the same ayanamsa used by the chart
+    mode = (payload.get("mode") or "tropical").lower()
+    if mode == "sidereal":
+        ay = _extract_ayanamsa_from_chart(chart)
+        if isinstance(ay, (int, float)):
+            houses = _rotate_sidereal_houses(houses, ay)
+
     if chart_warnings:
         chart["warnings"] = chart.get("warnings", []) + chart_warnings
 
@@ -542,6 +608,13 @@ def predictions_route():
 
     if chart is None:
         return _json_error("chart_internal", chart_error or "internal_error", 500)
+
+    # If sidereal, rotate houses by the same ayanamsa used by the chart
+    mode = (payload.get("mode") or "tropical").lower()
+    if mode == "sidereal":
+        ay = _extract_ayanamsa_from_chart(chart)
+        if isinstance(ay, (int, float)):
+            houses = _rotate_sidereal_houses(houses, ay)
 
     # Normalize chart for predictors that expect a mapping at chart["bodies"]
     chart_for_predict = _prepare_chart_for_predict(chart)
@@ -604,7 +677,7 @@ def predictions_route():
                 "abstained": abstained,
                 "evidence": pr.get("evidence"),
                 "mode": chart.get("mode"),
-                "ayanamsa_deg": chart.get("ayanamsa_deg"),
+                "ayanamsa_deg": chart.get("ayanamsa_deg") or (_extract_ayanamsa_from_chart(chart)),
                 "notes": "QIA+calibrated placeholder; subject to M3 tuning "
                          + ("abstained" if abstained else "accepted"),
             }
@@ -615,10 +688,8 @@ def predictions_route():
         try:
             preds = flag_predictions(preds, _freeze_horizon(horizon), th_path)
         except Exception as e:
-            # Don't 500 the endpoint if flagging logic hiccups
             if DEBUG_VERBOSE:
                 log.warning("flag_predictions failed: %r", e)
-            # leave `preds` unmodified
 
     meta = {
         "timescales": ts,
