@@ -30,15 +30,13 @@ api = Blueprint("api", __name__)
 DEBUG_VERBOSE = os.getenv("ASTRO_DEBUG_VERBOSE", "0").lower() in ("1", "true", "yes", "on")
 
 # ───────────────────────────── Chart engine (primary + fallback) ─────────────────────────────
-# Primary
 _compute_chart = None  # type: ignore
-_CHART_ENGINE_NAME = None
+_CHART_ENGINE_NAME: Optional[str] = None
 
 try:  # pragma: no cover
     from app.core.astronomy import compute_chart as _compute_chart  # type: ignore
     _CHART_ENGINE_NAME = "app.core.astronomy.compute_chart"
 except Exception as e1:  # pragma: no cover
-    # Fallback to app.core.chart.compute_chart
     try:
         from app.core.chart import compute_chart as _compute_chart  # type: ignore
         _CHART_ENGINE_NAME = "app.core.chart.compute_chart"
@@ -183,20 +181,36 @@ def _sig_accepts(fn, *names: str) -> Dict[str, bool]:
 def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str, Any]:
     """
     Call compute_chart (primary or fallback), passing flexible inputs.
-    Supplies jd_ut/jd_tt/jd_ut1 when supported, as well as bodies/topocentric/ayanamsa when present.
+    Supports engines that accept a single 'payload' dict OR granular kwargs.
+    Always supplies jd_ut/jd_tt/jd_ut1 when supported.
     """
     if _compute_chart is None:
         raise RuntimeError("chart_engine_unavailable")
 
     params = inspect.signature(_compute_chart).parameters
 
+    # --- engines that accept a single 'payload' dict (e.g., app.core.astronomy.compute_chart) ---
+    if "payload" in params:
+        merged = dict(payload)
+        merged.setdefault("jd_ut", ts["jd_utc"])
+        merged.setdefault("jd_tt", ts["jd_tt"])
+        merged.setdefault("jd_ut1", ts["jd_ut1"])
+        chart = _compute_chart(merged)
+        chart.setdefault("meta", {})
+        chart["meta"]["engine"] = _CHART_ENGINE_NAME or "unknown"
+        if "jd_ut" not in chart:
+            chart["jd_ut"] = ts["jd_utc"]
+        if "mode" not in chart and "mode" in payload:
+            chart["mode"] = payload["mode"]
+        return chart
+
+    # --- granular-kwargs engines ---
     def pick(*cands: str) -> Optional[str]:
         for c in cands:
             if c in params:
                 return c
         return None
 
-    # common flexible names
     name_date = pick("date", "date_s", "date_str")
     name_time = pick("time", "time_s", "time_str")
     name_lat  = pick("latitude", "lat")
@@ -209,7 +223,6 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
     name_elev = pick("elevation_m", "elevation")
 
     kwargs: Dict[str, Any] = {}
-    # date/time/site/mode
     if name_date: kwargs[name_date] = payload["date"]
     if name_time: kwargs[name_time] = payload["time"]
     if name_lat:  kwargs[name_lat]  = payload["latitude"]
@@ -217,27 +230,23 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
     if name_mode: kwargs[name_mode] = payload["mode"]
     if name_tz:   kwargs[name_tz]   = payload.get("timezone") or payload.get("place_tz")
 
-    # optional pass-throughs
     if name_bods and "bodies" in payload: kwargs[name_bods] = payload["bodies"]
     if name_aya and "ayanamsa" in payload: kwargs[name_aya] = payload["ayanamsa"]
     if name_topo and "topocentric" in payload: kwargs[name_topo] = bool(payload["topocentric"])
     if name_elev and "elevation_m" in payload: kwargs[name_elev] = payload["elevation_m"]
 
-    # timescales (always try to pass)
     if "jd_ut" in params:  kwargs["jd_ut"]  = ts["jd_utc"]
     if "jd_tt" in params:  kwargs["jd_tt"]  = ts["jd_tt"]
     if "jd_ut1" in params: kwargs["jd_ut1"] = ts["jd_ut1"]
-    if "timescales" in params: kwargs["timescales"] = ts  # some engines like a bundle
+    if "timescales" in params: kwargs["timescales"] = ts
 
     chart = _compute_chart(**kwargs)
 
-    # normalize minimal keys
     if "jd_ut" not in chart:
         chart["jd_ut"] = ts["jd_utc"]
     if "mode" not in chart and "mode" in payload:
         chart["mode"] = payload["mode"]
 
-    # annotate engine used
     chart.setdefault("meta", {})
     chart["meta"]["engine"] = _CHART_ENGINE_NAME or "unknown"
     return chart
