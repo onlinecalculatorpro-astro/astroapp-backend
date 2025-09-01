@@ -168,7 +168,6 @@ def _ensure_timescales(payload: Dict[str, Any]) -> Tuple[float, float, float]:
     def _jd_utc_via_stdlib(d: str, t: str, z: str) -> float:
         from datetime import datetime, timezone
         from zoneinfo import ZoneInfo
-        # Allow HH:MM or HH:MM:SS
         parts = t.split(":")
         timestr = t if len(parts) >= 3 else (t + ":00")
         dt_local = datetime.fromisoformat(f"{d}T{timestr}")
@@ -198,7 +197,6 @@ def _ensure_timescales(payload: Dict[str, Any]) -> Tuple[float, float, float]:
     try:
         y, m = map(int, str(date_str).split("-")[:2])
     except Exception:
-        # minimal safe fallback: parse from JD_UTC roughly (rare)
         y, m = 2000, 1
 
     if _ts is not None:
@@ -344,41 +342,54 @@ def _normalize_adapter_output_to_maps(
     """
     Normalize various adapter return styles into:
       (longitudes_map {name: deg}, speeds_map {name: deg/day or None})
+
+    CASE-INSENSITIVE for body names so adapters that return 'sun' won't
+    break when we request 'Sun'.
     """
     longitudes: Dict[str, float] = {}
     speeds: Dict[str, Optional[float]] = {}
 
+    want = list(names_key)
+    want_lc = [w.lower() for w in want]
+
+    def _merge_numeric_map(src: Dict[Any, Any], *, into: str) -> None:
+        src_lc = {str(k).lower(): v for k, v in src.items()}
+        for nm, nm_lc in zip(want, want_lc):
+            if nm_lc in src_lc and isinstance(src_lc[nm_lc], (int, float)):
+                if into == "lon":
+                    longitudes[nm] = float(src_lc[nm_lc])
+                    speeds.setdefault(nm, None)
+                else:
+                    speeds[nm] = float(src_lc[nm_lc])
+
     # Case A: dict formats
     if isinstance(res, dict):
         # A1: {name: deg}
-        if all(isinstance(k, str) and isinstance(v, (int, float)) for k, v in res.items()):
-            for nm in names_key:
-                if nm in res:
-                    longitudes[nm] = float(res[nm])
-                    speeds[nm] = None
+        if all(isinstance(k, (str, int)) and isinstance(v, (int, float)) for k, v in res.items()):
+            _merge_numeric_map(res, into="lon")
             return longitudes, speeds
-        # A2: {"longitudes": {...}, "velocities": {...}}
-        if "longitudes" in res and isinstance(res["longitudes"], dict):
-            for nm in names_key:
-                if nm in res["longitudes"]:
-                    longitudes[nm] = float(res["longitudes"][nm])
-                    speeds[nm] = None
-            if "velocities" in res and isinstance(res["velocities"], dict):
-                for nm in names_key:
-                    if nm in res["velocities"]:
-                        speeds[nm] = float(res["velocities"][nm])
+        # A2: {"longitudes": {...}, "velocities": {...}} (key variants allowed)
+        for lon_key in ("longitudes", "longitude", "lon"):
+            if lon_key in res and isinstance(res[lon_key], dict):
+                _merge_numeric_map(res[lon_key], into="lon")
+                break
+        for spd_key in ("velocities", "velocity", "speeds", "speed"):
+            if spd_key in res and isinstance(res[spd_key], dict):
+                _merge_numeric_map(res[spd_key], into="spd")
+                break
+        if longitudes:
             return longitudes, speeds
 
     # Case B: list/tuple formats
     if isinstance(res, (list, tuple)):
-        # B1: list of dicts with "name","lon","speed"
+        # B1: list of dict rows with "name","lon","speed"
         if len(res) and isinstance(res[0], dict):
-            tmp_lon: Dict[str, float] = {}
-            tmp_spd: Dict[str, Optional[float]] = {}
+            tmp_lon_lc: Dict[str, float] = {}
+            tmp_spd_lc: Dict[str, Optional[float]] = {}
             for row in res:
                 try:
-                    nm = str(row.get("name"))
-                    if not nm:
+                    nm_lc = str(row.get("name", "")).lower()
+                    if not nm_lc:
                         continue
                     if row.get("lon") is not None:
                         lonv = float(row["lon"])
@@ -388,19 +399,19 @@ def _normalize_adapter_output_to_maps(
                         lonv = float(row["longitude_deg"])
                     else:
                         continue
-                    tmp_lon[nm] = lonv
-                    sp = row.get("speed")
-                    if sp is None: sp = row.get("speed_deg_per_day")
-                    tmp_spd[nm] = float(sp) if sp is not None else None
+                    tmp_lon_lc[nm_lc] = lonv
+                    sp = row.get("speed") or row.get("speed_deg_per_day")
+                    tmp_spd_lc[nm_lc] = float(sp) if sp is not None else None
                 except Exception:
                     continue
-            for nm in names_key:
-                if nm in tmp_lon:
-                    longitudes[nm] = float(tmp_lon[nm])
-                    speeds[nm] = tmp_spd.get(nm, None)
+            for nm, nm_lc in zip(want, want_lc):
+                if nm_lc in tmp_lon_lc:
+                    longitudes[nm] = float(tmp_lon_lc[nm_lc])
+                    speeds[nm] = tmp_spd_lc.get(nm_lc, None)
             return longitudes, speeds
-        # B2: aligned numeric list with names
-        for i, nm in enumerate(names_key[:len(res)]):
+
+        # B2: aligned numeric list with names (positional)
+        for i, nm in enumerate(want[:len(res)]):
             longitudes[nm] = float(res[i])
             speeds[nm] = None
         return longitudes, speeds
@@ -664,10 +675,15 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
     if mode == "sidereal":
         ay_deg, ay_note = _resolve_ayanamsa(jd_tt, payload.get("ayanamsa"))
 
-    # Build bodies output (apply ayanāṁśa if needed)
+    # Build bodies output (apply ayanāṁśa if needed), tolerant to adapter omissions
     out_bodies: List[Dict[str, Any]] = []
+    missing: List[str] = []
     for nm in bodies:
-        lon_deg, speed = results[nm]
+        tup = results.get(nm)
+        if not tup:
+            missing.append(nm)
+            continue
+        lon_deg, speed = tup
         if mode == "sidereal" and ay_deg is not None:
             lon_deg = _norm360(lon_deg - float(ay_deg))
         out_bodies.append({
@@ -675,6 +691,8 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
             "longitude_deg": float(_norm360(lon_deg)),
             "speed_deg_per_day": float(speed),
         })
+    if missing:
+        warnings.append(f"adapter_missing_bodies({', '.join(missing)})")
 
     # Angles (Asc/MC) — strict parity with houses_advanced
     asc_mc = _compute_angles_parity(
