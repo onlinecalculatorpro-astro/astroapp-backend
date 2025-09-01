@@ -24,6 +24,7 @@ from app.core.validators import (
     parse_rectification_payload,
 )
 
+# ───────────────────────────── numeric helpers ─────────────────────────────
 def _wrap360(x: float) -> float:
     """Normalize degrees to [0, 360). Safe for any float-like."""
     try:
@@ -31,6 +32,21 @@ def _wrap360(x: float) -> float:
         return 0.0 if abs(v) < 1e-12 else v  # collapse -0.0
     except Exception:
         return x  # leave non-numerics untouched
+
+
+def _shortest_delta_deg(a2: float, a1: float) -> float:
+    """Signed shortest angular delta in degrees a2 - a1 in (-180, 180]."""
+    d = (float(a2) - float(a1) + 540.0) % 360.0 - 180.0
+    return -180.0 if d == 180.0 else d
+
+
+def _delta_arcsec(a: float, b: float) -> float:
+    """Unsigned shortest difference (arcseconds) between two angles in deg."""
+    return abs(_shortest_delta_deg(a, b)) * 3600.0
+
+
+ARCSEC_TOL = float(os.getenv("ASTRO_ASC_TOL_ARCSEC", "3.6"))  # 0.001° default
+
 
 log = logging.getLogger(__name__)
 api = Blueprint("api", __name__)
@@ -70,6 +86,120 @@ try:  # pragma: no cover
     from app.core import leapseconds as _leaps  # type: ignore
 except Exception:  # pragma: no cover
     _leaps = None  # type: ignore
+
+
+# ───────────────────────────── ERFA-first angle helpers ─────────────────────────────
+def _split_jd(jd: float) -> tuple[float, float]:
+    d = int(jd // 1)
+    return float(d), float(jd - d)
+
+
+def _sind(a: float) -> float:  # degrees
+    import math
+    return math.sin(math.radians(a))
+
+
+def _cosd(a: float) -> float:
+    import math
+    return math.cos(math.radians(a))
+
+
+def _atan2d(y: float, x: float) -> float:
+    import math
+    if x == 0.0 and y == 0.0:
+        raise ValueError("atan2(0,0) undefined")
+    return _wrap360(math.degrees(math.atan2(y, x)))
+
+
+def _gast_deg(jd_ut1: float, jd_tt: float) -> float:
+    """
+    Apparent sidereal time (GAST) in degrees, IAU 2006/2000A via ERFA when present;
+    GMST-like fallback otherwise.
+    """
+    try:
+        import erfa  # type: ignore
+        d1u, d2u = _split_jd(jd_ut1)
+        d1t, d2t = _split_jd(jd_tt)
+        gst_rad = erfa.gst06a(d1u, d2u, d1t, d2t)
+        import math
+        return _wrap360(math.degrees(gst_rad))
+    except Exception:
+        # Fallback GMST approximation
+        import math
+        T = (float(jd_ut1) - 2451545.0) / 36525.0
+        theta = (
+            280.46061837
+            + 360.98564736629 * (float(jd_ut1) - 2451545.0)
+            + 0.000387933 * (T**2)
+            - (T**3) / 38710000.0
+        )
+        return _wrap360(theta)
+
+
+def _true_obliquity_deg(jd_tt: float) -> float:
+    """
+    True obliquity ε = mean(IAU 2006) + nutation(IAU 2000A) with ERFA;
+    mean obliquity fallback if ERFA missing.
+    """
+    try:
+        import erfa  # type: ignore
+        d1, d2 = _split_jd(jd_tt)
+        eps0 = erfa.obl06(d1, d2)
+        _dpsi, deps = erfa.nut06a(d1, d2)
+        import math
+        return math.degrees(eps0 + deps)
+    except Exception:
+        # Meeus 2000 Eq. 22.3 mean obliquity (arcsec polynomial)
+        import math
+        T = (float(jd_tt) - 2451545.0) / 36525.0
+        eps_arcsec = 84381.448 - 46.8150 * T - 0.00059 * (T**2) + 0.001813 * (T**3)
+        return eps_arcsec / 3600.0
+
+
+def _ramc_deg(jd_ut1: float, jd_tt: float, lon_east_deg: float) -> float:
+    """Right Ascension of the MC = GAST + longitude (east-positive)."""
+    return _wrap360(_gast_deg(jd_ut1, jd_tt) + float(lon_east_deg))
+
+
+def _mc_from_ramc(ramc: float, eps: float) -> float:
+    """λ_MC = atan2( sin(RAMC) * cos ε, cos(RAMC) )."""
+    return _atan2d(_sind(ramc) * _cosd(eps), _cosd(ramc))
+
+
+def _asc_from_phi_ramc(phi: float, ramc: float, eps: float) -> float:
+    """
+    Exact Ascendant using quadrant-safe arccot/atan2 form:
+    ASC = arccot( - ( tan φ * sin ε + sin RAMC * cos ε ) / cos RAMC )
+    """
+    import math
+    def _acotd(x: float) -> float:
+        return _wrap360(math.degrees(math.atan2(1.0, x)))
+    num = -((math.tan(math.radians(phi)) * _sind(eps)) + (_sind(ramc) * _cosd(eps)))
+    den = _cosd(ramc)
+    den = den if abs(den) > 1e-15 else math.copysign(1e-15, den if den != 0 else 1.0)
+    return _acotd(num / den)
+
+
+def _recompute_angles_exact(
+    *,
+    jd_ut1: float,
+    jd_tt: float,
+    latitude: Optional[float],
+    longitude_east: Optional[float],
+    mode: str,
+    ayanamsa_deg: Optional[float],
+) -> Optional[Dict[str, float]]:
+    """Exact ASC/MC at ecliptic-of-date; sidereal = tropical − ayanāṁśa."""
+    if latitude is None or longitude_east is None:
+        return None
+    eps = _true_obliquity_deg(jd_tt)
+    ramc = _ramc_deg(jd_ut1, jd_tt, float(longitude_east))
+    mc = _mc_from_ramc(ramc, eps)
+    asc = _asc_from_phi_ramc(float(latitude), ramc, eps)
+    if (mode or "tropical").lower() == "sidereal" and isinstance(ayanamsa_deg, (int, float)):
+        asc = _wrap360(asc - float(ayanamsa_deg))
+        mc = _wrap360(mc - float(ayanamsa_deg))
+    return {"asc_deg": asc, "mc_deg": mc}
 
 
 # ───────────────────────────── Timescales helpers ─────────────────────────────
@@ -198,17 +328,15 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
 
     params = inspect.signature(_compute_chart).parameters
 
-    # --- engines that accept a single 'payload' dict (e.g., app.core.astronomy.compute_chart) ---
+    # engines that accept a single 'payload' dict
     if "payload" in params:
         merged = dict(payload)
-        # HARD-ASSIGN: single source of truth for timescales
         merged["jd_ut"] = ts["jd_utc"]
         merged["jd_tt"] = ts["jd_tt"]
         merged["jd_ut1"] = ts["jd_ut1"]
         chart = _compute_chart(merged)
         chart.setdefault("meta", {})
         chart["meta"]["engine"] = _CHART_ENGINE_NAME or "unknown"
-        # Enforce parity in the returned chart object too
         chart["jd_ut"] = ts["jd_utc"]
         chart["jd_tt"] = ts["jd_tt"]
         chart["jd_ut1"] = ts["jd_ut1"]
@@ -216,7 +344,7 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
             chart["mode"] = payload["mode"]
         return chart
 
-    # --- granular-kwargs engines ---
+    # granular-kwargs engines
     def pick(*cands: str) -> Optional[str]:
         for c in cands:
             if c in params:
@@ -255,7 +383,6 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
 
     chart = _compute_chart(**kwargs)
 
-    # Enforce parity in the returned chart object as well
     chart["jd_ut"] = ts["jd_utc"]
     chart["jd_tt"] = ts["jd_tt"]
     chart["jd_ut1"] = ts["jd_ut1"]
@@ -379,6 +506,7 @@ def _json_error(code: str, details: Any = None, http: int = 400):
     return jsonify(out), http
 
 
+# ───────────────────────────── houses normalization & parity ─────────────────────────────
 def _normalize_houses_payload(h: Any) -> Any:
     """
     Normalize/standardize houses payload:
@@ -415,6 +543,66 @@ def _normalize_houses_payload(h: Any) -> Any:
             h[key] = [_wrap360(c) if isinstance(c, (int, float)) else c for c in h[key]]
 
     return h
+
+
+def _ensure_houses_angles_parity(
+    h: Any, ts: Dict[str, Any], payload: Dict[str, Any], chart: Dict[str, Any]
+) -> Any:
+    """
+    Recompute ASC/MC with ERFA-first math (same as astronomy engine).
+    If houses ASC/MC differ beyond ARCSEC_TOL, overwrite with recomputed values
+    and annotate a warning. This aligns coordinate conventions + timescales.
+    """
+    if not isinstance(h, dict):
+        return h
+
+    lat = payload.get("latitude")
+    lon = payload.get("longitude")
+    mode = (payload.get("mode") or "tropical").lower()
+    ay = _extract_ayanamsa_from_chart(chart) if mode == "sidereal" else None
+
+    recomputed = _recompute_angles_exact(
+        jd_ut1=float(ts["jd_ut1"]),
+        jd_tt=float(ts["jd_tt"]),
+        latitude=float(lat) if isinstance(lat, (int, float)) else None,
+        longitude_east=float(lon) if isinstance(lon, (int, float)) else None,
+        mode=mode,
+        ayanamsa_deg=ay,
+    )
+
+    if not recomputed:
+        return h
+
+    asc_new = recomputed["asc_deg"]
+    mc_new = recomputed["mc_deg"]
+
+    # current (if any)
+    asc_old = h.get("asc_deg") if isinstance(h.get("asc_deg"), (int, float)) else h.get("asc")
+    mc_old = h.get("mc_deg") if isinstance(h.get("mc_deg"), (int, float)) else h.get("mc")
+
+    warn_list = h.get("warnings") or []
+    changed = False
+
+    if isinstance(asc_old, (int, float)):
+        d_asc = _delta_arcsec(asc_new, float(asc_old))
+        if d_asc > ARCSEC_TOL:
+            h["asc_deg"] = _wrap360(asc_new); h["asc"] = h["asc_deg"]; changed = True
+            warn_list.append(f"asc_corrected_for_parity({d_asc:.2f}arcsec)")
+    else:
+        h["asc_deg"] = _wrap360(asc_new); h["asc"] = h["asc_deg"]; changed = True
+
+    if isinstance(mc_old, (int, float)):
+        d_mc = _delta_arcsec(mc_new, float(mc_old))
+        if d_mc > ARCSEC_TOL:
+            h["mc_deg"] = _wrap360(mc_new); h["mc"] = h["mc_deg"]; changed = True
+            warn_list.append(f"mc_corrected_for_parity({d_mc:.2f}arcsec)")
+    else:
+        h["mc_deg"] = _wrap360(mc_new); h["mc"] = h["mc_deg"]; changed = True
+
+    if changed:
+        h["warnings"] = warn_list
+
+    return _normalize_houses_payload(h)
 
 
 # NEW: normalize chart.bodies for predictors that expect a mapping
@@ -514,7 +702,9 @@ def calculate():
         ay = _extract_ayanamsa_from_chart(chart)
         if isinstance(ay, (int, float)):
             houses = _rotate_sidereal_houses(houses, ay)
-            houses = _normalize_houses_payload(houses)  # re-normalize after rotation
+
+    # ERFA parity fix for ASC/MC
+    houses = _ensure_houses_angles_parity(houses, ts, payload, chart)
 
     if chart_warnings:
         chart["warnings"] = chart.get("warnings", []) + chart_warnings
@@ -578,7 +768,9 @@ def report():
         ay = _extract_ayanamsa_from_chart(chart)
         if isinstance(ay, (int, float)):
             houses = _rotate_sidereal_houses(houses, ay)
-            houses = _normalize_houses_payload(houses)  # re-normalize after rotation
+
+    # ERFA parity fix for ASC/MC
+    houses = _ensure_houses_angles_parity(houses, ts, payload, chart)
 
     if chart_warnings:
         chart["warnings"] = chart.get("warnings", []) + chart_warnings
@@ -640,7 +832,9 @@ def predictions_route():
         ay = _extract_ayanamsa_from_chart(chart)
         if isinstance(ay, (int, float)):
             houses = _rotate_sidereal_houses(houses, ay)
-            houses = _normalize_houses_payload(houses)  # re-normalize after rotation
+
+    # ERFA parity fix for ASC/MC
+    houses = _ensure_houses_angles_parity(houses, ts, payload, chart)
 
     # Normalize chart for predictors that expect a mapping at chart["bodies"]
     chart_for_predict = _prepare_chart_for_predict(chart)
@@ -650,6 +844,7 @@ def predictions_route():
         from app.core.predict import predict  # local import to avoid import cycles
         preds_raw = predict(chart_for_predict, houses, horizon)
     except Exception as e:
+        # Give more actionable debugging info during development
         return jsonify({"ok": False, "error": "internal_error", "message": str(e), "type": type(e).__name__}), 500
 
     # thresholds (with sensible defaults)
