@@ -7,7 +7,7 @@ import os
 import logging
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 from zoneinfo import ZoneInfo
 
 from flask import Blueprint, jsonify, request
@@ -22,30 +22,25 @@ from app.core.validators import (
     parse_chart_payload,
     parse_prediction_payload,
     parse_rectification_payload,
+    parse_ephemeris_payload,            # NEW
 )
 
 # ───────────────────────────── numeric helpers ─────────────────────────────
 def _wrap360(x: float) -> float:
-    """Normalize degrees to [0, 360). Safe for any float-like."""
     try:
         v = float(x) % 360.0
-        return 0.0 if abs(v) < 1e-12 else v  # collapse -0.0
+        return 0.0 if abs(v) < 1e-12 else v
     except Exception:
-        return x  # leave non-numerics untouched
-
+        return x
 
 def _shortest_delta_deg(a2: float, a1: float) -> float:
-    """Signed shortest angular delta in degrees a2 - a1 in (-180, 180]."""
     d = (float(a2) - float(a1) + 540.0) % 360.0 - 180.0
     return -180.0 if d == 180.0 else d
 
-
 def _delta_arcsec(a: float, b: float) -> float:
-    """Unsigned shortest difference (arcseconds) between two angles in deg."""
     return abs(_shortest_delta_deg(a, b)) * 3600.0
 
-
-ARCSEC_TOL = float(os.getenv("ASTRO_ASC_TOL_ARCSEC", "3.6"))  # 0.001° default
+ARCSEC_TOL = float(os.getenv("ASTRO_ASC_TOL_ARCSEC", "3.6"))  # 0.001°
 
 log = logging.getLogger(__name__)
 api = Blueprint("api", __name__)
@@ -86,22 +81,18 @@ try:  # pragma: no cover
 except Exception:  # pragma: no cover
     _leaps = None  # type: ignore
 
-
 # ───────────────────────────── ERFA-first angle helpers ─────────────────────────────
 def _split_jd(jd: float) -> tuple[float, float]:
     d = int(jd // 1)
     return float(d), float(jd - d)
 
-
-def _sind(a: float) -> float:  # degrees
+def _sind(a: float) -> float:
     import math
     return math.sin(math.radians(a))
-
 
 def _cosd(a: float) -> float:
     import math
     return math.cos(math.radians(a))
-
 
 def _atan2d(y: float, x: float) -> float:
     import math
@@ -109,12 +100,7 @@ def _atan2d(y: float, x: float) -> float:
         raise ValueError("atan2(0,0) undefined")
     return _wrap360(math.degrees(math.atan2(y, x)))
 
-
 def _gast_deg(jd_ut1: float, jd_tt: float) -> float:
-    """
-    Apparent sidereal time (GAST) in degrees, IAU 2006/2000A via ERFA when present;
-    GMST-like fallback otherwise.
-    """
     try:
         import erfa  # type: ignore
         d1u, d2u = _split_jd(jd_ut1)
@@ -123,7 +109,6 @@ def _gast_deg(jd_ut1: float, jd_tt: float) -> float:
         import math
         return _wrap360(math.degrees(gst_rad))
     except Exception:
-        # Fallback GMST approximation
         import math
         T = (float(jd_ut1) - 2451545.0) / 36525.0
         theta = (
@@ -134,12 +119,7 @@ def _gast_deg(jd_ut1: float, jd_tt: float) -> float:
         )
         return _wrap360(theta)
 
-
 def _true_obliquity_deg(jd_tt: float) -> float:
-    """
-    True obliquity ε = mean(IAU 2006) + nutation(IAU 2000A) with ERFA;
-    mean obliquity fallback if ERFA missing.
-    """
     try:
         import erfa  # type: ignore
         d1, d2 = _split_jd(jd_tt)
@@ -148,28 +128,18 @@ def _true_obliquity_deg(jd_tt: float) -> float:
         import math
         return math.degrees(eps0 + deps)
     except Exception:
-        # Meeus 2000 Eq. 22.3 mean obliquity (arcsec polynomial)
         import math
         T = (float(jd_tt) - 2451545.0) / 36525.0
         eps_arcsec = 84381.448 - 46.8150 * T - 0.00059 * (T**2) + 0.001813 * (T**3)
         return eps_arcsec / 3600.0
 
-
 def _ramc_deg(jd_ut1: float, jd_tt: float, lon_east_deg: float) -> float:
-    """Right Ascension of the MC = GAST + longitude (east-positive)."""
     return _wrap360(_gast_deg(jd_ut1, jd_tt) + float(lon_east_deg))
 
-
 def _mc_from_ramc(ramc: float, eps: float) -> float:
-    """λ_MC = atan2( sin(RAMC) * cos ε, cos(RAMC) )."""
     return _atan2d(_sind(ramc) * _cosd(eps), _cosd(ramc))
 
-
 def _asc_from_phi_ramc(phi: float, ramc: float, eps: float) -> float:
-    """
-    Exact Ascendant using quadrant-safe arccot/atan2 form:
-    ASC = arccot( - ( tan φ * sin ε + sin RAMC * cos ε ) / cos RAMC )
-    """
     import math
     def _acotd(x: float) -> float:
         return _wrap360(math.degrees(math.atan2(1.0, x)))
@@ -178,17 +148,10 @@ def _asc_from_phi_ramc(phi: float, ramc: float, eps: float) -> float:
     den = den if abs(den) > 1e-15 else math.copysign(1e-15, den if den != 0 else 1.0)
     return _acotd(num / den)
 
-
 def _recompute_angles_exact(
-    *,
-    jd_ut1: float,
-    jd_tt: float,
-    latitude: Optional[float],
-    longitude_east: Optional[float],
-    mode: str,
-    ayanamsa_deg: Optional[float],
+    *, jd_ut1: float, jd_tt: float, latitude: Optional[float], longitude_east: Optional[float],
+    mode: str, ayanamsa_deg: Optional[float],
 ) -> Optional[Dict[str, float]]:
-    """Exact ASC/MC at ecliptic-of-date; sidereal = tropical − ayanāṁśa."""
     if latitude is None or longitude_east is None:
         return None
     eps = _true_obliquity_deg(jd_tt)
@@ -200,40 +163,8 @@ def _recompute_angles_exact(
         mc = _wrap360(mc - float(ayanamsa_deg))
     return {"asc_deg": asc, "mc_deg": mc}
 
-
 # ───────────────────────────── Timescales helpers ─────────────────────────────
-def _datetime_to_jd_utc(dt_utc: datetime) -> float:
-    """Return Julian Date (UTC). Prefer ERFA; fallback to Meeus form."""
-    if dt_utc.tzinfo is None or dt_utc.tzinfo is not timezone.utc:
-        raise ValueError("dt_utc must be timezone-aware UTC")
-    try:
-        import erfa  # PyERFA
-        iy, im, id_ = dt_utc.year, dt_utc.month, dt_utc.day
-        ih, iv = dt_utc.hour, dt_utc.minute
-        sf = dt_utc.second + dt_utc.microsecond / 1e6
-        d1, d2 = erfa.dtf2d("UTC", iy, im, id_, ih, iv, sf)
-        return float(d1 + d2)
-    except Exception:
-        # Meeus fallback
-        Y, M, D = dt_utc.year, dt_utc.month, dt_utc.day
-        h, m = dt_utc.hour, dt_utc.minute
-        s = dt_utc.second + dt_utc.microsecond / 1_000_000.0
-        a = (14 - M) // 12
-        y = Y + 4800 - a
-        m_ = M + 12 * a - 3
-        jdn = D + (153 * m_ + 2) // 5 + 365 * y + y // 4 - y // 100 + y // 400 - 32045
-        dayfrac = (h - 12) / 24.0 + m / 1440.0 + s / 86400.0
-        return float(jdn + dayfrac)
-
-
 def _compute_timescales_from_local(date_str: str, time_str: str, tz_name: str) -> Dict[str, Any]:
-    """
-    Convert local date/time/tz → {jd_utc, jd_tt, jd_ut1, delta_t, dut1, ...}
-    Uses app.core.timescales (same as main.py). Stable JSON for callers.
-
-    NOTE: We normalize time to HH:MM:SS and ALWAYS parse with "%Y-%m-%d %H:%M:%S"
-          to avoid 'unconverted data remains' errors.
-    """
     try:
         tz = ZoneInfo(tz_name)
     except Exception:
@@ -250,18 +181,15 @@ def _compute_timescales_from_local(date_str: str, time_str: str, tz_name: str) -
             return f"{int(hh):02d}:{int(mm):02d}:{int(ss):02d}"
         raise ValidationError({"time": "must be 'HH:MM' or 'HH:MM:SS'"})
 
-    # Normalize first, then parse with seconds format
     time_norm = _norm_hms(time_str)
     fmt = "%Y-%m-%d %H:%M:%S"
 
     dt_local = datetime.strptime(f"{date_str} {time_norm}", fmt).replace(tzinfo=tz)
     dt_utc = dt_local.astimezone(timezone.utc)
 
-    # Use timescales helpers
     jd_utc = _ts.julian_day_utc(date_str, time_norm, tz_name)
     jd_tt = _ts.jd_tt_from_utc_jd(jd_utc, dt_utc.year, dt_utc.month)
 
-    # UT1 = UT + DUT1 (seconds)
     dut1 = float(os.getenv("ASTRO_DUT1_BROADCAST", os.getenv("ASTRO_DUT1", "0.0")))
     jd_ut1 = float(jd_utc) + dut1 / 86400.0
 
@@ -271,7 +199,7 @@ def _compute_timescales_from_local(date_str: str, time_str: str, tz_name: str) -
         delta_t = None
 
     tz_offset_seconds = int(dt_local.utcoffset().total_seconds()) if dt_local.utcoffset() else 0
-    out = {
+    return {
         "jd_utc": float(jd_utc),
         "jd_tt": float(jd_tt),
         "jd_ut1": float(jd_ut1),
@@ -282,8 +210,6 @@ def _compute_timescales_from_local(date_str: str, time_str: str, tz_name: str) -
         "tz_offset_seconds": tz_offset_seconds,
         "warnings": [],
     }
-    return out
-
 
 # ─────────────────────── engine call adapters ───────────────────────
 def _sig_accepts(fn, *names: str) -> Dict[str, bool]:
@@ -293,20 +219,12 @@ def _sig_accepts(fn, *names: str) -> Dict[str, bool]:
         return {n: False for n in names}
     return {n: (n in params) for n in names}
 
-
 def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Call compute_chart (primary or fallback), passing flexible inputs.
-    Supports engines that accept a single 'payload' dict OR granular kwargs.
-    Always supplies jd_ut/jd_tt/jd_ut1 from the SAME kernel to guarantee parity
-    with the houses engine.
-    """
     if _compute_chart is None:
         raise RuntimeError("chart_engine_unavailable")
 
     params = inspect.signature(_compute_chart).parameters
 
-    # engines that accept a single 'payload' dict
     if "payload" in params:
         merged = dict(payload)
         merged["jd_ut"] = ts["jd_utc"]
@@ -322,7 +240,6 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
             chart["mode"] = payload["mode"]
         return chart
 
-    # granular-kwargs engines
     def pick(*cands: str) -> Optional[str]:
         for c in cands:
             if c in params:
@@ -347,49 +264,38 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
     if name_lon:  kwargs[name_lon]  = payload["longitude"]
     if name_mode: kwargs[name_mode] = payload["mode"]
     if name_tz:   kwargs[name_tz]   = payload.get("timezone") or payload.get("place_tz")
-
     if name_bods and "bodies" in payload: kwargs[name_bods] = payload["bodies"]
     if name_aya and "ayanamsa" in payload: kwargs[name_aya] = payload["ayanamsa"]
     if name_topo and "topocentric" in payload: kwargs[name_topo] = bool(payload["topocentric"])
     if name_elev and "elevation_m" in payload: kwargs[name_elev] = payload["elevation_m"]
 
-    # Force identical timescales
     if "jd_ut" in params:  kwargs["jd_ut"]  = ts["jd_utc"]
     if "jd_tt" in params:  kwargs["jd_tt"]  = ts["jd_tt"]
     if "jd_ut1" in params: kwargs["jd_ut1"] = ts["jd_ut1"]
     if "timescales" in params: kwargs["timescales"] = ts
 
     chart = _compute_chart(**kwargs)
-
     chart["jd_ut"] = ts["jd_utc"]
     chart["jd_tt"] = ts["jd_tt"]
     chart["jd_ut1"] = ts["jd_ut1"]
     if "mode" not in chart and "mode" in payload:
         chart["mode"] = payload["mode"]
-
     chart.setdefault("meta", {})
     chart["meta"]["engine"] = _CHART_ENGINE_NAME or "unknown"
     return chart
 
-
 def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
-    """
-    Prefer policy façade; pass jd_tt/jd_ut1 when accepted.
-    Fallback to advanced compute_house_system signature if needed.
-    """
     lat = float(payload["latitude"])
     lon = float(payload["longitude"])
     requested_system = (payload.get("house_system") or "").strip().lower() or None
 
     accepts = _sig_accepts(
-        _houses_fn,
-        "lat", "lon", "latitude", "longitude",
+        _houses_fn, "lat", "lon", "latitude", "longitude",
         "system", "requested_house_system", "house_system",
         "mode", "jd_ut", "jd_tt", "jd_ut1", "diagnostics", "validation",
     )
 
     kwargs: Dict[str, Any] = {}
-    # lat/lon
     if accepts.get("lat"):
         kwargs["lat"] = lat
     elif accepts.get("latitude"):
@@ -403,7 +309,6 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
     else:
         kwargs["lon"] = lon
 
-    # requested system
     if requested_system:
         if accepts.get("system"):
             kwargs["system"] = requested_system
@@ -412,7 +317,6 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
         elif accepts.get("house_system"):
             kwargs["house_system"] = requested_system
 
-    # timescales (force same source as chart)
     if accepts.get("jd_tt"):
         kwargs["jd_tt"] = ts["jd_tt"]
     if accepts.get("jd_ut1"):
@@ -420,7 +324,6 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
     if accepts.get("jd_ut") and "jd_tt" not in kwargs and "jd_ut1" not in kwargs:
         kwargs["jd_ut"] = ts["jd_utc"]
 
-    # optional flags passthrough
     if accepts.get("diagnostics") and "diagnostics" in payload:
         kwargs["diagnostics"] = bool(payload["diagnostics"])
     if accepts.get("validation") and "validation" in payload:
@@ -428,43 +331,7 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
 
     return _houses_fn(**kwargs)
 
-
-# ───────────────────────────── helpers: sidereal rotation ─────────────────────────────
-def _rotate_sidereal_houses(h: Any, ay_deg: Optional[float]) -> Any:
-    """
-    Rotate a tropical houses payload to sidereal by subtracting ayanamsa degrees.
-    Modifies angle keys and cusp arrays if present.
-    """
-    if ay_deg is None or not isinstance(h, dict):
-        return h
-
-    def rot(v: Optional[float]) -> Optional[float]:
-        if v is None:
-            return None
-        x = (float(v) - float(ay_deg)) % 360.0
-        return 0.0 if abs(x) < 1e-12 else x
-
-    # rotate angles
-    for k in ("asc", "asc_deg", "mc", "mc_deg", "vertex", "eastpoint"):
-        if k in h and isinstance(h[k], (int, float)):
-            h[k] = rot(h[k])
-
-    # rotate cusps
-    if "cusps" in h and isinstance(h["cusps"], list):
-        h["cusps"] = [rot(c) for c in h["cusps"]]
-    if "cusps_deg" in h and isinstance(h["cusps_deg"], list):
-        h["cusps_deg"] = [rot(c) for c in h["cusps_deg"]]
-
-    # tag system
-    sys = h.get("system") or h.get("house_system")
-    if isinstance(sys, str) and not sys.endswith("_sidereal"):
-        sys = f"{sys}_sidereal"
-        h["system"] = sys
-        h["house_system"] = sys
-
-    return h
-
-
+# ───────────────────────────── helpers: sidereal rotation & parity ─────────────────────────────
 def _extract_ayanamsa_from_chart(chart: Dict[str, Any]) -> Optional[float]:
     if not isinstance(chart, dict):
         return None
@@ -475,28 +342,9 @@ def _extract_ayanamsa_from_chart(chart: Dict[str, Any]) -> Optional[float]:
     ay2 = chart.get("ayanamsa_deg")
     return float(ay2) if isinstance(ay2, (int, float)) else None
 
-
-# ───────────────────────────── error helpers ─────────────────────────────
-def _json_error(code: str, details: Any = None, http: int = 400):
-    out: Dict[str, Any] = {"ok": False, "error": code}
-    if details is not None:
-        out["details"] = details
-    return jsonify(out), http
-
-
-# ───────────────────────────── houses normalization & parity ─────────────────────────────
 def _normalize_houses_payload(h: Any) -> Any:
-    """
-    Normalize/standardize houses payload:
-      • ensure 'cusps' and 'cusps_deg' mirror each other,
-      • mirror 'system' and 'house_system',
-      • ensure 'asc_deg'/'mc_deg' are present,
-      • normalize all angles/cusps to [0, 360).
-    """
     if not isinstance(h, dict):
         return h
-
-    # Mirror fields
     if "cusps" not in h and "cusps_deg" in h:
         h["cusps"] = h["cusps_deg"]
     if "cusps_deg" not in h and "cusps" in h:
@@ -509,58 +357,36 @@ def _normalize_houses_payload(h: Any) -> Any:
         h["asc_deg"] = h["asc"]
     if "mc_deg" not in h and "mc" in h:
         h["mc_deg"] = h["mc"]
-
-    # Normalize scalar angles
     for k in ("asc", "asc_deg", "mc", "mc_deg", "vertex", "eastpoint", "armc", "ramc"):
         if k in h and isinstance(h[k], (int, float)):
-            h[k] = _wrap360(h[k])
-
-    # Normalize cusp arrays
+            h[k] = _wrap360(h[k"])
     for key in ("cusps", "cusps_deg"):
         if isinstance(h.get(key), list):
             h[key] = [_wrap360(c) if isinstance(c, (int, float)) else c for c in h[key]]
-
     return h
 
-
-def _ensure_houses_angles_parity(
+def _recompute_houses_angles_if_needed(
     h: Any, ts: Dict[str, Any], payload: Dict[str, Any], chart: Dict[str, Any]
 ) -> Any:
-    """
-    Recompute ASC/MC with ERFA-first math (same as astronomy engine).
-    If houses ASC/MC differ beyond ARCSEC_TOL, overwrite with recomputed values
-    and annotate a warning. This aligns coordinate conventions + timescales.
-    """
     if not isinstance(h, dict):
         return h
-
     lat = payload.get("latitude")
     lon = payload.get("longitude")
     mode = (payload.get("mode") or "tropical").lower()
     ay = _extract_ayanamsa_from_chart(chart) if mode == "sidereal" else None
-
     recomputed = _recompute_angles_exact(
-        jd_ut1=float(ts["jd_ut1"]),
-        jd_tt=float(ts["jd_tt"]),
+        jd_ut1=float(ts["jd_ut1"]), jd_tt=float(ts["jd_tt"]),
         latitude=float(lat) if isinstance(lat, (int, float)) else None,
         longitude_east=float(lon) if isinstance(lon, (int, float)) else None,
-        mode=mode,
-        ayanamsa_deg=ay,
+        mode=mode, ayanamsa_deg=ay,
     )
-
     if not recomputed:
         return h
-
-    asc_new = recomputed["asc_deg"]
-    mc_new = recomputed["mc_deg"]
-
-    # current (if any)
+    asc_new, mc_new = recomputed["asc_deg"], recomputed["mc_deg"]
     asc_old = h.get("asc_deg") if isinstance(h.get("asc_deg"), (int, float)) else h.get("asc")
-    mc_old = h.get("mc_deg") if isinstance(h.get("mc_deg"), (int, float)) else h.get("mc")
-
+    mc_old  = h.get("mc_deg") if isinstance(h.get("mc_deg"), (int, float)) else h.get("mc")
     warn_list = h.get("warnings") or []
     changed = False
-
     if isinstance(asc_old, (int, float)):
         d_asc = _delta_arcsec(asc_new, float(asc_old))
         if d_asc > ARCSEC_TOL:
@@ -568,7 +394,6 @@ def _ensure_houses_angles_parity(
             warn_list.append(f"asc_corrected_for_parity({d_asc:.2f}arcsec)")
     else:
         h["asc_deg"] = _wrap360(asc_new); h["asc"] = h["asc_deg"]; changed = True
-
     if isinstance(mc_old, (int, float)):
         d_mc = _delta_arcsec(mc_new, float(mc_old))
         if d_mc > ARCSEC_TOL:
@@ -576,26 +401,16 @@ def _ensure_houses_angles_parity(
             warn_list.append(f"mc_corrected_for_parity({d_mc:.2f}arcsec)")
     else:
         h["mc_deg"] = _wrap360(mc_new); h["mc"] = h["mc_deg"]; changed = True
-
     if changed:
         h["warnings"] = warn_list
-
     return _normalize_houses_payload(h)
 
-
-# NEW: normalize chart.bodies for predictors that expect a mapping
+# ───────────────────────────── helpers: predictions shape ─────────────────────────────
 def _prepare_chart_for_predict(chart: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Ensure `chart['bodies']` is a mapping {name: body_dict} for downstream
-    predictors, while preserving the original list (if any) at `bodies_list`.
-    Safe no-op if bodies is already a mapping.
-    """
-    ch = dict(chart)  # shallow copy to avoid mutating engine output
+    ch = dict(chart)
     bodies = ch.get("bodies")
-
     if isinstance(bodies, dict):
         return ch
-
     if isinstance(bodies, list):
         name_map: Dict[str, Any] = {}
         for b in bodies:
@@ -608,7 +423,6 @@ def _prepare_chart_for_predict(chart: Dict[str, Any]) -> Dict[str, Any]:
             ch["bodies"] = name_map
     return ch
 
-
 def _freeze_horizon(h: Any) -> Any:
     if isinstance(h, dict):
         return tuple(sorted((k, _freeze_horizon(v)) for k, v in h.items()))
@@ -616,18 +430,23 @@ def _freeze_horizon(h: Any) -> Any:
         return tuple(_freeze_horizon(v) for v in h)
     return h
 
+# ───────────────────────────── error helper ─────────────────────────────
+def _json_error(code: str, details: Any = None, http: int = 400):
+    out: Dict[str, Any] = {"ok": False, "error": code}
+    if details is not None:
+        out["details"] = details
+    return jsonify(out), http
 
-# ───────────────────────────── endpoints ─────────────────────────────
+# ───────────────────────────── endpoints: health & chart/report/pred ─────────────────────────────
 @api.get("/api/health")
 def health():
     return jsonify({"ok": True, "status": "up", "version": VERSION}), 200
-
 
 @api.post("/api/calculate")
 def calculate():
     try:
         body = request.get_json(force=True) or {}
-        payload = parse_chart_payload(body)  # expects: date, time, place_tz, latitude, longitude, mode
+        payload = parse_chart_payload(body)
         hs = str(body.get("house_system", "")).strip().lower()
         if hs:
             payload["house_system"] = hs
@@ -643,7 +462,7 @@ def calculate():
     ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name)
 
     chart: Dict[str, Any]
-    chart_warnings: list[str] = []
+    chart_warnings: List[str] = []
     try:
         chart = _call_compute_chart(payload, ts)
     except Exception as e:
@@ -672,9 +491,22 @@ def calculate():
     if mode == "sidereal":
         ay = _extract_ayanamsa_from_chart(chart)
         if isinstance(ay, (int, float)):
-            houses = _rotate_sidereal_houses(houses, ay)
+            # rotate houses to sidereal
+            def rot(v: Optional[float]) -> Optional[float]:
+                if v is None:
+                    return None
+                x = (float(v) - float(ay)) % 360.0
+                return 0.0 if abs(x) < 1e-12 else x
+            if isinstance(houses, dict):
+                for k in ("asc", "asc_deg", "mc", "mc_deg", "vertex", "eastpoint"):
+                    if k in houses and isinstance(houses[k], (int, float)):
+                        houses[k] = rot(houses[k])
+                if "cusps" in houses and isinstance(houses["cusps"], list):
+                    houses["cusps"] = [rot(c) for c in houses["cusps"]]
+                if "cusps_deg" in houses and isinstance(houses["cusps_deg"], list):
+                    houses["cusps_deg"] = [rot(c) for c in houses["cusps_deg"]]
 
-    houses = _ensure_houses_angles_parity(houses, ts, payload, chart)
+    houses = _recompute_houses_angles_if_needed(houses, ts, payload, chart)
 
     if chart_warnings:
         chart["warnings"] = chart.get("warnings", []) + chart_warnings
@@ -686,7 +518,6 @@ def calculate():
         "houses_engine": _HOUSES_KIND,
     }
     return jsonify({"ok": True, "chart": chart, "houses": houses, "meta": meta}), 200
-
 
 @api.post("/api/report")
 def report():
@@ -706,7 +537,7 @@ def report():
     ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name)
 
     chart: Dict[str, Any]
-    chart_warnings: list[str] = []
+    chart_warnings: List[str] = []
     try:
         chart = _call_compute_chart(payload, ts)
     except Exception as e:
@@ -735,9 +566,21 @@ def report():
     if mode == "sidereal":
         ay = _extract_ayanamsa_from_chart(chart)
         if isinstance(ay, (int, float)):
-            houses = _rotate_sidereal_houses(houses, ay)
+            def rot(v: Optional[float]) -> Optional[float]:
+                if v is None:
+                    return None
+                x = (float(v) - float(ay)) % 360.0
+                return 0.0 if abs(x) < 1e-12 else x
+            if isinstance(houses, dict):
+                for k in ("asc", "asc_deg", "mc", "mc_deg", "vertex", "eastpoint"):
+                    if k in houses and isinstance(houses[k], (int, float)):
+                        houses[k] = rot(houses[k])
+                if "cusps" in houses and isinstance(houses["cusps"], list):
+                    houses["cusps"] = [rot(c) for c in houses["cusps"]]
+                if "cusps_deg" in houses and isinstance(houses["cusps_deg"], list):
+                    houses["cusps_deg"] = [rot(c) for c in houses["cusps_deg"]]
 
-    houses = _ensure_houses_angles_parity(houses, ts, payload, chart)
+    houses = _recompute_houses_angles_if_needed(houses, ts, payload, chart)
 
     if chart_warnings:
         chart["warnings"] = chart.get("warnings", []) + chart_warnings
@@ -754,7 +597,6 @@ def report():
         "houses_engine": _HOUSES_KIND,
     }
     return jsonify({"ok": True, "chart": chart, "houses": houses, "narrative": narrative, "meta": meta}), 200
-
 
 @api.post("/predictions")
 def predictions_route():
@@ -796,9 +638,21 @@ def predictions_route():
     if mode == "sidereal":
         ay = _extract_ayanamsa_from_chart(chart)
         if isinstance(ay, (int, float)):
-            houses = _rotate_sidereal_houses(houses, ay)
+            def rot(v: Optional[float]) -> Optional[float]:
+                if v is None:
+                    return None
+                x = (float(v) - float(ay)) % 360.0
+                return 0.0 if abs(x) < 1e-12 else x
+            if isinstance(houses, dict):
+                for k in ("asc", "asc_deg", "mc", "mc_deg", "vertex", "eastpoint"):
+                    if k in houses and isinstance(houses[k], (int, float)):
+                        houses[k] = rot(houses[k])
+                if "cusps" in houses and isinstance(houses["cusps"], list):
+                    houses["cusps"] = [rot(c) for c in houses["cusps"]]
+                if "cusps_deg" in houses and isinstance(houses["cusps_deg"], list):
+                    houses["cusps_deg"] = [rot(c) for c in houses["cusps_deg"]]
 
-    houses = _ensure_houses_angles_parity(houses, ts, payload, chart)
+    houses = _recompute_houses_angles_if_needed(houses, ts, payload, chart)
 
     chart_for_predict = _prepare_chart_for_predict(chart)
 
@@ -855,8 +709,7 @@ def predictions_route():
                 "abstained": abstained,
                 "evidence": pr.get("evidence"),
                 "mode": chart.get("mode") if chart else None,
-                "ayanamsa_deg": (chart or {}).get("ayanamsa_deg")
-                                 or (chart and _extract_ayanamsa_from_chart(chart)),
+                "ayanamsa_deg": (chart or {}).get("ayanamsa_deg") or (chart and _extract_ayanamsa_from_chart(chart)),
                 "notes": "QIA+calibrated placeholder; subject to M3 tuning "
                          + ("abstained" if abstained else "accepted"),
             }
@@ -877,7 +730,6 @@ def predictions_route():
     }
     return jsonify({"ok": True, "predictions": preds, "meta": meta}), 200
 
-
 @api.post("/rectification/quick")
 def rect_quick():
     try:
@@ -885,12 +737,11 @@ def rect_quick():
         payload, window_minutes = parse_rectification_payload(body)
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
-
-    from app.core.rectify import rectification_candidates  # local import
+    from app.core.rectify import rectification_candidates
     result = rectification_candidates(payload, window_minutes)
     return jsonify({"ok": True, **result}), 200
 
-
+# ───────────────────────────── misc: openapi / system / metrics ─────────────────────────────
 @api.get("/api/openapi")
 def openapi_spec():
     import yaml
@@ -908,12 +759,9 @@ def openapi_spec():
             continue
     return _json_error("openapi_not_found", None, 404)
 
-
 @api.get("/system-validation")
 def system_validation():
     cfg = load_config(os.environ.get("ASTRO_CONFIG", "config/defaults.yaml"))
-
-    # leap status (best-effort)
     leap_status: Optional[Dict[str, Any]] = None
     if _leaps:
         for name in ("get_status", "status", "summary"):
@@ -930,7 +778,6 @@ def system_validation():
                     break
                 except Exception:
                     pass
-
     policy = {
         "houses_engine": _HOUSES_KIND,
         "polar": {
@@ -939,6 +786,21 @@ def system_validation():
             "numeric_fallback": os.getenv("ASTRO_HOUSES_NUMERIC_FALLBACK", "1").lower() in ("1", "true", "yes", "on"),
         },
     }
+    try:
+        now_utc = datetime.now(timezone.utc)
+        date_str = now_utc.strftime("%Y-%m-%d")
+        time_str = now_utc.strftime("%H:%M:%S")
+        ts_now = _compute_timescales_from_local(date_str, time_str, "UTC")
+        ts_sample = {
+            "jd_utc": float(ts_now.get("jd_utc")),
+            "jd_tt": float(ts_now.get("jd_tt")),
+            "jd_ut1": float(ts_now.get("jd_ut1")),
+            "delta_t": ts_now.get("delta_t"),
+            "delta_at": ts_now.get("delta_at"),
+            "dut1": float(ts_now.get("dut1")),
+        }
+    except Exception:
+        ts_sample = None
 
     return jsonify(
         {
@@ -952,15 +814,14 @@ def system_validation():
             "policy": policy,
             "leap_seconds": leap_status,
             "version": VERSION,
+            "timescale_sample": ts_sample,
         }
     ), 200
-
 
 @api.get("/metrics")
 def metrics_export():
     from flask import Response
     return Response(metrics.export_prometheus(), mimetype="text/plain")
-
 
 @api.get("/api/config")
 @metrics.middleware("config")
@@ -978,8 +839,7 @@ def config_info():
         now_utc = datetime.now(timezone.utc)
         date_str = now_utc.strftime("%Y-%m-%d")
         time_str = now_utc.strftime("%H:%M:%S")
-        tz_name = "UTC"
-        ts_now = _compute_timescales_from_local(date_str, time_str, tz_name)
+        ts_now = _compute_timescales_from_local(date_str, time_str, "UTC")
         ts_sample = {
             "jd_utc": float(ts_now.get("jd_utc")),
             "jd_tt": float(ts_now.get("jd_tt")),
@@ -1018,11 +878,9 @@ def config_info():
         }
     ), 200
 
-
 # ───────────────────────────── Dev endpoints ─────────────────────────────
 @api.get("/api/dev/ephem")
 def dev_ephem_status():
-    """Ephemeris adapter status for debugging runtime env."""
     try:
         from app.core import ephemeris_adapter as ea
         eph, path = ea.load_kernel()
@@ -1035,10 +893,8 @@ def dev_ephem_status():
     except Exception as e:
         return jsonify({"ok": False, "error": repr(e)}), 500
 
-
 @api.post("/api/dev/echo_timescales")
 def dev_echo_timescales():
-    """Debug helper: given {date,time,place_tz} return JD_UTC/TT/UT1 etc."""
     body = request.get_json(force=True) or {}
     try:
         date = body.get("date") or "2000-01-01"
@@ -1049,20 +905,64 @@ def dev_echo_timescales():
     except Exception as e:
         return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
 
-
 @api.post("/api/dev/horizons_spk")
 def dev_horizons_spk():
-    """
-    Disabled on this runtime. To enable small-body support, upload SPK .bsp files
-    into app/data/spk/ (e.g., Ceres.bsp, Pallas.bsp, Juno.bsp, Vesta.bsp, Chiron.bsp).
-    """
     return jsonify({
         "ok": False,
         "message": "Horizons telnet disabled on this host. Upload .bsp files into app/data/spk/ instead."
     }), 501
 
-
 # ───────────────────────────── Ephemeris adapter endpoints ─────────────────────────────
+def _norm_rows_from_longitudes(raw: Any) -> List[Dict[str, Any]]:
+    """Adapter-normalizer → rows[{body,name,longitude}] supporting maps, arrays, single-key objects, or results."""
+    rows: List[Dict[str, Any]] = []
+    if raw is None:
+        return rows
+    if isinstance(raw, dict) and all(isinstance(v, (int, float)) for v in raw.values()):
+        for k, v in raw.items():
+            rows.append({"body": str(k).lower(), "name": str(k), "longitude": float(v)})
+        return rows
+    data = raw.get("results") if isinstance(raw, dict) and isinstance(raw.get("results"), list) else raw
+    if isinstance(data, list):
+        for r in data:
+            if isinstance(r, dict):
+                if len(r) == 1 and isinstance(next(iter(r.values())), (int, float)):
+                    k, v = next(iter(r.items()))
+                    rows.append({"body": str(k).lower(), "name": str(k), "longitude": float(v)})
+                    continue
+                body = (r.get("body") or r.get("name") or r.get("planet") or r.get("id") or r.get("label"))
+                L = r.get("longitude") or r.get("lon") or r.get("lambda") or r.get("ecliptic_longitude")
+                if body and isinstance(L, (int, float)):
+                    rows.append({"body": str(body).lower(), "name": str(r.get("name") or body), "longitude": float(L)})
+    return rows
+
+def _norm_rows_from_lv(raw: Any) -> List[Dict[str, Any]]:
+    """Adapter-normalizer → rows[{body,name,longitude,velocity}] supporting {longitudes,velocities} or results."""
+    rows: Dict[str, Dict[str, Any]] = {}
+    if isinstance(raw, dict) and "longitudes" in raw and "velocities" in raw:
+        for k, v in (raw.get("longitudes") or {}).items():
+            rows.setdefault(str(k).lower(), {"body": str(k).lower(), "name": str(k)})["longitude"] = float(v)
+        for k, v in (raw.get("velocities") or {}).items():
+            rows.setdefault(str(k).lower(), {"body": str(k).lower(), "name": str(k)})["velocity"] = float(v)
+        return list(rows.values())
+    data = raw.get("results") if isinstance(raw, dict) and isinstance(raw.get("results"), list) else raw
+    if isinstance(data, list):
+        for r in data:
+            if not isinstance(r, dict):
+                continue
+            body = (r.get("body") or r.get("name") or r.get("planet") or r.get("id") or r.get("label"))
+            if not body:
+                continue
+            key = str(body).lower()
+            rec = rows.setdefault(key, {"body": key, "name": str(r.get("name") or body)})
+            L = r.get("longitude") or r.get("lon") or r.get("lambda") or r.get("ecliptic_longitude")
+            V = r.get("velocity") or r.get("vel") or r.get("dlambda_dt") or r.get("deg_per_day")
+            if isinstance(L, (int, float)):
+                rec["longitude"] = float(L)
+            if isinstance(V, (int, float)):
+                rec["velocity"] = float(V)
+    return list(rows.values())
+
 @api.post("/api/ephemeris/diagnostics")
 def ephemeris_diagnostics_endpoint():
     """
@@ -1072,77 +972,139 @@ def ephemeris_diagnostics_endpoint():
     try:
         from app.core import ephemeris_adapter as ea
         majors_plus_nodes = [
-            "Sun","Moon","Mercury","Venus","Mars",
-            "Jupiter","Saturn","Uranus","Neptune","Pluto",
+            "Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn","Uranus","Neptune","Pluto",
             "North Node","South Node"
         ]
         return jsonify(ea.ephemeris_diagnostics(requested=majors_plus_nodes)), 200
     except Exception as e:
         return _json_error("ephemeris_diag_error", str(e) if DEBUG_VERBOSE else None, 500)
 
-
 @api.post("/api/ephemeris/longitudes")
 def ephemeris_longitudes_endpoint():
     """
-    Body:
-      { jd_tt: float, names?: [str], frame?: "ecliptic-of-date"|"ecliptic-J2000",
-        topocentric?: bool, latitude?: float, longitude?: float, elevation_m?: float }
-    Returns: { name: longitude_deg, ... }  (nodes included if requested)
+    Body can include either:
+      • jd_tt (number), OR civil inputs (date, time, place_tz|tz).
+      • bodies: [ 'sun','moon','mercury', ... ]   (names optional; derived if omitted)
+      • frame: 'ecliptic-of-date' | 'ecliptic-j2000' (default ecliptic-of-date)
+      • center: 'geocentric' | 'topocentric'       (default geocentric)
+      • latitude/longitude/elev_m required when center='topocentric'
+    Returns:
+      {
+        ok, jd_tt, frame, center, units:{angles:'deg'},
+        results: [ { body, name, longitude } ... ]
+      }
     """
     try:
         body = request.get_json(force=True) or {}
-        jd_tt = float(body["jd_tt"])
-        names = body.get("names")
-        frame = str(body.get("frame") or "ecliptic-of-date")
-        topocentric = bool(body.get("topocentric", False))
-        latitude = body.get("latitude")
-        longitude = body.get("longitude")
-        elevation_m = body.get("elevation_m")
+        payload = parse_ephemeris_payload(body, require_bodies=True)
+    except ValidationError as e:
+        return _json_error("validation_error", e.errors(), 400)
+    except Exception as e:
+        return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
+
+    jd_tt   = payload["jd_tt"]
+    frame   = payload["frame"]
+    center  = payload["center"]
+    lat     = payload.get("latitude")
+    lon     = payload.get("longitude")
+    elev_m  = payload.get("elev_m", 0.0)
+    bodies  = payload["bodies"]
+    names   = payload["names"]
+    topocentric = (center == "topocentric")
+
+    try:
         from app.core import ephemeris_adapter as ea
-        out = ea.ecliptic_longitudes(
+        raw = ea.ecliptic_longitudes(
             jd_tt,
             names=names,
             frame=frame,
             topocentric=topocentric,
-            latitude=latitude,
-            longitude=longitude,
-            elevation_m=elevation_m,
+            latitude=lat, longitude=lon, elevation_m=elev_m,
         )
-        return jsonify(out), 200
-    except KeyError as e:
-        return _json_error("validation_error", f"missing field: {e.args[0]}", 400)
     except Exception as e:
         return _json_error("ephemeris_longitudes_error", str(e) if DEBUG_VERBOSE else None, 500)
 
+    rows = _norm_rows_from_longitudes(raw)
+
+    # STRICT filter + keep request order
+    requested = [b.lower() for b in bodies]
+    name_map  = {b.lower(): n for b, n in zip(bodies, names)}
+    by_body   = {r["body"]: r for r in rows if isinstance(r.get("longitude"), (int, float))}
+    ordered   = [
+        {"body": b, "name": name_map[b], "longitude": float(by_body[b]["longitude"])}
+        for b in requested if b in by_body
+    ]
+
+    return jsonify({
+        "ok": True,
+        "jd_tt": float(jd_tt),
+        "frame": frame,
+        "center": center,
+        "units": {"angles": "deg"},
+        "results": ordered,
+    }), 200
 
 @api.post("/api/ephemeris/longitudes_and_velocities")
 def ephemeris_lv_endpoint():
     """
-    Body: same as /api/ephemeris/longitudes but 'names' is REQUIRED.
+    Same inputs as /ephemeris/longitudes (names optional).
     Returns:
-      { longitudes: {name:deg}, velocities: {name:deg_per_day (no nodes)} }
+      {
+        ok, jd_tt, frame, center,
+        units:{angles:'deg', velocities:'deg/day'},
+        results: [ { body, name, longitude, velocity } ... ]
+      }
     """
     try:
         body = request.get_json(force=True) or {}
-        jd_tt = float(body["jd_tt"])
-        names = body["names"]
-        frame = str(body.get("frame") or "ecliptic-of-date")
-        topocentric = bool(body.get("topocentric", False))
-        latitude = body.get("latitude")
-        longitude = body.get("longitude")
-        elevation_m = body.get("elevation_m")
+        payload = parse_ephemeris_payload(body, require_bodies=True)
+    except ValidationError as e:
+        return _json_error("validation_error", e.errors(), 400)
+    except Exception as e:
+        return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
+
+    jd_tt   = payload["jd_tt"]
+    frame   = payload["frame"]
+    center  = payload["center"]
+    lat     = payload.get("latitude")
+    lon     = payload.get("longitude")
+    elev_m  = payload.get("elev_m", 0.0)
+    bodies  = payload["bodies"]
+    names   = payload["names"]
+    topocentric = (center == "topocentric")
+
+    try:
         from app.core import ephemeris_adapter as ea
-        out = ea.ecliptic_longitudes_and_velocities(
+        raw = ea.ecliptic_longitudes_and_velocities(
             jd_tt,
             names=names,
             frame=frame,
             topocentric=topocentric,
-            latitude=latitude,
-            longitude=longitude,
-            elevation_m=elevation_m,
+            latitude=lat, longitude=lon, elevation_m=elev_m,
         )
-        return jsonify(out), 200
-    except KeyError as e:
-        return _json_error("validation_error", f"missing field: {e.args[0]}", 400)
     except Exception as e:
         return _json_error("ephemeris_lv_error", str(e) if DEBUG_VERBOSE else None, 500)
+
+    rows = _norm_rows_from_lv(raw)
+
+    requested = [b.lower() for b in bodies]
+    name_map  = {b.lower(): n for b, n in zip(bodies, names)}
+    by_body   = {r["body"]: r for r in rows if isinstance(r.get("longitude"), (int, float)) or isinstance(r.get("velocity"), (int, float))}
+    ordered   = [
+        {
+            "body": b,
+            "name": name_map[b],
+            "longitude": float(by_body[b]["longitude"]) if "longitude" in by_body[b] else None,
+            "velocity": float(by_body[b]["velocity"]) if "velocity" in by_body[b] else None,
+        }
+        for b in requested if b in by_body
+    ]
+
+    return jsonify({
+        "ok": True,
+        "jd_tt": float(jd_tt),
+        "frame": frame,
+        "center": center,
+        "units": {"angles": "deg", "velocities": "deg/day"},
+        "results": ordered,
+    }), 200
