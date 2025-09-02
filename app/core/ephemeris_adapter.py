@@ -718,6 +718,14 @@ def get_ecliptic_longitudes(
         elevation_m=elevation_m,
     )
 
+
+def get_node_longitude(jd_tt: float, name: str, *, latitude: Optional[float] = None, longitude: Optional[float] = None) -> float:
+    """Public helper for nodes; topo inputs ignored by design."""
+    canon, kind = _canon_name(name)
+    if kind != "node":
+        raise ValueError("name must be 'North Node' or 'South Node'")
+    return _node_longitude(canon, jd_tt)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Diagnostics
 # ─────────────────────────────────────────────────────────────────────────────
@@ -800,7 +808,9 @@ __all__ = [
     "ecliptic_longitudes",
     "ecliptic_longitudes_and_velocities",
     "get_ecliptic_longitudes",
+    "get_node_longitude",
     "ephemeris_diagnostics",
     "load_kernel",
+    "current_kernel_name",
     "clear_adapter_caches",
 ]
