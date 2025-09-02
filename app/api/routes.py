@@ -1094,6 +1094,103 @@ def dev_echo_timescales():
     except Exception as e:
         return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
 
+# ───────────────────────────── Dev: fetch SPKs from Horizons (Type-2) ─────────────────────────────
+import re, telnetlib, time, urllib.request, pathlib
+
+def _horizons_spk_type2(cmd: str, start: str, stop: str, center: str = "500@10") -> Dict[str, Any]:
+    """
+    Ask Horizons (telnet) to build a Type-2 SPK for 'cmd' (e.g., '1','2','3','4','2060').
+    Returns {"ok": bool, "message": str, "url": str|None, "saved_as": str|None}.
+    """
+    host, port = "horizons.jpl.nasa.gov", 6775
+    tn = None
+    out_txt = ""
+    try:
+        tn = telnetlib.Telnet(host, port, timeout=90)
+        def rd(expect=b"Horizons>", t=60):
+            nonlocal out_txt
+            chunk = tn.read_until(expect, t)
+            out_txt += chunk.decode("utf-8", "ignore")
+            return chunk
+        def wr(line: str):
+            tn.write(line.encode("ascii") + b"\n")
+
+        rd()                                # banner -> 'Horizons>'
+        wr("PAGE=K")                        # no paging
+        rd()
+
+        # Batch block
+        wr("!$$SOF")
+        wr(f"COMMAND= '{cmd}'")
+        wr(f"CENTER= '{center}'")
+        wr("MAKE_EPHEM= 'NO'")
+        wr("TABLE_TYPE= 'SPK'")
+        wr(f"START_TIME= '{start}'")
+        wr(f"STOP_TIME= '{stop}'")
+        wr("SPK_TYPE= 2")
+        wr("!$$EOF")
+
+        # Horizons usually asks to confirm creation:
+        # Look for a 'Create and deliver SPK' or similar prompt; send YES and prefer HTTP delivery.
+        # We'll read a bit, then answer proactively.
+        time.sleep(0.8)
+        tn.write(b"Y\n")    # confirm
+        time.sleep(0.4)
+        tn.write(b"H\n")    # choose HTTP delivery when asked
+        time.sleep(0.4)
+
+        # Collect output for a while and close
+        time.sleep(3.0)
+        out_txt += tn.read_very_eager().decode("utf-8", "ignore")
+    except Exception as e:
+        return {"ok": False, "message": f"telnet error: {e}", "url": None, "saved_as": None}
+    finally:
+        try:
+            if tn: tn.close()
+        except Exception:
+            pass
+
+    # Try to find a URL in the transcript
+    m = re.search(r"https?://\S+", out_txt)
+    if not m:
+        return {"ok": False, "message": "no HTTP URL found in Horizons response", "url": None, "saved_as": None}
+    url = m.group(0)
+
+    # Download to app/data/spk/<name>.bsp
+    dst_dir = pathlib.Path("app/data/spk")
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    name = {
+        "1": "Ceres", "2": "Pallas", "3": "Juno", "4": "Vesta", "2060": "Chiron"
+    }.get(str(cmd), f"spk_{cmd}")
+    dst_path = dst_dir / f"{name}.bsp"
+    try:
+        urllib.request.urlretrieve(url, dst_path.as_posix())
+    except Exception as e:
+        return {"ok": False, "message": f"download error: {e}", "url": url, "saved_as": None}
+
+    return {"ok": True, "message": "fetched", "url": url, "saved_as": dst_path.as_posix()}
+
+@api.post("/api/dev/horizons_spk")
+def dev_horizons_spk():
+    """
+    Server-side SPK fetcher: POST {targets:[ '1','2','3','4','2060' ],
+    start:'2000-01-01', stop:'2050-01-01', center:'500@10'}.
+    Saves files to app/data/spk/ and reports results.
+    """
+    body = request.get_json(force=True) or {}
+    targets = [str(x) for x in (body.get("targets") or [])]
+    start = body.get("start") or "2000-01-01"
+    stop  = body.get("stop")  or "2050-01-01"
+    center = body.get("center") or "500@10"
+    if not targets:
+        return _json_error("bad_request", "provide targets=['1','2','3','4','2060']", 400)
+
+    results = []
+    for cmd in targets:
+        results.append({ "cmd": cmd, **_horizons_spk_type2(cmd, start, stop, center) })
+    ok = all(r.get("ok") for r in results)
+    return jsonify({"ok": ok, "results": results}), 200 if ok else 502
+
 
 # ───────────────────────────── NEW: Ephemeris adapter endpoints ─────────────────────────────
 @api.post("/api/ephemeris/diagnostics")
