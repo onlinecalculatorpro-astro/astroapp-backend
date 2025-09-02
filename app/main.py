@@ -146,11 +146,12 @@ def _body_json() -> Dict[str, Any]:
 def _normalize_time_hms(s: str) -> str:
     """Accept 'HH:MM' or 'HH:MM:SS'; normalize to HH:MM:SS."""
     s = s.strip()
-    if len(s.split(":")) == 2:
-        hh, mm = s.split(":")
+    parts = s.split(":")
+    if len(parts) == 2:
+        hh, mm = parts
         return f"{int(hh):02d}:{int(mm):02d}:00"
-    elif len(s.split(":")) == 3:
-        hh, mm, ss = s.split(":")
+    if len(parts) == 3:
+        hh, mm, ss = parts
         return f"{int(hh):02d}:{int(mm):02d}:{int(ss):02d}"
     raise BadRequest("time must be 'HH:MM' or 'HH:MM:SS'")
 
@@ -177,7 +178,7 @@ def _compute_timescales_payload(date: str, time_s: str, tz: str) -> Dict[str, An
     jd_tt = _ts.jd_tt_from_utc_jd(jd_ut, dt_utc.year, dt_utc.month)
 
     # UT1 = UT + DUT1 (seconds)/86400
-    dut1 = float(os.getenv("ASTRO_DUT1_BROADCAST", os.getenv("ASTRO_DUT1", "0.0")))
+    dut1 = float(os.getenv("ASTRO_DUT1_BROADCAST", os.getenv("ASTRO_DUT1", "0.0")) or 0.0)
     jd_ut1 = jd_ut + (dut1 / 86400.0)
 
     return {
@@ -226,12 +227,52 @@ def _register_core_api(app: Flask) -> None:
         # Defaults
         payload.setdefault("mode", "tropical")
 
-        res = compute_chart(payload)  # astronomy.py should handle normalization & warnings
+        res = compute_chart(payload)  # astronomy.py handles normalization & warnings
         return jsonify(res), 200
 
     app.add_url_rule("/api/chart", "chart", _chart_handler, methods=["POST"])
-    for alias in ("/chart", "/api/compute_chart", "/compute_chart", "/api/astronomy/chart", "/astronomy/chart", "/api/astro/chart"):
+    for alias in (
+        "/chart",
+        "/api/compute_chart",
+        "/compute_chart",
+        "/api/astronomy/chart",
+        "/astronomy/chart",
+        "/api/astro/chart",
+    ):
         app.add_url_rule(alias, f"chart_alias_{alias}", _chart_handler, methods=["POST"])
+
+    # ---- calculate (alias of /api/chart; defaults to 10 planets + both nodes) ----
+    def _calculate_handler():
+        payload = _body_json()
+
+        # If caller passed civil inputs but not jd_*, compute them here
+        have_all_jd = all(k in payload for k in ("jd_ut", "jd_tt", "jd_ut1"))
+        if not have_all_jd:
+            date = payload.get("date")
+            time_s = payload.get("time")
+            tz = payload.get("tz") or payload.get("place_tz")
+            if isinstance(date, str) and isinstance(time_s, str) and isinstance(tz, str):
+                ts = _compute_timescales_payload(date, time_s, tz)
+                payload.update({k: ts[k] for k in ("jd_ut", "jd_tt", "jd_ut1")})
+            else:
+                raise BadRequest("Provide either jd_ut/jd_tt/jd_ut1 or civil 'date'+'time'+'tz'")
+
+        # Default: classic 10 + lunar nodes
+        if not payload.get("bodies"):
+            payload["bodies"] = [
+                "Sun", "Moon", "Mercury", "Venus", "Mars",
+                "Jupiter", "Saturn", "Uranus", "Neptune", "Pluto",
+                "North Node", "South Node",
+            ]
+
+        payload.setdefault("mode", "tropical")
+
+        res = compute_chart(payload)
+        return jsonify(res), 200
+
+    app.add_url_rule("/api/calculate", "calculate", _calculate_handler, methods=["POST"])
+    for alias in ("/calculate", "/api/calc", "/calc"):
+        app.add_url_rule(alias, f"calculate_alias_{alias}", _calculate_handler, methods=["POST"])
 
 
 # ───────────────────────────── app factory ─────────────────────────────
@@ -253,7 +294,12 @@ def create_app() -> Flask:
             app.cfg = {}  # type: ignore[attr-defined]
 
     # Pre-seed metrics
-    seeded_routes = ("/", "/api/health-check", "/api/chart", "/api/time/timescales", "/health", "/healthz", "/metrics")
+    seeded_routes = (
+        "/", "/api/health-check",
+        "/api/chart", "/api/calculate",
+        "/api/time/timescales",
+        "/health", "/healthz", "/metrics"
+    )
     for route in seeded_routes:
         MET_REQUESTS.labels(route=route).inc(0)
         REQ_LATENCY.labels(route=route).observe(0.0)
@@ -287,7 +333,7 @@ def create_app() -> Flask:
     _register_health(app)
     _register_errors(app)
 
-    # Core minimal API (timescales + chart)
+    # Core minimal API (timescales + chart + calculate)
     _register_core_api(app)
 
     # Optional feature blueprints
@@ -326,23 +372,22 @@ def create_app() -> Flask:
         return jsonify({"spk": files}), 200
 
     @app.get("/__debug/ephem")
-def __debug_ephem():
-    import os, importlib.util
-    from app.core import ephemeris_adapter as eph
-    path = os.getenv("OCP_EPHEMERIS")
-    exists = bool(path and os.path.isfile(path))
-    size = (os.path.getsize(path) if exists else None)
-    skyfield_ok = importlib.util.find_spec("skyfield") is not None
-    jplephem_ok = importlib.util.find_spec("jplephem") is not None
-    return jsonify({
-        "OCP_EPHEMERIS": path,
-        "file_exists": exists,
-        "file_size_bytes": size,
-        "skyfield_importable": skyfield_ok,
-        "jplephem_importable": jplephem_ok,
-        "diagnostics": eph.ephemeris_diagnostics(),
-    }), 200
-
+    def __debug_ephem():
+        import importlib.util
+        from app.core import ephemeris_adapter as eph
+        path = os.getenv("OCP_EPHEMERIS")
+        exists = bool(path and os.path.isfile(path))
+        size = (os.path.getsize(path) if exists else None)
+        skyfield_ok = importlib.util.find_spec("skyfield") is not None
+        jplephem_ok = importlib.util.find_spec("jplephem") is not None
+        return jsonify({
+            "OCP_EPHEMERIS": path,
+            "file_exists": exists,
+            "file_size_bytes": size,
+            "skyfield_importable": skyfield_ok,
+            "jplephem_importable": jplephem_ok,
+            "diagnostics": eph.ephemeris_diagnostics(),
+        }), 200
     # ---------------------------------------------------------------------------
 
     # /metrics (Basic Auth)
@@ -353,7 +398,7 @@ def __debug_ephem():
 
         GAUGE_APP_UP.set(1.0)
         try:
-            GAUGE_DUT1.set(float(os.environ.get("ASTRO_DUT1_BROADCAST", os.environ.get("ASTRO_DUT1", "0.0"))))
+            GAUGE_DUT1.set(float(os.environ.get("ASTRO_DUT1_BROADCAST", os.environ.get("ASTRO_DUT1", "0.0")) or 0.0))
         except Exception:
             pass
 
