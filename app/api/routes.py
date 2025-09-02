@@ -230,9 +230,10 @@ def _compute_timescales_from_local(date_str: str, time_str: str, tz_name: str) -
     """
     Convert local date/time/tz → {jd_utc, jd_tt, jd_ut1, delta_t, dut1, ...}
     Uses app.core.timescales (same as main.py). Stable JSON for callers.
-    """
-    fmt = "%Y-%m-%d %H:%M" if time_str.count(":") == 1 else "%Y-%m-%d %H:%M:%S"
 
+    NOTE: We normalize time to HH:MM:SS and ALWAYS parse with "%Y-%m-%d %H:%M:%S"
+          to avoid 'unconverted data remains' errors.
+    """
     try:
         tz = ZoneInfo(tz_name)
     except Exception:
@@ -249,7 +250,9 @@ def _compute_timescales_from_local(date_str: str, time_str: str, tz_name: str) -
             return f"{int(hh):02d}:{int(mm):02d}:{int(ss):02d}"
         raise ValidationError({"time": "must be 'HH:MM' or 'HH:MM:SS'"})
 
+    # Normalize first, then parse with seconds format
     time_norm = _norm_hms(time_str)
+    fmt = "%Y-%m-%d %H:%M:%S"
 
     dt_local = datetime.strptime(f"{date_str} {time_norm}", fmt).replace(tzinfo=tz)
     dt_utc = dt_local.astimezone(timezone.utc)
@@ -1062,7 +1065,10 @@ def dev_horizons_spk():
 # ───────────────────────────── Ephemeris adapter endpoints ─────────────────────────────
 @api.post("/api/ephemeris/diagnostics")
 def ephemeris_diagnostics_endpoint():
-    """Diagnostics limited to majors + nodes (avoids SPICE for now)."""
+    """
+    POST-only diagnostics limited to majors + nodes (avoids SPICE).
+    Ignores any 'names' provided by callers for now.
+    """
     try:
         from app.core import ephemeris_adapter as ea
         majors_plus_nodes = [
