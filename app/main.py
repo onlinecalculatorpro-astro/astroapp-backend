@@ -15,22 +15,26 @@ from werkzeug.exceptions import HTTPException, BadRequest
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 # ───────────────────────────── Optional blueprints ─────────────────────────────
-# Make blueprint import failures VISIBLE in logs so 404s are easy to debug.
+# Make blueprint import failures VISIBLE so 404s are easy to debug.
+_routes_import_err: str | None = None
+_pred_import_err: str | None = None
 
 try:
     from app.api import routes as _routes_mod  # type: ignore
     _routes_bp = _routes_mod.api
 except Exception as e:  # pragma: no cover
-    print("WARNING: routes blueprint failed to import:", repr(e), file=sys.stderr)
-    traceback.print_exc()
     _routes_bp = None
+    _routes_import_err = repr(e)
+    print("WARNING: routes blueprint failed to import:", _routes_import_err, file=sys.stderr)
+    traceback.print_exc()
 
 try:
     from app.api.predictions import predictions_bp as _pred_bp  # type: ignore
 except Exception as e:  # pragma: no cover
-    print("WARNING: predictions blueprint failed to import:", repr(e), file=sys.stderr)
-    traceback.print_exc()
     _pred_bp = None
+    _pred_import_err = repr(e)
+    print("WARNING: predictions blueprint failed to import:", _pred_import_err, file=sys.stderr)
+    traceback.print_exc()
 
 # ───────────────────────────── Optional config loader ─────────────────────────────
 try:
@@ -291,6 +295,36 @@ def create_app() -> Flask:
         app.register_blueprint(_routes_bp)
     if _pred_bp is not None:
         app.register_blueprint(_pred_bp, url_prefix="/api")
+
+    # --- DEBUG endpoints: verify blueprint load + list routes + list SPK files ---
+    @app.get("/__debug/imports")
+    def __debug_imports():
+        return jsonify({
+            "routes_blueprint_loaded": _routes_bp is not None,
+            "routes_import_error": _routes_import_err,
+            "predictions_blueprint_loaded": _pred_bp is not None,
+            "predictions_import_error": _pred_import_err,
+            "blueprints": list(app.blueprints.keys()),
+        }), 200
+
+    @app.get("/__debug/routes")
+    def __debug_routes():
+        rules = []
+        for r in app.url_map.iter_rules():
+            methods = sorted(m for m in (r.methods or []) if m not in ("HEAD", "OPTIONS"))
+            rules.append({"rule": str(r), "endpoint": r.endpoint, "methods": methods})
+        rules.sort(key=lambda x: x["rule"])
+        return jsonify({"count": len(rules), "rules": rules}), 200
+
+    @app.get("/__debug/files")
+    def __debug_files():
+        spk_dir = "app/data/spk"
+        try:
+            files = sorted(os.listdir(spk_dir)) if os.path.isdir(spk_dir) else []
+        except Exception as e:
+            files = [f"<error: {e}>"]
+        return jsonify({"spk": files}), 200
+    # ---------------------------------------------------------------------------
 
     # /metrics (Basic Auth)
     @app.route("/metrics", methods=["GET"])
