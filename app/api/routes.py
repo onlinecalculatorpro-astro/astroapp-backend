@@ -1082,6 +1082,9 @@ try:  # Python 3.13 removes telnetlib
 except Exception:
     telnetlib = None  # type: ignore
 
+if telnetlib is None:
+    return {"ok": False, "message": "telnetlib not available on this runtime", "url": None, "saved_as": None}
+
 def _horizons_spk_type2(cmd: str, start: str, stop: str, center: str = "500@10") -> Dict[str, Any]:
     """
     Ask Horizons (telnet) to build a Type-2 SPK for 'cmd' (e.g., '1','2','3','4','2060').
