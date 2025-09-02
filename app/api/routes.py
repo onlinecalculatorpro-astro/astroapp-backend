@@ -1060,23 +1060,17 @@ def dev_horizons_spk():
 
 
 # ───────────────────────────── Ephemeris adapter endpoints ─────────────────────────────
-@api.route("/api/ephemeris/diagnostics", methods=["GET", "POST"])
+@api.post("/api/ephemeris/diagnostics")
 def ephemeris_diagnostics_endpoint():
-    """
-    GET  /api/ephemeris/diagnostics[?names=Ceres,Pallas]
-    POST /api/ephemeris/diagnostics {"names":["Ceres","Pallas", ...]}
-    """
+    """Diagnostics limited to majors + nodes (avoids SPICE for now)."""
     try:
         from app.core import ephemeris_adapter as ea
-        names = None
-        if request.method == "GET":
-            q = request.args.get("names")
-            if q:
-                names = [s.strip() for s in q.split(",") if s.strip()]
-        else:
-            body = request.get_json(silent=True) or {}
-            names = body.get("names")
-        return jsonify(ea.ephemeris_diagnostics(requested=names)), 200
+        majors_plus_nodes = [
+            "Sun","Moon","Mercury","Venus","Mars",
+            "Jupiter","Saturn","Uranus","Neptune","Pluto",
+            "North Node","South Node"
+        ]
+        return jsonify(ea.ephemeris_diagnostics(requested=majors_plus_nodes)), 200
     except Exception as e:
         return _json_error("ephemeris_diag_error", str(e) if DEBUG_VERBOSE else None, 500)
 
