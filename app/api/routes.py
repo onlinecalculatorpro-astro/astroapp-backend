@@ -1076,7 +1076,11 @@ def dev_echo_timescales():
         return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
 
 # ───────────────────────────── Dev: fetch SPKs from Horizons (Type-2) ─────────────────────────────
-import re, telnetlib, time, urllib.request, pathlib
+import re, time, urllib.request, pathlib
+try:  # Python 3.13 removes telnetlib
+    import telnetlib  # type: ignore
+except Exception:
+    telnetlib = None  # type: ignore
 
 def _horizons_spk_type2(cmd: str, start: str, stop: str, center: str = "500@10") -> Dict[str, Any]:
     """
