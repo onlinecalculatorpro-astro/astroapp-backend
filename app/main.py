@@ -241,7 +241,11 @@ def _register_core_api(app: Flask) -> None:
     ):
         app.add_url_rule(alias, f"chart_alias_{alias}", _chart_handler, methods=["POST"])
 
-    # ---- calculate (alias of /api/chart; defaults to 10 planets + both nodes) ----
+    # ---- calculate ----
+    # Alias of /api/chart with the SAME behavior:
+    # - If 'bodies' is omitted → astronomy.compute_chart defaults to the classic 10 majors.
+    # - Optional 'points' (e.g., ["North Node","South Node"]) are passed through untouched.
+    # - If nodes appear inside 'bodies', astronomy.py moves them to 'points' and still returns majors.
     def _calculate_handler():
         payload = _body_json()
 
@@ -257,14 +261,10 @@ def _register_core_api(app: Flask) -> None:
             else:
                 raise BadRequest("Provide either jd_ut/jd_tt/jd_ut1 or civil 'date'+'time'+'tz'")
 
-        # Default: classic 10 + lunar nodes
-        if not payload.get("bodies"):
-            payload["bodies"] = [
-                "Sun", "Moon", "Mercury", "Venus", "Mars",
-                "Jupiter", "Saturn", "Uranus", "Neptune", "Pluto",
-                "North Node", "South Node",
-            ]
-
+        # Do NOT inject nodes into 'bodies'. Let astronomy.compute_chart:
+        # - default majors when 'bodies' omitted,
+        # - handle 'points',
+        # - and move any node names from bodies → points internally.
         payload.setdefault("mode", "tropical")
 
         res = compute_chart(payload)
