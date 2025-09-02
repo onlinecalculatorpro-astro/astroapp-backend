@@ -1,7 +1,6 @@
 # app/api/routes.py
 from __future__ import annotations
 
-import re, telnetlib, time, urllib.request, pathlib
 import inspect
 import json
 import os
