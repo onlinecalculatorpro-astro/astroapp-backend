@@ -324,6 +324,25 @@ def create_app() -> Flask:
         except Exception as e:
             files = [f"<error: {e}>"]
         return jsonify({"spk": files}), 200
+
+    @app.get("/__debug/ephem")
+def __debug_ephem():
+    import os, importlib.util
+    from app.core import ephemeris_adapter as eph
+    path = os.getenv("OCP_EPHEMERIS")
+    exists = bool(path and os.path.isfile(path))
+    size = (os.path.getsize(path) if exists else None)
+    skyfield_ok = importlib.util.find_spec("skyfield") is not None
+    jplephem_ok = importlib.util.find_spec("jplephem") is not None
+    return jsonify({
+        "OCP_EPHEMERIS": path,
+        "file_exists": exists,
+        "file_size_bytes": size,
+        "skyfield_importable": skyfield_ok,
+        "jplephem_importable": jplephem_ok,
+        "diagnostics": eph.ephemeris_diagnostics(),
+    }), 200
+
     # ---------------------------------------------------------------------------
 
     # /metrics (Basic Auth)
