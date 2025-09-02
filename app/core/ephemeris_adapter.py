@@ -401,7 +401,7 @@ def _spice_ecliptic_longitude(
 
 def _spice_ecliptic_longitude_speed(
     jd_tt: float, name: str, *, frame: str
-) -> Tuple[Optional[float], Optional[float]]]:
+) -> Tuple[Optional[float], Optional[float]]:
     lon0 = _spice_ecliptic_longitude(jd_tt, name, frame=frame)
     if lon0 is None:
         return None, None
