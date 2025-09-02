@@ -496,9 +496,7 @@ def _normalize_adapter_output_to_maps(
             longitudes[nm] = float(res[i]); speeds[nm] = None
         return longitudes, speeds
 
-    # Final fallback: return empty (caller will warn about missing bodies)
-    return {}, {}
-
+    
     # C) object/dataclass with attributes
     longs = getattr(res, "longitudes", None)
     if isinstance(longs, dict):
