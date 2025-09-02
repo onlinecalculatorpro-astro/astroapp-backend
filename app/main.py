@@ -7,14 +7,14 @@ import sys
 import traceback
 from datetime import datetime
 from time import perf_counter
-from typing import Any, Dict, Final
+from typing import Any, Dict, Final, List, Optional
 
 from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 from werkzeug.exceptions import HTTPException, BadRequest
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-# ───────────────────────── Optional blueprints ─────────────────────────
+# Optional blueprints
 _routes_import_err: str | None = None
 _pred_import_err: str | None = None
 
@@ -35,7 +35,7 @@ except Exception as e:  # pragma: no cover
     print("WARNING: predictions blueprint failed to import:", _pred_import_err, file=sys.stderr)
     traceback.print_exc()
 
-# ───────────────────────── Optional config loader ─────────────────────────
+# Config loader (optional)
 try:
     from app.utils.config import load_config  # type: ignore
 except Exception as e:  # pragma: no cover
@@ -45,18 +45,21 @@ except Exception as e:  # pragma: no cover
 # Core engines
 from app.core.astronomy import compute_chart
 from app.core import timescales as _ts
-
-# House policy façade + constants
 from app.core.house import (
     compute_houses_with_policy,
+    list_supported_house_systems,
     GATED_NOT_IMPLEMENTED,
     POLAR_POLICY,
     POLAR_SOFT_LIMIT_DEG,
     POLAR_HARD_LIMIT_DEG,
 )
 
-# For counts in /system-validation
-from app.core.houses_advanced import IMPLEMENTED_HOUSE_SYSTEMS, SUPPORTED_HOUSE_SYSTEMS
+# Detect advanced houses backend for labeling
+try:
+    from app.core.houses_advanced import PreciseHouseCalculator  # noqa: F401
+    _ADV_OK = True
+except Exception:
+    _ADV_OK = False
 
 # Prometheus metrics
 from prometheus_client import (
@@ -68,7 +71,7 @@ from prometheus_client import (
     generate_latest,
 )
 
-# ───────────────────────── metrics ─────────────────────────
+# ───────────────────────────── metrics ─────────────────────────────
 MET_REQUESTS: Final = Counter("astro_api_requests_total", "API requests", ["route"])
 MET_FALLBACKS: Final = Counter(
     "astro_house_fallback_total", "House fallbacks at high latitude", ["requested", "fallback"]
@@ -78,11 +81,12 @@ GAUGE_DUT1: Final = Gauge("astro_dut1_broadcast_seconds", "DUT1 broadcast second
 GAUGE_APP_UP: Final = Gauge("astro_app_up", "1 if app is running")
 REQ_LATENCY: Final = Histogram("astro_request_seconds", "API request latency", ["route"])
 
-# ───────────────────────── engine label ─────────────────────────
-# Fixed default; can be overridden via env (HOUSES_ENGINE_NAME)
-HOUSES_ENGINE_NAME = os.getenv("HOUSES_ENGINE_NAME", "houses-advanced")
+# ───────────────────────────── policy façade labels ─────────────────────────────
+ENGINE_LABEL: Final[str] = (
+    os.getenv("HOUSES_ENGINE_NAME")
+    or ("houses-advanced" if _ADV_OK else "proto-basic")
+)
 
-# ───────────────────────── helpers ─────────────────────────
 def _configure_logging(app: Flask) -> None:
     gerr = logging.getLogger("gunicorn.error")
     if gerr.handlers:
@@ -135,12 +139,7 @@ def _metrics_auth_ok() -> bool:
     user = os.getenv("METRICS_USER", "")
     pw = os.getenv("METRICS_PASS", "")
     return bool(
-        auth
-        and auth.type == "basic"
-        and auth.username == user
-        and auth.password == pw
-        and user
-        and pw
+        auth and auth.type == "basic" and auth.username == user and auth.password == pw and user and pw
     )
 
 def _body_json() -> Dict[str, Any]:
@@ -187,49 +186,33 @@ def _compute_timescales_payload(date: str, time_s: str, tz: str) -> Dict[str, An
     }
 
 def _timescales_meta_from_chart(chart: Dict[str, Any]) -> Dict[str, Any]:
-    """Build meta.timescales from compute_chart() output (which provides jd_ut/jd_tt/jd_ut1)."""
     jd_ut = float(chart.get("jd_ut"))
     jd_tt = float(chart.get("jd_tt"))
     jd_ut1 = float(chart.get("jd_ut1"))
     delta_t_sec = (jd_tt - jd_ut) * 86400.0
     dut1_sec = (jd_ut1 - jd_ut) * 86400.0
+    return {"jd_utc": jd_ut, "jd_tt": jd_tt, "jd_ut1": jd_ut1, "delta_t": delta_t_sec, "delta_at": 0.0, "dut1": dut1_sec}
+
+# ───────────────────────────── system/policy endpoints ─────────────────────────────
+def _houses_policy_blob() -> Dict[str, Any]:
     return {
-        "jd_utc": jd_ut,
-        "jd_tt": jd_tt,
-        "jd_ut1": jd_ut1,
-        "delta_t": delta_t_sec,
-        "delta_at": 0.0,  # leap seconds not tracked here
-        "dut1": dut1_sec,
+        "houses_engine": ENGINE_LABEL,
+        "polar": {
+            "policy": POLAR_POLICY,
+            "soft_limit_deg": POLAR_SOFT_LIMIT_DEG,
+            "hard_limit_deg": POLAR_HARD_LIMIT_DEG,
+            "numeric_fallback_enabled": os.getenv("ASTRO_HOUSES_NUMERIC_FALLBACK", "1").lower() in ("1", "true", "yes", "on"),
+        },
+        "declared_systems": list(list_supported_house_systems()),
+        "gated_systems": sorted(list(GATED_NOT_IMPLEMENTED)),
     }
 
-# ───────────────────────── core API ─────────────────────────
 def _register_core_api(app: Flask) -> None:
-
-    # ---- system-validation (policy & counts) ----
     @app.get("/system-validation")
     def _system_validation():
-        declared = list(SUPPORTED_HOUSE_SYSTEMS)
-        implemented = sorted(list(IMPLEMENTED_HOUSE_SYSTEMS))
-        gated = sorted(list(GATED_NOT_IMPLEMENTED))
-        return jsonify({
-            "ok": True,
-            "engine_label": HOUSES_ENGINE_NAME,
-            "policy": {
-                "polar_policy": POLAR_POLICY,
-                "polar_soft_limit_deg": POLAR_SOFT_LIMIT_DEG,
-                "polar_hard_limit_deg": POLAR_HARD_LIMIT_DEG,
-            },
-            "house_systems": {
-                "declared_count": len(declared),
-                "implemented_count": len(implemented),
-                "gated_count": len(gated),
-                "declared": declared,
-                "implemented": implemented,
-                "gated": gated,
-            }
-        }), 200
+        return jsonify({"ok": True, "policy": _houses_policy_blob()}), 200
 
-    # ---- timescales ----
+    # timescales
     def _timescales_handler():
         data = _body_json()
         date = data.get("date")
@@ -244,11 +227,11 @@ def _register_core_api(app: Flask) -> None:
     for alias in ("/api/timescales", "/time/timescales", "/timescales", "/api/time/convert"):
         app.add_url_rule(alias, f"timescales_alias_{alias}", _timescales_handler, methods=["POST"])
 
-    # ---- chart ----
+    # chart only
     def _chart_handler():
         payload = _body_json()
 
-        # If caller passed civil inputs but not jd_*, compute them here
+        # backfill timescales if civil provided
         have_all_jd = all(k in payload for k in ("jd_ut", "jd_tt", "jd_ut1"))
         if not have_all_jd:
             date = payload.get("date")
@@ -262,108 +245,108 @@ def _register_core_api(app: Flask) -> None:
 
         payload.setdefault("mode", "tropical")
 
-        chart = compute_chart(payload)  # astronomy.py handles normalization & warnings
+        chart = compute_chart(payload)
         chart["ok"] = True
         chart.setdefault("meta", {}).setdefault("timescales", _timescales_meta_from_chart(chart))
         return jsonify(chart), 200
 
     app.add_url_rule("/api/chart", "chart", _chart_handler, methods=["POST"])
-    for alias in ("/chart", "/api/compute_chart", "/compute_chart", "/api/astronomy/chart",
-                  "/astronomy/chart", "/api/astro/chart"):
+    for alias in ("/chart", "/api/compute_chart", "/compute_chart", "/api/astronomy/chart", "/astronomy/chart", "/api/astro/chart"):
         app.add_url_rule(alias, f"chart_alias_{alias}", _chart_handler, methods=["POST"])
 
-    # ---- calculate (chart + houses via policy façade) ----
+    # calculate (chart + optional houses via policy façade)
     def _calculate_handler():
-        payload = _body_json()
+        body = _body_json()
 
-        # Compute timescales if only civil provided
-        have_all_jd = all(k in payload for k in ("jd_ut", "jd_tt", "jd_ut1"))
+        # timescales fill if missing
+        have_all_jd = all(k in body for k in ("jd_ut", "jd_tt", "jd_ut1"))
         if not have_all_jd:
-            date = payload.get("date")
-            time_s = payload.get("time")
-            tz = payload.get("tz") or payload.get("place_tz")
+            date = body.get("date")
+            time_s = body.get("time")
+            tz = body.get("tz") or body.get("place_tz")
             if isinstance(date, str) and isinstance(time_s, str) and isinstance(tz, str):
                 ts = _compute_timescales_payload(date, time_s, tz)
-                payload.update({k: ts[k] for k in ("jd_ut", "jd_tt", "jd_ut1")})
-                payload["_timescales"] = ts
+                body.update({k: ts[k] for k in ("jd_ut", "jd_tt", "jd_ut1")})
+                body["_timescales"] = ts
             else:
                 raise BadRequest("Provide either jd_ut/jd_tt/jd_ut1 or civil 'date'+'time'+'tz'")
 
-        payload.setdefault("mode", "tropical")
+        body.setdefault("mode", "tropical")
 
-        # Base chart
-        chart = compute_chart(payload)
+        chart = compute_chart(body)
         chart["ok"] = True
         chart.setdefault("meta", {}).setdefault("timescales", _timescales_meta_from_chart(chart))
 
         # Houses only if requested
-        system = (payload.get("house_system") or payload.get("system") or "").strip().lower()
-        if not system:
+        system_req = (body.get("house_system") or body.get("system") or "").strip()
+        if not system_req:
             return jsonify(chart), 200
 
-        # Pull lat/lon (required by the house façade)
-        lat = payload.get("lat") or payload.get("latitude")
-        lon = payload.get("lon") or payload.get("longitude")
-        if lat is None or lon is None:
+        try:
+            lat = float(body.get("lat") if body.get("lat") is not None else body.get("latitude"))
+            lon = float(body.get("lon") if body.get("lon") is not None else body.get("longitude"))
+        except Exception:
             return jsonify({
                 "ok": False,
                 "error": "angles_missing_geography",
-                "details": {"note": "ASC/MC & houses require latitude and longitude"},
+                "details": {"note": "ASC/MC & houses require 'lat' and 'lon'"},
             }), 400
+
+        diagnostics = bool(body.get("diagnostics", False))
+        validation = bool(body.get("validation", False))
 
         try:
             houses = compute_houses_with_policy(
-                lat=float(lat),
-                lon=float(lon),
-                system=system,
-                jd_tt=float(payload["jd_tt"]),
-                jd_ut1=float(payload["jd_ut1"]),
-                jd_ut=float(payload.get("jd_ut", 0.0)),
-                # optional passthrough toggles
-                diagnostics=bool(payload.get("diagnostics")),
-                validation=bool(payload.get("validation")),
+                lat=lat,
+                lon=lon,
+                system=system_req,
+                jd_tt=float(body["jd_tt"]),
+                jd_ut1=float(body["jd_ut1"]),
+                jd_ut=float(body.get("jd_ut")) if body.get("jd_ut") is not None else None,
+                diagnostics=diagnostics,
+                validation=validation,
             )
-            chart["houses"] = houses
-            return jsonify(chart), 200
-
         except NotImplementedError as e:
-            # Clean 501 for the 6 gated systems
+            # 6 gated systems → 501
             return jsonify({
                 "ok": False,
                 "error": "house_system_gated",
-                "details": {"system": system, "note": str(e)},
+                "details": {"system": system_req.strip().lower(), "note": str(e)},
             }), 501
-
         except ValueError as e:
-            # Input/policy violations (e.g., missing strict timescales / bad latitude)
-            return jsonify({
-                "ok": False,
-                "error": "houses_invalid_input",
-                "details": {"message": str(e)},
-            }), 400
-
-        except RuntimeError as e:
-            # Numeric engine failed even after fallbacks → do NOT 500
+            # Policy rejections (e.g., polar absolute) or bad inputs → 422
             return jsonify({
                 "ok": False,
                 "error": "house_engine_failed",
-                "details": {"message": str(e)},
+                "details": {"system": system_req.strip().lower(), "note": str(e)},
             }), 422
+        except Exception as e:
+            # If every fallback failed or engine blew up → 422 (not 500)
+            return jsonify({
+                "ok": False,
+                "error": "house_engine_failed",
+                "details": {"system": system_req.strip().lower(), "note": str(e)},
+            }), 422
+
+        # Attach houses + policy echo + engine label
+        houses_payload = dict(houses)
+        houses_payload.setdefault("policy", {}).update({"engine_label": ENGINE_LABEL})
+        chart["houses"] = houses_payload
+        return jsonify(chart), 200
 
     app.add_url_rule("/api/calculate", "calculate", _calculate_handler, methods=["POST"])
     for alias in ("/calculate", "/api/calc", "/calc"):
         app.add_url_rule(alias, f"calculate_alias_{alias}", _calculate_handler, methods=["POST"])
 
-# ───────────────────────── app factory ─────────────────────────
+# ───────────────────────────── app factory ─────────────────────────────
 def create_app() -> Flask:
     app = Flask(__name__)
     app.config["JSON_SORT_KEYS"] = False
-
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)  # type: ignore
 
     _configure_logging(app)
 
-    # Config file (optional)
+    # Optional config
     cfg_path = os.environ.get("ASTRO_CONFIG", "config/defaults.yaml")
     if load_config:
         try:
@@ -371,7 +354,7 @@ def create_app() -> Flask:
         except Exception:
             app.cfg = {}  # type: ignore[attr-defined]
 
-    # Pre-seed metrics
+    # Seed metrics
     seeded_routes = (
         "/", "/api/health-check",
         "/api/chart", "/api/calculate",
@@ -385,7 +368,6 @@ def create_app() -> Flask:
     MET_WARNINGS.labels(kind="polar_soft_fallback").inc(0)
     GAUGE_APP_UP.set(1.0)
 
-    # Request metrics
     @app.before_request
     def _before():
         try:
@@ -407,20 +389,16 @@ def create_app() -> Flask:
             pass
         return resp
 
-    # Register health/errors first
     _register_health(app)
     _register_errors(app)
-
-    # Core API
     _register_core_api(app)
 
-    # Optional feature blueprints
     if _routes_bp is not None:
         app.register_blueprint(_routes_bp)
     if _pred_bp is not None:
         app.register_blueprint(_pred_bp, url_prefix="/api")
 
-    # --- DEBUG endpoints ---
+    # Debug endpoints
     @app.get("/__debug/imports")
     def __debug_imports():
         return jsonify({
@@ -428,6 +406,8 @@ def create_app() -> Flask:
             "routes_import_error": _routes_import_err,
             "predictions_blueprint_loaded": _pred_bp is not None,
             "predictions_import_error": _pred_import_err,
+            "houses_backend_ok": _ADV_OK,
+            "engine_label": ENGINE_LABEL,
             "blueprints": list(app.blueprints.keys()),
         }), 200
 
@@ -439,15 +419,6 @@ def create_app() -> Flask:
             rules.append({"rule": str(r), "endpoint": r.endpoint, "methods": methods})
         rules.sort(key=lambda x: x["rule"])
         return jsonify({"count": len(rules), "rules": rules}), 200
-
-    @app.get("/__debug/files")
-    def __debug_files():
-        spk_dir = "app/data/spk"
-        try:
-            files = sorted(os.listdir(spk_dir)) if os.path.isdir(spk_dir) else []
-        except Exception as e:
-            files = [f"<error: {e}>"]
-        return jsonify({"spk": files}), 200
 
     @app.get("/__debug/ephem")
     def __debug_ephem():
@@ -472,23 +443,19 @@ def create_app() -> Flask:
     def metrics_endpoint():
         if not _metrics_auth_ok():
             return Response("Unauthorized", 401, {"WWW-Authenticate": 'Basic realm="metrics"'})
-
         GAUGE_APP_UP.set(1.0)
         try:
             GAUGE_DUT1.set(float(os.environ.get("ASTRO_DUT1_BROADCAST", os.environ.get("ASTRO_DUT1", "0.0")) or 0.0))
         except Exception:
             pass
-
         data = generate_latest(REGISTRY)
         return Response(data, mimetype=CONTENT_TYPE_LATEST)
 
-    app.logger.info(
-        "App initialized; engine=%s; routes_loaded=%s, predictions_loaded=%s",
-        HOUSES_ENGINE_NAME, bool(_routes_bp), bool(_pred_bp)
-    )
+    app.logger.info("App initialized; houses_engine=%s; routes_loaded=%s, predictions_loaded=%s",
+                    ENGINE_LABEL, bool(_routes_bp), bool(_pred_bp))
     return app
 
-# ───────────────────────── app instance ─────────────────────────
+# ───────────────────────────── app instance ─────────────────────────────
 app = create_app()
 
 # CORS for browser UIs
