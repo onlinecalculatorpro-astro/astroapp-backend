@@ -585,60 +585,96 @@ def ecliptic_longitudes_and_velocities(
     latitude: Optional[float] = None,
     longitude: Optional[float] = None,
     elevation_m: Optional[float] = None,
-) -> Dict[str, Dict[str, float]]:
+) -> List[Dict[str, float]]:
     """
-    Convenience dict form for callers that want maps:
-      {"longitudes": {name:deg}, "velocities": {name:deg/day}}
+    Return rows (NOT maps) to satisfy the astronomy harness:
+      [{"name": <as requested>, "lon": <deg>, "lat": <deg?>, "speed": <deg/day?>}, ...]
+    Notes:
+      • Nodes: geocentric, longitude only (no speed). We omit 'lat'.
+      • Small bodies (if enabled): provide lon (+ speed if available).
     """
-    rows = ecliptic_longitudes(
-        jd_tt,
-        names=names,
-        frame=frame,
+    # Prepare SPICE (for small bodies only; harmless if unavailable)
+    if _SPICE_OK and _ENABLE_SMALLS:
+        _spice_bootstrap()
+
+    rows: List[Dict[str, float]] = []
+
+    main, _ = _get_kernels()
+    if main is None:
+        return rows
+
+    t  = _to_tts(jd_tt)
+    ef = _get_ecliptic_frame(frame)
+    obs = _observer(
+        main,
         topocentric=topocentric,
         latitude=latitude,
         longitude=longitude,
         elevation_m=elevation_m,
     )
+
+    if t is None or ef is None or obs is None:
+        return rows
+
+    ts = _get_timescale()
+
+    for raw in names:
+        canon, kind = _canon_name(raw)
+
+        # Nodes (geocentric only; no speed)
+        if kind == "node":
+            try:
+                lon = _node_longitude(canon, jd_tt)
+                rows.append({"name": raw, "lon": float(lon)})
+            except Exception as e:
+                log.debug("Node computation failed for %s: %s", canon, e)
+            continue
+
+        skyfield_success = False
+        if kind == "major":
+            body = _get_body(canon)
+            if body is not None:
+                try:
+                    geo = obs.at(t).observe(body).apparent()
+                    lon, lat = _frame_latlon(geo, ef)
+                    row: Dict[str, float] = {"name": raw, "lon": float(lon), "lat": float(lat)}
+                    if ts is not None:
+                        step = _speed_step_for(canon)
+                        t0 = ts.tt_jd(jd_tt - step)
+                        t1 = ts.tt_jd(jd_tt + step)
+                        lon0, _ = _frame_latlon(obs.at(t0).observe(body).apparent(), ef)
+                        lon1, _ = _frame_latlon(obs.at(t1).observe(body).apparent(), ef)
+                        row["speed"] = _wrap_diff_deg(lon1, lon0) / (2.0 * step)
+                    rows.append(row)
+                    skyfield_success = True
+                except Exception as e:
+                    log.debug("Skyfield failed for %s: %s", canon, e)
+
+        # Optional small-body path (SPICE); lat not computed here
+        if (not skyfield_success) and _SPICE_READY and _ENABLE_SMALLS:
+            lon, spd = _spice_ecliptic_longitude_speed(jd_tt, canon, frame=frame)
+            if lon is not None:
+                row: Dict[str, float] = {"name": raw, "lon": float(lon)}
+                if spd is not None:
+                    row["speed"] = float(spd)
+                rows.append(row)
+
+    return rows
+
+
+# Optional utility for any caller that still wants {longitudes, velocities} maps.
+def rows_to_maps(rows: List[Dict[str, float]]) -> Dict[str, Dict[str, float]]:
     lon_map: Dict[str, float] = {}
     vel_map: Dict[str, float] = {}
     for r in rows:
         nm = r.get("name")
-        if nm is None:
+        if not nm:
             continue
         if "lon" in r:
             lon_map[nm] = float(r["lon"])
         if "speed" in r:
             vel_map[nm] = float(r["speed"])
     return {"longitudes": lon_map, "velocities": vel_map}
-
-# Backwards-compat helpers
-def get_ecliptic_longitudes(
-    jd_tt: float,
-    names: List[str],
-    *,
-    frame: str = "ecliptic-of-date",
-    topocentric: bool = False,
-    latitude: Optional[float] = None,
-    longitude: Optional[float] = None,
-    elevation_m: Optional[float] = None,
-) -> List[Dict[str, float]]:
-    """Alias to the row-returning API (kept to avoid adapter_return_invalid)."""
-    return ecliptic_longitudes(
-        jd_tt,
-        names=names,
-        frame=frame,
-        topocentric=topocentric,
-        latitude=latitude,
-        longitude=longitude,
-        elevation_m=elevation_m,
-    )
-
-def get_node_longitude(jd_tt: float, name: str, *, latitude: Optional[float] = None, longitude: Optional[float] = None) -> float:
-    """Public helper for nodes; topo inputs ignored by design."""
-    canon, kind = _canon_name(name)
-    if kind != "node":
-        raise ValueError("name must be 'North Node' or 'South Node'")
-    return _node_longitude(canon, jd_tt)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Diagnostics
