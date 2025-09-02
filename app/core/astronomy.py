@@ -1,20 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-High‑precision planetary chart computation (ecliptic‑of‑date).
+High-precision planetary chart computation (ecliptic-of-date).
+
+New in this version
+-------------------
+- Accepts optional `points` (e.g., ["North Node","South Node"]) and returns
+  BOTH majors (in `bodies`) and nodes (in `points`) in the same response.
+- If client puts node names in `bodies`, we move them to `points` internally
+  and still return majors (default 10 if the majors subset ends up empty).
+- Points are tagged with `is_point: True` and `speed/speed_deg_per_day: None`.
 
 Key points
 ----------
-- **Timescales**: prefer caller‑supplied jd_ut/jd_tt/jd_ut1 (routes lock them);
-  otherwise derive from app.core.time_kernel → app.core.timescales → local fallback.
-- **Ephemeris**: delegate positions (and velocities, when available) to
-  `app.core.ephemeris_adapter` (Skyfield + DE421; future SPICE small‑bodies).
-- **Angles**: Asc/MC computed with ERFA (IAU 2006/2000A) when available; fall
-  back to Meeus-grade approximations with clear warnings so we never 500.
-- **Sidereal**: rotate all longitudes (planets + angles) by ayanāṁśa
-  (from app.core.ayanamsa or app.core.astro_extras; safe fallback).
-- **Topocentric**: supported for bodies via adapter; angles require lat/lon.
-- **Schema**: predictable output with both legacy (lon/speed) and explicit
-  (longitude_deg/speed_deg_per_day) fields for maximum compatibility.
+- Timescales: prefer caller-supplied jd_ut/jd_tt/jd_ut1; else derive from
+  app.core.time_kernel → app.core.timescales → stdlib fallback.
+- Ephemeris: delegate positions to app.core.ephemeris_adapter (Skyfield DE421).
+- Angles: ERFA (IAU 2006/2000A) when available; Meeus-grade fallback otherwise.
+- Sidereal: rotate all longitudes (planets + angles + points) by ayanāṁśa.
+- Topocentric: supported for bodies via adapter; points (nodes) are geocentric.
+- Schema: predictable output; legacy keys (lon/speed) retained for compatibility.
 
 Public API
 ----------
@@ -67,13 +71,22 @@ _CLASSIC_10 = (
     "Sun", "Moon", "Mercury", "Venus", "Mars",
     "Jupiter", "Saturn", "Uranus", "Neptune", "Pluto",
 )
-_EXTRA_POINTS = (
-    # future‑use small bodies + nodes (adapter is already future‑proof)
+# Future small bodies are kept in the allowed set for forward-compat,
+# but this file only gives special treatment to the lunar nodes as "points".
+_EXTRA_ALLOWED = (
     "Ceres", "Pallas", "Juno", "Vesta", "Chiron",
     "North Node", "South Node",
 )
-ALLOWED_BODIES = set(_CLASSIC_10) | set(_EXTRA_POINTS)
+
+ALLOWED_BODIES = set(_CLASSIC_10) | set(_EXTRA_ALLOWED)
 _DEF_BODIES: Tuple[str, ...] = _CLASSIC_10
+
+# Node canonical names (case-insensitive matching)
+_NODE_CANON = {
+    "north node": "North Node",
+    "south node": "South Node",
+}
+_NODE_SET_LC = set(_NODE_CANON.keys())
 
 _JD_QUANT       = float(os.getenv("OCP_ASTRO_JD_QUANT", "1e-7"))     # ~0.009 s
 _LATLON_QUANT   = float(os.getenv("OCP_ASTRO_LL_QUANT", "1e-6"))     # ~0.11 m
@@ -136,25 +149,86 @@ def _is_finite(x: Any) -> bool:
         return False
 
 
-# ───────────────────────────── Validation ─────────────────────────────
-def _validate_payload(payload: Dict[str, Any]) -> Tuple[str, List[str]]:
+# ───────────────────────────── Validation & parsing ───────────────────
+def _validate_mode(payload: Dict[str, Any]) -> str:
     mode = str(payload.get("mode", "tropical")).strip().lower()
     if mode not in ("tropical", "sidereal"):
         raise AstronomyError("invalid_input", "mode must be 'tropical' or 'sidereal'")
+    return mode
 
-    bodies = payload.get("bodies")
-    if bodies is None:
-        bodies_list = list(_DEF_BODIES)
+
+def _canon_node_name(s: str) -> Optional[str]:
+    key = str(s).strip().lower()
+    return _NODE_CANON.get(key)
+
+
+def _split_bodies_points(
+    payload: Dict[str, Any]
+) -> Tuple[List[str], List[str], bool, List[str]]:
+    """
+    Returns: (majors, points, bodies_were_omitted, warnings)
+    - Move any node names from `bodies` → `points`.
+    - If bodies explicitly provided and become empty after moving nodes,
+      we fall back to default 10 majors.
+    """
+    warnings: List[str] = []
+
+    # Parse requested bodies
+    bodies_raw = payload.get("bodies", None)
+    bodies_were_omitted = bodies_raw is None
+    if bodies_raw is None:
+        majors: List[str] = list(_DEF_BODIES)
     else:
         try:
-            bodies_list = [str(b) for b in bodies]
+            majors = [str(b) for b in bodies_raw]
         except Exception:
             raise AstronomyError("invalid_input", "bodies must be a list of names")
-        unknown = [b for b in bodies_list if b not in ALLOWED_BODIES]
-        if unknown:
+
+    # Parse requested points
+    points_raw = payload.get("points", [])
+    points: List[str] = []
+    if points_raw is None:
+        points_raw = []
+    if isinstance(points_raw, (list, tuple)):
+        for p in points_raw:
+            nm = _canon_node_name(p) or None
+            if nm:
+                points.append(nm)
+            else:
+                # Only nodes supported as "points" in this version; ignore others silently.
+                pass
+    else:
+        warnings.append("points_ignored_non_list")
+
+    # Move any node names present in `majors` to `points`
+    majors_out: List[str] = []
+    for b in majors:
+        if b not in ALLOWED_BODIES:
             allowed = ", ".join(sorted(ALLOWED_BODIES))
-            raise AstronomyError("unsupported_body", f"'{unknown[0]}' not supported (allowed: {allowed})")
-    return mode, bodies_list
+            raise AstronomyError("unsupported_body", f"'{b}' not supported (allowed: {allowed})")
+        b_lc = str(b).strip().lower()
+        if b_lc in _NODE_SET_LC:
+            canon = _canon_node_name(b_lc)
+            if canon and canon not in points:
+                points.append(canon)
+            # Do not keep in majors
+        else:
+            majors_out.append(b)
+
+    # If the client explicitly set bodies but after moving nodes none remain,
+    # return the default 10 majors (acceptance test D).
+    if not bodies_were_omitted and len(majors_out) == 0:
+        majors_out = list(_DEF_BODIES)
+
+    # Deduplicate stable order for points
+    points_seen = set()
+    points_final: List[str] = []
+    for p in points:
+        if p not in points_seen:
+            points_seen.add(p)
+            points_final.append(p)
+
+    return majors_out, points_final, bodies_were_omitted, warnings
 
 
 # ───────────────────────────── Timescales ─────────────────────────────
@@ -343,7 +417,8 @@ def _resolve_ayanamsa(jd_tt: float, ayanamsa: Any, warnings: List[str]) -> Tuple
 
 # ───────────────────────────── Adapter I/O ────────────────────────────
 def _adapter_source_tag() -> str:
-    tag = getattr(eph, "current_kernel_name", None) or getattr(eph, "EPHEMERIS_NAME", None) or "adapter"
+    tag = getattr(eph, "current_kernel_name", None) \
+          or getattr(eph, "EPHEMERIS_NAME", None) or "adapter"
     return str(tag)
 
 
@@ -580,6 +655,20 @@ def _longitudes_and_speeds(
     return out, source
 
 
+def _longitudes_only_geocentric(
+    jd_tt: float,
+    names: List[str],
+) -> Tuple[Dict[str, float], str]:
+    """
+    Fetch only longitudes for points (nodes) as GEOCENTRIC regardless of topo setting.
+    We call the same adapter machinery but with topocentric=False to ensure geo.
+    """
+    names_key = tuple(names)
+    jd_tt_q = _q(jd_tt, _JD_QUANT) or jd_tt
+    lon_map, _spd_map, source = _cached_positions(jd_tt_q, names_key, False, None, None, None)
+    return {k: _norm360(float(v)) for k, v in lon_map.items()}, source
+
+
 # ───────────────────────────── Angles (Asc/MC) ────────────────────────
 _def_warn_angles = "angles_fallback_Meeus"
 
@@ -596,9 +685,7 @@ def _atan2d(y: float, x: float) -> float:
 
 
 def _sind(a: float) -> float: return math.sin(math.radians(a))
-
 def _cosd(a: float) -> float: return math.cos(math.radians(a))
-
 def _tand(a: float) -> float: return math.tan(math.radians(a))
 
 
@@ -616,7 +703,7 @@ def _gast_deg(jd_ut1: float, jd_tt: float, warnings: List[str]) -> float:
             return _norm360(math.degrees(gst_rad))
         except Exception:
             pass
-    # Meeus GMST‑like fallback
+    # Meeus GMST-like fallback
     T = (float(jd_ut1) - 2451545.0) / 36525.0
     theta = (
         280.46061837
@@ -644,21 +731,6 @@ def _true_obliquity_deg(jd_tt: float, warnings: List[str]) -> float:
     return eps_arcsec / 3600.0
 
 
-def _ramc_deg(jd_ut1: float, jd_tt: float, lon_east_deg: float, warnings: List[str]) -> float:
-    return _norm360(_gast_deg(jd_ut1, jd_tt, warnings) + float(lon_east_deg))
-
-
-def _mc_longitude_deg(ramc: float, eps: float) -> float:
-    return _atan2d(_sind(ramc) * _cosd(eps), _cosd(ramc))
-
-
-def _asc_longitude_deg(phi: float, ramc: float, eps: float) -> float:
-    num = -((_tand(phi) * _sind(eps)) + (_sind(ramc) * _cosd(eps)))
-    den = _cosd(ramc)
-    den = den if abs(den) > 1e-15 else math.copysign(1e-15, den if den != 0 else 1.0)
-    return _acotd(num / den)
-
-
 def _compute_angles(
     jd_ut1: float,
     jd_tt: float,
@@ -674,10 +746,21 @@ def _compute_angles(
         return None, None, {}
 
     eps = _true_obliquity_deg(jd_tt, warnings)
+    # GAST and RAMC
+    T = (float(jd_ut1) - 2451545.0) / 36525.0  # keep for dbg even if ERFA path used
     gast = _gast_deg(jd_ut1, jd_tt, warnings)
     ramc = _norm360(gast + float(longitude))
-    mc = _mc_longitude_deg(ramc, eps)
-    asc = _asc_longitude_deg(float(latitude), ramc, eps)
+
+    # MC (ecliptic-of-date)
+    mc = _atan2d(_sind(ramc) * _cosd(eps), _cosd(ramc))
+
+    # ASC (ecliptic-of-date)
+    # formula: acot( - (tanφ sinε + sinRAMC cosε) / cosRAMC )
+    def _acotd_safe(num: float, den: float) -> float:
+        den = den if abs(den) > 1e-15 else math.copysign(1e-15, den if den != 0 else 1.0)
+        return _acotd(num / den)
+
+    asc = _acotd_safe(-((_tand(float(latitude)) * _sind(eps)) + (_sind(ramc) * _cosd(eps))), _cosd(ramc))
 
     if mode == "sidereal" and ayanamsa_deg is not None:
         asc = _norm360(asc - float(ayanamsa_deg))
@@ -692,12 +775,17 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
     if eph is None:
         raise AstronomyError("ephemeris_unavailable", f"ephemeris_adapter import failed: {_EPH_IMPORT_ERROR!r}")
 
-    mode, bodies = _validate_payload(payload)
+    mode = _validate_mode(payload)
 
+    # Bodies & points (nodes)
+    majors_req, points_req, bodies_were_omitted, move_warnings = _split_bodies_points(payload)
+
+    # Timescales
     jd_ut, jd_tt, jd_ut1, ts_warnings = _ensure_timescales(payload)
 
+    # Observer settings
     topocentric = _coerce_bool(payload.get("topocentric"), False)
-    warnings: List[str] = list(ts_warnings)
+    warnings: List[str] = list(ts_warnings) + list(move_warnings)
 
     # Geo for bodies (topo optional) and for angles (required → can be None)
     if topocentric:
@@ -713,9 +801,9 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
         lon = float(payload.get("longitude")) if _is_finite(payload.get("longitude")) else None
         elev = None
 
-    # Ephemeris (longitudes + speeds)
+    # Ephemeris (longitudes + speeds) for majors
     results, source_tag = _longitudes_and_speeds(
-        jd_tt, bodies,
+        jd_tt, majors_req,
         topocentric=topocentric,
         latitude=lat, longitude=lon, elevation_m=elev,
         speed_step_days=_SPEED_STEP_DEF,
@@ -727,10 +815,10 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
     if mode == "sidereal":
         ay_deg, ay_note = _resolve_ayanamsa(jd_tt, payload.get("ayanamsa"), warnings)
 
-    # Build bodies list
+    # Build majors (bodies) list
     out_bodies: List[Dict[str, Any]] = []
     missing_bodies: List[str] = []
-    for nm in bodies:
+    for nm in majors_req:
         tup = results.get(nm)
         if not tup:
             missing_bodies.append(nm)
@@ -740,20 +828,65 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
             lon_deg = _norm360(lon_deg - float(ay_deg))
         row: Dict[str, Any] = {
             "name": nm,
-            # dual keying for compatibility
             "lon": float(_norm360(lon_deg)),
             "longitude_deg": float(_norm360(lon_deg)),
             "speed": (float(speed) if speed is not None else None),
             "speed_deg_per_day": (float(speed) if speed is not None else None),
-            # (lat is not provided by adapter; keep placeholder for API parity)
             "lat": None,
         }
-        if nm in ("North Node", "South Node"):
-            row["is_point"] = True
         out_bodies.append(row)
 
     if missing_bodies:
         warnings.append(f"adapter_missing_bodies({', '.join(missing_bodies)})")
+
+    # Points (nodes): always geocentric; speed intentionally None
+    out_points: List[Dict[str, Any]] = []
+    if points_req:
+        # Try to fetch both nodes via adapter in one shot.
+        # If one is missing, compute it from the other (+180).
+        lon_map_nodes, source_nodes = _longitudes_only_geocentric(jd_tt, points_req)
+
+        # Fill any missing node via 180° complement if its counterpart exists.
+        need_north = ("North Node" in points_req) and ("North Node" not in lon_map_nodes)
+        need_south = ("South Node" in points_req) and ("South Node" not in lon_map_nodes)
+
+        if need_north or need_south:
+            # If we have one node, derive the other
+            if "North Node" in lon_map_nodes and need_south:
+                lon_map_nodes["South Node"] = _norm360(lon_map_nodes["North Node"] + 180.0)
+            elif "South Node" in lon_map_nodes and need_north:
+                lon_map_nodes["North Node"] = _norm360(lon_map_nodes["South Node"] + 180.0)
+            else:
+                # As a last resort, try fetching the counterpart explicitly
+                counterpart = []
+                if need_north:
+                    counterpart.append("North Node")
+                if need_south:
+                    counterpart.append("South Node")
+                extra_map, _src2 = _longitudes_only_geocentric(jd_tt, counterpart)
+                lon_map_nodes.update(extra_map)
+
+        for nm in points_req:
+            if nm not in lon_map_nodes:
+                warnings.append(f"adapter_missing_points({nm})")
+                continue
+            lon_deg = float(lon_map_nodes[nm])
+            if mode == "sidereal" and ay_deg is not None:
+                lon_deg = _norm360(lon_deg - float(ay_deg))
+            out_points.append({
+                "name": nm,
+                "is_point": True,
+                "lon": float(_norm360(lon_deg)),
+                "longitude_deg": float(_norm360(lon_deg)),
+                "speed": None,
+                "speed_deg_per_day": None,
+                "lat": None,
+            })
+
+        # Override source tag if adapter used a different kernel path for nodes.
+        if source_nodes and source_nodes != source_tag:
+            # keep the first (majors) source, but note mismatch
+            warnings.append(f"points_source({source_nodes})")
 
     # Angles
     asc_deg, mc_deg, dbg = _compute_angles(
@@ -778,11 +911,12 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     out: Dict[str, Any] = {
         "mode": mode,
-        "ayanamsa_deg": float(ay_deg) if ay_deg is not None else None,  # top‑level mirror for routes
+        "ayanamsa_deg": float(ay_deg) if ay_deg is not None else None,  # top-level mirror
         "jd_ut": float(jd_ut),
         "jd_tt": float(jd_tt),
         "jd_ut1": float(jd_ut1),
         "bodies": out_bodies,
+        "points": out_points,  # <── new top-level key
         "angles": {
             "asc_deg": (float(asc_deg) if asc_deg is not None else None),
             "mc_deg": (float(mc_deg) if mc_deg is not None else None),
@@ -790,5 +924,6 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
         "asc_deg": (float(asc_deg) if asc_deg is not None else None),
         "mc_deg": (float(mc_deg) if mc_deg is not None else None),
         "meta": meta,
+        "warnings": warnings,  # also mirror warnings at top-level for convenience
     }
     return out
