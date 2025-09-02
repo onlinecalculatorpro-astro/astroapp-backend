@@ -397,12 +397,6 @@ def _normalize_adapter_output_to_maps(
     """
     Normalize various adapter return styles into:
       (longitudes_map {name: deg}, speeds_map {name: deg/day or None})
-
-    Accepts ALL of:
-      • {"Mercury": 123.4, "Venus": ...}                   # plain mapping
-      • {"longitudes": {...}, "velocities": {...}}         # split mapping
-      • [{"name": "Mercury", "longitude_deg": 12.3, ...}]  # list of rows
-      • (positional list) [lon1, lon2, ...]                # aligned to names
     """
     longitudes: Dict[str, float] = {}
     speeds: Dict[str, Optional[float]] = {}
@@ -422,10 +416,39 @@ def _normalize_adapter_output_to_maps(
 
     # A) dict formats
     if isinstance(res, dict):
-        # A1: {name: deg}
+        # A0: nested "resolved": { name: {lon|longitude|longitude_deg, speed|speed_deg_per_day|v } }
+        if "resolved" in res and isinstance(res["resolved"], dict):
+            tmp_lon_lc: Dict[str, float] = {}
+            tmp_spd_lc: Dict[str, Optional[float]] = {}
+            for k, row in res["resolved"].items():
+                try:
+                    nm_lc = str(k).lower()
+                    if isinstance(row, dict):
+                        if row.get("lon") is not None:
+                            lonv = float(row["lon"])
+                        elif row.get("longitude") is not None:
+                            lonv = float(row["longitude"])
+                        elif row.get("longitude_deg") is not None:
+                            lonv = float(row["longitude_deg"])
+                        else:
+                            continue
+                        tmp_lon_lc[nm_lc] = lonv
+                        sp = row.get("speed") or row.get("speed_deg_per_day") or row.get("v")
+                        tmp_spd_lc[nm_lc] = float(sp) if sp is not None else None
+                except Exception:
+                    continue
+            for nm, nm_lc in zip(want, want_lc):
+                if nm_lc in tmp_lon_lc:
+                    longitudes[nm] = float(tmp_lon_lc[nm_lc])
+                    speeds[nm] = tmp_spd_lc.get(nm_lc, None)
+            if longitudes:
+                return longitudes, speeds
+
+        # A1: flat {name:deg}
         if all(isinstance(k, (str, int)) and isinstance(v, (int, float)) for k, v in res.items()):
             _merge_numeric_map(res, into="lon")
             return longitudes, speeds
+
         # A2: {"longitudes": {...}, "velocities": {...}}
         for lon_key in ("longitudes", "longitude", "lon"):
             if lon_key in res and isinstance(res[lon_key], dict):
@@ -472,6 +495,9 @@ def _normalize_adapter_output_to_maps(
         for i, nm in enumerate(want[:len(res)]):
             longitudes[nm] = float(res[i]); speeds[nm] = None
         return longitudes, speeds
+
+    # Final fallback: return empty (caller will warn about missing bodies)
+    return {}, {}
 
     # C) object/dataclass with attributes
     longs = getattr(res, "longitudes", None)
