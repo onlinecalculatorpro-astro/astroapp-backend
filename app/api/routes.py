@@ -1077,24 +1077,29 @@ def dev_echo_timescales():
 
 # ───────────────────────────── Dev: fetch SPKs from Horizons (Type-2) ─────────────────────────────
 import re, time, urllib.request, pathlib
-try:  # Python 3.13 removes telnetlib
+
+# telnetlib is not available on some PaaS images; detect safely
+try:
     import telnetlib  # type: ignore
+    _TELNET_AVAILABLE = True
 except Exception:
     telnetlib = None  # type: ignore
+    _TELNET_AVAILABLE = False
 
-if telnetlib is None:
-    return {"ok": False, "message": "telnetlib not available on this runtime", "url": None, "saved_as": None}
 
 def _horizons_spk_type2(cmd: str, start: str, stop: str, center: str = "500@10") -> Dict[str, Any]:
     """
     Ask Horizons (telnet) to build a Type-2 SPK for 'cmd' (e.g., '1','2','3','4','2060').
     Returns {"ok": bool, "message": str, "url": str|None, "saved_as": str|None}.
     """
+    if not _TELNET_AVAILABLE:
+        return {"ok": False, "message": "telnetlib not available on this runtime", "url": None, "saved_as": None}
+
     host, port = "horizons.jpl.nasa.gov", 6775
     tn = None
     out_txt = ""
     try:
-        tn = telnetlib.Telnet(host, port, timeout=90)
+        tn = telnetlib.Telnet(host, port, timeout=90)  # type: ignore[attr-defined]
         def rd(expect=b"Horizons>", t=60):
             nonlocal out_txt
             chunk = tn.read_until(expect, t)
@@ -1119,10 +1124,8 @@ def _horizons_spk_type2(cmd: str, start: str, stop: str, center: str = "500@10")
         wr("!$$EOF")
 
         # Confirm + choose HTTP (usually prompted)
-        time.sleep(0.8)
-        tn.write(b"Y\n")    # confirm
-        time.sleep(0.4)
-        tn.write(b"H\n")    # choose HTTP
+        time.sleep(0.8); tn.write(b"Y\n")
+        time.sleep(0.4); tn.write(b"H\n")
         time.sleep(0.4)
 
         time.sleep(3.0)
@@ -1151,6 +1154,7 @@ def _horizons_spk_type2(cmd: str, start: str, stop: str, center: str = "500@10")
 
     return {"ok": True, "message": "fetched", "url": url, "saved_as": dst_path.as_posix()}
 
+
 @api.post("/api/dev/horizons_spk")
 def dev_horizons_spk():
     """
@@ -1158,6 +1162,9 @@ def dev_horizons_spk():
     start:'2000-01-01', stop:'2050-01-01', center:'500@10'}.
     Saves files to app/data/spk/ and reports results.
     """
+    if not _TELNET_AVAILABLE:
+        return jsonify({"ok": False, "results": [], "message": "telnetlib not available on this runtime"}), 200
+
     body = request.get_json(force=True) or {}
     targets = [str(x) for x in (body.get("targets") or [])]
     start = body.get("start") or "2000-01-01"
