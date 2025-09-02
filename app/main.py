@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
+import traceback
 from datetime import datetime
 from time import perf_counter
 from typing import Any, Dict, Final
@@ -12,21 +14,29 @@ from flask_cors import CORS
 from werkzeug.exceptions import HTTPException, BadRequest
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-# Optional blueprints (won't crash app if absent)
+# ───────────────────────────── Optional blueprints ─────────────────────────────
+# Make blueprint import failures VISIBLE in logs so 404s are easy to debug.
+
 try:
-    from app.api.routes import api as _routes_bp  # type: ignore
-except Exception:  # pragma: no cover
+    from app.api import routes as _routes_mod  # type: ignore
+    _routes_bp = _routes_mod.api
+except Exception as e:  # pragma: no cover
+    print("WARNING: routes blueprint failed to import:", repr(e), file=sys.stderr)
+    traceback.print_exc()
     _routes_bp = None
 
 try:
     from app.api.predictions import predictions_bp as _pred_bp  # type: ignore
-except Exception:  # pragma: no cover
+except Exception as e:  # pragma: no cover
+    print("WARNING: predictions blueprint failed to import:", repr(e), file=sys.stderr)
+    traceback.print_exc()
     _pred_bp = None
 
-# Config loader (optional)
+# ───────────────────────────── Optional config loader ─────────────────────────────
 try:
     from app.utils.config import load_config  # type: ignore
-except Exception:  # pragma: no cover
+except Exception as e:  # pragma: no cover
+    print("INFO: app.utils.config.load_config not available:", repr(e), file=sys.stderr)
     load_config = None  # type: ignore
 
 # Core engines
@@ -67,8 +77,6 @@ def _configure_logging(app: Flask) -> None:
 
 def _register_errors(app: Flask) -> None:
     """Consistent JSON error payloads (and visible 500 bodies for DevTools)."""
-    import traceback
-
     @app.errorhandler(HTTPException)
     def _http(e: HTTPException):
         app.logger.warning("HTTP %s at %s %s: %s", e.code, request.method, request.path, e.description)
@@ -157,7 +165,11 @@ def _compute_timescales_payload(date: str, time_s: str, tz: str) -> Dict[str, An
     jd_ut = _ts.julian_day_utc(date, time_norm, tz)
 
     # For ΔT polynomial we need UTC year/month
-    dt_utc = datetime.fromisoformat(f"{date}T{time_norm}").replace(tzinfo=ZoneInfo(tz)).astimezone(ZoneInfo("UTC"))
+    dt_utc = (
+        datetime.fromisoformat(f"{date}T{time_norm}")
+        .replace(tzinfo=ZoneInfo(tz))
+        .astimezone(ZoneInfo("UTC"))
+    )
     jd_tt = _ts.jd_tt_from_utc_jd(jd_ut, dt_utc.year, dt_utc.month)
 
     # UT1 = UT + DUT1 (seconds)/86400
@@ -198,7 +210,8 @@ def _register_core_api(app: Flask) -> None:
         # If caller passed civil inputs but not jd_*, compute them here
         have_all_jd = all(k in payload for k in ("jd_ut", "jd_tt", "jd_ut1"))
         if not have_all_jd:
-            date = payload.get("date"); time_s = payload.get("time")
+            date = payload.get("date")
+            time_s = payload.get("time")
             tz = payload.get("tz") or payload.get("place_tz")
             if isinstance(date, str) and isinstance(time_s, str) and isinstance(tz, str):
                 ts = _compute_timescales_payload(date, time_s, tz)
@@ -294,7 +307,10 @@ def create_app() -> Flask:
         data = generate_latest(REGISTRY)
         return Response(data, mimetype=CONTENT_TYPE_LATEST)
 
-    app.logger.info("App initialized; core endpoints ready")
+    app.logger.info(
+        "App initialized; core endpoints ready; routes_loaded=%s, predictions_loaded=%s",
+        bool(_routes_bp), bool(_pred_bp)
+    )
     return app
 
 
