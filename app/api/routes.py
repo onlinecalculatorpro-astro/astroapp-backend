@@ -47,7 +47,6 @@ def _delta_arcsec(a: float, b: float) -> float:
 
 ARCSEC_TOL = float(os.getenv("ASTRO_ASC_TOL_ARCSEC", "3.6"))  # 0.001° default
 
-
 log = logging.getLogger(__name__)
 api = Blueprint("api", __name__)
 
@@ -239,7 +238,6 @@ def _compute_timescales_from_local(date_str: str, time_str: str, tz_name: str) -
     except Exception:
         raise ValidationError({"place_tz": "must be a valid IANA zone like 'Asia/Kolkata'"})
 
-    # normalize HH:MM vs HH:MM:SS
     def _norm_hms(s: str) -> str:
         s = s.strip()
         parts = s.split(":")
@@ -264,7 +262,6 @@ def _compute_timescales_from_local(date_str: str, time_str: str, tz_name: str) -
     dut1 = float(os.getenv("ASTRO_DUT1_BROADCAST", os.getenv("ASTRO_DUT1", "0.0")))
     jd_ut1 = float(jd_utc) + dut1 / 86400.0
 
-    # Optional ΔT (seconds) if provided by timescales module
     try:
         delta_t = float(_ts.delta_t_seconds(dt_utc.year, dt_utc.month))  # type: ignore[attr-defined]
     except Exception:
@@ -276,7 +273,7 @@ def _compute_timescales_from_local(date_str: str, time_str: str, tz_name: str) -
         "jd_tt": float(jd_tt),
         "jd_ut1": float(jd_ut1),
         "delta_t": delta_t,
-        "delta_at": None,  # fill if you have leap-second tables elsewhere
+        "delta_at": None,
         "dut1": float(dut1),
         "timezone": tz_name,
         "tz_offset_seconds": tz_offset_seconds,
@@ -593,11 +590,9 @@ def _prepare_chart_for_predict(chart: Dict[str, Any]) -> Dict[str, Any]:
     ch = dict(chart)  # shallow copy to avoid mutating engine output
     bodies = ch.get("bodies")
 
-    # If already a dict-like mapping, keep as-is.
     if isinstance(bodies, dict):
         return ch
 
-    # If it's a list of dicts, build a name->dict map.
     if isinstance(bodies, list):
         name_map: Dict[str, Any] = {}
         for b in bodies:
@@ -611,7 +606,6 @@ def _prepare_chart_for_predict(chart: Dict[str, Any]) -> Dict[str, Any]:
     return ch
 
 
-# Make horizon JSON-safe input hashable for caching/keys
 def _freeze_horizon(h: Any) -> Any:
     if isinstance(h, dict):
         return tuple(sorted((k, _freeze_horizon(v)) for k, v in h.items()))
@@ -634,7 +628,6 @@ def calculate():
         hs = str(body.get("house_system", "")).strip().lower()
         if hs:
             payload["house_system"] = hs
-        # pass-through optional chart args if present
         for k in ("bodies", "ayanamsa", "topocentric", "elevation_m"):
             if k in body:
                 payload[k] = body[k]
@@ -646,7 +639,6 @@ def calculate():
     tz_name = payload.get("place_tz") or payload.get("timezone") or "UTC"
     ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name)
 
-    # chart is optional here — we won't fail the endpoint on chart errors
     chart: Dict[str, Any]
     chart_warnings: list[str] = []
     try:
@@ -663,7 +655,6 @@ def calculate():
         if DEBUG_VERBOSE:
             chart["error"] = str(e)
 
-    # houses are required for this endpoint
     try:
         houses = _call_compute_houses(payload, ts)
         houses = _normalize_houses_payload(houses)
@@ -674,14 +665,12 @@ def calculate():
     except Exception as e:
         return _json_error("houses_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
-    # If sidereal, rotate houses by the same ayanamsa used by the chart
     mode = (payload.get("mode") or "tropical").lower()
     if mode == "sidereal":
         ay = _extract_ayanamsa_from_chart(chart)
         if isinstance(ay, (int, float)):
             houses = _rotate_sidereal_houses(houses, ay)
 
-    # ERFA parity fix for ASC/MC
     houses = _ensure_houses_angles_parity(houses, ts, payload, chart)
 
     if chart_warnings:
@@ -713,7 +702,6 @@ def report():
     tz_name = payload.get("place_tz") or payload.get("timezone") or "UTC"
     ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name)
 
-    # chart optional (same behavior as /api/calculate)
     chart: Dict[str, Any]
     chart_warnings: list[str] = []
     try:
@@ -740,14 +728,12 @@ def report():
     except Exception as e:
         return _json_error("houses_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
-    # If sidereal, rotate houses by the same ayanamsa used by the chart
     mode = (payload.get("mode") or "tropical").lower()
     if mode == "sidereal":
         ay = _extract_ayanamsa_from_chart(chart)
         if isinstance(ay, (int, float)):
             houses = _rotate_sidereal_houses(houses, ay)
 
-    # ERFA parity fix for ASC/MC
     houses = _ensure_houses_angles_parity(houses, ts, payload, chart)
 
     if chart_warnings:
@@ -784,7 +770,6 @@ def predictions_route():
     tz_name = payload.get("place_tz") or payload.get("timezone") or "UTC"
     ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name)
 
-    # Chart is REQUIRED for predictions
     chart: Optional[Dict[str, Any]]
     chart_error: Optional[str] = None
     try:
@@ -804,28 +789,22 @@ def predictions_route():
     if chart is None:
         return _json_error("chart_internal", chart_error or "internal_error", 500)
 
-    # If sidereal, rotate houses by the same ayanamsa used by the chart
     mode = (payload.get("mode") or "tropical").lower()
     if mode == "sidereal":
         ay = _extract_ayanamsa_from_chart(chart)
         if isinstance(ay, (int, float)):
             houses = _rotate_sidereal_houses(houses, ay)
 
-    # ERFA parity fix for ASC/MC
     houses = _ensure_houses_angles_parity(houses, ts, payload, chart)
 
-    # Normalize chart for predictors that expect a mapping at chart["bodies"]
     chart_for_predict = _prepare_chart_for_predict(chart)
 
-    # Run predictor
     try:
-        from app.core.predict import predict  # local import to avoid import cycles
+        from app.core.predict import predict  # local import to avoid cycles
         preds_raw = predict(chart_for_predict, houses, horizon)
     except Exception as e:
-        # Give more actionable debugging info during development
         return jsonify({"ok": False, "error": "internal_error", "message": str(e), "type": type(e).__name__}), 500
 
-    # thresholds (with sensible defaults)
     th_path = os.environ.get("ASTRO_HC_THRESHOLDS", "config/hc_thresholds.json")
     try:
         with open(th_path, "r", encoding="utf-8") as f:
@@ -837,7 +816,6 @@ def predictions_route():
     tau = float(defaults.get("tau", 0.88))
     floor = float(defaults.get("floor", 0.60))
 
-    # request-body overrides (test only)
     overrides = body.get("hc_overrides") or {}
     if isinstance(overrides, dict):
         if "tau" in overrides:
@@ -845,7 +823,6 @@ def predictions_route():
         if "floor" in overrides:
             floor = float(overrides["floor"])
 
-    # env debug overrides
     env_over = os.environ.get("ASTRO_HC_DEBUG_OVERRIDES")
     if env_over:
         try:
@@ -874,14 +851,14 @@ def predictions_route():
                 "hc_flag": hc_flag,
                 "abstained": abstained,
                 "evidence": pr.get("evidence"),
-                "mode": chart.get("mode"),
-                "ayanamsa_deg": chart.get("ayanamsa_deg") or (_extract_ayanamsa_from_chart(chart)),
+                "mode": chart.get("mode") if chart else None,
+                "ayanamsa_deg": (chart or {}).get("ayanamsa_deg")
+                                 or (chart and _extract_ayanamsa_from_chart(chart)),
                 "notes": "QIA+calibrated placeholder; subject to M3 tuning "
                          + ("abstained" if abstained else "accepted"),
             }
         )
 
-    # Final HC flagging (safe)
     if not overrides and not os.environ.get("ASTRO_HC_DEBUG_OVERRIDES"):
         try:
             preds = flag_predictions(preds, _freeze_horizon(horizon), th_path)
@@ -994,10 +971,8 @@ def config_info():
     calib_ver = None
     th_summary = None
 
-    # timescale sample for "now" (debug aid)
     try:
         now_utc = datetime.now(timezone.utc)
-        # mirror /api/_compute_timescales_from_local using timescales helpers
         date_str = now_utc.strftime("%Y-%m-%d")
         time_str = now_utc.strftime("%H:%M:%S")
         tz_name = "UTC"
@@ -1044,12 +1019,10 @@ def config_info():
 # ───────────────────────────── Dev endpoints ─────────────────────────────
 @api.get("/api/dev/ephem")
 def dev_ephem_status():
-    """
-    Ephemeris adapter status for debugging runtime env.
-    """
+    """Ephemeris adapter status for debugging runtime env."""
     try:
         from app.core import ephemeris_adapter as ea
-        eph, path = ea.load_kernel()  # returns (eph, path or None)
+        eph, path = ea.load_kernel()
         return jsonify({
             "skyfield_available": ea._skyfield_available(),
             "kernel_loaded": bool(eph),
@@ -1062,9 +1035,7 @@ def dev_ephem_status():
 
 @api.post("/api/dev/echo_timescales")
 def dev_echo_timescales():
-    """
-    Debug helper: given {date,time,place_tz} return JD_UTC/TT/UT1 etc.
-    """
+    """Debug helper: given {date,time,place_tz} return JD_UTC/TT/UT1 etc."""
     body = request.get_json(force=True) or {}
     try:
         date = body.get("date") or "2000-01-01"
@@ -1075,7 +1046,7 @@ def dev_echo_timescales():
     except Exception as e:
         return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
 
-# ───────────────────────────── Dev: fetch SPKs from Horizons (Type-2) ─────────────────────────────
+
 @api.post("/api/dev/horizons_spk")
 def dev_horizons_spk():
     """
@@ -1088,13 +1059,24 @@ def dev_horizons_spk():
     }), 501
 
 
-# ───────────────────────────── NEW: Ephemeris adapter endpoints ─────────────────────────────
-@api.post("/api/ephemeris/diagnostics")
+# ───────────────────────────── Ephemeris adapter endpoints ─────────────────────────────
+@api.route("/api/ephemeris/diagnostics", methods=["GET", "POST"])
 def ephemeris_diagnostics_endpoint():
-    """Expose adapter diagnostics for the DevTools harness."""
+    """
+    GET  /api/ephemeris/diagnostics[?names=Ceres,Pallas]
+    POST /api/ephemeris/diagnostics {"names":["Ceres","Pallas", ...]}
+    """
     try:
         from app.core import ephemeris_adapter as ea
-        return jsonify(ea.ephemeris_diagnostics()), 200
+        names = None
+        if request.method == "GET":
+            q = request.args.get("names")
+            if q:
+                names = [s.strip() for s in q.split(",") if s.strip()]
+        else:
+            body = request.get_json(silent=True) or {}
+            names = body.get("names")
+        return jsonify(ea.ephemeris_diagnostics(requested=names)), 200
     except Exception as e:
         return _json_error("ephemeris_diag_error", str(e) if DEBUG_VERBOSE else None, 500)
 
@@ -1105,8 +1087,7 @@ def ephemeris_longitudes_endpoint():
     Body:
       { jd_tt: float, names?: [str], frame?: "ecliptic-of-date"|"ecliptic-J2000",
         topocentric?: bool, latitude?: float, longitude?: float, elevation_m?: float }
-    Returns:
-      { name: longitude_deg, ... }  (nodes included if requested)
+    Returns: { name: longitude_deg, ... }  (nodes included if requested)
     """
     try:
         body = request.get_json(force=True) or {}
