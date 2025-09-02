@@ -8,12 +8,14 @@ from functools import lru_cache
 
 log = logging.getLogger(__name__)
 
+# ──────────────────────────────────────────────────────────────────────────────
 # Human label for the primary kernel
+# ──────────────────────────────────────────────────────────────────────────────
 EPHEMERIS_NAME = "de421"
 
-# ---------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Capability check
-# ---------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 def _skyfield_available() -> bool:
     try:
         import skyfield  # noqa: F401
@@ -21,15 +23,17 @@ def _skyfield_available() -> bool:
     except Exception:
         return False
 
-# ---------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Lazy singletons
-# ---------------------------
-_TS = None            # Skyfield timescale
-_MAIN = None          # Main ephemeris (DE421 by default)
-_EXTRA: List[Any] = []   # Extra SPKs (small-bodies)
-_KERNEL_PATHS: List[str] = []  # For reporting
+# ──────────────────────────────────────────────────────────────────────────────
+_TS = None                 # Skyfield timescale
+_MAIN = None               # Main ephemeris (DE421 by default)
+_EXTRA: List[Any] = []     # Extra SPKs (small bodies)
+_KERNEL_PATHS: List[str] = []  # For reporting/diagnostics
 
-# Original 10 bodies (DE421 uses barycenters for outer planets)
+# ──────────────────────────────────────────────────────────────────────────────
+# Canonical bodies (DE421 uses barycenters for outer planets)
+# ──────────────────────────────────────────────────────────────────────────────
 _PLANET_KEYS: Dict[str, str] = {
     "Sun": "sun",
     "Moon": "moon",
@@ -43,32 +47,37 @@ _PLANET_KEYS: Dict[str, str] = {
     "Pluto": "pluto barycenter",
 }
 
-# Heuristics for names present inside various SPKs (case-sensitive keys Skyfield exposes)
+# Small bodies we want to support out-of-the-box
 _SMALLBODY_HINTS: Dict[str, List[str]] = {
+    # Include a mix of common labels and NAIF-like numeric IDs that kernels expose
     "Ceres":  ["1 Ceres", "Ceres", "00001 Ceres", "2000001", "1"],
     "Pallas": ["2 Pallas", "Pallas", "00002 Pallas", "2000002", "2"],
     "Juno":   ["3 Juno", "Juno", "00003 Juno", "2000003", "3"],
     "Vesta":  ["4 Vesta", "Vesta", "00004 Vesta", "2000004", "4"],
-    "Chiron": ["2060 Chiron", "Chiron", "20002060", "2060"],
+    "Chiron": ["2060 Chiron", "Chiron", "20002060", "2060", "95P/Chiron"],
 }
 
 _NODE_NAMES = {"North Node", "South Node"}
 
-# ---------------------------
-# Tunables (env)
-# ---------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Tunables (via env)
+# ──────────────────────────────────────────────────────────────────────────────
 _SPEED_STEP_DEFAULT = float(os.getenv("OCP_SPEED_STEP_DEFAULT", "0.5"))   # ±12h
 _SPEED_STEP_FAST    = float(os.getenv("OCP_SPEED_STEP_FAST", "0.05"))     # ±1.2h (Moon)
 _NODE_MODEL         = os.getenv("OCP_NODE_MODEL", "true").strip().lower()  # "true" | "mean"
 _NODE_ALERT_DEG     = float(os.getenv("OCP_NODE_ALERT_DEG", "10.0"))       # warn if |true-mean| >
-_NODE_CACHE_DECIMALS = int(os.getenv("OCP_NODE_CACHE_DECIMALS", "5"))      # JD rounding for cache (1e-5 ~ 0.864s)
+_NODE_CACHE_DECIMALS = int(os.getenv("OCP_NODE_CACHE_DECIMALS", "5"))      # JD rounding for cache (~0.864 s)
+# Allow explicit list of SPK files (comma separated) or fallback to directory scan
+# OCP_EXTRA_SPK_FILES=/abs/path/asteroids.bsp,/abs/path/chiron.bsp
+# OCP_EXTRA_SPK_DIR=app/data/spk
+# OCP_EPHEMERIS=/abs/path/de421.bsp
 
-# ---------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Kernel resolution & loading
-# ---------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 def _resolve_kernel_path() -> Optional[str]:
     """
-    Try to resolve a local DE421 first; else allow Skyfield to load by name.
+    Resolve a local DE421 first; else allow Skyfield to load by name.
     Priority:
       1) OCP_EPHEMERIS (absolute path)
       2) app/data/de421.bsp
@@ -87,11 +96,17 @@ def _resolve_kernel_path() -> Optional[str]:
     return None
 
 def _extra_spk_paths() -> List[str]:
+    files = os.getenv("OCP_EXTRA_SPK_FILES")
+    if files:
+        out = [f.strip() for f in files.split(",") if f.strip()]
+        return [p for p in out if os.path.isfile(p)]
+
     root = os.getenv("OCP_EXTRA_SPK_DIR", os.path.join(os.getcwd(), "app", "data", "spk"))
     out: List[str] = []
     try:
         if os.path.isdir(root):
-            for fn in os.listdir(root):
+            # deterministic order for fuzzers
+            for fn in sorted(os.listdir(root)):
                 if fn.lower().endswith(".bsp"):
                     out.append(os.path.join(root, fn))
     except Exception as e:
@@ -165,7 +180,7 @@ def current_kernel_name() -> str:
     return EPHEMERIS_NAME
 
 def load_kernel(kernel_name: str = "de421"):
-    """Legacy helper used by some callers."""
+    """Legacy helper used by some callers (kept for compatibility)."""
     k, _ = _get_kernels()
     return k, current_kernel_name()
 
@@ -178,9 +193,9 @@ def _to_tts(jd_tt: float):
     except Exception:
         return None
 
-# ---------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Math helpers
-# ---------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 def _frame_latlon(geo, ecliptic_frame) -> Tuple[float, float]:
     # returns (lon_deg [0..360), lat_deg)
     lat, lon, _ = geo.frame_latlon(ecliptic_frame)
@@ -193,6 +208,10 @@ def _cross(a, b):
 def _atan2deg(y, x):
     return (math.degrees(math.atan2(y, x)) % 360.0)
 
+def _wrap_diff_deg(a: float, b: float) -> float:
+    """Smallest signed difference a-b in degrees in (-180, 180]."""
+    return ((a - b + 540.0) % 360.0) - 180.0
+
 def _central_diff_speed(jd_tt: float, body, observer, ecliptic_frame, delta_days: float) -> float:
     ts = _get_timescale()
     if ts is None:
@@ -202,8 +221,7 @@ def _central_diff_speed(jd_tt: float, body, observer, ecliptic_frame, delta_days
         t1 = ts.tt_jd(jd_tt + delta_days)
         lon0, _ = _frame_latlon(observer.at(t0).observe(body).apparent(), ecliptic_frame)
         lon1, _ = _frame_latlon(observer.at(t1).observe(body).apparent(), ecliptic_frame)
-        d = (lon1 - lon0 + 540.0) % 360.0 - 180.0
-        return d / (2.0 * delta_days)
+        return _wrap_diff_deg(lon1, lon0) / (2.0 * delta_days)
     except Exception:
         return 0.0
 
@@ -211,14 +229,87 @@ def _speed_step_for(name: str) -> float:
     # Tighter step for Moon; default for all others
     return _SPEED_STEP_FAST if name == "Moon" else _SPEED_STEP_DEFAULT
 
-# ---------------------------
-# Body resolution across kernels
-# ---------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Frames
+# ──────────────────────────────────────────────────────────────────────────────
+def _get_ecliptic_frame(frame: str):
+    """
+    Returns a Skyfield frame object.
+    Supported: "ecliptic-of-date" (default), "ecliptic-J2000".
+    """
+    try:
+        from skyfield import framelib as _fl
+        # Prefer explicit J2000 frame when requested
+        if frame and frame.lower() in ("ecliptic-j2000", "j2000", "ecl-j2000"):
+            f = getattr(_fl, "ecliptic_J2000_frame", None)
+            if f is not None:
+                return f
+        # Fallback/default: of-date
+        return getattr(_fl, "ecliptic_frame", None)
+    except Exception:
+        return None
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Kernel iteration
+# ──────────────────────────────────────────────────────────────────────────────
 def _kernels_iter() -> Iterable[Any]:
     main, extra = _get_kernels()
-    if main: yield main
-    for k in extra: yield k
+    if main: 
+        yield main
+    for k in extra: 
+        yield k
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Small-body & body resolution (cached, case-insensitive, fuzzy)
+# ──────────────────────────────────────────────────────────────────────────────
+def _all_kernel_labels(k) -> List[str]:
+    """Enumerate likely labels from a kernel for fuzzy matching."""
+    labels: List[str] = []
+    for attr in ("names", "aliases", "bodies"):
+        try:
+            obj = getattr(k, attr, None)
+            if isinstance(obj, dict):
+                labels.extend(list(obj.keys()))
+        except Exception:
+            pass
+    # Seed with our known hints to increase hit rate
+    for lst in _SMALLBODY_HINTS.values():
+        labels.extend(lst)
+    # unique preserving order
+    seen = set(); out: List[str] = []
+    for s in labels:
+        if s not in seen:
+            seen.add(s); out.append(s)
+    return out
+
+@lru_cache(maxsize=2048)
+def _resolve_small_body(name_norm: str):
+    """
+    Resolve small body by:
+      1) Trying known hint labels exactly (across kernels),
+      2) Fuzzy case-insensitive substring search in kernel labels.
+    name_norm is canonical capitalization (e.g., "Ceres").
+    """
+    hints = _SMALLBODY_HINTS.get(name_norm, [])
+    # 1) Try hints directly
+    for label in hints:
+        for k in _kernels_iter():
+            try:
+                return k[label]
+            except Exception:
+                continue
+    # 2) Fuzzy (substring, case-insensitive)
+    needle = name_norm.lower()
+    for k in _kernels_iter():
+        for lab in _all_kernel_labels(k):
+            try:
+                if needle in lab.lower():
+                    return k[lab]
+            except Exception:
+                continue
+    return None
+
+@lru_cache(maxsize=2048)
 def _get_body(name: str):
     # First try main mapping (10 bodies)
     if name in _PLANET_KEYS:
@@ -228,19 +319,17 @@ def _get_body(name: str):
                 return k[key]
             except Exception:
                 continue
-    # Then try small-bodies via hints
-    if name in _SMALLBODY_HINTS:
-        for label in _SMALLBODY_HINTS[name]:
-            for k in _kernels_iter():
-                try:
-                    return k[label]
-                except Exception:
-                    continue
+    # Then small-bodies
+    if name in _SMALLBODY_HINTS or name.lower() in ("ceres", "pallas", "juno", "vesta", "chiron"):
+        b = _resolve_small_body(name.capitalize())
+        if b is not None:
+            return b
+    log.debug("Body not resolved: %s", name)
     return None
 
-# ---------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Lunar nodes (geocentric)
-# ---------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 def _mean_node(jd_tt: float) -> float:
     """
     Mean node longitude (deg) in ecliptic-of-date, geocentric.
@@ -259,7 +348,6 @@ def _true_node_geocentric_cached(jd_q: float) -> float:
     try:
         from skyfield.framelib import ecliptic_frame
     except Exception:
-        # No frames available → mean node fallback
         return _mean_node(jd_q)
 
     ts = _get_timescale()
@@ -268,13 +356,12 @@ def _true_node_geocentric_cached(jd_q: float) -> float:
     if ts is None or moon is None or main is None:
         return _mean_node(jd_q)
 
-    # Geocentric observer by definition for nodes
     try:
         earth = main["earth"]
     except Exception:
         return _mean_node(jd_q)
 
-    step = _speed_step_for("Moon")  # consistent with Moon speed calc (e.g., 0.05 d)
+    step = _speed_step_for("Moon")
     try:
         t0 = ts.tt_jd(jd_q)
         tp = ts.tt_jd(jd_q + step)
@@ -301,7 +388,7 @@ def _true_node_geocentric_cached(jd_q: float) -> float:
 
         # Sanity check vs mean node
         mean_val = _mean_node(jd_q)
-        diff = abs(((val - mean_val + 180.0) % 360.0) - 180.0)
+        diff = abs(_wrap_diff_deg(val, mean_val))
         if diff > _NODE_ALERT_DEG:
             log.warning("True vs Mean node differ %.2f° at JD %.6f (threshold=%.1f°)",
                         diff, jd_q, _NODE_ALERT_DEG)
@@ -324,9 +411,9 @@ def _node_longitude(name: str, jd_tt: float) -> float:
         asc = _true_node_geocentric_cached(jd_q)
     return asc if name == "North Node" else (asc + 180.0) % 360.0
 
-# ---------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Observer (for planets/small-bodies)
-# ---------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 def _observer(main, *, topocentric: bool,
               latitude: Optional[float],
               longitude: Optional[float],
@@ -345,9 +432,9 @@ def _observer(main, *, topocentric: bool,
     except Exception:
         return None
 
-# ---------------------------
-# Main APIs
-# ---------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Public APIs
+# ──────────────────────────────────────────────────────────────────────────────
 def ecliptic_longitudes(
     jd_tt: float,
     names: Optional[List[str]] = None,
@@ -373,9 +460,8 @@ def ecliptic_longitudes(
     if t is None:
         return {} if names else []
 
-    try:
-        from skyfield.framelib import ecliptic_frame
-    except Exception:
+    ef = _get_ecliptic_frame(frame)
+    if ef is None:
         return {} if names else []
 
     obs = _observer(main, topocentric=topocentric, latitude=latitude,
@@ -383,18 +469,22 @@ def ecliptic_longitudes(
     if obs is None:
         return {} if names else []
 
+    # Map mode
     if names:
         out: Dict[str, float] = {}
         for nm in names:
             if nm in _NODE_NAMES:
-                out[nm] = _node_longitude(nm, jd_tt)
+                try:
+                    out[nm] = _node_longitude(nm, jd_tt)
+                except Exception:
+                    pass
                 continue
             body = _get_body(nm)
             if body is None:
                 continue
             try:
                 geo = obs.at(t).observe(body).apparent()
-                lon, _ = _frame_latlon(geo, ecliptic_frame)
+                lon, _ = _frame_latlon(geo, ef)
                 out[nm] = lon
             except Exception:
                 continue
@@ -408,9 +498,8 @@ def ecliptic_longitudes(
             continue
         try:
             geo = obs.at(t).observe(body).apparent()
-            lon, lat = _frame_latlon(geo, ecliptic_frame)
-            spd = _central_diff_speed(jd_tt, body, obs, ecliptic_frame,
-                                      delta_days=_speed_step_for(nm))
+            lon, lat = _frame_latlon(geo, ef)
+            spd = _central_diff_speed(jd_tt, body, obs, ef, delta_days=_speed_step_for(nm))
             rows.append({"name": nm, "lon": lon, "lat": lat, "speed": spd})
         except Exception:
             continue
@@ -441,9 +530,8 @@ def ecliptic_longitudes_and_velocities(
     if t is None:
         return {"longitudes": lon_map, "velocities": vel_map}
 
-    try:
-        from skyfield.framelib import ecliptic_frame
-    except Exception:
+    ef = _get_ecliptic_frame(frame)
+    if ef is None:
         return {"longitudes": lon_map, "velocities": vel_map}
 
     obs = _observer(main, topocentric=topocentric, latitude=latitude,
@@ -457,7 +545,6 @@ def ecliptic_longitudes_and_velocities(
                 lon_map[nm] = _node_longitude(nm, jd_tt)
             except Exception:
                 pass
-            # no velocity for nodes
             continue
 
         body = _get_body(nm)
@@ -465,10 +552,10 @@ def ecliptic_longitudes_and_velocities(
             continue
         try:
             geo = obs.at(t).observe(body).apparent()
-            lon, _ = _frame_latlon(geo, ecliptic_frame)
+            lon, _ = _frame_latlon(geo, ef)
             lon_map[nm] = lon
             vel_map[nm] = _central_diff_speed(
-                jd_tt, body, obs, ecliptic_frame, delta_days=_speed_step_for(nm)
+                jd_tt, body, obs, ef, delta_days=_speed_step_for(nm)
             )
         except Exception:
             continue
@@ -495,3 +582,74 @@ def get_ecliptic_longitudes(
         longitude=longitude,
         elevation_m=elevation_m,
     )
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Diagnostics (for harness/fuzzer parity)
+# ──────────────────────────────────────────────────────────────────────────────
+def ephemeris_diagnostics(requested: Optional[List[str]] = None) -> Dict[str, Any]:
+    """
+    Report kernels, resolved labels, and misses for reproducible tests.
+    Default set includes 10 majors + 5 small bodies + 2 nodes = 17 bodies.
+    """
+    main, extras = _get_kernels()
+    kernels = [p for p in _KERNEL_PATHS] or [EPHEMERIS_NAME]
+
+    default_names = list(_PLANET_KEYS.keys()) + \
+                    ["Ceres", "Pallas", "Juno", "Vesta", "Chiron",
+                     "North Node", "South Node"]
+    wanted = requested or default_names
+
+    resolved = {}
+    missing: List[str] = []
+    for nm in wanted:
+        if nm in _NODE_NAMES:
+            resolved[nm] = {"type": "node", "kernel": "computed", "label": nm}
+            continue
+        b = _get_body(nm)
+        if b is None:
+            missing.append(nm)
+            continue
+        # Try to identify which kernel/label matched
+        used_label = None
+        used_kernel = "main"
+        for k in _kernels_iter():
+            # Probe the most likely labels
+            candidates = []
+            if nm in _PLANET_KEYS:
+                candidates.append(_PLANET_KEYS[nm])
+            candidates += _SMALLBODY_HINTS.get(nm, [])
+            for lab in candidates:
+                try:
+                    if k[lab] is b:
+                        used_label = lab
+                        used_kernel = "extra" if (k in extras) else "main"
+                        break
+                except Exception:
+                    pass
+            if used_label:
+                break
+        resolved[nm] = {"type": "body", "kernel": used_kernel, "label": used_label or "n/a"}
+
+    return {
+        "kernels": kernels,
+        "ephemeris_name": current_kernel_name(),
+        "resolved": resolved,
+        "missing": missing,
+        "node_model": _NODE_MODEL,
+    }
+
+# Optional helper for tests
+def clear_adapter_caches() -> None:
+    """Clear internal caches (useful in tests between kernel configurations)."""
+    try:
+        _resolve_small_body.cache_clear()  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        _get_body.cache_clear()  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        _true_node_geocentric_cached.cache_clear()  # type: ignore[attr-defined]
+    except Exception:
+        pass
