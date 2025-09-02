@@ -7,14 +7,14 @@ import sys
 import traceback
 from datetime import datetime
 from time import perf_counter
-from typing import Any, Dict, Final, List, Optional
+from typing import Any, Dict, Final
 
 from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 from werkzeug.exceptions import HTTPException, BadRequest
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-# ───────────────────────────── Optional blueprints ─────────────────────────────
+# ───────────────────────── Optional blueprints ─────────────────────────
 _routes_import_err: str | None = None
 _pred_import_err: str | None = None
 
@@ -35,7 +35,7 @@ except Exception as e:  # pragma: no cover
     print("WARNING: predictions blueprint failed to import:", _pred_import_err, file=sys.stderr)
     traceback.print_exc()
 
-# ───────────────────────────── Optional config loader ─────────────────────────────
+# ───────────────────────── Optional config loader ─────────────────────────
 try:
     from app.utils.config import load_config  # type: ignore
 except Exception as e:  # pragma: no cover
@@ -46,12 +46,17 @@ except Exception as e:  # pragma: no cover
 from app.core.astronomy import compute_chart
 from app.core import timescales as _ts
 
-# Policy façade (this is what enables 12 working + 6 gated)
+# House policy façade + constants
 from app.core.house import (
     compute_houses_with_policy,
-    POLAR_SOFT_LIMIT_DEG as _POLAR_SOFT_DEFAULT,
-    POLAR_HARD_LIMIT_DEG as _POLAR_HARD_DEFAULT,
+    GATED_NOT_IMPLEMENTED,
+    POLAR_POLICY,
+    POLAR_SOFT_LIMIT_DEG,
+    POLAR_HARD_LIMIT_DEG,
 )
+
+# For counts in /system-validation
+from app.core.houses_advanced import IMPLEMENTED_HOUSE_SYSTEMS, SUPPORTED_HOUSE_SYSTEMS
 
 # Prometheus metrics
 from prometheus_client import (
@@ -63,7 +68,7 @@ from prometheus_client import (
     generate_latest,
 )
 
-# ───────────────────────────── metrics ─────────────────────────────
+# ───────────────────────── metrics ─────────────────────────
 MET_REQUESTS: Final = Counter("astro_api_requests_total", "API requests", ["route"])
 MET_FALLBACKS: Final = Counter(
     "astro_house_fallback_total", "House fallbacks at high latitude", ["requested", "fallback"]
@@ -73,14 +78,11 @@ GAUGE_DUT1: Final = Gauge("astro_dut1_broadcast_seconds", "DUT1 broadcast second
 GAUGE_APP_UP: Final = Gauge("astro_app_up", "1 if app is running")
 REQ_LATENCY: Final = Histogram("astro_request_seconds", "API request latency", ["route"])
 
-# ───────────────────────────── policy façade (UI echo) ─────────────────────────────
-HOUSES_ENGINE_NAME = os.getenv("HOUSES_ENGINE_NAME", "proto-basic")
-POLAR_SOFT_LIMIT = float(os.getenv("POLAR_SOFT_LIMIT_DEG", str(_POLAR_SOFT_DEFAULT)))
-POLAR_HARD_LIMIT = float(os.getenv("POLAR_HARD_LIMIT_DEG", str(_POLAR_HARD_DEFAULT)))
-# match house.py env knob so /system-validation reflects real behavior
-NUMERIC_FALLBACK_ENABLED = os.getenv("ASTRO_HOUSES_NUMERIC_FALLBACK", "1").lower() in ("1", "true", "yes", "on")
+# ───────────────────────── engine label ─────────────────────────
+# Fixed default; can be overridden via env (HOUSES_ENGINE_NAME)
+HOUSES_ENGINE_NAME = os.getenv("HOUSES_ENGINE_NAME", "houses-advanced")
 
-# ───────────────────────────── helpers ─────────────────────────────
+# ───────────────────────── helpers ─────────────────────────
 def _configure_logging(app: Flask) -> None:
     gerr = logging.getLogger("gunicorn.error")
     if gerr.handlers:
@@ -88,7 +90,6 @@ def _configure_logging(app: Flask) -> None:
         app.logger.setLevel(gerr.level)
     else:
         logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
-
 
 def _register_errors(app: Flask) -> None:
     @app.errorhandler(HTTPException)
@@ -115,7 +116,6 @@ def _register_errors(app: Flask) -> None:
             path=request.path,
         ), 500
 
-
 def _register_health(app: Flask) -> None:
     @app.route("/", methods=["GET"])
     def root():
@@ -130,7 +130,6 @@ def _register_health(app: Flask) -> None:
     def health():
         return jsonify(ok=True, status="ok"), 200
 
-
 def _metrics_auth_ok() -> bool:
     auth = request.authorization
     user = os.getenv("METRICS_USER", "")
@@ -144,13 +143,11 @@ def _metrics_auth_ok() -> bool:
         and pw
     )
 
-
 def _body_json() -> Dict[str, Any]:
     data = request.get_json(force=True, silent=False)
     if not isinstance(data, dict):
         raise BadRequest("JSON body must be an object")
     return data
-
 
 def _normalize_time_hms(s: str) -> str:
     s = s.strip()
@@ -162,7 +159,6 @@ def _normalize_time_hms(s: str) -> str:
         hh, mm, ss = parts
         return f"{int(hh):02d}:{int(mm):02d}:{int(ss):02d}"
     raise BadRequest("time must be 'HH:MM' or 'HH:MM:SS'")
-
 
 def _compute_timescales_payload(date: str, time_s: str, tz: str) -> Dict[str, Any]:
     """Civil date/time/tz → {jd_ut, jd_tt, jd_ut1, utc, dut1} using app.core.timescales."""
@@ -190,7 +186,6 @@ def _compute_timescales_payload(date: str, time_s: str, tz: str) -> Dict[str, An
         "dut1": float(dut1),
     }
 
-
 def _timescales_meta_from_chart(chart: Dict[str, Any]) -> Dict[str, Any]:
     """Build meta.timescales from compute_chart() output (which provides jd_ut/jd_tt/jd_ut1)."""
     jd_ut = float(chart.get("jd_ut"))
@@ -198,34 +193,41 @@ def _timescales_meta_from_chart(chart: Dict[str, Any]) -> Dict[str, Any]:
     jd_ut1 = float(chart.get("jd_ut1"))
     delta_t_sec = (jd_tt - jd_ut) * 86400.0
     dut1_sec = (jd_ut1 - jd_ut) * 86400.0
-    # Leap seconds not tracked here — expose 0 to satisfy the test printer.
     return {
         "jd_utc": jd_ut,
         "jd_tt": jd_tt,
         "jd_ut1": jd_ut1,
         "delta_t": delta_t_sec,
-        "delta_at": 0.0,
+        "delta_at": 0.0,  # leap seconds not tracked here
         "dut1": dut1_sec,
     }
 
-
-def _policy_blob() -> Dict[str, Any]:
-    """Shape used by /system-validation (what your harness prints)."""
-    return {
-        "houses_engine": HOUSES_ENGINE_NAME,
-        "polar": {
-            "polar_soft_limit_deg": POLAR_SOFT_LIMIT,
-            "polar_hard_limit_deg": POLAR_HARD_LIMIT,
-            "numeric_fallback_enabled": bool(NUMERIC_FALLBACK_ENABLED),
-        },
-    }
-
-# ───────────────────────────── core API ─────────────────────────────
+# ───────────────────────── core API ─────────────────────────
 def _register_core_api(app: Flask) -> None:
-    # ---- system-validation ----
+
+    # ---- system-validation (policy & counts) ----
     @app.get("/system-validation")
     def _system_validation():
-        return jsonify({"ok": True, "policy": _policy_blob()}), 200
+        declared = list(SUPPORTED_HOUSE_SYSTEMS)
+        implemented = sorted(list(IMPLEMENTED_HOUSE_SYSTEMS))
+        gated = sorted(list(GATED_NOT_IMPLEMENTED))
+        return jsonify({
+            "ok": True,
+            "engine_label": HOUSES_ENGINE_NAME,
+            "policy": {
+                "polar_policy": POLAR_POLICY,
+                "polar_soft_limit_deg": POLAR_SOFT_LIMIT_DEG,
+                "polar_hard_limit_deg": POLAR_HARD_LIMIT_DEG,
+            },
+            "house_systems": {
+                "declared_count": len(declared),
+                "implemented_count": len(implemented),
+                "gated_count": len(gated),
+                "declared": declared,
+                "implemented": implemented,
+                "gated": gated,
+            }
+        }), 200
 
     # ---- timescales ----
     def _timescales_handler():
@@ -266,21 +268,15 @@ def _register_core_api(app: Flask) -> None:
         return jsonify(chart), 200
 
     app.add_url_rule("/api/chart", "chart", _chart_handler, methods=["POST"])
-    for alias in (
-        "/chart",
-        "/api/compute_chart",
-        "/compute_chart",
-        "/api/astronomy/chart",
-        "/astronomy/chart",
-        "/api/astro/chart",
-    ):
+    for alias in ("/chart", "/api/compute_chart", "/compute_chart", "/api/astronomy/chart",
+                  "/astronomy/chart", "/api/astro/chart"):
         app.add_url_rule(alias, f"chart_alias_{alias}", _chart_handler, methods=["POST"])
 
-    # ---- calculate (bodies + optional houses with policy) ----
+    # ---- calculate (chart + houses via policy façade) ----
     def _calculate_handler():
         payload = _body_json()
 
-        # If caller passed civil inputs but not jd_*, compute them here
+        # Compute timescales if only civil provided
         have_all_jd = all(k in payload for k in ("jd_ut", "jd_tt", "jd_ut1"))
         if not have_all_jd:
             date = payload.get("date")
@@ -289,72 +285,76 @@ def _register_core_api(app: Flask) -> None:
             if isinstance(date, str) and isinstance(time_s, str) and isinstance(tz, str):
                 ts = _compute_timescales_payload(date, time_s, tz)
                 payload.update({k: ts[k] for k in ("jd_ut", "jd_tt", "jd_ut1")})
-                payload["_timescales"] = ts  # may be helpful for meta echo
+                payload["_timescales"] = ts
             else:
                 raise BadRequest("Provide either jd_ut/jd_tt/jd_ut1 or civil 'date'+'time'+'tz'")
 
         payload.setdefault("mode", "tropical")
 
-        # Base chart (bodies + optional points, angles, meta)
+        # Base chart
         chart = compute_chart(payload)
         chart["ok"] = True
         chart.setdefault("meta", {}).setdefault("timescales", _timescales_meta_from_chart(chart))
 
-        # Houses (policy façade)
-        system = (payload.get("house_system") or payload.get("system") or "").strip()
-        if system:
-            try:
-                houses = compute_houses_with_policy(
-                    lat=float(payload.get("latitude") or payload.get("lat")),
-                    lon=float(payload.get("longitude") or payload.get("lon")),
-                    system=system,
-                    jd_tt=float(payload["jd_tt"]),
-                    jd_ut1=float(payload["jd_ut1"]),
-                    jd_ut=float(payload.get("jd_ut", 0.0)),
-                    # optional toggles; keep default behavior if omitted
-                    diagnostics=payload.get("enable_diagnostics"),
-                    validation=payload.get("enable_validation"),
-                )
-            except NotImplementedError as e:
-                # 6 gated systems → HTTP 501
-                return jsonify({
-                    "ok": False,
-                    "error": "house_system_gated",
-                    "details": {"system": system, "note": str(e)},
-                }), 501
-            except ValueError as e:
-                # input/policy issues
-                return jsonify({
-                    "ok": False,
-                    "error": "house_input_error",
-                    "details": {"message": str(e)},
-                }), 400
-            except Exception as e:
-                return jsonify({
-                    "ok": False,
-                    "error": "house_engine_failed",
-                    "details": {"message": str(e)},
-                }), 500
+        # Houses only if requested
+        system = (payload.get("house_system") or payload.get("system") or "").strip().lower()
+        if not system:
+            return jsonify(chart), 200
 
-            # Normalize / add a couple of aliases your UI expects
-            # (keep both asc/mc and asc_deg/mc_deg; cusps and cusps_deg)
-            houses_out = dict(houses)
-            houses_out.setdefault("house_system", houses_out.get("system"))
-            houses_out.setdefault("requested_house_system", houses_out.get("requested_system"))
-            houses_out.setdefault("asc_deg", houses_out.get("asc"))
-            houses_out.setdefault("mc_deg", houses_out.get("mc"))
-            houses_out.setdefault("cusps_deg", houses_out.get("cusps"))
+        # Pull lat/lon (required by the house façade)
+        lat = payload.get("lat") or payload.get("latitude")
+        lon = payload.get("lon") or payload.get("longitude")
+        if lat is None or lon is None:
+            return jsonify({
+                "ok": False,
+                "error": "angles_missing_geography",
+                "details": {"note": "ASC/MC & houses require latitude and longitude"},
+            }), 400
 
-            chart["houses"] = houses_out
+        try:
+            houses = compute_houses_with_policy(
+                lat=float(lat),
+                lon=float(lon),
+                system=system,
+                jd_tt=float(payload["jd_tt"]),
+                jd_ut1=float(payload["jd_ut1"]),
+                jd_ut=float(payload.get("jd_ut", 0.0)),
+                # optional passthrough toggles
+                diagnostics=bool(payload.get("diagnostics")),
+                validation=bool(payload.get("validation")),
+            )
+            chart["houses"] = houses
+            return jsonify(chart), 200
 
-        return jsonify(chart), 200
+        except NotImplementedError as e:
+            # Clean 501 for the 6 gated systems
+            return jsonify({
+                "ok": False,
+                "error": "house_system_gated",
+                "details": {"system": system, "note": str(e)},
+            }), 501
+
+        except ValueError as e:
+            # Input/policy violations (e.g., missing strict timescales / bad latitude)
+            return jsonify({
+                "ok": False,
+                "error": "houses_invalid_input",
+                "details": {"message": str(e)},
+            }), 400
+
+        except RuntimeError as e:
+            # Numeric engine failed even after fallbacks → do NOT 500
+            return jsonify({
+                "ok": False,
+                "error": "house_engine_failed",
+                "details": {"message": str(e)},
+            }), 422
 
     app.add_url_rule("/api/calculate", "calculate", _calculate_handler, methods=["POST"])
     for alias in ("/calculate", "/api/calc", "/calc"):
         app.add_url_rule(alias, f"calculate_alias_{alias}", _calculate_handler, methods=["POST"])
 
-
-# ───────────────────────────── app factory ─────────────────────────────
+# ───────────────────────── app factory ─────────────────────────
 def create_app() -> Flask:
     app = Flask(__name__)
     app.config["JSON_SORT_KEYS"] = False
@@ -420,7 +420,7 @@ def create_app() -> Flask:
     if _pred_bp is not None:
         app.register_blueprint(_pred_bp, url_prefix="/api")
 
-    # --- DEBUG endpoints (handy while you iterate) ---
+    # --- DEBUG endpoints ---
     @app.get("/__debug/imports")
     def __debug_imports():
         return jsonify({
@@ -440,6 +440,33 @@ def create_app() -> Flask:
         rules.sort(key=lambda x: x["rule"])
         return jsonify({"count": len(rules), "rules": rules}), 200
 
+    @app.get("/__debug/files")
+    def __debug_files():
+        spk_dir = "app/data/spk"
+        try:
+            files = sorted(os.listdir(spk_dir)) if os.path.isdir(spk_dir) else []
+        except Exception as e:
+            files = [f"<error: {e}>"]
+        return jsonify({"spk": files}), 200
+
+    @app.get("/__debug/ephem")
+    def __debug_ephem():
+        import importlib.util
+        from app.core import ephemeris_adapter as eph
+        path = os.getenv("OCP_EPHEMERIS")
+        exists = bool(path and os.path.isfile(path))
+        size = (os.path.getsize(path) if exists else None)
+        skyfield_ok = importlib.util.find_spec("skyfield") is not None
+        jplephem_ok = importlib.util.find_spec("jplephem") is not None
+        return jsonify({
+            "OCP_EPHEMERIS": path,
+            "file_exists": exists,
+            "file_size_bytes": size,
+            "skyfield_importable": skyfield_ok,
+            "jplephem_importable": jplephem_ok,
+            "diagnostics": eph.ephemeris_diagnostics(),
+        }), 200
+
     # /metrics (Basic Auth)
     @app.route("/metrics", methods=["GET"])
     def metrics_endpoint():
@@ -456,16 +483,15 @@ def create_app() -> Flask:
         return Response(data, mimetype=CONTENT_TYPE_LATEST)
 
     app.logger.info(
-        "App initialized; core endpoints ready; routes_loaded=%s, predictions_loaded=%s",
-        bool(_routes_bp), bool(_pred_bp)
+        "App initialized; engine=%s; routes_loaded=%s, predictions_loaded=%s",
+        HOUSES_ENGINE_NAME, bool(_routes_bp), bool(_pred_bp)
     )
     return app
 
-
-# ───────────────────────────── app instance ─────────────────────────────
+# ───────────────────────── app instance ─────────────────────────
 app = create_app()
 
-# CORS for browser UIs (Netlify frontend, etc.)
+# CORS for browser UIs
 _allowed_origin = (
     os.environ.get("CORS_ALLOW_ORIGIN")
     or os.environ.get("NETLIFY_ORIGIN")
