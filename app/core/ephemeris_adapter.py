@@ -340,7 +340,7 @@ def _spice_ecliptic_longitude(
         x2, y2, z2 = _rotate_to_ecliptic_xyz(frame, jd_tt, x, y, z)
         return _atan2deg(y2, x2)
     except Exception as e:
-        log.debug("SPICE position failed for %s: %s", name, e)
+        log.debug("SPICE position failed for %s (ID %s): %s", name, tid, e)
         return None
 
 def _spice_ecliptic_longitude_speed(
@@ -523,7 +523,7 @@ def _get_body(name: str):
     return None
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Public APIs
+# Public APIs - FIXED FALLBACK LOGIC
 # ──────────────────────────────────────────────────────────────────────────────
 def ecliptic_longitudes(
     jd_tt: float,
@@ -566,23 +566,29 @@ def ecliptic_longitudes(
                     pass
                 continue
 
-            # 1) Try Skyfield path
+            # FIXED: Try both paths and ensure SPICE fallback works
+            skyfield_success = False
+            
+            # 1) Try Skyfield path first (only for major planets or working small bodies)
             if main is not None and t is not None and ef is not None and obs is not None:
-                body = _get_body(nm)
-                if body is not None:
-                    try:
-                        geo = obs.at(t).observe(body).apparent()
-                        lon, _ = _frame_latlon(geo, ef)
-                        out[nm] = lon
-                        continue
-                    except Exception:
-                        pass
+                # Only try Skyfield for major planets to avoid the fallback issue
+                if nm in _PLANET_KEYS:
+                    body = _get_body(nm)
+                    if body is not None:
+                        try:
+                            geo = obs.at(t).observe(body).apparent()
+                            lon, _ = _frame_latlon(geo, ef)
+                            out[nm] = lon
+                            skyfield_success = True
+                        except Exception as e:
+                            log.debug("Skyfield failed for %s: %s", nm, e)
 
-            # 2) Fallback to SPICE (geocentric) for small bodies
-            if _SPICE_READY:
+            # 2) If Skyfield didn't work, try SPICE (for small bodies and fallback)
+            if not skyfield_success and _SPICE_READY:
                 lon = _spice_ecliptic_longitude(jd_tt, nm, frame=frame)
                 if lon is not None:
                     out[nm] = lon
+                    
         return out
 
     # Legacy rows (10 planets) — Skyfield path only
@@ -644,32 +650,32 @@ def ecliptic_longitudes_and_velocities(
                 pass
             continue
 
-        # 1) Try Skyfield
-        did = False
+        # FIXED: Same logic - try Skyfield only for major planets, SPICE for others
+        skyfield_success = False
+        
+        # 1) Try Skyfield (major planets only)
         if main is not None and t is not None and ef is not None and obs is not None:
-            body = _get_body(nm)
-            if body is not None:
-                try:
-                    geo = obs.at(t).observe(body).apparent()
-                    lon, _ = _frame_latlon(geo, ef)
-                    lon_map[nm] = lon
-                    # speed
-                    step = _speed_step_for(nm)
-                    from skyfield.framelib import ecliptic_frame as _eframe
-                    ts = _get_timescale()
-                    t0 = ts.tt_jd(jd_tt - step); t1 = ts.tt_jd(jd_tt + step)
-                    lon0, _ = _frame_latlon(obs.at(t0).observe(body).apparent(), _eframe)
-                    lon1, _ = _frame_latlon(obs.at(t1).observe(body).apparent(), _eframe)
-                    vel_map[nm] = _wrap_diff_deg(lon1, lon0) / (2.0 * step)
-                    did = True
-                except Exception:
-                    pass
+            if nm in _PLANET_KEYS:
+                body = _get_body(nm)
+                if body is not None:
+                    try:
+                        geo = obs.at(t).observe(body).apparent()
+                        lon, _ = _frame_latlon(geo, ef)
+                        lon_map[nm] = lon
+                        # speed
+                        step = _speed_step_for(nm)
+                        from skyfield.framelib import ecliptic_frame as _eframe
+                        ts = _get_timescale()
+                        t0 = ts.tt_jd(jd_tt - step); t1 = ts.tt_jd(jd_tt + step)
+                        lon0, _ = _frame_latlon(obs.at(t0).observe(body).apparent(), _eframe)
+                        lon1, _ = _frame_latlon(obs.at(t1).observe(body).apparent(), _eframe)
+                        vel_map[nm] = _wrap_diff_deg(lon1, lon0) / (2.0 * step)
+                        skyfield_success = True
+                    except Exception as e:
+                        log.debug("Skyfield failed for %s: %s", nm, e)
 
-        if did:
-            continue
-
-        # 2) SPICE fallback (small-bodies; geocentric, speed via FD)
-        if _SPICE_READY:
+        # 2) SPICE fallback (small-bodies and failed major planets)
+        if not skyfield_success and _SPICE_READY:
             lon, spd = _spice_ecliptic_longitude_speed(jd_tt, nm, frame=frame)
             if lon is not None:
                 lon_map[nm] = lon
@@ -725,7 +731,12 @@ def ephemeris_diagnostics(requested: Optional[List[str]] = None) -> Dict[str, An
             resolved[nm] = {"type": "node", "kernel": "computed", "label": nm}
             continue
 
-        # Prefer Skyfield resolution
+        # Check SPICE first for small bodies
+        if _SPICE_READY and _spice_id_for_name(nm) is not None:
+            resolved[nm] = {"type": "body", "kernel": "spice", "label": str(_spice_id_for_name(nm))}
+            continue
+
+        # Fallback to Skyfield resolution  
         b = _get_body(nm)
         if b is not None:
             used_label = None
@@ -746,11 +757,6 @@ def ephemeris_diagnostics(requested: Optional[List[str]] = None) -> Dict[str, An
                 if used_label:
                     break
             resolved[nm] = {"type": "body", "kernel": used_kernel, "label": used_label or "n/a"}
-            continue
-
-        # SPICE fallback
-        if _SPICE_READY and _spice_id_for_name(nm) is not None:
-            resolved[nm] = {"type": "body", "kernel": "spice", "label": str(_spice_id_for_name(nm))}
         else:
             missing.append(nm)
 
