@@ -13,6 +13,7 @@ numpy==1.26.4
 pyerfa==2.0.1
 skyfield==1.48
 jplephem==2.22
+spiceypy>=6.0.0
 tzdata==2024.1
 
 # --- Monitoring ---
