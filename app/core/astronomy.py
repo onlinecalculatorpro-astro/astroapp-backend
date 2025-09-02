@@ -1,4 +1,3 @@
-# app/core/astronomy.py
 # -*- coding: utf-8 -*-
 """
 High-precision planetary chart computation (ecliptic-of-date).
@@ -17,7 +16,7 @@ Design goals
   `app.core.astro_extras`. If not available, a linearized fallback is used and
   clearly warned in metadata.
 - Topocentric handling for planets is supported; angles computation requires lat/lon.
-- "Math‑pure" policy: we do not force Placidus cusp1≈ASC. Houses are not handled
+- "Math-pure" policy: we do not force Placidus cusp1≈ASC. Houses are not handled
   here; routes orchestrate houses separately with `houses_advanced` module.
 - Robust I/O validation with clear error codes and human-friendly messages.
 - Predictable output schema, forward-compatible fields, and concise debug meta.
@@ -25,31 +24,6 @@ Design goals
 Public API
 ----------
 compute_chart(payload: dict) -> dict
-
-Payload keys (subset; see below for full validation rules):
-- mode: "tropical" | "sidereal"  (default=tropical)
-- bodies: list of names (subset of ALLOWED_BODIES). Default = the 10 classical bodies.
-- topocentric: bool (default=False). If True, require lat/lon (and optionally elevation).
-- latitude, longitude, elevation_m
-- date, time, place_tz           (used only when jd_* not supplied)
-- jd_ut, jd_tt, jd_ut1           (preferred, if already computed by routes/time_kernel)
-- ayanamsa: str | float          (sidereal only)
-- options: dict (reserved; ignored here)
-
-Return schema (stable keys):
-- jd_ut: float
-- jd_tt: float
-- meta: { ... }
-- bodies: [ { name, longitude_deg, speed_deg_per_day (or None), is_point? } ]
-- angles: { asc_deg, mc_deg }
-- asc_deg, mc_deg  (mirrors for parity with earlier API users)
-
-Notes
------
-- "is_point": True is set for abstract, non-physical points (e.g., lunar nodes) where
-  velocity is either undefined or intentionally omitted.
-- Warnings are additive in meta["warnings"]. They never block results.
-- This module intentionally does not compute houses. Keep separation-of-concerns.
 """
 from __future__ import annotations
 
@@ -103,7 +77,7 @@ _CLASSIC_10 = (
     "Sun", "Moon", "Mercury", "Venus", "Mars",
     "Jupiter", "Saturn", "Uranus", "Neptune", "Pluto",
 )
-# Extended set we support *if requested* (does not disturb defaults)
+# Extended set we support *if requested*
 _EXTRA_POINTS = (
     "Ceres", "Pallas", "Juno", "Vesta", "Chiron",
     "North Node", "South Node",
@@ -116,7 +90,7 @@ _JD_QUANT       = float(os.getenv("OCP_ASTRO_JD_QUANT", "1e-7"))     # ~0.009 s
 _LATLON_QUANT   = float(os.getenv("OCP_ASTRO_LL_QUANT", "1e-6"))     # ~0.11 m
 _ELEV_QUANT     = float(os.getenv("OCP_GEO_ELEV_QUANT", "0.1"))      # 10 cm
 # For speed fallback if adapter doesn't supply velocities (Moon may need smaller step)
-_SPEED_STEP_DEF = float(os.getenv("OCP_SPEED_FD_STEP_DAYS", "0.25")) # ±6 h (safer for Moon)
+_SPEED_STEP_DEF = float(os.getenv("OCP_SPEED_FD_STEP_DAYS", "0.25")) # ±6 h
 _DEF_AYANAMSA   = os.getenv("OCP_AYANAMSA_DEFAULT", "lahiri").strip().lower()
 
 _GEO_SOFT_LAT     = float(os.getenv("OCP_GEO_SOFT_LAT", "89.5"))
@@ -423,6 +397,12 @@ def _normalize_adapter_output_to_maps(
     """
     Normalize various adapter return styles into:
       (longitudes_map {name: deg}, speeds_map {name: deg/day or None})
+
+    Accepts ALL of:
+      • {"Mercury": 123.4, "Venus": ...}                   # plain mapping
+      • {"longitudes": {...}, "velocities": {...}}         # split mapping
+      • [{"name": "Mercury", "longitude_deg": 12.3, ...}]  # list of rows
+      • (positional list) [lon1, lon2, ...]                # aligned to names
     """
     longitudes: Dict[str, float] = {}
     speeds: Dict[str, Optional[float]] = {}
@@ -491,6 +471,15 @@ def _normalize_adapter_output_to_maps(
         # B2: aligned numeric list with names (positional)
         for i, nm in enumerate(want[:len(res)]):
             longitudes[nm] = float(res[i]); speeds[nm] = None
+        return longitudes, speeds
+
+    # C) object/dataclass with attributes
+    longs = getattr(res, "longitudes", None)
+    if isinstance(longs, dict):
+        vels = getattr(res, "velocities", {}) or {}
+        _merge_numeric_map(longs, into="lon")
+        if isinstance(vels, dict):
+            _merge_numeric_map(vels, into="spd")
         return longitudes, speeds
 
     raise AstronomyError("adapter_return_invalid", f"Unsupported adapter return type: {type(res)}")
@@ -627,7 +616,6 @@ def _longitudes_and_speeds(
         if jd_q in plus_lon_cache:
             return plus_lon_cache[jd_q]
         lon_m, _spd_m, _ = _cached_positions(jd_q, names_key, topocentric, lat_q, lon_q, elev_q)
-        # store in both to simplify lookups
         minus_lon_cache[jd_q] = lon_m; plus_lon_cache[jd_q] = lon_m
         return lon_m
 
@@ -754,10 +742,6 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
     - Sidereal = tropical − ayanamsa (pluggable; explicit degrees or named model).
     - Adapter speeds preferred; FD speeds as fallback (or None when impossible).
     - Angles (Asc/MC): ERFA GAST + true obliquity (mandatory).
-
-    This function is intentionally agnostic of houses. It is orchestrated by routes,
-    which compute timescales and call both astronomy and houses engines with the
-    same JD inputs to maintain strict parity.
     """
     if eph is None:
         raise AstronomyError("ephemeris_unavailable", f"ephemeris_adapter import failed: {_EPH_IMPORT_ERROR!r}")
@@ -838,7 +822,6 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
         }
         if nm in ("North Node", "South Node"):
             row["is_point"] = True
-            # Leave speed as None (points)
         out_bodies.append(row)
 
     if missing_bodies:
