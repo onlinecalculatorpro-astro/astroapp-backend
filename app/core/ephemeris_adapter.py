@@ -1,4 +1,30 @@
 # app/core/ephemeris_adapter.py
+# -----------------------------------------------------------------------------
+# PURPOSE (read me):
+# - Primary ephemeris path = Skyfield + DE421 for the 10 classical bodies
+#   (supports geocentric and topocentric).
+# - Fallback for small bodies (Ceres/Pallas/Juno/Vesta/Chiron) = SPICE
+#   (geocentric) using spiceypy with our furnished kernels.
+#
+# CRITICAL BEHAVIOR:
+# - DO NOT "count" Skyfield unless a longitude is actually produced.
+#   If Skyfield throws or cannot resolve -> try SPICE immediately.
+# - SPICE states are in J2000; we rotate to ecliptic-of-date (or ecliptic-J2000)
+#   using ERFA (obl06 + nut06a); polynomial fallback if ERFA is absent.
+# - Nodes (North/South) are geocentric; model controlled via OCP_NODE_MODEL in
+#   {"true","mean"} (default "true").
+#
+# FILE DISCOVERY (no network):
+# - Main kernel (DE421):  OCP_EPHEMERIS  OR  app/data/de421.bsp
+# - Extra SPKs:           OCP_EXTRA_SPK_FILES (comma list)  OR  OCP_EXTRA_SPK_DIR
+#                         (default app/data/spk)
+#
+# DIAGNOSTICS:
+# - Lists all Skyfield kernels we managed to load, and all SPICE kernels we
+#   successfully furnished during bootstrap. Helpful for deployment validation.
+# - Logs a clear warning if a furnished path looks like a Git LFS pointer.
+# -----------------------------------------------------------------------------
+
 from __future__ import annotations
 from typing import Dict, Any, List, Optional, Tuple, Iterable
 import os
@@ -9,12 +35,12 @@ from functools import lru_cache
 log = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Human label for the primary kernel
+# Human label for the primary kernel (overridden when extras are loaded)
 # ──────────────────────────────────────────────────────────────────────────────
 EPHEMERIS_NAME = "de421"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Optional backends
+# Optional backends (Skyfield required for primary path; SPICE optional)
 # ──────────────────────────────────────────────────────────────────────────────
 def _skyfield_available() -> bool:
     try:
@@ -24,7 +50,7 @@ def _skyfield_available() -> bool:
         return False
 
 try:
-    import spiceypy as sp  # optional, used for small bodies
+    import spiceypy as sp  # optional fallback for small bodies
     _SPICE_OK = True
 except Exception:
     sp = None  # type: ignore
@@ -34,12 +60,12 @@ except Exception:
 # Lazy singletons / state
 # ──────────────────────────────────────────────────────────────────────────────
 _TS = None                 # Skyfield timescale
-_MAIN = None               # Main ephemeris (DE421 by default) for Skyfield
-_EXTRA: List[Any] = []     # Extra SPKs (if Skyfield can load any)
-_KERNEL_PATHS: List[str] = []  # For reporting/diagnostics
+_MAIN = None               # Main DE421 kernel for Skyfield
+_EXTRA: List[Any] = []     # Extra SPKs (only if Skyfield can read them; often won't)
+_KERNEL_PATHS: List[str] = []  # For Skyfield diagnostics
 
 _SPICE_READY = False
-_SPICE_KERNELS: List[str] = []  # all kernels furnished to SPICE (de421 + extras)
+_SPICE_KERNELS: List[str] = []  # All kernels furnished to SPICE (de421 + extras)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Canonical bodies (DE421 uses barycenters for outer planets)
@@ -57,9 +83,8 @@ _PLANET_KEYS: Dict[str, str] = {
     "Pluto": "pluto barycenter",
 }
 
-# Small bodies we want to support out-of-the-box (SPICE path)
+# Small bodies (SPICE path). Include common labels + NAIF-ish variants.
 _SMALLBODY_HINTS: Dict[str, List[str]] = {
-    # include NAIF-style numeric IDs and common labels
     "Ceres":  ["1 Ceres", "Ceres", "00001 Ceres", "2000001", "1"],
     "Pallas": ["2 Pallas", "Pallas", "00002 Pallas", "2000002", "2"],
     "Juno":   ["3 Juno", "Juno", "00003 Juno", "2000003", "3"],
@@ -78,8 +103,8 @@ _NODE_ALERT_DEG     = float(os.getenv("OCP_NODE_ALERT_DEG", "10.0"))
 _NODE_CACHE_DECIMALS = int(os.getenv("OCP_NODE_CACHE_DECIMALS", "5"))
 
 # Kernel resolution rules (NO network):
-# OCP_EPHEMERIS (absolute path) else app/data/de421.bsp
-# Extras: OCP_EXTRA_SPK_FILES (comma list) or OCP_EXTRA_SPK_DIR (default app/data/spk)
+# - OCP_EPHEMERIS (absolute path) else app/data/de421.bsp
+# - OCP_EXTRA_SPK_FILES (comma list) or OCP_EXTRA_SPK_DIR (default app/data/spk)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Kernel resolution & loading (Skyfield)
@@ -100,6 +125,10 @@ def _resolve_kernel_path() -> Optional[str]:
     return None
 
 def _extra_spk_paths() -> List[str]:
+    """
+    Discover extra SPKs for SPICE furnishing.
+    We return only paths that exist (avoids SPICE(FILEREADFAILED) spam).
+    """
     files = os.getenv("OCP_EXTRA_SPK_FILES")
     if files:
         out = [f.strip() for f in files.split(",") if f.strip()]
@@ -130,11 +159,14 @@ def _get_timescale():
         return None
 
 def _load_kernel(path: str):
+    """
+    Try to load a kernel into Skyfield. Many small-body SPKs (Type 13/21) will
+    fail here — that's OK (SPICE will handle those). We record paths for diag.
+    """
     try:
         from skyfield.api import load
         return load(path)
     except Exception as e:
-        # Skyfield can't read many SB SPKs (Type 13/21) — that's OK, SPICE will.
         log.info("Skyfield failed to load kernel %s (ok for small-bodies): %s", path, e)
         return None
 
@@ -179,6 +211,9 @@ def current_kernel_name() -> str:
     return EPHEMERIS_NAME
 
 def load_kernel(kernel_name: str = "de421"):
+    """
+    Small helper used by /api/dev/ephem: returns (skyfield_ephem, label).
+    """
     k, _ = _get_kernels()
     return k, current_kernel_name()
 
@@ -194,8 +229,26 @@ def _to_tts(jd_tt: float):
 # ──────────────────────────────────────────────────────────────────────────────
 # SPICE bootstrap (for small-bodies)
 # ──────────────────────────────────────────────────────────────────────────────
+def _looks_like_lfs_pointer(path: str) -> bool:
+    """
+    Detect Git LFS pointer file: tiny text that starts with the LFS spec header.
+    We don't block on this, but we log a very explicit warning for ops clarity.
+    """
+    try:
+        if os.path.getsize(path) <= 512:
+            with open(path, "rb") as f:
+                head = f.read(128)
+            return head.startswith(b"version https://git-lfs.github.com/spec/v1")
+    except Exception:
+        pass
+    return False
+
 def _spice_bootstrap() -> bool:
-    """Furnish de421 + all .bsp in app/data/spk (or env overrides)."""
+    """
+    Furnish de421 + all .bsp in extras for SPICE.
+    - No-op if already furnished.
+    - We log warnings for likely LFS pointers to make deployment issues obvious.
+    """
     global _SPICE_READY, _SPICE_KERNELS
     if _SPICE_READY:
         return True
@@ -209,14 +262,22 @@ def _spice_bootstrap() -> bool:
             pass
 
         furnished: List[str] = []
+
         # Furnish DE421 if present
         de421_path = _resolve_kernel_path()
         if de421_path and os.path.isfile(de421_path):
-            sp.furnsh(de421_path)
-            furnished.append(de421_path)
+            if _looks_like_lfs_pointer(de421_path):
+                log.warning("SPICE: %s looks like a Git LFS pointer (not a real .bsp).", de421_path)
+            try:
+                sp.furnsh(de421_path)
+                furnished.append(de421_path)
+            except Exception as e:
+                log.warning("SPICE failed to furnish %s: %s", de421_path, e)
 
-        # Furnish extras (these are the small-body SPKs that Skyfield cannot read)
+        # Furnish extras (small-body SPKs)
         for p in _extra_spk_paths():
+            if _looks_like_lfs_pointer(p):
+                log.warning("SPICE: %s looks like a Git LFS pointer (not a real .bsp).", p)
             try:
                 sp.furnsh(p)
                 furnished.append(p)
@@ -239,17 +300,19 @@ def _et_from_jd_tt(jd_tt: float) -> float:
     return (float(jd_tt) - 2451545.0) * 86400.0
 
 def _rotate_to_ecliptic_xyz(frame: str, jd_tt: float, x: float, y: float, z: float) -> Tuple[float, float, float]:
-    """Equatorial J2000 -> ecliptic ({of-date}|J2000)"""
+    """
+    Rotate an equatorial J2000 vector -> ecliptic-of-date or ecliptic-J2000.
+    Prefer ERFA IAU2006/2000A; polynomial mean obliquity fallback if no ERFA.
+    """
     try:
         import erfa
+        # ecliptic-J2000: fixed mean obliquity at J2000
         if frame and frame.lower() in ("ecliptic-j2000", "j2000", "ecl-j2000"):
-            # Mean obliquity at J2000
-            eps = 23.439291111  # degrees
-            eps = math.radians(eps)
+            eps = math.radians(23.439291111)
         else:
             d = math.floor(jd_tt); f = jd_tt - d
-            eps0 = erfa.obl06(d, f)
-            _dpsi, deps = erfa.nut06a(d, f)
+            eps0 = erfa.obl06(d, f)         # mean obliquity
+            _dpsi, deps = erfa.nut06a(d, f) # nutation (2000A)
             eps = float(eps0 + deps)
         ce, se = math.cos(eps), math.sin(eps)
         x2 = x
@@ -257,7 +320,7 @@ def _rotate_to_ecliptic_xyz(frame: str, jd_tt: float, x: float, y: float, z: flo
         z2 = -y * se + z * ce
         return x2, y2, z2
     except Exception:
-        # Very close fallback (mean obliquity polynomial)
+        # Fallback: mean obliquity polynomial (Meeus)
         T = (float(jd_tt) - 2451545.0) / 36525.0
         eps_arcsec = 84381.448 - 46.8150*T - 0.00059*(T**2) + 0.001813*(T**3)
         eps = math.radians(eps_arcsec / 3600.0)
@@ -277,11 +340,14 @@ def _speed_step_for(name: str) -> float:
     return _SPEED_STEP_FAST if name == "Moon" else _SPEED_STEP_DEFAULT
 
 def _spice_try_id(s: str) -> Optional[int]:
-    """Try to convert 'Ceres' or '2000001' into a NAIF id using SPICE tables."""
+    """
+    Try to convert 'Ceres' or '2000001' into a NAIF id using SPICE tables.
+    Requires SPICE to be bootstrapped; returns None if not resolved.
+    """
     if not _SPICE_READY:
         return None
     try:
-        # If it's an int string, accept directly
+        # If it's numeric, accept directly
         try:
             return int(s)
         except Exception:
@@ -295,16 +361,14 @@ def _spice_id_for_name(name: str) -> Optional[int]:
     # Try SPICE name tables then our hints (including numeric forms)
     if not _SPICE_READY:
         return None
-    # 1) direct
     i = _spice_try_id(name)
     if i is not None:
         return i
-    # 2) try hints
     for cand in _SMALLBODY_HINTS.get(name.capitalize(), []):
         i = _spice_try_id(cand)
         if i is not None:
             return i
-    # 3) last-ditch hard maps for the five we care about
+    # Hard fallback IDs for our five, if SPICE mappings exist
     fallback = {
         "ceres": 2000001, "pallas": 2000002, "juno": 2000003, "vesta": 2000004,
         "chiron": 20002060,
@@ -326,7 +390,7 @@ def _spice_ecliptic_longitude(
     try:
         et = _et_from_jd_tt(jd_tt)
         # Earth center id = 399; J2000 inertial frame
-        # Use spkpos to avoid need for leapsecond kernels (we provide ET directly).
+        # Use spkpos to avoid leapseconds kernels (we provide ET directly).
         pos, _lt = sp.spkpos(str(tid), et, "J2000", "NONE", "399")  # type: ignore
         x, y, z = float(pos[0]), float(pos[1]), float(pos[2])
         x2, y2, z2 = _rotate_to_ecliptic_xyz(frame, jd_tt, x, y, z)
@@ -337,7 +401,7 @@ def _spice_ecliptic_longitude(
 
 def _spice_ecliptic_longitude_speed(
     jd_tt: float, name: str, *, frame: str
-) -> Tuple[Optional[float], Optional[float]]:
+) -> Tuple[Optional[float], Optional[float]]]:
     lon0 = _spice_ecliptic_longitude(jd_tt, name, frame=frame)
     if lon0 is None:
         return None, None
@@ -350,7 +414,7 @@ def _spice_ecliptic_longitude_speed(
     return lon0, spd
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Skyfield math helpers
+# Skyfield helpers
 # ──────────────────────────────────────────────────────────────────────────────
 def _frame_latlon(geo, ecliptic_frame) -> Tuple[float, float]:
     lat, lon, _ = geo.frame_latlon(ecliptic_frame)
@@ -370,6 +434,10 @@ def _mean_node(jd_tt: float) -> float:
 
 @lru_cache(maxsize=8192)
 def _true_node_geocentric_cached(jd_q: float) -> float:
+    """
+    Compute true node from the Moon's instantaneous orbital plane.
+    Uses Skyfield if available; falls back to mean node otherwise.
+    """
     try:
         from skyfield.framelib import ecliptic_frame
     except Exception:
@@ -401,6 +469,7 @@ def _true_node_geocentric_cached(jd_q: float) -> float:
         if norm_xy < 1e-12:
             return _mean_node(jd_q)
         val = _atan2deg(n[1], n[0])
+        # Optional sanity alert if true vs mean deviates a lot (rare)
         mean_val = _mean_node(jd_q)
         diff = abs(_wrap_diff_deg(val, mean_val))
         if diff > _NODE_ALERT_DEG:
@@ -423,6 +492,10 @@ def _node_longitude(name: str, jd_tt: float) -> float:
 # Observer (Skyfield path)
 # ──────────────────────────────────────────────────────────────────────────────
 def _get_ecliptic_frame(frame: str):
+    """
+    Returns Skyfield ecliptic frame object for requested frame name.
+    - "ecliptic-of-date" (default) or "ecliptic-J2000"/"j2000".
+    """
     try:
         from skyfield import framelib as _fl
         if frame and frame.lower() in ("ecliptic-j2000", "j2000", "ecl-j2000"):
@@ -437,6 +510,10 @@ def _observer(main, *, topocentric: bool,
               latitude: Optional[float],
               longitude: Optional[float],
               elevation_m: Optional[float]):
+    """
+    Returns an observer (Earth center or wgs84 latlon).
+    - Topocentric supported only via Skyfield primary path.
+    """
     if main is None:
         return None
     if topocentric and latitude is not None and longitude is not None:
@@ -482,6 +559,10 @@ def _all_kernel_labels(k) -> List[str]:
 
 @lru_cache(maxsize=2048)
 def _resolve_small_body(name_norm: str):
+    """
+    Try to get a small body from any loaded Skyfield kernel by name/alias/hint.
+    Often returns None since Skyfield can't read many SB SPKs; that's fine.
+    """
     hints = _SMALLBODY_HINTS.get(name_norm, [])
     for label in hints:
         for k in _kernels_iter():
@@ -501,6 +582,10 @@ def _resolve_small_body(name_norm: str):
 
 @lru_cache(maxsize=2048)
 def _get_body(name: str):
+    """
+    Resolve classical planets (always available in DE421) and small-bodies if
+    Skyfield can read their SPK (often not). SPICE fallback will cover the rest.
+    """
     if name in _PLANET_KEYS:
         key = _PLANET_KEYS[name]
         for k in _kernels_iter():
@@ -549,7 +634,7 @@ def ecliptic_longitudes(
     obs = _observer(main, topocentric=topocentric, latitude=latitude,
                     longitude=longitude, elevation_m=elevation_m) if main is not None else None
 
-    # Map mode
+    # Map mode (explicit names list)
     if names:
         out: Dict[str, float] = {}
         for nm in names:
@@ -662,7 +747,7 @@ def ecliptic_longitudes_and_velocities(
                 except Exception as e:
                     log.debug("Skyfield failed for %s: %s", nm, e)
 
-        # 2) SPICE fallback (small-bodies and failed majors)
+        # 2) SPICE fallback (small-bodies and failed majors) — geocentric only
         if not skyfield_success and _SPICE_READY:
             lon, spd = _spice_ecliptic_longitude_speed(jd_tt, nm, frame=frame)
             if lon is not None:
@@ -672,7 +757,7 @@ def ecliptic_longitudes_and_velocities(
 
     return {"longitudes": lon_map, "velocities": vel_map}
 
-# Convenience alias
+# Convenience alias (signature must remain)
 def get_ecliptic_longitudes(
     jd_tt: float,
     names: List[str],
@@ -700,6 +785,9 @@ def ephemeris_diagnostics(requested: Optional[List[str]] = None) -> Dict[str, An
     """
     Report kernels, resolved labels, and misses for reproducible tests.
     Default set: 10 majors + 5 small bodies + 2 nodes.
+
+    NOTE: "kernels" includes both Skyfield-loaded kernel paths and furnished
+    SPICE kernels (prefixed with "[spice]").
     """
     main, extras = _get_kernels()
     kernels = [p for p in _KERNEL_PATHS] or [EPHEMERIS_NAME]
@@ -719,12 +807,12 @@ def ephemeris_diagnostics(requested: Optional[List[str]] = None) -> Dict[str, An
             resolved[nm] = {"type": "node", "kernel": "computed", "label": nm}
             continue
 
-        # Prefer SPICE for small bodies
+        # Prefer SPICE for small bodies when we can map name->NAIF id
         if _SPICE_READY and _spice_id_for_name(nm) is not None:
             resolved[nm] = {"type": "body", "kernel": "spice", "label": str(_spice_id_for_name(nm))}
             continue
 
-        # Fall back to Skyfield kernel resolution
+        # Fallback to Skyfield resolution (majors & any SB that managed to load)
         b = _get_body(nm)
         if b is not None:
             used_label = None
