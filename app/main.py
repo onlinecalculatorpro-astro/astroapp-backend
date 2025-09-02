@@ -46,6 +46,13 @@ except Exception as e:  # pragma: no cover
 from app.core.astronomy import compute_chart
 from app.core import timescales as _ts
 
+# Policy façade (this is what enables 12 working + 6 gated)
+from app.core.house import (
+    compute_houses_with_policy,
+    POLAR_SOFT_LIMIT_DEG as _POLAR_SOFT_DEFAULT,
+    POLAR_HARD_LIMIT_DEG as _POLAR_HARD_DEFAULT,
+)
+
 # Prometheus metrics
 from prometheus_client import (
     Counter,
@@ -66,19 +73,12 @@ GAUGE_DUT1: Final = Gauge("astro_dut1_broadcast_seconds", "DUT1 broadcast second
 GAUGE_APP_UP: Final = Gauge("astro_app_up", "1 if app is running")
 REQ_LATENCY: Final = Histogram("astro_request_seconds", "API request latency", ["route"])
 
-# ───────────────────────────── simple policy façade ─────────────────────────────
+# ───────────────────────────── policy façade (UI echo) ─────────────────────────────
 HOUSES_ENGINE_NAME = os.getenv("HOUSES_ENGINE_NAME", "proto-basic")
-POLAR_SOFT_LIMIT = float(os.getenv("POLAR_SOFT_LIMIT_DEG", "66.0"))
-POLAR_HARD_LIMIT = float(os.getenv("POLAR_HARD_LIMIT_DEG", "80.0"))
-NUMERIC_FALLBACK_ENABLED = bool(int(os.getenv("HOUSES_NUMERIC_FALLBACK", "0")))
-
-SUPPORTED_HOUSE_SYSTEMS = {"equal", "whole_sign"}  # minimal demo
-GATED_HOUSE_SYSTEMS = {
-    "placidus","koch","regiomontanus","campanus",
-    "porphyry","alcabitius","morinus","topocentric",
-    "meridian","horizon","carter_pe","sunshine",
-    "vehlow_equal","sripati","krusinski","pullen_sd"
-}
+POLAR_SOFT_LIMIT = float(os.getenv("POLAR_SOFT_LIMIT_DEG", str(_POLAR_SOFT_DEFAULT)))
+POLAR_HARD_LIMIT = float(os.getenv("POLAR_HARD_LIMIT_DEG", str(_POLAR_HARD_DEFAULT)))
+# match house.py env knob so /system-validation reflects real behavior
+NUMERIC_FALLBACK_ENABLED = os.getenv("ASTRO_HOUSES_NUMERIC_FALLBACK", "1").lower() in ("1", "true", "yes", "on")
 
 # ───────────────────────────── helpers ─────────────────────────────
 def _configure_logging(app: Flask) -> None:
@@ -209,41 +209,23 @@ def _timescales_meta_from_chart(chart: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-# ───────────────────────────── minimal houses (demo) ─────────────────────────────
-def _wrap360(x: float) -> float:
-    v = float(x) % 360.0
-    return v + 360.0 if v < 0 else v
-
-def _equal_cusps_from_asc(asc_deg: float) -> List[float]:
-    base = _wrap360(asc_deg)
-    return [_wrap360(base + 30.0 * i) for i in range(12)]
-
-def _whole_sign_cusps_from_asc(asc_deg: float) -> List[float]:
-    # Cusp 1 is the start of the ASC's zodiac sign (0°, 30°, 60°...).
-    sign0 = int(_wrap360(asc_deg) // 30) * 30.0
-    return [_wrap360(sign0 + 30.0 * i) for i in range(12)]
-
-def _houses_policy_blob() -> Dict[str, Any]:
+def _policy_blob() -> Dict[str, Any]:
+    """Shape used by /system-validation (what your harness prints)."""
     return {
         "houses_engine": HOUSES_ENGINE_NAME,
-        "polar_policy": {
+        "polar": {
             "polar_soft_limit_deg": POLAR_SOFT_LIMIT,
             "polar_hard_limit_deg": POLAR_HARD_LIMIT,
-            "numeric_fallback_enabled": NUMERIC_FALLBACK_ENABLED,
+            "numeric_fallback_enabled": bool(NUMERIC_FALLBACK_ENABLED),
         },
     }
 
-
+# ───────────────────────────── core API ─────────────────────────────
 def _register_core_api(app: Flask) -> None:
-    """Timescales + chart + calculate + system-validation."""
-
-    # ---- system-validation (policy façade) ----
+    # ---- system-validation ----
     @app.get("/system-validation")
     def _system_validation():
-        return jsonify({
-            "ok": True,
-            "policy": _houses_policy_blob()
-        }), 200
+        return jsonify({"ok": True, "policy": _policy_blob()}), 200
 
     # ---- timescales ----
     def _timescales_handler():
@@ -279,7 +261,6 @@ def _register_core_api(app: Flask) -> None:
         payload.setdefault("mode", "tropical")
 
         chart = compute_chart(payload)  # astronomy.py handles normalization & warnings
-        # add ok + timescales blob for parity
         chart["ok"] = True
         chart.setdefault("meta", {}).setdefault("timescales", _timescales_meta_from_chart(chart))
         return jsonify(chart), 200
@@ -295,7 +276,7 @@ def _register_core_api(app: Flask) -> None:
     ):
         app.add_url_rule(alias, f"chart_alias_{alias}", _chart_handler, methods=["POST"])
 
-    # ---- calculate ----
+    # ---- calculate (bodies + optional houses with policy) ----
     def _calculate_handler():
         payload = _body_json()
 
@@ -308,8 +289,7 @@ def _register_core_api(app: Flask) -> None:
             if isinstance(date, str) and isinstance(time_s, str) and isinstance(tz, str):
                 ts = _compute_timescales_payload(date, time_s, tz)
                 payload.update({k: ts[k] for k in ("jd_ut", "jd_tt", "jd_ut1")})
-                # stash for meta if helpful
-                payload["_timescales"] = ts
+                payload["_timescales"] = ts  # may be helpful for meta echo
             else:
                 raise BadRequest("Provide either jd_ut/jd_tt/jd_ut1 or civil 'date'+'time'+'tz'")
 
@@ -320,58 +300,53 @@ def _register_core_api(app: Flask) -> None:
         chart["ok"] = True
         chart.setdefault("meta", {}).setdefault("timescales", _timescales_meta_from_chart(chart))
 
-        # Houses façade (only if requested)
-        system = (payload.get("house_system") or payload.get("system") or "").strip().lower()
+        # Houses (policy façade)
+        system = (payload.get("house_system") or payload.get("system") or "").strip()
         if system:
-            if system in SUPPORTED_HOUSE_SYSTEMS:
-                asc = chart.get("asc_deg") or (chart.get("angles") or {}).get("asc_deg")
-                mc  = chart.get("mc_deg")  or (chart.get("angles") or {}).get("mc_deg")
-                if asc is None or mc is None:
-                    return jsonify({
-                        "ok": False,
-                        "error": "angles_missing_geography",
-                        "details": {"note": "ASC/MC require latitude and longitude"},
-                    }), 400
-
-                if system == "equal":
-                    cusps = _equal_cusps_from_asc(float(asc))
-                    engine_sys = "equal"
-                else:  # whole_sign
-                    cusps = _whole_sign_cusps_from_asc(float(asc))
-                    engine_sys = "whole_sign"
-
-                houses = {
-                    "requested_house_system": system,
-                    "house_system": engine_sys,
-                    "engine_system": engine_sys,
-                    "asc_deg": float(asc),
-                    "mc_deg": float(mc),
-                    "cusps_deg": [float(x) for x in cusps],
-                    "warnings": [],
-                    "policy": _houses_policy_blob()["polar_policy"],
-                }
-                chart["houses"] = houses
-                return jsonify(chart), 200
-
-            # Gate all others with 501 (as your harness expects)
-            if system in GATED_HOUSE_SYSTEMS:
+            try:
+                houses = compute_houses_with_policy(
+                    lat=float(payload.get("latitude") or payload.get("lat")),
+                    lon=float(payload.get("longitude") or payload.get("lon")),
+                    system=system,
+                    jd_tt=float(payload["jd_tt"]),
+                    jd_ut1=float(payload["jd_ut1"]),
+                    jd_ut=float(payload.get("jd_ut", 0.0)),
+                    # optional toggles; keep default behavior if omitted
+                    diagnostics=payload.get("enable_diagnostics"),
+                    validation=payload.get("enable_validation"),
+                )
+            except NotImplementedError as e:
+                # 6 gated systems → HTTP 501
                 return jsonify({
                     "ok": False,
                     "error": "house_system_gated",
-                    "details": {
-                        "system": system,
-                        "note": "House systems are intentionally gated in this build (only 'equal' and 'whole_sign' enabled)."
-                    }
+                    "details": {"system": system, "note": str(e)},
                 }), 501
-            else:
-                # Unknown label
+            except ValueError as e:
+                # input/policy issues
                 return jsonify({
                     "ok": False,
-                    "error": "house_system_unknown",
-                    "details": {"system": system}
+                    "error": "house_input_error",
+                    "details": {"message": str(e)},
                 }), 400
+            except Exception as e:
+                return jsonify({
+                    "ok": False,
+                    "error": "house_engine_failed",
+                    "details": {"message": str(e)},
+                }), 500
 
-        # No house system requested → just return the chart payload
+            # Normalize / add a couple of aliases your UI expects
+            # (keep both asc/mc and asc_deg/mc_deg; cusps and cusps_deg)
+            houses_out = dict(houses)
+            houses_out.setdefault("house_system", houses_out.get("system"))
+            houses_out.setdefault("requested_house_system", houses_out.get("requested_system"))
+            houses_out.setdefault("asc_deg", houses_out.get("asc"))
+            houses_out.setdefault("mc_deg", houses_out.get("mc"))
+            houses_out.setdefault("cusps_deg", houses_out.get("cusps"))
+
+            chart["houses"] = houses_out
+
         return jsonify(chart), 200
 
     app.add_url_rule("/api/calculate", "calculate", _calculate_handler, methods=["POST"])
@@ -436,7 +411,7 @@ def create_app() -> Flask:
     _register_health(app)
     _register_errors(app)
 
-    # Core minimal API
+    # Core API
     _register_core_api(app)
 
     # Optional feature blueprints
@@ -445,7 +420,7 @@ def create_app() -> Flask:
     if _pred_bp is not None:
         app.register_blueprint(_pred_bp, url_prefix="/api")
 
-    # --- DEBUG endpoints ---
+    # --- DEBUG endpoints (handy while you iterate) ---
     @app.get("/__debug/imports")
     def __debug_imports():
         return jsonify({
@@ -464,34 +439,6 @@ def create_app() -> Flask:
             rules.append({"rule": str(r), "endpoint": r.endpoint, "methods": methods})
         rules.sort(key=lambda x: x["rule"])
         return jsonify({"count": len(rules), "rules": rules}), 200
-
-    @app.get("/__debug/files")
-    def __debug_files():
-        spk_dir = "app/data/spk"
-        try:
-            files = sorted(os.listdir(spk_dir)) if os.path.isdir(spk_dir) else []
-        except Exception as e:
-            files = [f"<error: {e}>"]
-        return jsonify({"spk": files}), 200
-
-    @app.get("/__debug/ephem")
-    def __debug_ephem():
-        import importlib.util
-        from app.core import ephemeris_adapter as eph
-        path = os.getenv("OCP_EPHEMERIS")
-        exists = bool(path and os.path.isfile(path))
-        size = (os.path.getsize(path) if exists else None)
-        skyfield_ok = importlib.util.find_spec("skyfield") is not None
-        jplephem_ok = importlib.util.find_spec("jplephem") is not None
-        return jsonify({
-            "OCP_EPHEMERIS": path,
-            "file_exists": exists,
-            "file_size_bytes": size,
-            "skyfield_importable": skyfield_ok,
-            "jplephem_importable": jplephem_ok,
-            "diagnostics": eph.ephemeris_diagnostics(),
-        }), 200
-    # ---------------------------------------------------------------------------
 
     # /metrics (Basic Auth)
     @app.route("/metrics", methods=["GET"])
