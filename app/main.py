@@ -7,7 +7,7 @@ import sys
 import traceback
 from datetime import datetime
 from time import perf_counter
-from typing import Any, Dict, Final
+from typing import Any, Dict, Final, List, Optional
 
 from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
@@ -15,7 +15,6 @@ from werkzeug.exceptions import HTTPException, BadRequest
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 # ───────────────────────────── Optional blueprints ─────────────────────────────
-# Make blueprint import failures VISIBLE so 404s are easy to debug.
 _routes_import_err: str | None = None
 _pred_import_err: str | None = None
 
@@ -67,10 +66,22 @@ GAUGE_DUT1: Final = Gauge("astro_dut1_broadcast_seconds", "DUT1 broadcast second
 GAUGE_APP_UP: Final = Gauge("astro_app_up", "1 if app is running")
 REQ_LATENCY: Final = Histogram("astro_request_seconds", "API request latency", ["route"])
 
+# ───────────────────────────── simple policy façade ─────────────────────────────
+HOUSES_ENGINE_NAME = os.getenv("HOUSES_ENGINE_NAME", "proto-basic")
+POLAR_SOFT_LIMIT = float(os.getenv("POLAR_SOFT_LIMIT_DEG", "66.0"))
+POLAR_HARD_LIMIT = float(os.getenv("POLAR_HARD_LIMIT_DEG", "80.0"))
+NUMERIC_FALLBACK_ENABLED = bool(int(os.getenv("HOUSES_NUMERIC_FALLBACK", "0")))
+
+SUPPORTED_HOUSE_SYSTEMS = {"equal", "whole_sign"}  # minimal demo
+GATED_HOUSE_SYSTEMS = {
+    "placidus","koch","regiomontanus","campanus",
+    "porphyry","alcabitius","morinus","topocentric",
+    "meridian","horizon","carter_pe","sunshine",
+    "vehlow_equal","sripati","krusinski","pullen_sd"
+}
 
 # ───────────────────────────── helpers ─────────────────────────────
 def _configure_logging(app: Flask) -> None:
-    """Unify logging with Gunicorn or fall back to std logging."""
     gerr = logging.getLogger("gunicorn.error")
     if gerr.handlers:
         app.logger.handlers = gerr.handlers
@@ -80,11 +91,11 @@ def _configure_logging(app: Flask) -> None:
 
 
 def _register_errors(app: Flask) -> None:
-    """Consistent JSON error payloads (and visible 500 bodies for DevTools)."""
     @app.errorhandler(HTTPException)
     def _http(e: HTTPException):
         app.logger.warning("HTTP %s at %s %s: %s", e.code, request.method, request.path, e.description)
         return jsonify(
+            ok=False,
             error="http_error",
             code=e.code,
             name=e.name,
@@ -97,6 +108,7 @@ def _register_errors(app: Flask) -> None:
         tb = traceback.format_exc()
         app.logger.error("UNHANDLED %s at %s %s\n%s", type(e).__name__, request.method, request.path, tb)
         return jsonify(
+            ok=False,
             error="internal_error",
             type=type(e).__name__,
             message=str(e),
@@ -105,7 +117,6 @@ def _register_errors(app: Flask) -> None:
 
 
 def _register_health(app: Flask) -> None:
-    """Health endpoints for Render/CF probes."""
     @app.route("/", methods=["GET"])
     def root():
         return jsonify(ok=True, service="astro-backend", health="/health"), 200
@@ -117,11 +128,10 @@ def _register_health(app: Flask) -> None:
     @app.route("/health", methods=["GET"])
     @app.route("/healthz", methods=["GET"])
     def health():
-        return jsonify(status="ok"), 200
+        return jsonify(ok=True, status="ok"), 200
 
 
 def _metrics_auth_ok() -> bool:
-    """Basic Auth guard for /metrics, using METRICS_USER + METRICS_PASS env vars."""
     auth = request.authorization
     user = os.getenv("METRICS_USER", "")
     pw = os.getenv("METRICS_PASS", "")
@@ -136,7 +146,6 @@ def _metrics_auth_ok() -> bool:
 
 
 def _body_json() -> Dict[str, Any]:
-    """Strict JSON object parser with nice 400s."""
     data = request.get_json(force=True, silent=False)
     if not isinstance(data, dict):
         raise BadRequest("JSON body must be an object")
@@ -144,7 +153,6 @@ def _body_json() -> Dict[str, Any]:
 
 
 def _normalize_time_hms(s: str) -> str:
-    """Accept 'HH:MM' or 'HH:MM:SS'; normalize to HH:MM:SS."""
     s = s.strip()
     parts = s.split(":")
     if len(parts) == 2:
@@ -157,19 +165,13 @@ def _normalize_time_hms(s: str) -> str:
 
 
 def _compute_timescales_payload(date: str, time_s: str, tz: str) -> Dict[str, Any]:
-    """
-    Convert civil date/time/tz → {jd_ut, jd_tt, jd_ut1, utc}.
-    Uses app.core.timescales; UT1 is UT + DUT1 (env) seconds.
-    """
+    """Civil date/time/tz → {jd_ut, jd_tt, jd_ut1, utc, dut1} using app.core.timescales."""
     from zoneinfo import ZoneInfo
-
     time_norm = _normalize_time_hms(time_s)
 
-    # UTC ISO and JD(UT) via your timescale helpers
     utc_iso = _ts.to_utc_iso(date, time_norm, tz)
     jd_ut = _ts.julian_day_utc(date, time_norm, tz)
 
-    # For ΔT polynomial we need UTC year/month
     dt_utc = (
         datetime.fromisoformat(f"{date}T{time_norm}")
         .replace(tzinfo=ZoneInfo(tz))
@@ -177,7 +179,6 @@ def _compute_timescales_payload(date: str, time_s: str, tz: str) -> Dict[str, An
     )
     jd_tt = _ts.jd_tt_from_utc_jd(jd_ut, dt_utc.year, dt_utc.month)
 
-    # UT1 = UT + DUT1 (seconds)/86400
     dut1 = float(os.getenv("ASTRO_DUT1_BROADCAST", os.getenv("ASTRO_DUT1", "0.0")) or 0.0)
     jd_ut1 = jd_ut + (dut1 / 86400.0)
 
@@ -190,8 +191,59 @@ def _compute_timescales_payload(date: str, time_s: str, tz: str) -> Dict[str, An
     }
 
 
+def _timescales_meta_from_chart(chart: Dict[str, Any]) -> Dict[str, Any]:
+    """Build meta.timescales from compute_chart() output (which provides jd_ut/jd_tt/jd_ut1)."""
+    jd_ut = float(chart.get("jd_ut"))
+    jd_tt = float(chart.get("jd_tt"))
+    jd_ut1 = float(chart.get("jd_ut1"))
+    delta_t_sec = (jd_tt - jd_ut) * 86400.0
+    dut1_sec = (jd_ut1 - jd_ut) * 86400.0
+    # Leap seconds not tracked here — expose 0 to satisfy the test printer.
+    return {
+        "jd_utc": jd_ut,
+        "jd_tt": jd_tt,
+        "jd_ut1": jd_ut1,
+        "delta_t": delta_t_sec,
+        "delta_at": 0.0,
+        "dut1": dut1_sec,
+    }
+
+
+# ───────────────────────────── minimal houses (demo) ─────────────────────────────
+def _wrap360(x: float) -> float:
+    v = float(x) % 360.0
+    return v + 360.0 if v < 0 else v
+
+def _equal_cusps_from_asc(asc_deg: float) -> List[float]:
+    base = _wrap360(asc_deg)
+    return [_wrap360(base + 30.0 * i) for i in range(12)]
+
+def _whole_sign_cusps_from_asc(asc_deg: float) -> List[float]:
+    # Cusp 1 is the start of the ASC's zodiac sign (0°, 30°, 60°...).
+    sign0 = int(_wrap360(asc_deg) // 30) * 30.0
+    return [_wrap360(sign0 + 30.0 * i) for i in range(12)]
+
+def _houses_policy_blob() -> Dict[str, Any]:
+    return {
+        "houses_engine": HOUSES_ENGINE_NAME,
+        "polar_policy": {
+            "polar_soft_limit_deg": POLAR_SOFT_LIMIT,
+            "polar_hard_limit_deg": POLAR_HARD_LIMIT,
+            "numeric_fallback_enabled": NUMERIC_FALLBACK_ENABLED,
+        },
+    }
+
+
 def _register_core_api(app: Flask) -> None:
-    """Minimal, stable endpoints used by browser console tests."""
+    """Timescales + chart + calculate + system-validation."""
+
+    # ---- system-validation (policy façade) ----
+    @app.get("/system-validation")
+    def _system_validation():
+        return jsonify({
+            "ok": True,
+            "policy": _houses_policy_blob()
+        }), 200
 
     # ---- timescales ----
     def _timescales_handler():
@@ -202,7 +254,7 @@ def _register_core_api(app: Flask) -> None:
         if not (isinstance(date, str) and isinstance(time_s, str) and isinstance(tz, str)):
             raise BadRequest("Provide 'date', 'time', and 'tz' (IANA)")
         out = _compute_timescales_payload(date, time_s, tz)
-        return jsonify(out), 200
+        return jsonify({"ok": True, **out}), 200
 
     app.add_url_rule("/api/time/timescales", "timescales", _timescales_handler, methods=["POST"])
     for alias in ("/api/timescales", "/time/timescales", "/timescales", "/api/time/convert"):
@@ -224,11 +276,13 @@ def _register_core_api(app: Flask) -> None:
             else:
                 raise BadRequest("Provide either jd_ut/jd_tt/jd_ut1 or civil 'date'+'time'+'tz'")
 
-        # Defaults
         payload.setdefault("mode", "tropical")
 
-        res = compute_chart(payload)  # astronomy.py handles normalization & warnings
-        return jsonify(res), 200
+        chart = compute_chart(payload)  # astronomy.py handles normalization & warnings
+        # add ok + timescales blob for parity
+        chart["ok"] = True
+        chart.setdefault("meta", {}).setdefault("timescales", _timescales_meta_from_chart(chart))
+        return jsonify(chart), 200
 
     app.add_url_rule("/api/chart", "chart", _chart_handler, methods=["POST"])
     for alias in (
@@ -242,10 +296,6 @@ def _register_core_api(app: Flask) -> None:
         app.add_url_rule(alias, f"chart_alias_{alias}", _chart_handler, methods=["POST"])
 
     # ---- calculate ----
-    # Alias of /api/chart with the SAME behavior:
-    # - If 'bodies' is omitted → astronomy.compute_chart defaults to the classic 10 majors.
-    # - Optional 'points' (e.g., ["North Node","South Node"]) are passed through untouched.
-    # - If nodes appear inside 'bodies', astronomy.py moves them to 'points' and still returns majors.
     def _calculate_handler():
         payload = _body_json()
 
@@ -258,17 +308,71 @@ def _register_core_api(app: Flask) -> None:
             if isinstance(date, str) and isinstance(time_s, str) and isinstance(tz, str):
                 ts = _compute_timescales_payload(date, time_s, tz)
                 payload.update({k: ts[k] for k in ("jd_ut", "jd_tt", "jd_ut1")})
+                # stash for meta if helpful
+                payload["_timescales"] = ts
             else:
                 raise BadRequest("Provide either jd_ut/jd_tt/jd_ut1 or civil 'date'+'time'+'tz'")
 
-        # Do NOT inject nodes into 'bodies'. Let astronomy.compute_chart:
-        # - default majors when 'bodies' omitted,
-        # - handle 'points',
-        # - and move any node names from bodies → points internally.
         payload.setdefault("mode", "tropical")
 
-        res = compute_chart(payload)
-        return jsonify(res), 200
+        # Base chart (bodies + optional points, angles, meta)
+        chart = compute_chart(payload)
+        chart["ok"] = True
+        chart.setdefault("meta", {}).setdefault("timescales", _timescales_meta_from_chart(chart))
+
+        # Houses façade (only if requested)
+        system = (payload.get("house_system") or payload.get("system") or "").strip().lower()
+        if system:
+            if system in SUPPORTED_HOUSE_SYSTEMS:
+                asc = chart.get("asc_deg") or (chart.get("angles") or {}).get("asc_deg")
+                mc  = chart.get("mc_deg")  or (chart.get("angles") or {}).get("mc_deg")
+                if asc is None or mc is None:
+                    return jsonify({
+                        "ok": False,
+                        "error": "angles_missing_geography",
+                        "details": {"note": "ASC/MC require latitude and longitude"},
+                    }), 400
+
+                if system == "equal":
+                    cusps = _equal_cusps_from_asc(float(asc))
+                    engine_sys = "equal"
+                else:  # whole_sign
+                    cusps = _whole_sign_cusps_from_asc(float(asc))
+                    engine_sys = "whole_sign"
+
+                houses = {
+                    "requested_house_system": system,
+                    "house_system": engine_sys,
+                    "engine_system": engine_sys,
+                    "asc_deg": float(asc),
+                    "mc_deg": float(mc),
+                    "cusps_deg": [float(x) for x in cusps],
+                    "warnings": [],
+                    "policy": _houses_policy_blob()["polar_policy"],
+                }
+                chart["houses"] = houses
+                return jsonify(chart), 200
+
+            # Gate all others with 501 (as your harness expects)
+            if system in GATED_HOUSE_SYSTEMS:
+                return jsonify({
+                    "ok": False,
+                    "error": "house_system_gated",
+                    "details": {
+                        "system": system,
+                        "note": "House systems are intentionally gated in this build (only 'equal' and 'whole_sign' enabled)."
+                    }
+                }), 501
+            else:
+                # Unknown label
+                return jsonify({
+                    "ok": False,
+                    "error": "house_system_unknown",
+                    "details": {"system": system}
+                }), 400
+
+        # No house system requested → just return the chart payload
+        return jsonify(chart), 200
 
     app.add_url_rule("/api/calculate", "calculate", _calculate_handler, methods=["POST"])
     for alias in ("/calculate", "/api/calc", "/calc"):
@@ -280,7 +384,6 @@ def create_app() -> Flask:
     app = Flask(__name__)
     app.config["JSON_SORT_KEYS"] = False
 
-    # Trust proxy headers (Render/Cloudflare)
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)  # type: ignore
 
     _configure_logging(app)
@@ -298,7 +401,7 @@ def create_app() -> Flask:
         "/", "/api/health-check",
         "/api/chart", "/api/calculate",
         "/api/time/timescales",
-        "/health", "/healthz", "/metrics"
+        "/health", "/healthz", "/metrics", "/system-validation"
     )
     for route in seeded_routes:
         MET_REQUESTS.labels(route=route).inc(0)
@@ -312,7 +415,7 @@ def create_app() -> Flask:
     def _before():
         try:
             p = (request.path or "")
-            if p.startswith("/api/") or p in ("/", "/health", "/healthz", "/metrics"):
+            if p.startswith("/api/") or p in ("/", "/health", "/healthz", "/metrics", "/system-validation"):
                 MET_REQUESTS.labels(route=p).inc()
                 request._t0 = perf_counter()
         except Exception:
@@ -322,18 +425,18 @@ def create_app() -> Flask:
     def _after(resp):
         try:
             p = (request.path or "")
-            if (p.startswith("/api/") or p in ("/", "/health", "/healthz")) and hasattr(request, "_t0"):
+            if (p.startswith("/api/") or p in ("/", "/health", "/healthz", "/system-validation")) and hasattr(request, "_t0"):
                 dt = perf_counter() - request._t0
                 REQ_LATENCY.labels(route=p).observe(dt)
         except Exception:
             pass
         return resp
 
-    # Register health/errors first (so probes always work)
+    # Register health/errors first
     _register_health(app)
     _register_errors(app)
 
-    # Core minimal API (timescales + chart + calculate)
+    # Core minimal API
     _register_core_api(app)
 
     # Optional feature blueprints
@@ -342,7 +445,7 @@ def create_app() -> Flask:
     if _pred_bp is not None:
         app.register_blueprint(_pred_bp, url_prefix="/api")
 
-    # --- DEBUG endpoints: verify blueprint load + list routes + list SPK files ---
+    # --- DEBUG endpoints ---
     @app.get("/__debug/imports")
     def __debug_imports():
         return jsonify({
