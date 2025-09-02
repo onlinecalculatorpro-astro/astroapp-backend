@@ -7,7 +7,7 @@ import os
 import logging
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
 from flask import Blueprint, jsonify, request
@@ -78,8 +78,8 @@ except Exception:
     from app.core.houses_advanced import compute_house_system as _houses_fn  # type: ignore
     _HOUSES_KIND = "legacy"
 
-# Timescale kernel (required)
-from app.core import time_kernel as _tk  # type: ignore
+# Timescales (use the same helpers as main.py)
+from app.core import timescales as _ts  # type: ignore
 
 # Optional leap-seconds helper
 try:  # pragma: no cover
@@ -227,55 +227,10 @@ def _datetime_to_jd_utc(dt_utc: datetime) -> float:
         return float(jdn + dayfrac)
 
 
-def _find_kernel_callable() -> Callable[[float], Dict[str, Any]]:
-    """
-    Locate a JD_UTC -> timescales callable on app.core.time_kernel.
-    Must return dict-like with jd_tt, jd_ut1, delta_t, delta_at, dut1, warnings?, policy?
-    """
-    candidates = (
-        "jd_utc_to_timescales",
-        "utc_jd_to_timescales",
-        "timescales_from_jd_utc",
-        "compute_from_jd_utc",
-        "derive_timescales",
-    )
-    for name in candidates:
-        fn = getattr(_tk, name, None)
-        if callable(fn):
-            def _wrap(jd_utc: float, fn=fn):
-                out = fn(jd_utc)
-                if is_dataclass(out):
-                    return asdict(out)  # type: ignore
-                if hasattr(out, "__dict__"):
-                    return dict(out.__dict__)
-                return dict(out)
-            return _wrap
-
-    TK = getattr(_tk, "TimeKernel", None)
-    if TK is not None:
-        inst = TK()  # type: ignore
-        for name in ("from_jd_utc", "utc_jd_to_timescales"):
-            fn = getattr(inst, name, None)
-            if callable(fn):
-                def _wrap2(jd_utc: float, fn=fn):
-                    out = fn(jd_utc)
-                    if is_dataclass(out):
-                        return asdict(out)  # type: ignore
-                    if hasattr(out, "__dict__"):
-                        return dict(out.__dict__)
-                    return dict(out)
-                return _wrap2
-
-    raise RuntimeError("time_kernel: no JD_UTC→timescales function found")
-
-
-_JD_TO_TS = _find_kernel_callable()
-
-
 def _compute_timescales_from_local(date_str: str, time_str: str, tz_name: str) -> Dict[str, Any]:
     """
-    Convert local date/time/tz to JD(UTC), then expand to jd_tt/jd_ut1 with time_kernel.
-    Returns a dict safe for JSON clients.
+    Convert local date/time/tz → {jd_utc, jd_tt, jd_ut1, delta_t, dut1, ...}
+    Uses app.core.timescales (same as main.py). Stable JSON for callers.
     """
     fmt = "%Y-%m-%d %H:%M" if time_str.count(":") == 1 else "%Y-%m-%d %H:%M:%S"
 
@@ -284,26 +239,49 @@ def _compute_timescales_from_local(date_str: str, time_str: str, tz_name: str) -
     except Exception:
         raise ValidationError({"place_tz": "must be a valid IANA zone like 'Asia/Kolkata'"})
 
-    dt_local = datetime.strptime(f"{date_str} {time_str}", fmt).replace(tzinfo=tz)
+    # normalize HH:MM vs HH:MM:SS
+    def _norm_hms(s: str) -> str:
+        s = s.strip()
+        parts = s.split(":")
+        if len(parts) == 2:
+            hh, mm = parts
+            return f"{int(hh):02d}:{int(mm):02d}:00"
+        if len(parts) == 3:
+            hh, mm, ss = parts
+            return f"{int(hh):02d}:{int(mm):02d}:{int(ss):02d}"
+        raise ValidationError({"time": "must be 'HH:MM' or 'HH:MM:SS'"})
+
+    time_norm = _norm_hms(time_str)
+
+    dt_local = datetime.strptime(f"{date_str} {time_norm}", fmt).replace(tzinfo=tz)
     dt_utc = dt_local.astimezone(timezone.utc)
-    jd_utc = _datetime_to_jd_utc(dt_utc)
 
-    ts = _JD_TO_TS(jd_utc)
+    # Use timescales helpers
+    jd_utc = _ts.julian_day_utc(date_str, time_norm, tz_name)
+    jd_tt = _ts.jd_tt_from_utc_jd(jd_utc, dt_utc.year, dt_utc.month)
+
+    # UT1 = UT + DUT1 (seconds)
+    dut1 = float(os.getenv("ASTRO_DUT1_BROADCAST", os.getenv("ASTRO_DUT1", "0.0")))
+    jd_ut1 = float(jd_utc) + dut1 / 86400.0
+
+    # Optional ΔT (seconds) if provided by timescales module
+    try:
+        delta_t = float(_ts.delta_t_seconds(dt_utc.year, dt_utc.month))  # type: ignore[attr-defined]
+    except Exception:
+        delta_t = None
+
     tz_offset_seconds = int(dt_local.utcoffset().total_seconds()) if dt_local.utcoffset() else 0
-
     out = {
         "jd_utc": float(jd_utc),
-        "jd_tt": float(ts.get("jd_tt")),
-        "jd_ut1": float(ts.get("jd_ut1")),
-        "delta_t": float(ts.get("delta_t")),
-        "delta_at": float(ts.get("delta_at")),
-        "dut1": float(ts.get("dut1")),
+        "jd_tt": float(jd_tt),
+        "jd_ut1": float(jd_ut1),
+        "delta_t": delta_t,
+        "delta_at": None,  # fill if you have leap-second tables elsewhere
+        "dut1": float(dut1),
         "timezone": tz_name,
         "tz_offset_seconds": tz_offset_seconds,
-        "warnings": ts.get("warnings", []) or [],
+        "warnings": [],
     }
-    if "policy" in ts:
-        out["policy"] = ts["policy"]
     return out
 
 
@@ -1019,14 +997,17 @@ def config_info():
     # timescale sample for "now" (debug aid)
     try:
         now_utc = datetime.now(timezone.utc)
-        jd_now = _datetime_to_jd_utc(now_utc)
-        ts_now = _JD_TO_TS(jd_now)
+        # mirror /api/_compute_timescales_from_local using timescales helpers
+        date_str = now_utc.strftime("%Y-%m-%d")
+        time_str = now_utc.strftime("%H:%M:%S")
+        tz_name = "UTC"
+        ts_now = _compute_timescales_from_local(date_str, time_str, tz_name)
         ts_sample = {
-            "jd_utc": float(jd_now),
+            "jd_utc": float(ts_now.get("jd_utc")),
             "jd_tt": float(ts_now.get("jd_tt")),
             "jd_ut1": float(ts_now.get("jd_ut1")),
-            "delta_t": float(ts_now.get("delta_t")),
-            "delta_at": float(ts_now.get("delta_at")),
+            "delta_t": ts_now.get("delta_t"),
+            "delta_at": ts_now.get("delta_at"),
             "dut1": float(ts_now.get("dut1")),
         }
     except Exception:
@@ -1130,16 +1111,13 @@ def _horizons_spk_type2(cmd: str, start: str, stop: str, center: str = "500@10")
         wr("SPK_TYPE= 2")
         wr("!$$EOF")
 
-        # Horizons usually asks to confirm creation:
-        # Look for a 'Create and deliver SPK' or similar prompt; send YES and prefer HTTP delivery.
-        # We'll read a bit, then answer proactively.
+        # Confirm + choose HTTP (usually prompted)
         time.sleep(0.8)
         tn.write(b"Y\n")    # confirm
         time.sleep(0.4)
-        tn.write(b"H\n")    # choose HTTP delivery when asked
+        tn.write(b"H\n")    # choose HTTP
         time.sleep(0.4)
 
-        # Collect output for a while and close
         time.sleep(3.0)
         out_txt += tn.read_very_eager().decode("utf-8", "ignore")
     except Exception as e:
@@ -1150,18 +1128,14 @@ def _horizons_spk_type2(cmd: str, start: str, stop: str, center: str = "500@10")
         except Exception:
             pass
 
-    # Try to find a URL in the transcript
     m = re.search(r"https?://\S+", out_txt)
     if not m:
         return {"ok": False, "message": "no HTTP URL found in Horizons response", "url": None, "saved_as": None}
     url = m.group(0)
 
-    # Download to app/data/spk/<name>.bsp
     dst_dir = pathlib.Path("app/data/spk")
     dst_dir.mkdir(parents=True, exist_ok=True)
-    name = {
-        "1": "Ceres", "2": "Pallas", "3": "Juno", "4": "Vesta", "2060": "Chiron"
-    }.get(str(cmd), f"spk_{cmd}")
+    name = {"1": "Ceres", "2": "Pallas", "3": "Juno", "4": "Vesta", "2060": "Chiron"}.get(str(cmd), f"spk_{cmd}")
     dst_path = dst_dir / f"{name}.bsp"
     try:
         urllib.request.urlretrieve(url, dst_path.as_posix())
@@ -1187,7 +1161,7 @@ def dev_horizons_spk():
 
     results = []
     for cmd in targets:
-        results.append({ "cmd": cmd, **_horizons_spk_type2(cmd, start, stop, center) })
+        results.append({"cmd": cmd, **_horizons_spk_type2(cmd, start, stop, center)})
     ok = all(r.get("ok") for r in results)
     return jsonify({"ok": ok, "results": results}), 200 if ok else 502
 
