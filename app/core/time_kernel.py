@@ -4,7 +4,7 @@ Time Kernel — research-grade timescale conversions for AstroApp.
 
 Inputs:
   • Local civil time: date "YYYY-MM-DD", time "HH:MM[:SS]", IANA tz (e.g., "Asia/Kolkata")
-  • Or JD(UTC) via the jd_utc_to_timescales adapter
+  • Or JD(UTC) via jd_utc_to_timescales()
 
 Outputs:
   • jd_utc  : Julian Date (UTC)
@@ -14,22 +14,27 @@ Outputs:
               leap table source/status/last-known, warnings
 
 Policies & knobs:
-  • ΔT: Espenak–Meeus polynomials (+ small 'c' correction outside 1955–2005)
-  • ΔAT: try PyERFA (erfa.dat); fallback to internal helper (leapseconds.py)
-  • DUT1: env ASTRO_DUT1_BROADCAST (clamped to [-0.9, 0.9]) or 0.0
-  • Pre-1972: TT−UTC := ΔT + DUT1 (no official TAI−UTC then)
-  • Freshness: ASTRO_LEAP_POLICY = "warn" (default) | "error"
+  • ΔT: Espenak–Meeus polynomials (with small “c” correction outside 1955–2005)
+  • ΔAT: prefer ERFA (erfa.dat), fallback to app.core.leapseconds
+  • DUT1: env ASTRO_DUT1_BROADCAST (clamped to [-0.9, 0.9]) else 0.0
+  • Pre-1972: TT−UTC := ΔT + DUT1 (no official TAI−UTC before 1972)
 """
 
 from __future__ import annotations
+
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import Optional, List, Dict, Any
-
 import os
+import math
 
-from app.core.leapseconds import delta_at as resolve_delta_at, LeapInfo
+# Optional leap seconds helper (graceful fallback if absent)
+try:
+    from app.core.leapseconds import delta_at as resolve_delta_at, LeapInfo  # type: ignore
+except Exception:  # pragma: no cover
+    resolve_delta_at = None  # type: ignore
+    LeapInfo = object  # type: ignore
 
 
 # ─────────────────────────── Data model ────────────────────────────
@@ -39,7 +44,7 @@ class Timescales:
     jd_tt: float
     jd_ut1: float
     delta_t_sec: float              # TT - UT1 (Espenak–Meeus)
-    delta_at_sec: Optional[float]   # TAI - UTC (None when pre-1972 path used)
+    delta_at_sec: Optional[float]   # TAI - UTC (None when pre-1972 path used / unavailable)
     tt_minus_utc_sec: float         # TT - UTC actually applied
     dut1_applied_sec: float         # UT1 - UTC applied (env override / 0.0)
     y_decimal: float                # decimal year used for ΔT
@@ -51,8 +56,23 @@ class Timescales:
 
 
 # ─────────────────────── JD & calendar helpers ─────────────────────
+def _normalize_hms(time_str: str) -> str:
+    s = str(time_str).strip()
+    parts = s.split(":")
+    if len(parts) == 2:
+        hh, mm = parts; ss = "00"
+    elif len(parts) == 3:
+        hh, mm, ss = parts
+    else:
+        raise ValueError("time must be 'HH:MM' or 'HH:MM:SS'")
+    h = int(hh); m = int(mm); sec = int(ss)
+    if not (0 <= h <= 23 and 0 <= m <= 59 and 0 <= sec <= 59):
+        raise ValueError("time must be within 00:00:00–23:59:59")
+    return f"{h:02d}:{m:02d}:{sec:02d}"
+
+
 def _julian_date(dt_utc: datetime) -> float:
-    """UTC-aware datetime -> Julian Date (days)."""
+    """UTC-aware datetime → Julian Date (days)."""
     if dt_utc.tzinfo is None or dt_utc.tzinfo != timezone.utc:
         raise ValueError("dt_utc must be timezone-aware in UTC")
     Y, M, D = dt_utc.year, dt_utc.month, dt_utc.day
@@ -65,29 +85,25 @@ def _julian_date(dt_utc: datetime) -> float:
 
     jdn = D + (153 * m_ + 2) // 5 + 365 * y + y // 4 - y // 100 + y // 400 - 32045
     dayfrac = (h - 12) / 24.0 + m / 1440.0 + s / 86400.0
-    return jdn + dayfrac
+    return float(jdn + dayfrac)
 
 
 def _mjd_from_jd(jd: float) -> float:
-    return jd - 2400000.5
+    return float(jd - 2400000.5)
 
 
 def _decimal_year(dt_utc: datetime) -> float:
-    """Espenak uses y = year + (month - 0.5)/12 (mid-month)."""
-    return dt_utc.year + (dt_utc.month - 0.5) / 12.0
+    """Espenak uses y = year + (month − 0.5)/12 (mid-month)."""
+    return float(dt_utc.year + (dt_utc.month - 0.5) / 12.0)
 
 
 def _datetime_from_jd_utc(jd_utc: float) -> datetime:
-    """
-    Convert JD(UTC) -> timezone-aware datetime(UTC).
-    Prefer PyERFA jd2cal; fall back to a pure-python conversion.
-    """
+    """JD(UTC) → aware datetime(UTC). Prefer ERFA, fallback to pure-python."""
     try:
         import erfa  # type: ignore
         iy, im, id_, fd = erfa.jd2cal(jd_utc, 0.0)  # fd in days [0,1)
         return datetime(iy, im, id_, tzinfo=timezone.utc) + timedelta(days=float(fd))
     except Exception:
-        # Meeus-style inverse algorithm
         jd = jd_utc + 0.5
         Z = int(jd)
         F = jd - Z
@@ -103,7 +119,6 @@ def _datetime_from_jd_utc(jd_utc: float) -> datetime:
         day = B - D - int(30.6001 * E) + F
         month = E - 1 if E < 14 else E - 13
         year = C - 4716 if month > 2 else C - 4715
-
         day_int = int(day)
         frac = day - day_int
         seconds = frac * 86400.0
@@ -119,7 +134,7 @@ def _datetime_from_jd_utc(jd_utc: float) -> datetime:
 # ─────────────────────── ΔT (Espenak–Meeus) ───────────────────────
 def _delta_t_seconds_espenak(y_decimal: float) -> float:
     """NASA/Espenak–Meeus ΔT, with small 'c' correction outside 1955–2005."""
-    y = y_decimal
+    y = float(y_decimal)
     if y < -500:
         u = (y - 1820.0) / 100.0
         delta = -20.0 + 32.0 * u * u
@@ -176,27 +191,18 @@ def _delta_t_seconds_espenak(y_decimal: float) -> float:
 
 
 # ───────────────────────────── Public API ──────────────────────────
-def utc_from_local(date_str: str, time_str: str, tz_name: str) -> datetime:
+def utc_from_local(date: str, time: str, tz_name: str) -> datetime:
     """
     Build an aware UTC datetime from local components and IANA tz.
     date: 'YYYY-MM-DD'; time: 'HH:MM' or 'HH:MM:SS'; tz_name: 'Area/City'
     """
-    parts = time_str.split(":")
-    if len(parts) == 2:
-        hh, mm = parts; ss = "00"
-    elif len(parts) == 3:
-        hh, mm, ss = parts
-    else:
-        raise ValueError("time must be 'HH:MM' or 'HH:MM:SS'")
+    t_norm = _normalize_hms(time)
     try:
         tz = ZoneInfo(tz_name)
     except Exception as e:
         raise ValueError(f"invalid IANA timezone: {tz_name}") from e
     try:
-        dt_local = datetime(
-            int(date_str[0:4]), int(date_str[5:7]), int(date_str[8:10]),
-            int(hh), int(mm), int(ss), tzinfo=tz
-        )
+        dt_local = datetime.fromisoformat(f"{date}T{t_norm}").replace(tzinfo=tz)
     except Exception as e:
         raise ValueError("invalid date/time components") from e
     return dt_local.astimezone(timezone.utc)
@@ -212,8 +218,8 @@ def compute_timescales_from_utc(
     Core conversion:
       • JD_UTC from a UTC datetime
       • ΔT via Espenak–Meeus
-      • ΔAT via PyERFA (preferred) or leapseconds helper
-      • TT: ΔAT? → (TAI−UTC)+32.184 else (pre-1972 or unavailable) → ΔT + DUT1
+      • ΔAT via ERFA preferred, fallback to app.core.leapseconds
+      • TT: if ΔAT available: (TAI−UTC)+32.184 else (pre-1972 or unavailable): ΔT + DUT1
       • UT1: UTC + DUT1 (env override clamped to [-0.9, 0.9])
     """
     if dt_utc.tzinfo != timezone.utc:
@@ -242,36 +248,40 @@ def compute_timescales_from_utc(
     if leap_policy not in ("warn", "error"):
         leap_policy = "warn"
 
-    # ΔAT (TAI − UTC) — prefer ERFA, fallback to helper, final fallback to None
+    # ΔAT (TAI − UTC) — prefer ERFA, fallback to helper, else None
     delta_at: Optional[float] = None
     leap_source: Optional[str] = "erfa"
     leap_status: Optional[str] = "ok"
     leap_last_known: Optional[float] = None
 
-    # Try ERFA first
     try:
         import erfa  # type: ignore
         fd = (dt_utc.hour + (dt_utc.minute + (dt_utc.second + dt_utc.microsecond / 1e6) / 60.0) / 60.0) / 24.0
         delta_at = float(erfa.dat(dt_utc.year, dt_utc.month, dt_utc.day, fd))
     except Exception:
-        # Fallback to our helper
-        try:
-            li: LeapInfo = resolve_delta_at(mjd_utc)
-            delta_at = float(li.delta_at)
-            leap_source = li.source
-            leap_status = li.status
-            leap_last_known = li.last_known_mjd
-            if li.status != "ok":
-                msg = f"leap second table status: {li.status} (source={li.source}; last_mjd={li.last_known_mjd})"
+        if resolve_delta_at is not None:
+            try:
+                li: LeapInfo = resolve_delta_at(mjd_utc)  # type: ignore
+                delta_at = float(getattr(li, "delta_at"))
+                leap_source = getattr(li, "source", "leapseconds")
+                leap_status = getattr(li, "status", "ok")
+                leap_last_known = getattr(li, "last_known_mjd", None)
+                if leap_status != "ok":
+                    msg = f"leap second table status: {leap_status} (source={leap_source}; last_mjd={leap_last_known})"
+                    if leap_policy == "error":
+                        raise ValueError(msg)
+                    warnings.append(msg)
+            except Exception as e2:
+                leap_source = "unavailable"
+                leap_status = "unavailable"
                 if leap_policy == "error":
-                    raise ValueError(msg)
-                warnings.append(msg)
-        except Exception as e2:
-            # Last resort: operate without ΔAT and warn (handled below)
+                    raise ValueError("leap seconds unavailable") from e2
+                warnings.append("leap seconds unavailable; using TT-UTC = ΔT + DUT1 fallback")
+        else:
             leap_source = "unavailable"
             leap_status = "unavailable"
             if leap_policy == "error":
-                raise ValueError("leap seconds unavailable") from e2
+                raise ValueError("leap seconds unavailable")
             warnings.append("leap seconds unavailable; using TT-UTC = ΔT + DUT1 fallback")
 
     # Pre-1972 (or ΔAT unavailable): use ΔT + DUT1
@@ -281,21 +291,21 @@ def compute_timescales_from_utc(
             warnings.append("pre-1972 era: TT-UTC inferred as ΔT + DUT1 (no official TAI−UTC)")
         tt_minus_utc = delta_t + dut1
     else:
-        tt_minus_utc = delta_at + 32.184
+        tt_minus_utc = float(delta_at) + 32.184
 
     jd_tt = jd_utc + tt_minus_utc / 86400.0
     jd_ut1 = jd_utc + dut1 / 86400.0
 
     return Timescales(
-        jd_utc=jd_utc,
-        jd_tt=jd_tt,
-        jd_ut1=jd_ut1,
-        delta_t_sec=delta_t,
-        delta_at_sec=delta_at,
-        tt_minus_utc_sec=tt_minus_utc,
-        dut1_applied_sec=dut1,
-        y_decimal=y_dec,
-        mjd_utc=mjd_utc,
+        jd_utc=float(jd_utc),
+        jd_tt=float(jd_tt),
+        jd_ut1=float(jd_ut1),
+        delta_t_sec=float(delta_t),
+        delta_at_sec=None if delta_at is None else float(delta_at),
+        tt_minus_utc_sec=float(tt_minus_utc),
+        dut1_applied_sec=float(dut1),
+        y_decimal=float(y_dec),
+        mjd_utc=float(mjd_utc),
         leap_source=leap_source,
         leap_status=leap_status,
         leap_last_known_mjd=leap_last_known,
@@ -311,7 +321,7 @@ def compute_timescales_from_payload(
     dut1_override_sec: Optional[float] = None,
     leap_policy: Optional[str] = None,
 ) -> Timescales:
-    """Convenience wrapper for your validators’ payload shape."""
+    """Convenience wrapper for validators’ payload shape."""
     dt_utc = utc_from_local(date, time, place_tz)
     return compute_timescales_from_utc(
         dt_utc,
@@ -320,14 +330,37 @@ def compute_timescales_from_payload(
     )
 
 
-# ─────────────── Public adapter expected by routes.py ──────────────
+# ─────────────── Public adapters expected by various callers ───────────────
+
+def timescales_from_civil(date: str, time: str, tz_name: str, *_args) -> Dict[str, float]:
+    """
+    Minimal dict API for callers like astronomy._ensure_timescales().
+    Extra *_args (lat, lon) are accepted and ignored for signature compatibility.
+    """
+    ts = compute_timescales_from_payload(date=date, time=time, place_tz=tz_name)
+    return {"jd_ut": ts.jd_utc, "jd_tt": ts.jd_tt, "jd_ut1": ts.jd_ut1}
+
+
+# Aliases some code might look for
+def compute_timescales(date: str, time: str, tz_name: str, *_args) -> Dict[str, float]:
+    return timescales_from_civil(date, time, tz_name, *_args)
+
+def build_timescales(date: str, time: str, tz_name: str, *_args) -> Dict[str, float]:
+    return timescales_from_civil(date, time, tz_name, *_args)
+
+def to_timescales(date: str, time: str, tz_name: str, *_args) -> Dict[str, float]:
+    return timescales_from_civil(date, time, tz_name, *_args)
+
+def from_civil(date: str, time: str, tz_name: str, *_args) -> Dict[str, float]:
+    return timescales_from_civil(date, time, tz_name, *_args)
+
+
 def jd_utc_to_timescales(jd_utc: float) -> Dict[str, Any]:
     """
     Given JD(UTC), return a dict with jd_tt, jd_ut1, delta_t, delta_at, dut1, warnings, policy.
     """
-    dt_utc = _datetime_from_jd_utc(jd_utc)
+    dt_utc = _datetime_from_jd_utc(float(jd_utc))
     ts = compute_timescales_from_utc(dt_utc)
-
     return {
         "jd_tt": float(ts.jd_tt),
         "jd_ut1": float(ts.jd_ut1),
@@ -345,7 +378,7 @@ def jd_utc_to_timescales(jd_utc: float) -> Dict[str, Any]:
     }
 
 
-# Alternate name accepted by routes
+# Alternate name accepted by some routes
 utc_jd_to_timescales = jd_utc_to_timescales
 
 
@@ -363,6 +396,13 @@ __all__ = [
     "utc_from_local",
     "compute_timescales_from_utc",
     "compute_timescales_from_payload",
+    # minimal dict APIs used by astronomy._ensure_timescales():
+    "timescales_from_civil",
+    "compute_timescales",
+    "build_timescales",
+    "to_timescales",
+    "from_civil",
+    # JD(UTC) adapter(s):
     "jd_utc_to_timescales",
     "utc_jd_to_timescales",
     "TimeKernel",
