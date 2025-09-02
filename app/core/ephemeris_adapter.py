@@ -77,32 +77,26 @@ _NODE_MODEL         = os.getenv("OCP_NODE_MODEL", "true").strip().lower()  # "tr
 _NODE_ALERT_DEG     = float(os.getenv("OCP_NODE_ALERT_DEG", "10.0"))
 _NODE_CACHE_DECIMALS = int(os.getenv("OCP_NODE_CACHE_DECIMALS", "5"))
 
-# Allow explicit list of SPK files (comma separated) or fallback to directory scan
-# OCP_EXTRA_SPK_FILES=/abs/path/asteroids.bsp,/abs/path/chiron.bsp
-# OCP_EXTRA_SPK_DIR=app/data/spk
-# OCP_EPHEMERIS=/abs/path/de421.bsp
+# Kernel resolution rules (NO network):
+# OCP_EPHEMERIS (absolute path) else app/data/de421.bsp
+# Extras: OCP_EXTRA_SPK_FILES (comma list) or OCP_EXTRA_SPK_DIR (default app/data/spk)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Kernel resolution & loading (Skyfield)
 # ──────────────────────────────────────────────────────────────────────────────
 def _resolve_kernel_path() -> Optional[str]:
     """
-    Resolve a local DE421 first; else allow Skyfield to load by name.
+    Resolve local DE421 only. No network.
     Priority:
       1) OCP_EPHEMERIS (absolute path)
       2) app/data/de421.bsp
-      3) data/de421.bsp
-      4) None -> load("de421.bsp")
     """
     p = os.getenv("OCP_EPHEMERIS")
     if p and os.path.isfile(p):
         return p
-    for c in (
-        os.path.join(os.getcwd(), "app", "data", "de421.bsp"),
-        os.path.join(os.getcwd(), "data", "de421.bsp"),
-    ):
-        if os.path.isfile(c):
-            return c
+    p2 = os.path.join(os.getcwd(), "app", "data", "de421.bsp")
+    if os.path.isfile(p2):
+        return p2
     return None
 
 def _extra_spk_paths() -> List[str]:
@@ -125,6 +119,8 @@ def _get_timescale():
     global _TS
     if _TS is not None:
         return _TS
+    if not _skyfield_available():
+        return None
     try:
         from skyfield.api import load
         _TS = load.timescale()
@@ -146,6 +142,7 @@ def _get_kernels():
     """
     Returns (main_kernel, [extra_kernels]) for Skyfield use.
     Small-body SPKs may fail to load here; SPICE will handle them.
+    No network fetches are attempted.
     """
     global _MAIN, _EXTRA, _KERNEL_PATHS, EPHEMERIS_NAME
     if _MAIN is not None:
@@ -154,20 +151,15 @@ def _get_kernels():
         log.warning("Skyfield not installed; ephemeris unavailable for Skyfield path.")
         return None, []
 
-    # Main kernel
+    # Main kernel (no remote fallback)
     path = _resolve_kernel_path()
     if path:
         _MAIN = _load_kernel(path)
         if _MAIN:
             _KERNEL_PATHS.append(path)
     else:
-        try:
-            from skyfield.api import load
-            _MAIN = load("de421.bsp")
-            _KERNEL_PATHS.append("de421 (cache/name)")
-        except Exception as e:
-            log.warning("Failed to load main kernel: %s", e)
-            _MAIN = None
+        log.warning("No local DE421 found (OCP_EPHEMERIS/app/data/de421.bsp). Skyfield path disabled.")
+        _MAIN = None
 
     # Extra SPKs (often unsupported by Skyfield; harmless if None)
     _EXTRA = []
@@ -251,7 +243,7 @@ def _rotate_to_ecliptic_xyz(frame: str, jd_tt: float, x: float, y: float, z: flo
     try:
         import erfa
         if frame and frame.lower() in ("ecliptic-j2000", "j2000", "ecl-j2000"):
-            # Use mean obliquity at J2000
+            # Mean obliquity at J2000
             eps = 23.439291111  # degrees
             eps = math.radians(eps)
         else:
@@ -479,6 +471,7 @@ def _all_kernel_labels(k) -> List[str]:
                 labels.extend(list(obj.keys()))
         except Exception:
             pass
+    # include our small-body hints for a loose match pass
     for lst in _SMALLBODY_HINTS.values():
         labels.extend(lst)
     seen = set(); out: List[str] = []
@@ -523,7 +516,7 @@ def _get_body(name: str):
     return None
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Public APIs - FIXED FALLBACK LOGIC
+# Public APIs (SIGNATURES MUST NOT CHANGE)
 # ──────────────────────────────────────────────────────────────────────────────
 def ecliptic_longitudes(
     jd_tt: float,
@@ -542,8 +535,9 @@ def ecliptic_longitudes(
     Nodes are geocentric by definition.
 
     Strategy:
-      • Use Skyfield for anything it can resolve (incl. topocentric).
-      • If a small body is not available via Skyfield, try SPICE (geocentric).
+      • Use Skyfield for anything it can resolve (incl. topocentric) — primarily majors.
+      • If longitude is not actually computed via Skyfield (including small bodies or any failure),
+        fall through to SPICE (geocentric). DO NOT “continue” on Skyfield exceptions.
     """
     # Ensure SPICE is ready if available (no-op if already done)
     if _SPICE_OK:
@@ -559,6 +553,7 @@ def ecliptic_longitudes(
     if names:
         out: Dict[str, float] = {}
         for nm in names:
+            # Nodes (geocentric)
             if nm in _NODE_NAMES:
                 try:
                     out[nm] = _node_longitude(nm, jd_tt)
@@ -566,32 +561,29 @@ def ecliptic_longitudes(
                     pass
                 continue
 
-            # FIXED: Try both paths and ensure SPICE fallback works
             skyfield_success = False
-            
-            # 1) Try Skyfield path first (only for major planets or working small bodies)
-            if main is not None and t is not None and ef is not None and obs is not None:
-                # Only try Skyfield for major planets to avoid the fallback issue
-                if nm in _PLANET_KEYS:
-                    body = _get_body(nm)
-                    if body is not None:
-                        try:
-                            geo = obs.at(t).observe(body).apparent()
-                            lon, _ = _frame_latlon(geo, ef)
-                            out[nm] = lon
-                            skyfield_success = True
-                        except Exception as e:
-                            log.debug("Skyfield failed for %s: %s", nm, e)
 
-            # 2) If Skyfield didn't work, try SPICE (for small bodies and fallback)
+            # Skyfield for classical bodies only (and only if we can produce a longitude)
+            if nm in _PLANET_KEYS and main is not None and t is not None and ef is not None and obs is not None:
+                body = _get_body(nm)
+                if body is not None:
+                    try:
+                        geo = obs.at(t).observe(body).apparent()
+                        lon, _ = _frame_latlon(geo, ef)
+                        out[nm] = lon
+                        skyfield_success = True
+                    except Exception as e:
+                        log.debug("Skyfield failed for %s: %s", nm, e)
+
+            # If Skyfield didn't actually yield a longitude, try SPICE
             if not skyfield_success and _SPICE_READY:
                 lon = _spice_ecliptic_longitude(jd_tt, nm, frame=frame)
                 if lon is not None:
                     out[nm] = lon
-                    
+
         return out
 
-    # Legacy rows (10 planets) — Skyfield path only
+    # Legacy rows (10 planets) — Skyfield path only (topocentric if requested)
     rows: List[Dict[str, Any]] = []
     if main is None or t is None or ef is None or obs is None:
         return rows
@@ -602,13 +594,12 @@ def ecliptic_longitudes(
         try:
             geo = obs.at(t).observe(body).apparent()
             lon, lat = _frame_latlon(geo, ef)
-            # speed via central difference (Skyfield)
+            # speed via central difference in the same requested frame
             step = _speed_step_for(nm)
-            from skyfield.framelib import ecliptic_frame as _eframe
             ts = _get_timescale()
             t0 = ts.tt_jd(jd_tt - step); t1 = ts.tt_jd(jd_tt + step)
-            lon0, _ = _frame_latlon(obs.at(t0).observe(body).apparent(), _eframe)
-            lon1, _ = _frame_latlon(obs.at(t1).observe(body).apparent(), _eframe)
+            lon0, _ = _frame_latlon(obs.at(t0).observe(body).apparent(), ef)
+            lon1, _ = _frame_latlon(obs.at(t1).observe(body).apparent(), ef)
             spd = _wrap_diff_deg(lon1, lon0) / (2.0 * step)
             rows.append({"name": nm, "lon": lon, "lat": lat, "speed": spd})
         except Exception:
@@ -650,31 +641,28 @@ def ecliptic_longitudes_and_velocities(
                 pass
             continue
 
-        # FIXED: Same logic - try Skyfield only for major planets, SPICE for others
         skyfield_success = False
-        
-        # 1) Try Skyfield (major planets only)
-        if main is not None and t is not None and ef is not None and obs is not None:
-            if nm in _PLANET_KEYS:
-                body = _get_body(nm)
-                if body is not None:
-                    try:
-                        geo = obs.at(t).observe(body).apparent()
-                        lon, _ = _frame_latlon(geo, ef)
-                        lon_map[nm] = lon
-                        # speed
-                        step = _speed_step_for(nm)
-                        from skyfield.framelib import ecliptic_frame as _eframe
-                        ts = _get_timescale()
-                        t0 = ts.tt_jd(jd_tt - step); t1 = ts.tt_jd(jd_tt + step)
-                        lon0, _ = _frame_latlon(obs.at(t0).observe(body).apparent(), _eframe)
-                        lon1, _ = _frame_latlon(obs.at(t1).observe(body).apparent(), _eframe)
-                        vel_map[nm] = _wrap_diff_deg(lon1, lon0) / (2.0 * step)
-                        skyfield_success = True
-                    except Exception as e:
-                        log.debug("Skyfield failed for %s: %s", nm, e)
 
-        # 2) SPICE fallback (small-bodies and failed major planets)
+        # 1) Try Skyfield (majors only) and compute velocity in same requested frame
+        if nm in _PLANET_KEYS and main is not None and t is not None and ef is not None and obs is not None:
+            body = _get_body(nm)
+            if body is not None:
+                try:
+                    geo = obs.at(t).observe(body).apparent()
+                    lon, _ = _frame_latlon(geo, ef)
+                    lon_map[nm] = lon
+                    # speed
+                    step = _speed_step_for(nm)
+                    ts = _get_timescale()
+                    t0 = ts.tt_jd(jd_tt - step); t1 = ts.tt_jd(jd_tt + step)
+                    lon0, _ = _frame_latlon(obs.at(t0).observe(body).apparent(), ef)
+                    lon1, _ = _frame_latlon(obs.at(t1).observe(body).apparent(), ef)
+                    vel_map[nm] = _wrap_diff_deg(lon1, lon0) / (2.0 * step)
+                    skyfield_success = True
+                except Exception as e:
+                    log.debug("Skyfield failed for %s: %s", nm, e)
+
+        # 2) SPICE fallback (small-bodies and failed majors)
         if not skyfield_success and _SPICE_READY:
             lon, spd = _spice_ecliptic_longitude_speed(jd_tt, nm, frame=frame)
             if lon is not None:
@@ -724,19 +712,19 @@ def ephemeris_diagnostics(requested: Optional[List[str]] = None) -> Dict[str, An
                      "North Node", "South Node"]
     wanted = requested or default_names
 
-    resolved = {}
+    resolved: Dict[str, Dict[str, str]] = {}
     missing: List[str] = []
     for nm in wanted:
         if nm in _NODE_NAMES:
             resolved[nm] = {"type": "node", "kernel": "computed", "label": nm}
             continue
 
-        # Check SPICE first for small bodies
+        # Prefer SPICE for small bodies
         if _SPICE_READY and _spice_id_for_name(nm) is not None:
             resolved[nm] = {"type": "body", "kernel": "spice", "label": str(_spice_id_for_name(nm))}
             continue
 
-        # Fallback to Skyfield resolution  
+        # Fall back to Skyfield kernel resolution
         b = _get_body(nm)
         if b is not None:
             used_label = None
