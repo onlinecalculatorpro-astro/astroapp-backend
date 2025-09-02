@@ -1093,3 +1093,82 @@ def dev_echo_timescales():
         return jsonify({"ok": True, "timescales": ts}), 200
     except Exception as e:
         return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
+
+
+# ───────────────────────────── NEW: Ephemeris adapter endpoints ─────────────────────────────
+@api.post("/api/ephemeris/diagnostics")
+def ephemeris_diagnostics_endpoint():
+    """Expose adapter diagnostics for the DevTools harness."""
+    try:
+        from app.core import ephemeris_adapter as ea
+        return jsonify(ea.ephemeris_diagnostics()), 200
+    except Exception as e:
+        return _json_error("ephemeris_diag_error", str(e) if DEBUG_VERBOSE else None, 500)
+
+
+@api.post("/api/ephemeris/longitudes")
+def ephemeris_longitudes_endpoint():
+    """
+    Body:
+      { jd_tt: float, names?: [str], frame?: "ecliptic-of-date"|"ecliptic-J2000",
+        topocentric?: bool, latitude?: float, longitude?: float, elevation_m?: float }
+    Returns:
+      { name: longitude_deg, ... }  (nodes included if requested)
+    """
+    try:
+        body = request.get_json(force=True) or {}
+        jd_tt = float(body["jd_tt"])
+        names = body.get("names")
+        frame = str(body.get("frame") or "ecliptic-of-date")
+        topocentric = bool(body.get("topocentric", False))
+        latitude = body.get("latitude")
+        longitude = body.get("longitude")
+        elevation_m = body.get("elevation_m")
+        from app.core import ephemeris_adapter as ea
+        out = ea.ecliptic_longitudes(
+            jd_tt,
+            names=names,
+            frame=frame,
+            topocentric=topocentric,
+            latitude=latitude,
+            longitude=longitude,
+            elevation_m=elevation_m,
+        )
+        return jsonify(out), 200
+    except KeyError as e:
+        return _json_error("validation_error", f"missing field: {e.args[0]}", 400)
+    except Exception as e:
+        return _json_error("ephemeris_longitudes_error", str(e) if DEBUG_VERBOSE else None, 500)
+
+
+@api.post("/api/ephemeris/longitudes_and_velocities")
+def ephemeris_lv_endpoint():
+    """
+    Body: same as /api/ephemeris/longitudes but 'names' is REQUIRED.
+    Returns:
+      { longitudes: {name:deg}, velocities: {name:deg_per_day (no nodes)} }
+    """
+    try:
+        body = request.get_json(force=True) or {}
+        jd_tt = float(body["jd_tt"])
+        names = body["names"]
+        frame = str(body.get("frame") or "ecliptic-of-date")
+        topocentric = bool(body.get("topocentric", False))
+        latitude = body.get("latitude")
+        longitude = body.get("longitude")
+        elevation_m = body.get("elevation_m")
+        from app.core import ephemeris_adapter as ea
+        out = ea.ecliptic_longitudes_and_velocities(
+            jd_tt,
+            names=names,
+            frame=frame,
+            topocentric=topocentric,
+            latitude=latitude,
+            longitude=longitude,
+            elevation_m=elevation_m,
+        )
+        return jsonify(out), 200
+    except KeyError as e:
+        return _json_error("validation_error", f"missing field: {e.args[0]}", 400)
+    except Exception as e:
+        return _json_error("ephemeris_lv_error", str(e) if DEBUG_VERBOSE else None, 500)
