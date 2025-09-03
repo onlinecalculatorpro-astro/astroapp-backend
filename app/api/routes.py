@@ -747,7 +747,7 @@ def predictions_route():
                 "abstained": abstained,
                 "evidence": pr.get("evidence"),
                 "mode": chart.get("mode") if chart else None,
-                "ayanamsa_deg": (chart or {}).get("ayanamsa_deg") or _extract_ayanamsa_from_chart(chart) if chart else None,
+                "ayanamsa_deg": ((chart.get("ayanamsa_deg") if ("ayanamsa_deg" in chart) else _extract_ayanamsa_from_chart(chart)) if chart else None),
                 "notes": "QIA+calibrated placeholder; subject to M3 tuning "
                          + ("abstained" if abstained else "accepted"),
             }
