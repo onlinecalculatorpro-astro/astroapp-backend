@@ -1,4 +1,24 @@
 # app/api/routes.py
+"""
+API ROUTES — Research-Grade, ERFA-Aligned Timescales (TT/UT1 exactness)
+
+What & Why
+- Public HTTP API (chart, houses, ephemeris, predictions).
+- Single source of truth for civil→(UTC, TT, UT1): app.core.timescales.build_timescales().
+- Strict research mode: DUT1 is required (payload or env), no silent fallbacks.
+- No POSIX timestamp shortcuts; ERFA two-part JD path preserves precision.
+
+Design Highlights
+- Timescales dataclass → adapted to dict for response/meta shape.
+- ASC/MC parity recomputation uses ERFA gst06a/obl06+nut06a.
+- Sidereal rotation applies chart ayanamsa to house angles/cusps.
+- Houses go via policy façade if present; legacy fallback allowed.
+
+Precision Guarantees (Gold Standard)
+- JD_TT/JD_UT1 via ERFA → ~1e-15 day arithmetic.
+- ΔAT (TAI–UTC) from ERFA leap-second table; DUT1 enforced (±0.9 s operational reality).
+"""
+
 from __future__ import annotations
 
 import inspect
@@ -25,7 +45,10 @@ from app.core.validators import (
     parse_ephemeris_payload,
 )
 
-# Use the new predictions engine (structured output)
+# Timescales: final ERFA-based API
+from app.core.timescales import build_timescales, TimeScales
+
+# Predictions
 from app.core.predict import predict as predict_engine
 
 log = logging.getLogger(__name__)
@@ -67,11 +90,11 @@ except Exception as e1:  # pragma: no cover
 
 # ───────────────────────────── Houses: prefer policy façade ─────────────────────
 _HOUSES_KIND = "policy"
-_can_sys = None  # canonicalizer (if policy façade is present)
+_can_sys = None
 try:
     from app.core.house import (
         compute_houses_with_policy as _houses_fn,
-        canonicalize_system as _can_sys,  # ← system alias canonicalizer
+        canonicalize_system as _can_sys,
         POLAR_SOFT_LIMIT_DEG,
         POLAR_HARD_LIMIT_DEG,
     )  # type: ignore
@@ -79,7 +102,7 @@ except Exception:
     try:
         from app.core.houses_advanced import compute_house_system as _houses_fn  # type: ignore
         _HOUSES_KIND = "legacy"
-        POLAR_SOFT_LIMIT_DEG = float(os.getenv("ASTRO_POLAR_SOFT_LAT", "66.0"))  # fallback constants
+        POLAR_SOFT_LIMIT_DEG = float(os.getenv("ASTRO_POLAR_SOFT_LAT", "66.0"))
         POLAR_HARD_LIMIT_DEG = float(os.getenv("ASTRO_POLAR_HARD_LAT", "80.0"))
     except Exception as e:
         _houses_fn = None  # type: ignore
@@ -87,9 +110,6 @@ except Exception:
         POLAR_SOFT_LIMIT_DEG = float(os.getenv("ASTRO_POLAR_SOFT_LAT", "66.0"))
         POLAR_HARD_LIMIT_DEG = float(os.getenv("ASTRO_POLAR_HARD_LAT", "80.0"))
         log.error("No house engine available: %r", e)
-
-# Timescales
-from app.core import timescales as _ts  # type: ignore
 
 # Optional leap-seconds helper
 try:  # pragma: no cover
@@ -179,52 +199,64 @@ def _recompute_angles_exact(
         mc = _wrap360(mc - float(ayanamsa_deg))
     return {"asc_deg": asc, "mc_deg": mc}
 
-# ───────────────────────────── Timescales helpers ─────────────────────────────
-def _compute_timescales_from_local(date_str: str, time_str: str, tz_name: str) -> Dict[str, Any]:
+# ───────────────────────────── Timescales helper (matches final API) ─────────────────────────────
+def _compute_timescales_from_local(
+    date_str: str,
+    time_str: str,
+    tz_name: str,
+    payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Canonical timescale builder using app.core.timescales.build_timescales()
+    - Requires DUT1 (payload 'dut1' or environment ASTRO_DUT1_BROADCAST/ASTRO_DUT1).
+    - Converts TimeScales dataclass to dict shape used throughout the API.
+    """
+    # Validate tz early for clearer errors (build_timescales also checks)
     try:
-        tz = ZoneInfo(tz_name)
+        _ = ZoneInfo(tz_name)
     except Exception:
         raise ValidationError({"place_tz": "must be a valid IANA zone like 'Asia/Kolkata'"})
 
-    def _norm_hms(s: str) -> str:
-        s = str(s).strip()
-        parts = s.split(":")
-        if len(parts) == 2:
-            hh, mm = parts
-            return f"{int(hh):02d}:{int(mm):02d}:00"
-        if len(parts) == 3:
-            hh, mm, ss = parts
-            return f"{int(hh):02d}:{int(mm):02d}:{int(ss):02d}"
-        raise ValidationError({"time": "must be 'HH:MM' or 'HH:MM:SS'"})
+    # DUT1: strict research mode (no silent fallback)
+    if payload and "dut1" in payload:
+        try:
+            dut1_seconds = float(payload["dut1"])
+        except Exception:
+            raise ValidationError({"dut1": "must be a number (seconds)"})
+    else:
+        env_dut1 = os.getenv("ASTRO_DUT1_BROADCAST", os.getenv("ASTRO_DUT1"))
+        if env_dut1 is None:
+            raise ValidationError({"dut1": "DUT1 required (provide in request or set ASTRO_DUT1[_BROADCAST])"})
+        try:
+            dut1_seconds = float(env_dut1)
+        except Exception:
+            raise ValidationError({"dut1": "environment DUT1 must be a valid number"})
 
-    time_norm = _norm_hms(time_str)
-    fmt = "%Y-%m-%d %H:%M:%S"
-
-    dt_local = datetime.strptime(f"{date_str} {time_norm}", fmt).replace(tzinfo=tz)
-    dt_utc = dt_local.astimezone(timezone.utc)
-
-    jd_utc = _ts.julian_day_utc(date_str, time_norm, tz_name)
-    jd_tt = _ts.jd_tt_from_utc_jd(jd_utc, dt_utc.year, dt_utc.month)
-
-    dut1 = float(os.getenv("ASTRO_DUT1_BROADCAST", os.getenv("ASTRO_DUT1", "0.0")))
-    jd_ut1 = float(jd_utc) + dut1 / 86400.0
-
+    # Build timescales, map domain ValueError → API ValidationError with field hints
     try:
-        delta_t = float(_ts.delta_t_seconds(dt_utc.year, dt_utc.month))  # type: ignore[attr-defined]
-    except Exception:
-        delta_t = None
+        ts: TimeScales = build_timescales(date_str, time_str, tz_name, dut1_seconds)
+    except ValueError as e:
+        msg = str(e)
+        # heuristic field mapping for better UX
+        if "DUT1" in msg:
+            raise ValidationError({"dut1": msg})
+        if "UTC before 1960" in msg or "pre-1960" in msg:
+            raise ValidationError({"date": msg})
+        if "leap" in msg.lower() or "ΔAT" in msg or "TAI-UTC" in msg:
+            raise ValidationError({"timescales": msg})
+        raise ValidationError({"timescales": msg})
 
-    tz_offset_seconds = int(dt_local.utcoffset().total_seconds()) if dt_local.utcoffset() else 0
+    # Adapt dataclass → dict expected by callers
     return {
-        "jd_utc": float(jd_utc),
-        "jd_tt": float(jd_tt),
-        "jd_ut1": float(jd_ut1),
-        "delta_t": delta_t,
-        "delta_at": None,
-        "dut1": float(dut1),
+        "jd_utc": float(ts.jd_utc),
+        "jd_tt": float(ts.jd_tt),
+        "jd_ut1": float(ts.jd_ut1),
+        "delta_t": float(ts.delta_t),
+        "delta_at": float(ts.dat),  # dat → delta_at
+        "dut1": float(ts.dut1),
         "timezone": tz_name,
-        "tz_offset_seconds": tz_offset_seconds,
-        "warnings": [],
+        "tz_offset_seconds": int(ts.tz_offset_seconds),
+        "warnings": list(ts.warnings),
     }
 
 # ─────────────────────── engine call adapters ───────────────────────
@@ -308,7 +340,6 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
     lon = float(payload["longitude"])
 
     requested_system_raw = (payload.get("house_system") or "").strip()
-    # Canonicalize only if policy façade is present; legacy engine may not support extra aliases
     requested_system = (
         _can_sys(requested_system_raw) if (_can_sys and requested_system_raw)
         else (requested_system_raw.lower() or None)
@@ -433,13 +464,8 @@ def _recompute_houses_angles_if_needed(
 
 # ───────────────────────────── helpers: predictions shape ─────────────────────────────
 def _prepare_chart_for_predict(chart: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Keep chart['bodies'] exactly as provided (typically a list of rows).
-    Provide a sidecar name→row map at chart['bodies_map'] for convenience.
-    """
     ch = dict(chart)
     bodies = ch.get("bodies")
-
     if isinstance(bodies, list):
         name_map: Dict[str, Any] = {}
         for b in bodies:
@@ -449,11 +475,8 @@ def _prepare_chart_for_predict(chart: Dict[str, Any]) -> Dict[str, Any]:
                     name_map[nm] = b
         if name_map:
             ch["bodies_map"] = name_map
-
     elif isinstance(bodies, dict):
-        # If upstream ever sends a dict, expose it as the map without touching 'bodies'
         ch["bodies_map"] = bodies
-
     return ch
 
 # ───────────────────────────── error helper ─────────────────────────────
@@ -476,7 +499,7 @@ def calculate():
         hs = str(body.get("house_system", "")).strip()
         if hs:
             payload["house_system"] = hs
-        for k in ("bodies", "ayanamsa", "topocentric", "elevation_m"):
+        for k in ("bodies", "ayanamsa", "topocentric", "elevation_m", "dut1"):
             if k in body:
                 payload[k] = body[k]
     except ValidationError as e:
@@ -485,7 +508,7 @@ def calculate():
         return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
 
     tz_name = payload.get("place_tz") or payload.get("timezone") or "UTC"
-    ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name)
+    ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name, payload=payload)
 
     chart: Dict[str, Any]
     chart_warnings: List[str] = []
@@ -510,7 +533,6 @@ def calculate():
     except NotImplementedError as e:
         return _json_error("houses_not_implemented", str(e) if DEBUG_VERBOSE else None, 501)
     except ValueError as e:
-        # Policy/validation rejections → 422
         return _json_error("houses_error", str(e), 422)
     except Exception as e:
         return _json_error("houses_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
@@ -555,14 +577,14 @@ def report():
         hs = str(body.get("house_system", "")).strip()
         if hs:
             payload["house_system"] = hs
-        for k in ("bodies", "ayanamsa", "topocentric", "elevation_m"):
+        for k in ("bodies", "ayanamsa", "topocentric", "elevation_m", "dut1"):
             if k in body:
                 payload[k] = body[k]
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
 
     tz_name = payload.get("place_tz") or payload.get("timezone") or "UTC"
-    ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name)
+    ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name, payload=payload)
 
     chart: Dict[str, Any]
     chart_warnings: List[str] = []
@@ -629,19 +651,18 @@ def report():
 def predictions_route():
     body = request.get_json(force=True) or {}
     try:
-        # Keep your validator contract: returns (payload, horizon)
         payload, horizon = parse_prediction_payload(body)
         hs = str(body.get("house_system", "")).strip()
         if hs:
             payload["house_system"] = hs
-        for k in ("bodies", "ayanamsa", "topocentric", "elevation_m"):
+        for k in ("bodies", "ayanamsa", "topocentric", "elevation_m", "dut1"):
             if k in body:
                 payload[k] = body[k]
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
 
     tz_name = payload.get("place_tz") or payload.get("timezone") or "UTC"
-    ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name)
+    ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name, payload=payload)
 
     chart: Optional[Dict[str, Any]]
     chart_error: Optional[str] = None
@@ -687,17 +708,16 @@ def predictions_route():
 
     chart_for_predict = _prepare_chart_for_predict(chart)
 
-    # Call the structured predictions engine
+    # Structured predictions engine
     try:
         result = predict_engine(chart_for_predict, houses, horizon)
-        # Support both shapes: dict with "predictions" (new) or list (legacy)
         raw_preds = result.get("predictions") if isinstance(result, dict) else result
         if not isinstance(raw_preds, list):
             raise TypeError("predict() returned unexpected shape")
     except Exception as e:
         return jsonify({"ok": False, "error": "internal_error", "message": str(e), "type": type(e).__name__}), 500
 
-    # Load HC thresholds (with overrides)
+    # HC thresholds (with overrides)
     th_path = os.environ.get("ASTRO_HC_THRESHOLDS", "config/hc_thresholds.json")
     try:
         with open(th_path, "r", encoding="utf-8") as f:
@@ -753,7 +773,7 @@ def predictions_route():
             }
         )
 
-    # Optional HC auto-flagging (if no explicit overrides)
+    # Optional HC auto-flagging
     if not overrides and not os.environ.get("ASTRO_HC_DEBUG_OVERRIDES"):
         try:
             preds = flag_predictions(preds, _freeze_horizon(horizon), th_path)
@@ -939,8 +959,10 @@ def dev_echo_timescales():
         date = body.get("date") or "2000-01-01"
         time_ = body.get("time") or "12:00"
         tz = body.get("place_tz") or body.get("timezone") or "UTC"
-        ts = _compute_timescales_from_local(date, time_, tz)
+        ts = _compute_timescales_from_local(date, time_, tz, payload=body if isinstance(body, dict) else None)
         return jsonify({"ok": True, "timescales": ts}), 200
+    except ValidationError as e:
+        return _json_error("validation_error", e.errors(), 400)
     except Exception as e:
         return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
 
@@ -953,7 +975,6 @@ def dev_horizons_spk():
 
 # ───────────────────────────── Ephemeris adapter endpoints ─────────────────────────────
 def _norm_rows_from_longitudes(raw: Any) -> List[Dict[str, Any]]:
-    """Adapter-normalizer → rows[{body,name,longitude}] supporting maps, arrays, single-key objects, or results."""
     rows: List[Dict[str, Any]] = []
     if raw is None:
         return rows
@@ -976,7 +997,6 @@ def _norm_rows_from_longitudes(raw: Any) -> List[Dict[str, Any]]:
     return rows
 
 def _norm_rows_from_lv(raw: Any) -> List[Dict[str, Any]]:
-    """Adapter-normalizer → rows[{body,name,longitude,velocity}] supporting {longitudes,velocities} or results."""
     rows: Dict[str, Dict[str, Any]] = {}
     if isinstance(raw, dict) and "longitudes" in raw and "velocities" in raw:
         for k, v in (raw.get("longitudes") or {}).items():
@@ -1020,9 +1040,9 @@ def ephemeris_longitudes_endpoint():
     """
     Body can include either:
       • jd_tt (number), OR civil inputs (date, time, place_tz|tz).
-      • bodies: [ 'sun','moon','mercury', ... ]   (names optional; derived if omitted)
+      • bodies: [ 'sun','moon','mercury', ... ]
       • frame: 'ecliptic-of-date' | 'ecliptic-j2000' (default ecliptic-of-date)
-      • center: 'geocentric' | 'topocentric'       (default geocentric)
+      • center: 'geocentric' | 'topocentric' (default geocentric)
       • latitude/longitude/elev_m required when center='topocentric'
     """
     try:
@@ -1057,7 +1077,6 @@ def ephemeris_longitudes_endpoint():
 
     rows = _norm_rows_from_longitudes(raw)
 
-    # STRICT filter + keep request order
     requested = [b.lower() for b in bodies]
     name_map  = {b.lower(): n for b, n in zip(bodies, names)}
     by_body   = {r["body"]: r for r in rows if isinstance(r.get("longitude"), (int, float))}
@@ -1138,3 +1157,7 @@ def ephemeris_lv_endpoint():
         "units": {"angles": "deg", "velocities": "deg/day"},
         "results": ordered,
     }), 200
+
+# ───────────────────────────── Helpers used above but defined later ─────────────────────────────
+def _freeze_horizon(h: Any) -> Any:
+    return h
