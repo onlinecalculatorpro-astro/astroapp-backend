@@ -171,49 +171,13 @@ def _local_to_utc_calendar(
 def _utc_calendar_to_jd_utc(
     iy: int, im: int, iday: int, ih: int, imin: int, isec: int, ifrac: int
 ) -> float:
-    """
-    Produce JD(UTC) via ERFA dtf2d, adapting to the pyERFA build:
-      (A) positional 8-arg:  dtf2d("UTC", iy, im, id, ih, imn, sec, f)
-      (B) ihmsf[4] array:    dtf2d("UTC", iy, im, id, [ih, imn, sec, f])
-      (C) keyword 8-arg:     dtf2d("UTC", iy=..., im=..., id=..., ih=..., imn=..., sec=..., f=...)
-    """
-    sig = getattr(erfa.dtf2d, "__text_signature__", "") or (erfa.dtf2d.__doc__ or "")
-    msgs = []
-
-    # Choose a likely-good order based on the signature
-    if "ihmsf" in sig:
-        try_order = ["array", "pos", "kw"]
-    elif ("imn" in sig) and ("sec" in sig):
-        try_order = ["pos", "array", "kw"]
-    else:
-        try_order = ["pos", "array", "kw"]
-
-    for mode in try_order:
-        try:
-            if mode == "pos":
-                utc1, utc2 = erfa.dtf2d(
-                    "UTC",
-                    int(iy), int(im), int(iday),
-                    int(ih), int(imin), int(isec), int(ifrac),
-                )
-            elif mode == "array":
-                utc1, utc2 = erfa.dtf2d(
-                    "UTC",
-                    int(iy), int(im), int(iday),
-                    [int(ih), int(imin), int(isec), int(ifrac)],
-                )
-            else:  # "kw"
-                utc1, utc2 = erfa.dtf2d(
-                    "UTC",
-                    iy=int(iy), im=int(im), id=int(iday),
-                    ih=int(ih), imn=int(imin), sec=int(isec), f=int(ifrac),
-                )
-            return math.fsum((utc1, utc2))
-        except Exception as e:
-            msgs.append(f"{mode}={e!s}")
-
-    raise ValueError(f"ERFA dtf2d failed (tried {', '.join(try_order)}): " + " ; ".join(msgs))
-
+    """Produce JD(UTC) via ERFA dtf2d - this ERFA expects exactly 7 args."""
+    try:
+        # 7 arguments total: scale + 6 time components
+        utc1, utc2 = erfa.dtf2d("UTC", int(iy), int(im), int(iday), int(ih), int(imin), int(isec))
+        return math.fsum((utc1, utc2))
+    except Exception as e:
+        raise ValueError(f"ERFA dtf2d failed: {e}")
     
     # C) Try keyword 8-arg (some builds expose named params)
     try:
