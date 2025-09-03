@@ -172,26 +172,50 @@ def _utc_calendar_to_jd_utc(
     iy: int, im: int, iday: int, ih: int, imin: int, isec: int, ifrac: int
 ) -> float:
     """
-    Produce JD(UTC) via ERFA dtf2d, handling pyERFA builds that expose:
+    Produce JD(UTC) via ERFA dtf2d, adapting to the pyERFA build:
       (A) positional 8-arg:  dtf2d("UTC", iy, im, id, ih, imn, sec, f)
       (B) ihmsf[4] array:    dtf2d("UTC", iy, im, id, [ih, imn, sec, f])
       (C) keyword 8-arg:     dtf2d("UTC", iy=..., im=..., id=..., ih=..., imn=..., sec=..., f=...)
     """
+    sig = getattr(erfa.dtf2d, "__text_signature__", "") or (erfa.dtf2d.__doc__ or "")
+    msgs = []
 
-    # A) Try positional 8-arg first (your latest error indicates this is needed)
-    try:
-        utc1, utc2 = erfa.dtf2d(
-            "UTC", int(iy), int(im), int(iday), int(ih), int(imin), int(isec), int(ifrac)
-        )
-        return math.fsum((utc1, utc2))
-    except Exception as e_pos:
-        last = f"pos-8: {e_pos!s}"
+    # Prefer what the signature hints at
+    try_order = []
+    if "ihmsf" in sig:
+        try_order = ["array", "pos", "kw"]
+    elif ("imn" in sig) and ("sec" in sig):
+        try_order = ["pos", "array", "kw"]
+    else:
+        try_order = ["pos", "array", "kw"]  # safest default
 
-    # B) Try ihmsf[4] array form
-    try:
-        ihmsf = [int(ih), int(imin), int(isec), int(ifrac)]
-        utc1, utc2 = erfa.dtf2d("UTC", int(iy), int(im), int(iday), ihmsf)
-        return math.fsum((utc1, utc2))
+    for mode in try_order:
+        try:
+            if mode == "pos":
+                utc1, utc2 = erfa.dtf2d(
+                    "UTC",
+                    int(iy), int(im), int(iday),
+                    int(ih), int(imin), int(isec), int(ifrac),
+                )
+            elif mode == "array":
+                utc1, utc2 = erfa.dtf2d(
+                    "UTC", int(iy), int(im), int(iday),
+                    [int(ih), int(imin), int(isec), int(ifrac)],
+                )
+            else:  # "kw"
+                # Some builds accept keywords; many do not.
+                utc1, utc2 = erfa.dtf2d(
+                    "UTC",
+                    iy=int(iy), im=int(im), id=int(iday),
+                    ih=int(ih), imn=int(imin), sec=int(isec), f=int(ifrac),
+                )
+            return math.fsum((utc1, utc2))
+        except Exception as e:
+            msgs.append(f"{mode}={e!s}")
+
+    # If all attempts failed, surface a clear error
+    raise ValueError(f"ERFA dtf2d failed (tried {', '.join(try_order)}): " + " ; ".join(msgs))
+
     except Exception as e_arr:
         last += f"; ihmsf: {e_arr!s}"
 
