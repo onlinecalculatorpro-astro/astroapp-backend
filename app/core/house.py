@@ -4,22 +4,41 @@ from __future__ import annotations
 """
 Policy façade for house-system computation.
 
-This module normalizes public house-system names, enforces strict time-scales,
-applies a clear polar-latitude policy, and executes the gold-standard engine
-(app.core.houses_advanced.PreciseHouseCalculator) with a numeric fallback chain.
+This module:
+- Normalizes user-facing house-system names to canonical labels (slug-based).
+- Enforces strict time-scales (JD_TT + JD_UT1).
+- Applies a clear polar-latitude policy and numeric fallback chain.
+- Calls the gold-standard engine: app.core.houses_advanced.PreciseHouseCalculator.
 
-POLAR POLICY (decision tree — high visibility)
+POLAR POLICY — decision tree
 1) Validate latitude within (-90, 90); hard-guard near poles (±89.999999°).
 2) If requested system ∈ HARD_REJECT and |lat| ≥ hard_limit (default 80°):
-     - Record a warning and attempt fallbacks (do not compute with the requested).
+     → Record a warning and attempt fallbacks (do NOT compute with requested).
 3) If policy == "reject_above_66deg" and requested ∈ RISKY and |lat| > soft_limit (default 66°):
-     - Reject early with an explanatory error.
-4) Otherwise, build the fallback chain:
-     - requested → env-provided chain → similarity-based defaults → robust systems tail
-     - If policy == "fallback_to_equal_above_66deg" AND requested is RISKY at |lat|>soft_limit:
-         bias the chain to robust families first:
-           {equal, whole, equal_from_mc, natural_houses} then porphyry, then others.
-5) Iterate over the chain (unless fallbacks disabled), returning the first success.
+     → Reject early with an explanatory error (no fallbacks tried).
+4) Otherwise build the fallback chain:
+     requested → env-provided chain → similarity-based defaults → robust tail
+     If policy == "fallback_to_equal_above_66deg" AND requested is RISKY at |lat|>soft_limit:
+       → Bias chain to robust families first:
+         {equal, whole, equal_from_mc, natural_houses} then porphyry, then others.
+5) Iterate over chain (unless fallbacks disabled), return first success.
+
+QUICK EXAMPLES
+-----------
+from app.core.house import compute_houses_with_policy
+
+# Strict mode (recommended): must pass jd_tt and jd_ut1
+res = compute_houses_with_policy(
+    lat=51.5, lon=-0.12, system="placidus",
+    jd_tt=2451545.0, jd_ut1=2451545.0,
+)
+
+# Override polar policy to hard-reject risky systems above the soft limit
+res = compute_houses_with_policy(
+    lat=70.0, lon=19.0, system="placidus",
+    jd_tt=2451545.0, jd_ut1=2451545.0,
+    polar_policy="reject_above_66deg",
+)
 """
 
 import difflib
@@ -76,9 +95,11 @@ _FALLBACK_JSON: Optional[str] = os.getenv("ASTRO_HOUSES_FALLBACK_JSON")
 DEFAULT_DIAGNOSTICS: Final[bool] = os.getenv("ASTRO_HOUSES_DEBUG", "").lower() in ("1", "true", "yes", "on")
 DEFAULT_VALIDATION: Final[bool] = os.getenv("ASTRO_HOUSES_VALIDATE", "").lower() in ("1", "true", "yes", "on")
 
+# Collect boot-time non-fatal issues (e.g., invalid env JSON) to surface later
+_BOOT_WARNINGS: List[str] = []
+
 # ───────────────────────── Public Systems (canonical) ─────────────────────────
-# We expose a compact, canonical list for docs/clients. Aliases (spaces/hyphens/case)
-# are handled by the slug canonicalizer below.
+# Compact canonical list for docs/clients. Aliases are handled via slug canonicalizer.
 SUPPORTED_HOUSE_SYSTEMS: Final[Tuple[str, ...]] = (
     # classical/modern (implemented)
     "placidus", "koch", "regiomontanus", "campanus",
@@ -86,7 +107,7 @@ SUPPORTED_HOUSE_SYSTEMS: Final[Tuple[str, ...]] = (
     "equal", "whole",
     # additional implemented
     "vehlow_equal", "sripati",
-    # v10 additions
+    # v10+ additions
     "equal_from_mc", "natural_houses",
     "bhava_chalit_sripati", "bhava_chalit_equal_from_mc",
     # declared but gated (501)
@@ -101,11 +122,11 @@ GATED_NOT_IMPLEMENTED: Final[frozenset[str]] = frozenset({
     "meridian", "krusinski",
 })
 
-# ───────────────────────── Alias Canonicalization ─────────────────────────
-# Simplify aliases: lowercase + strip non-alphanumerics → slug, then map to canonical public label.
+# ───────────────────────── Alias Canonicalization (slug-based) ─────────────────────────
+# Simplify aliases: lowercase + strip non-alphanumerics → slug → canonical label.
 # Examples:
-#   "Whole Sign" / "whole-sign" / "WHOLE_SIGN" → slug "wholesign" → "whole"
-#   "equal-from-mc" / "Equal From MC" → slug "equalfrommc" → "equal_from_mc"
+#   "Whole Sign" / "whole-sign" / "WHOLE_SIGN" → "wholesign" → "whole"
+#   "Equal From MC" / "equal-from-mc"          → "equalfrommc" → "equal_from_mc"
 
 def _slug(s: str) -> str:
     return "".join(ch for ch in s.lower() if ch.isalnum())
@@ -134,14 +155,14 @@ _CANON_FROM_SLUG: Final[Dict[str, str]] = {
     "whole":"whole", "wholesign":"whole",
     # extras
     "vehlowequal":"vehlow_equal", "sripati":"sripati",
-    # v10 additions
-    "equalfrommc":"equal_from_mc",
-    "naturalhouses":"natural_houses",
+    "equalfrommc":"equal_from_mc", "naturalhouses":"natural_houses",
     "bhavachalitsripati":"bhava_chalit_sripati",
     "bhavachalitequalfrommc":"bhava_chalit_equal_from_mc",
-    # gated
+    # gated + common alias to gated
     "meridian":"meridian","horizon":"horizon","carterpe":"carter_pe","sunshine":"sunshine",
     "krusinski":"krusinski","pullensd":"pullen_sd",
+    # engine synonym
+    "azimuthal":"horizon",
 }
 
 def _suggest_systems(name: str, n: int = 5) -> List[str]:
@@ -150,7 +171,6 @@ def _suggest_systems(name: str, n: int = 5) -> List[str]:
     Uses both raw names and their slugs for friendlier messages.
     """
     slug = _slug(name)
-    # compare against canonical names
     candidates = list(SUPPORTED_HOUSE_SYSTEMS)
     scored = difflib.get_close_matches(name.lower(), candidates, n=n, cutoff=0.6)
     # also consider slugs → map back to canonical
@@ -165,7 +185,7 @@ def _suggest_systems(name: str, n: int = 5) -> List[str]:
 def _normalize_public_name(name: Optional[str]) -> str:
     """
     Normalize a user-facing house-system to a canonical *public* label.
-    (Aliases collapse to one label via slug mapping; no long alias lists.)
+    (Aliases collapse to one label via slug mapping; avoids long alias lists.)
     """
     if not name:
         return "placidus"
@@ -238,8 +258,8 @@ def _fallback_chain(requested_public: str) -> List[str]:
             maybe = mapping.get(requested_public)
             if isinstance(maybe, list):
                 env_chain = [_normalize_public_name(str(x)) for x in maybe]
-        except Exception:
-            pass
+        except Exception as e:
+            _BOOT_WARNINGS.append(f"ASTRO_HOUSES_FALLBACK_JSON ignored: {type(e).__name__}: {e}")
 
     chain = [requested_public] + env_chain + default_chain + ["equal_from_mc", "natural_houses", "equal", "whole"]
     return _dedupe(chain)
@@ -332,6 +352,9 @@ def compute_houses_with_policy(
         validation = DEFAULT_VALIDATION
 
     warnings: List[str] = []
+
+    # Surface any boot-time non-fatal issues (e.g., bad env JSON)
+    warnings.extend(_BOOT_WARNINGS)
 
     # ---- polar rules (stage 1: hard-limit filter)
     if abs(lat_f) >= hard_lim and requested_public in _HARD_REJECT_AT_POLAR:
@@ -431,14 +454,19 @@ def compute_houses_with_policy(
             "hard_reject_systems_at_polar": sorted(_HARD_REJECT_AT_POLAR),
             "risky_at_polar": sorted(_RISKY_AT_POLAR),
             "numeric_fallback_enabled": NUMERIC_FALLBACK_ENABLED,
-            "fallback_chain_tried": chain_public_all,  # include pre-filter for transparency
+            "fallback_chain_declared": chain_public_all,  # pre-filter, before lat gating / bias
+            "fallback_chain_final": chain_public,         # actual order used after gating/bias
         },
-        # timescale echo (useful for client sanity checks)
+        # timescale & input echo (useful for client sanity checks / support)
         "meta": {
             "timescales": {
                 "jd_tt": float(jd_tt),
                 "jd_ut1": float(jd_ut1),
                 "jd_ut_legacy": float(jd_ut) if jd_ut is not None else None,
+            },
+            "input": {
+                "requested_input_raw": requested_public_in,
+                "requested_input_slug": _slug(requested_public_in) if requested_public_in else None,
             },
             "diagnostics_enabled": bool(diagnostics),
             "validation_enabled": bool(validation),
@@ -476,3 +504,11 @@ __all__ = [
     "POLAR_ABSOLUTE_LIMIT_DEG",
     "GATED_NOT_IMPLEMENTED",
 ]
+
+# ───────────────────────── Unit-test checklist (dev note) ─────────────────────────
+# - slug canonicalization (happy path + unknown input suggestions)
+# - gated systems → NotImplementedError (501)
+# - strict timescale enforcement (jd_tt/jd_ut1 required)
+# - polar hard-limit filter and soft policy bias ordering
+# - env fallback JSON parsing (valid + invalid populates _BOOT_WARNINGS)
+# - numeric fallback toggle behavior
