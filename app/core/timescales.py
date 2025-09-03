@@ -218,18 +218,34 @@ def _local_to_utc_calendar(
 
 def _utc_calendar_to_jd_utc(iy, im, iday, ih, imin, isec, ifrac_1e4):
     """
-    ERFA dtf2d using the array calling convention:
-      erfa.dtf2d("UTC", iy, im, iday, [ih, imin, isec, ifrac_1e4])
-    The last element is in 1e-4 s units (0..9999); sec may be 60 at a leap second.
+    Call ERFA dtf2d. Prefer ihmsf-array variant; fall back to the 7-arg form
+    with seconds as a float (works on pyERFA builds that lack the array wrapper).
     """
+    # 1) Preferred: ihmsf list [ih, imn, sec, ifrac(1e-4 s)]
     try:
         utc1, utc2 = erfa.dtf2d(
             "UTC", int(iy), int(im), int(iday),
             [int(ih), int(imin), int(isec), int(ifrac_1e4)]
         )
         return math.fsum((utc1, utc2))
-    except Exception as e:
-        raise ValueError(f"ERFA dtf2d failed: {e}")
+    except TypeError:
+        pass  # this build likely lacks the array variant
+
+    # 2) Fallback: positional 7-arg form with sec as float seconds
+    sec = float(isec) + (float(ifrac_1e4) / 1e4)
+    try:
+        utc1, utc2 = erfa.dtf2d("UTC", int(iy), int(im), int(iday), int(ih), int(imin), sec)
+        return math.fsum((utc1, utc2))
+    except Exception:
+        # 3) Last-chance: keyword version (some builds expose kw names)
+        try:
+            utc1, utc2 = erfa.dtf2d(
+                "UTC", iy=int(iy), im=int(im), id=int(iday),
+                ih=int(ih), imn=int(imin), sec=float(sec)
+            )
+            return math.fsum((utc1, utc2))
+        except Exception as e_kw:
+            raise ValueError(f"ERFA dtf2d failed: {e_kw}")
 
 def _delta_t_seconds_from_parts(tt1: float, tt2: float, ut11: float, ut12: float) -> float:
     """Two-part difference BEFORE collapsing — preserves precision."""
