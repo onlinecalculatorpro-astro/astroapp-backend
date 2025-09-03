@@ -7,9 +7,9 @@
 # - Frames: "ecliptic-of-date" (default) or "ecliptic-J2000"
 # - Topocentric supported via WGS84 (lat/lon/elevation)
 #
-# IMPORTANT: ecliptic_longitudes(...) ALWAYS RETURNS A LIST OF ROWS:
-#   [{"name": <as requested>, "lon": <deg>, "lat": <deg>, "speed": <deg/day>?}, ...]
-# This matches harness expectations and avoids "adapter_return_invalid".
+# RETURN SHAPE (always a list of rows):
+#   [{"name": <as requested>, "longitude": <deg>, "velocity": <deg/day>?, ...}, ...]
+# Back-compat: rows also include "lon" (same as longitude) and "speed" (same as velocity).
 # -----------------------------------------------------------------------------
 from __future__ import annotations
 
@@ -343,6 +343,11 @@ def _spice_lon_lat_speed(jd_tt: float, name: str, *, frame: str) -> Tuple[Option
         log.debug("SPICE position failed for %s (ID %s): %s", name, tid, e)
         return None, None, None
 
+def _spice_ecliptic_longitude_speed(jd_tt: float, name: str, *, frame: str) -> Tuple[Optional[float], Optional[float]]:
+    """Wrapper for LV path: returns (longitude, velocity) for SPICE small-bodies."""
+    lon, _lat, spd = _spice_lon_lat_speed(jd_tt, name, frame=frame)
+    return lon, spd
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Skyfield helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -508,7 +513,8 @@ def ecliptic_longitudes(
 ) -> List[Dict[str, float]]:
     """
     RETURN TYPE (always): list of rows
-      [{"name": <as requested>, "lon": <deg>, "lat": <deg>, "speed": <deg/day>?}, ...]
+      [{"name": <as requested>, "longitude": <deg>, "velocity": <deg/day>?, ...}, ...]
+    (Back-compat fields: "lon", "speed")
     """
     # Prepare SPICE (no-op if unavailable); only used for small bodies/fallbacks
     if _SPICE_OK and _ENABLE_SMALLS:
@@ -530,16 +536,16 @@ def ecliptic_longitudes(
         # Lunar nodes (geocentric)
         if kind == "node":
             try:
-                lon = _node_longitude(canon, jd_tt)
+                lon_val = _node_longitude(canon, jd_tt)
                 # optional speed by finite difference (use same step as Moon)
                 step = _speed_step_for("Moon")
                 lon_m = _node_longitude(canon, jd_tt - step)
                 lon_p = _node_longitude(canon, jd_tt + step)
-                spd = _wrap_diff_deg(lon_p, lon_m) / (2.0 * step)
-                rows.append({"name": raw, "lon": lon, "lat": 0.0, "speed": spd})
+                vel_val = _wrap_diff_deg(lon_p, lon_m) / (2.0 * step)
+                row = {"name": raw, "longitude": lon_val, "lon": lon_val, "velocity": vel_val, "speed": vel_val, "lat": 0.0}
             except Exception:
-                # still push a minimal row if anything fails
-                rows.append({"name": raw, "lon": 0.0, "lat": 0.0})
+                row = {"name": raw, "longitude": 0.0, "lon": 0.0, "lat": 0.0}
+            rows.append(row)
             continue
 
         # Majors via Skyfield
@@ -549,13 +555,14 @@ def ecliptic_longitudes(
                 try:
                     geo = obs.at(t).observe(body).apparent()
                     lon, lat = _frame_latlon(geo, ef)
-                    row = {"name": raw, "lon": lon, "lat": lat}
+                    row: Dict[str, float] = {"name": raw, "longitude": lon, "lon": lon, "lat": lat}
                     if ts is not None:
                         step = _speed_step_for(canon)
                         t0 = ts.tt_jd(jd_tt - step); t1 = ts.tt_jd(jd_tt + step)
                         lon0, _ = _frame_latlon(obs.at(t0).observe(body).apparent(), ef)
                         lon1, _ = _frame_latlon(obs.at(t1).observe(body).apparent(), ef)
-                        row["speed"] = _wrap_diff_deg(lon1, lon0) / (2.0 * step)
+                        vel = _wrap_diff_deg(lon1, lon0) / (2.0 * step)
+                        row["velocity"] = vel; row["speed"] = vel
                     rows.append(row)
                     continue
                 except Exception as e:
@@ -565,13 +572,13 @@ def ecliptic_longitudes(
         if kind == "small" and _SPICE_READY and _ENABLE_SMALLS:
             lon, lat, spd = _spice_lon_lat_speed(jd_tt, canon, frame=frame)
             if lon is not None and lat is not None:
-                row = {"name": raw, "lon": lon, "lat": lat}
+                row = {"name": raw, "longitude": lon, "lon": lon, "lat": lat}
                 if spd is not None:
-                    row["speed"] = spd
+                    row["velocity"] = spd; row["speed"] = spd
                 rows.append(row)
                 continue
 
-        # If nothing worked, omit or push a placeholder (omit is cleaner)
+        # If nothing worked, note and move on
         log.debug("Ephemeris: unresolved body %s (kind=%s)", raw, kind)
 
     return rows
@@ -587,11 +594,11 @@ def ecliptic_longitudes_and_velocities(
     elevation_m: Optional[float] = None,
 ) -> List[Dict[str, float]]:
     """
-    Return rows (NOT maps) to satisfy the astronomy harness:
-      [{"name": <as requested>, "lon": <deg>, "lat": <deg?>, "speed": <deg/day?>}, ...]
+    Return rows (NOT maps) to satisfy the API:
+      [{"name": <as requested>, "longitude": <deg>, "velocity": <deg/day?>, ...}, ...]
     Notes:
-      • Nodes: geocentric, longitude only (no speed). We omit 'lat'.
-      • Small bodies (if enabled): provide lon (+ speed if available).
+      • Nodes: geocentric, longitude only (no velocity in this endpoint).
+      • Small bodies (if enabled): provide longitude (+ velocity if available).
     """
     # Prepare SPICE (for small bodies only; harmless if unavailable)
     if _SPICE_OK and _ENABLE_SMALLS:
@@ -621,11 +628,11 @@ def ecliptic_longitudes_and_velocities(
     for raw in names:
         canon, kind = _canon_name(raw)
 
-        # Nodes (geocentric only; no speed)
+        # Nodes (geocentric only; no velocity here)
         if kind == "node":
             try:
-                lon = _node_longitude(canon, jd_tt)
-                rows.append({"name": raw, "lon": float(lon)})
+                lon_val = _node_longitude(canon, jd_tt)
+                rows.append({"name": raw, "longitude": float(lon_val), "lon": float(lon_val)})
             except Exception as e:
                 log.debug("Node computation failed for %s: %s", canon, e)
             continue
@@ -637,26 +644,27 @@ def ecliptic_longitudes_and_velocities(
                 try:
                     geo = obs.at(t).observe(body).apparent()
                     lon, lat = _frame_latlon(geo, ef)
-                    row: Dict[str, float] = {"name": raw, "lon": float(lon), "lat": float(lat)}
+                    row: Dict[str, float] = {"name": raw, "longitude": float(lon), "lon": float(lon), "lat": float(lat)}
                     if ts is not None:
                         step = _speed_step_for(canon)
                         t0 = ts.tt_jd(jd_tt - step)
                         t1 = ts.tt_jd(jd_tt + step)
                         lon0, _ = _frame_latlon(obs.at(t0).observe(body).apparent(), ef)
                         lon1, _ = _frame_latlon(obs.at(t1).observe(body).apparent(), ef)
-                        row["speed"] = _wrap_diff_deg(lon1, lon0) / (2.0 * step)
+                        vel = _wrap_diff_deg(lon1, lon0) / (2.0 * step)
+                        row["velocity"] = float(vel); row["speed"] = float(vel)
                     rows.append(row)
                     skyfield_success = True
                 except Exception as e:
                     log.debug("Skyfield failed for %s: %s", canon, e)
 
-        # Optional small-body path (SPICE); lat not computed here
-        if (not skyfield_success) and _SPICE_READY and _ENABLE_SMALLS:
-            lon, spd = _spice_ecliptic_longitude_speed(jd_tt, canon, frame=frame)
+        # Optional small-body path (SPICE); lat not guaranteed here
+        if (not skyfield_success) and _SPICE_READY and _ENABLE_SMALLS and kind == "small":
+            lon, vel = _spice_ecliptic_longitude_speed(jd_tt, canon, frame=frame)
             if lon is not None:
-                row: Dict[str, float] = {"name": raw, "lon": float(lon)}
-                if spd is not None:
-                    row["speed"] = float(spd)
+                row: Dict[str, float] = {"name": raw, "longitude": float(lon), "lon": float(lon)}
+                if vel is not None:
+                    row["velocity"] = float(vel); row["speed"] = float(vel)
                 rows.append(row)
 
     return rows
@@ -670,9 +678,13 @@ def rows_to_maps(rows: List[Dict[str, float]]) -> Dict[str, Dict[str, float]]:
         nm = r.get("name")
         if not nm:
             continue
-        if "lon" in r:
+        if "longitude" in r:
+            lon_map[nm] = float(r["longitude"])
+        elif "lon" in r:
             lon_map[nm] = float(r["lon"])
-        if "speed" in r:
+        if "velocity" in r:
+            vel_map[nm] = float(r["velocity"])
+        elif "speed" in r:
             vel_map[nm] = float(r["speed"])
     return {"longitudes": lon_map, "velocities": vel_map}
 
@@ -751,13 +763,26 @@ def clear_adapter_caches() -> None:
     except Exception:
         pass
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Back-compat tiny wrappers (kept to avoid import breakages)
+# ─────────────────────────────────────────────────────────────────────────────
+def get_ecliptic_longitudes(*args, **kwargs):
+    return ecliptic_longitudes(*args, **kwargs)
+
+def get_node_longitude(name: str, jd_tt: float) -> float:
+    canon, kind = _canon_name(name)
+    if kind != "node":
+        raise ValueError("get_node_longitude expects a node name")
+    return _node_longitude(canon, jd_tt)
+
 __all__ = [
     "ecliptic_longitudes",
     "ecliptic_longitudes_and_velocities",
-    "get_ecliptic_longitudes",
-    "get_node_longitude",
+    "rows_to_maps",
     "ephemeris_diagnostics",
     "load_kernel",
     "current_kernel_name",
     "clear_adapter_caches",
+    "get_ecliptic_longitudes",
+    "get_node_longitude",
 ]
