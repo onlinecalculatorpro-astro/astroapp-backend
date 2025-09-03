@@ -180,6 +180,7 @@ def _utc_calendar_to_jd_utc(
     try:
         ihmsf = [int(ih), int(imin), int(isec), int(ifrac)]
         utc1, utc2 = erfa.dtf2d("UTC", int(iy), int(im), int(iday), ihmsf)
+        return math.fsum((utc1, utc2))
     except Exception as e:
         # Surface the precise failure up the stack (becomes HTTP 400 JSON)
         raise ValueError(f"ERFA dtf2d failed: {e}")
