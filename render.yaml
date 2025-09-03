@@ -5,13 +5,28 @@ services:
     plan: free
     branch: released
     buildCommand: |
+      set -e
       python --version
       pip --version
-      pip install --upgrade pip
-      # Pre-install binary deps to avoid build hiccups
-      pip install "numpy==1.26.4" "pyerfa>=2.0.1"
-      pip install -r requirements.txt
-    startCommand: gunicorn app.main:app --bind 0.0.0.0:$PORT --workers=2 --threads=4 --timeout=120
+      pip install --upgrade pip setuptools wheel
+      # Prefer binary wheels for speed & reliability
+      pip install --prefer-binary "numpy==1.26.4" "pyerfa>=2.0.1"
+      # Project dependencies
+      pip install --prefer-binary -r requirements.txt
+    startCommand: >
+      gunicorn app.main:app
+      --bind 0.0.0.0:$PORT
+      --worker-class gthread
+      --workers=2
+      --threads=4
+      --timeout=120
+      --graceful-timeout=30
+      --max-requests=500
+      --max-requests-jitter=50
+      --worker-tmp-dir /dev/shm
+      --access-logfile -
+      --error-logfile -
+      --log-level info
     healthCheckPath: /api/health
     autoDeploy: true
     envVars:
@@ -33,4 +48,9 @@ services:
         value: "0"
       # (optional) make logs flush immediately
       - key: PYTHONUNBUFFERED
+        value: "1"
+      # (optional) reduce disk writes & pip cache size
+      - key: PYTHONDONTWRITEBYTECODE
+        value: "1"
+      - key: PIP_NO_CACHE_DIR
         value: "1"
