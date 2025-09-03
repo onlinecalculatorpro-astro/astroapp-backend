@@ -22,29 +22,12 @@ POLAR POLICY — decision tree
        → Bias chain to robust families first:
          {equal, whole, equal_from_mc, natural_houses} then porphyry, then others.
 5) Iterate over chain (unless fallbacks disabled), return first success.
-
-QUICK EXAMPLES
------------
-from app.core.house import compute_houses_with_policy
-
-# Strict mode (recommended): must pass jd_tt and jd_ut1
-res = compute_houses_with_policy(
-    lat=51.5, lon=-0.12, system="placidus",
-    jd_tt=2451545.0, jd_ut1=2451545.0,
-)
-
-# Override polar policy to hard-reject risky systems above the soft limit
-res = compute_houses_with_policy(
-    lat=70.0, lon=19.0, system="placidus",
-    jd_tt=2451545.0, jd_ut1=2451545.0,
-    polar_policy="reject_above_66deg",
-)
 """
 
+from typing import Any, Dict, Final, List, Optional, Tuple
 import difflib
 import json
 import os
-from typing import Any, Dict, List, Optional, Tuple, Final
 
 # ───────────────────────── Engine import ─────────────────────────
 try:
@@ -99,7 +82,6 @@ DEFAULT_VALIDATION: Final[bool] = os.getenv("ASTRO_HOUSES_VALIDATE", "").lower()
 _BOOT_WARNINGS: List[str] = []
 
 # ───────────────────────── Public Systems (canonical) ─────────────────────────
-# Compact canonical list for docs/clients. Aliases are handled via slug canonicalizer.
 SUPPORTED_HOUSE_SYSTEMS: Final[Tuple[str, ...]] = (
     # classical/modern (implemented)
     "placidus", "koch", "regiomontanus", "campanus",
@@ -123,12 +105,8 @@ GATED_NOT_IMPLEMENTED: Final[frozenset[str]] = frozenset({
 })
 
 # ───────────────────────── Alias Canonicalization (slug-based) ─────────────────────────
-# Simplify aliases: lowercase + strip non-alphanumerics → slug → canonical label.
-# Examples:
-#   "Whole Sign" / "whole-sign" / "WHOLE_SIGN" → "wholesign" → "whole"
-#   "Equal From MC" / "equal-from-mc"          → "equalfrommc" → "equal_from_mc"
-
 def _slug(s: str) -> str:
+    """Lowercase + strip non-alphanumerics → short alias token."""
     return "".join(ch for ch in s.lower() if ch.isalnum())
 
 def _assert_unique_slugs(names: List[str]) -> None:
@@ -166,16 +144,11 @@ _CANON_FROM_SLUG: Final[Dict[str, str]] = {
 }
 
 def _suggest_systems(name: str, n: int = 5) -> List[str]:
-    """
-    Suggest closest canonical public labels for an unrecognized input.
-    Uses both raw names and their slugs for friendlier messages.
-    """
+    """Suggest closest canonical public labels for an unrecognized input."""
     slug = _slug(name)
     candidates = list(SUPPORTED_HOUSE_SYSTEMS)
     scored = difflib.get_close_matches(name.lower(), candidates, n=n, cutoff=0.6)
-    # also consider slugs → map back to canonical
-    slug_candidates = list(_CANON_FROM_SLUG.keys())
-    slug_hits = difflib.get_close_matches(slug, slug_candidates, n=n, cutoff=0.6)
+    slug_hits = difflib.get_close_matches(slug, list(_CANON_FROM_SLUG.keys()), n=n, cutoff=0.6)
     for sh in slug_hits:
         canon = _CANON_FROM_SLUG.get(sh)
         if canon and canon not in scored:
@@ -197,6 +170,13 @@ def _normalize_public_name(name: Optional[str]) -> str:
         raise ValueError(f"unsupported house system: '{name}' (slug='{slug}').{hint}")
     return canon
 
+def canonicalize_system(name: str) -> str:
+    """
+    Public helper: canonicalize a user-facing name to our public label.
+    Identical to the policy’s normalization (single source of truth).
+    """
+    return _normalize_public_name(name)
+
 def _public_to_engine(system_public: str) -> str:
     """Public normalized name → engine canonical (the math name)."""
     return "whole_sign" if system_public == "whole" else system_public
@@ -210,9 +190,6 @@ def list_supported_house_systems() -> List[str]:
     return list(SUPPORTED_HOUSE_SYSTEMS)
 
 # ───────────────────────── Fallback Chains ─────────────────────────
-# Design principle: fall back to mathematically similar time-division systems first,
-# then to robust angular/segment families.
-
 def _dedupe(seq: List[str]) -> List[str]:
     seen, out = set(), []
     for s in seq:
@@ -281,7 +258,7 @@ def compute_houses_with_policy(
     system: Optional[str] = None,
     jd_tt: Optional[float] = None,
     jd_ut1: Optional[float] = None,
-    jd_ut: Optional[float] = None,              # ignored in strict mode
+    jd_ut: Optional[float] = None,              # echoed only; ignored in strict mode
     diagnostics: Optional[bool] = None,
     validation: Optional[bool] = None,
 
@@ -503,12 +480,5 @@ __all__ = [
     "POLAR_HARD_LIMIT_DEG",
     "POLAR_ABSOLUTE_LIMIT_DEG",
     "GATED_NOT_IMPLEMENTED",
+    "canonicalize_system",
 ]
-
-# ───────────────────────── Unit-test checklist (dev note) ─────────────────────────
-# - slug canonicalization (happy path + unknown input suggestions)
-# - gated systems → NotImplementedError (501)
-# - strict timescale enforcement (jd_tt/jd_ut1 required)
-# - polar hard-limit filter and soft policy bias ordering
-# - env fallback JSON parsing (valid + invalid populates _BOOT_WARNINGS)
-# - numeric fallback toggle behavior
