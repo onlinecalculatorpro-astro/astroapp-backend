@@ -174,23 +174,17 @@ def _utc_calendar_to_jd_utc(
     """
     Produce JD(UTC) via ERFA dtf2d.
 
-    Try the 5-arg ihmsf[4] form first (most universally supported across
-    pyERFA builds), then fall back to the 8-positional-arg form.
+    This pyERFA build expects the 5-argument form with an ihmsf[4] array:
+        dtf2d("UTC", year, month, day, [hour, minute, second, 1e-4s])
     """
-    # 1) ihmsf[4] form: ["hour","min","sec","1e-4 sec"]
     try:
         ihmsf = [int(ih), int(imin), int(isec), int(ifrac)]
         utc1, utc2 = erfa.dtf2d("UTC", int(iy), int(im), int(iday), ihmsf)
-        return math.fsum((utc1, utc2))
-    except Exception as e1:
-        pass  # try the positional 8-arg form next
+    except Exception as e:
+        # Surface the precise failure up the stack (becomes HTTP 400 JSON)
+        raise ValueError(f"ERFA dtf2d failed: {e}")
+    return math.fsum((utc1, utc2))
 
-    # 2) 8 positional args: iy, im, id, ih, min, sec, f(1e-4s)
-    try:
-        utc1, utc2 = erfa.dtf2d(
-            "UTC", int(iy), int(im), int(iday), int(ih), int(imin), int(isec), int(ifrac)
-        )
-        return math.fsum((utc1, utc2))
     except Exception as e2:
         raise ValueError(f"ERFA dtf2d failed (ihmsf & positional): {e2}")
 
