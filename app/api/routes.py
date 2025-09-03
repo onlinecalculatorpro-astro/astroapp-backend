@@ -433,10 +433,13 @@ def _recompute_houses_angles_if_needed(
 
 # ───────────────────────────── helpers: predictions shape ─────────────────────────────
 def _prepare_chart_for_predict(chart: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Keep chart['bodies'] exactly as provided (typically a list of rows).
+    Provide a sidecar name→row map at chart['bodies_map'] for convenience.
+    """
     ch = dict(chart)
     bodies = ch.get("bodies")
-    if isinstance(bodies, dict):
-        return ch
+
     if isinstance(bodies, list):
         name_map: Dict[str, Any] = {}
         for b in bodies:
@@ -445,16 +448,13 @@ def _prepare_chart_for_predict(chart: Dict[str, Any]) -> Dict[str, Any]:
                 if isinstance(nm, str) and nm:
                     name_map[nm] = b
         if name_map:
-            ch["bodies_list"] = bodies
-            ch["bodies"] = name_map
-    return ch
+            ch["bodies_map"] = name_map
 
-def _freeze_horizon(h: Any) -> Any:
-    if isinstance(h, dict):
-        return tuple(sorted((k, _freeze_horizon(v)) for k, v in h.items()))
-    if isinstance(h, (list, tuple)):
-        return tuple(_freeze_horizon(v) for v in h)
-    return h
+    elif isinstance(bodies, dict):
+        # If upstream ever sends a dict, expose it as the map without touching 'bodies'
+        ch["bodies_map"] = bodies
+
+    return ch
 
 # ───────────────────────────── error helper ─────────────────────────────
 def _json_error(code: str, details: Any = None, http: int = 400):
