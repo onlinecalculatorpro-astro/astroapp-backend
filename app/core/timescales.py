@@ -168,17 +168,15 @@ def _local_to_utc_calendar(
 
     return iy_u, im_u, id_u, ih_u, in_u, is_u, ifrac_u, tz_off_sec, warnings
 
-def _utc_calendar_to_jd_utc(
-    iy: int, im: int, iday: int, ih: int, imin: int, isec: int, ifrac: int
-) -> float:
-    """Produce JD(UTC) via ERFA dtf2d - this ERFA expects exactly 7 args."""
+def _utc_calendar_to_jd_utc(iy, im, iday, ih, imin, isec, ifrac):
     try:
-        # 7 arguments total: scale + 6 time components
-        utc1, utc2 = erfa.dtf2d("UTC", int(iy), int(im), int(iday), int(ih), int(imin), int(isec))
+        # Convert fractional 1e-4s to decimal seconds
+        total_seconds = float(isec) + (float(ifrac) / 1e4)
+        utc1, utc2 = erfa.dtf2d("UTC", int(iy), int(im), int(iday), int(ih), int(imin), total_seconds)
         return math.fsum((utc1, utc2))
     except Exception as e:
         raise ValueError(f"ERFA dtf2d failed: {e}")
-    
+        
     # C) Try keyword 8-arg (some builds expose named params)
     try:
         utc1, utc2 = erfa.dtf2d(
