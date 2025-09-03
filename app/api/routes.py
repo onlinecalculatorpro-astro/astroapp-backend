@@ -359,7 +359,7 @@ def _normalize_houses_payload(h: Any) -> Any:
         h["mc_deg"] = h["mc"]
     for k in ("asc", "asc_deg", "mc", "mc_deg", "vertex", "eastpoint", "armc", "ramc"):
         if k in h and isinstance(h[k], (int, float)):
-            h[k] = _wrap360(h[k"])
+            h[k] = _wrap360(h[k])
     for key in ("cusps", "cusps_deg"):
         if isinstance(h.get(key), list):
             h[key] = [_wrap360(c) if isinstance(c, (int, float)) else c for c in h[key]]
