@@ -46,7 +46,6 @@ except Exception as e:  # pragma: no cover
 from app.core.astronomy import compute_chart
 from app.core import timescales as _ts
 from app.core.house import (
-    compute_houses_with_policy,
     list_supported_house_systems,
     GATED_NOT_IMPLEMENTED,
     POLAR_POLICY,
@@ -271,89 +270,7 @@ def _register_core_api(app: Flask) -> None:
     for alias in ("/chart", "/api/compute_chart", "/compute_chart", "/api/astronomy/chart", "/astronomy/chart", "/api/astro/chart"):
         app.add_url_rule(alias, f"chart_alias_{alias}", _chart_handler, methods=["POST"])
 
-    # calculate (chart + optional houses via policy façade)
-    def _calculate_handler():
-        body = _body_json()
-
-        # timescales fill if missing
-        have_all_jd = all(k in body for k in ("jd_ut", "jd_tt", "jd_ut1"))
-        if not have_all_jd:
-            date = body.get("date")
-            time_s = body.get("time")
-            tz = body.get("tz") or body.get("place_tz")
-            if isinstance(date, str) and isinstance(time_s, str) and isinstance(tz, str):
-                ts = _compute_timescales_payload(date, time_s, tz)
-                body.update({k: ts[k] for k in ("jd_ut", "jd_tt", "jd_ut1")})
-                body["_timescales"] = ts
-            else:
-                raise BadRequest("Provide either jd_ut/jd_tt/jd_ut1 or civil 'date'+'time'+'tz'")
-
-        body.setdefault("mode", "tropical")
-
-        chart = compute_chart(body)
-        chart["ok"] = True
-        chart.setdefault("meta", {}).setdefault("timescales", _timescales_meta_from_chart(chart))
-
-        # Houses only if requested
-        system_req = (body.get("house_system") or body.get("system") or "").strip()
-        if not system_req:
-            return jsonify(chart), 200
-
-        try:
-            lat = float(body.get("lat") if body.get("lat") is not None else body.get("latitude"))
-            lon = float(body.get("lon") if body.get("lon") is not None else body.get("longitude"))
-        except Exception:
-            return jsonify({
-                "ok": False,
-                "error": "angles_missing_geography",
-                "details": {"note": "ASC/MC & houses require 'lat' and 'lon'"},
-            }), 400
-
-        diagnostics = bool(body.get("diagnostics", False))
-        validation = bool(body.get("validation", False))
-
-        try:
-            houses = compute_houses_with_policy(
-                lat=lat,
-                lon=lon,
-                system=system_req,
-                jd_tt=float(body["jd_tt"]),
-                jd_ut1=float(body["jd_ut1"]),
-                jd_ut=float(body.get("jd_ut")) if body.get("jd_ut") is not None else None,
-                diagnostics=diagnostics,
-                validation=validation,
-            )
-        except NotImplementedError as e:
-            # 501 for gated systems
-            return jsonify({
-                "ok": False,
-                "error": "house_system_gated",
-                "details": {"system": system_req.strip().lower(), "note": str(e)},
-            }), 501
-        except ValueError as e:
-            # Policy rejections / bad inputs → 422
-            return jsonify({
-                "ok": False,
-                "error": "house_engine_failed",
-                "details": {"system": system_req.strip().lower(), "note": str(e)},
-            }), 422
-        except Exception as e:
-            # Engine blow-ups / all fallbacks failed → 422
-            return jsonify({
-                "ok": False,
-                "error": "house_engine_failed",
-                "details": {"system": system_req.strip().lower(), "note": str(e)},
-            }), 422
-
-        # Attach houses + policy echo + engine label
-        houses_payload = dict(houses)
-        houses_payload.setdefault("policy", {}).update({"engine_label": ENGINE_LABEL})
-        chart["houses"] = houses_payload
-        return jsonify(chart), 200
-
-    app.add_url_rule("/api/calculate", "calculate", _calculate_handler, methods=["POST"])
-    for alias in ("/calculate", "/api/calc", "/calc"):
-        app.add_url_rule(alias, f"calculate_alias_{alias}", _calculate_handler, methods=["POST"])
+    # NOTE: /api/calculate lives in the blueprint (app/api/routes.py) to avoid duplication.
 
 # ───────────────────────── app factory ─────────────────────────
 def create_app() -> Flask:
@@ -374,7 +291,7 @@ def create_app() -> Flask:
     # Seed metrics
     seeded_routes = (
         "/", "/api/health-check",
-        "/api/chart", "/api/calculate",
+        "/api/chart",
         "/api/time/timescales",
         "/health", "/healthz", "/metrics", "/system-validation"
     )
