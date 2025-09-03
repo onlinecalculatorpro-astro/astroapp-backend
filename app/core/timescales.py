@@ -46,7 +46,7 @@ class TimeScales:
     jd_tt: float
     jd_ut1: float
     delta_t: float         # TT − UT1 [s]
-    dat: float             # TAI − UTC [s] from ERFA leap table
+    dat: float             # TAI − UTC [s] (aka delta_at)
     dut1: float            # UT1 − UTC [s]
     tz_offset_seconds: int
     timezone: str
@@ -67,8 +67,7 @@ def _parse_date_str(date_str: str) -> Tuple[int, int, int, List[str]]:
     if not m:
         raise ValueError(f"Invalid date_str '{date_str}': expected YYYY-MM-DD")
     iy, im, iday = int(m.group(1)), int(m.group(2)), int(m.group(3))
-    # Existence check
-    datetime(iy, im, iday)
+    datetime(iy, im, iday)  # existence check
     warn: List[str] = []
     if iy < 1600 or iy > 2200:
         warn.append(f"date_year_{iy}_outside_optimal_erfa_range")
@@ -122,12 +121,15 @@ def _frac_units(frac_str: str, *, allow_carry: bool) -> Tuple[int, int, bool, bo
         # Clamp inside the second (used for leap-second instants)
         micro = int(min(micro_dec, 999_999))
         ifrac_1e4 = int(min(ifrac_dec, 9_999))
-        # If rounding would have carried, we also warn
         if mic_carry or ifrac_carry:
             warn_clamp = True
         carry = False  # never carry in leap-second mode
 
     return micro, ifrac_1e4, bool(warn_clamp), bool(carry)
+
+def _micro_to_ifrac_1e4(us: int) -> int:
+    """Round microseconds to 1e-4 s (100 µs) half-up, clamped to 0..9999."""
+    return min(9999, (int(us) + 50) // 100)
 
 # ───────────────────────────── Time zone / UTC helpers ─────────────────────────────
 
@@ -144,7 +146,7 @@ def _fold_offsets(z: ZoneInfo, naive_local: datetime) -> Tuple[int, List[str]]:
     aware1 = naive_local.replace(tzinfo=z, fold=1)
     off1 = aware1.utcoffset()
     if off1 is not None and off1 != off0:
-        warnings.append("dst_ambiguous")  # normalized token
+        warnings.append("dst_ambiguous")
     return int(off0.total_seconds()), warnings
 
 def _local_to_utc_calendar(
@@ -162,23 +164,21 @@ def _local_to_utc_calendar(
 
     leap_sec = (isec_in == 60)
 
-    # Fractional handling
+    # Fractions
     micro, ifrac_in_1e4, warn_prec, carry = _frac_units(frac_str, allow_carry=not leap_sec)
     if warn_prec:
         warnings.append("microsecond_precision_clamped")
 
-    # For tz offset resolution, build a local datetime:
-    # - normal seconds: second += carry (if any), micro as computed
-    # - leap second: build at 59 with computed micro (never carry)
+    # Build a local datetime for tz resolution:
+    # - normal seconds: apply carry (if any)
+    # - leap second: represent as :59 + fraction (never carry)
     build_sec = (59 if leap_sec else isec_in) + (1 if (not leap_sec and carry) else 0)
 
-    # Resolve timezone
     try:
         z = ZoneInfo(tz_name)
     except ZoneInfoNotFoundError as e:
         raise ValueError(f"Unknown IANA time zone '{tz_name}'") from e
 
-    # Build naive local time (Python handles rollovers for sec==60 when we add one second)
     base_local = datetime(iy, im, iday, ih, imin, min(build_sec, 59), microsecond=micro, tzinfo=None)
     if build_sec == 60:
         base_local = base_local + timedelta(seconds=1)
@@ -189,32 +189,25 @@ def _local_to_utc_calendar(
     aware_local = base_local.replace(tzinfo=z, fold=0)
     aware_utc = aware_local.astimezone(timezone.utc)
 
-    # Extract UTC calendar fields
+    # UTC calendar fields
     iy_u, im_u, id_u = aware_utc.year, aware_utc.month, aware_utc.day
     ih_u, in_u, is_u = aware_utc.hour, aware_utc.minute, aware_utc.second
 
-    # ERFA dtf2d input (UTC)
+    # ERFA dtf2d inputs
     if leap_sec:
-        # Represent the leap second itself: second=60, ifrac from input (clamped)
+        # Represent the leap second itself
         isec_erfa = 60
         ifrac_erfa = ifrac_in_1e4
     else:
-        # Normal seconds: if the 1e-4s value would carry, reflect that in ERFA fields
         if carry and ifrac_in_1e4 == 0:
-            # carried to next whole second in ERFA
-            # (UTC calendar already reflects the carry via base_local)
+            # Already carried to next whole second
             isec_erfa = is_u
             ifrac_erfa = 0
         else:
-            # no carry: derive ifrac from the UTC microsecond value (rounded to 1e-4 s)
             isec_erfa = is_u
-            ifrac_erfa = int(
-                Decimal(aware_utc.microsecond / 1_000_000)
-                .scaleb(4)
-                .to_integral_value(rounding=ROUND_HALF_UP)
-            )
+            ifrac_erfa = _micro_to_ifrac_1e4(aware_utc.microsecond)
             if ifrac_erfa >= 10_000:
-                # ultra-rare guard
+                # Ultra-rare guard; keep consistent just in case
                 aware_utc = aware_utc + timedelta(microseconds=100)
                 iy_u, im_u, id_u = aware_utc.year, aware_utc.month, aware_utc.day
                 ih_u, in_u, is_u = aware_utc.hour, aware_utc.minute, aware_utc.second
@@ -225,9 +218,9 @@ def _local_to_utc_calendar(
 
 def _utc_calendar_to_jd_utc(iy, im, iday, ih, imin, isec, ifrac_1e4):
     """
-    Call ERFA dtf2d using the array calling convention:
+    ERFA dtf2d using the array calling convention:
       erfa.dtf2d("UTC", iy, im, iday, [ih, imin, isec, ifrac_1e4])
-    where the last element is in 1e-4 second units (0..9999, or sec==60 on leap).
+    The last element is in 1e-4 s units (0..9999); sec may be 60 at a leap second.
     """
     try:
         utc1, utc2 = erfa.dtf2d(
@@ -264,7 +257,7 @@ def build_timescales(
     """Compute research-grade time scales for a local civil instant."""
     warnings: List[str] = []
 
-    # DUT1 policy (standardized with time_kernel.py)
+    # DUT1 policy
     if not isinstance(dut1_seconds, (int, float)):
         raise TypeError("dut1_seconds must be a number (float seconds).")
     if abs(dut1_seconds) > 0.9 + 1e-12:
@@ -295,7 +288,7 @@ def build_timescales(
     ut11, ut12 = erfa.utcut1(utc1, utc2, float(dut1_seconds))
     jd_ut1 = math.fsum((ut11, ut12))
 
-    # ΔT & ΔAT (ΔT with two-part precision)
+    # ΔT & ΔAT
     delta_t = _delta_t_seconds_from_parts(tt1, tt2, ut11, ut12)
     dat = _dat_seconds(iy_u, im_u, id_u, ih_u, in_u, is_u, ifrac_u)
 
