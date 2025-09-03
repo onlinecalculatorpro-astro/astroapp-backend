@@ -2,13 +2,6 @@
 """
 Professional House System Calculations — v10 GOLD STANDARD (research-grade; 24 declared)
 
-WHAT’S NEW vs v9
-- Intercepted signs & duplicated signs analysis (house-level diagnostics).
-- House-size analysis (per-house spans, stats, deviation from 30°).
-- Clear documentation of Bhāva Chalit (Vedic) vs cusp-lines distinction.
-- Kept: true Topocentric (Polich–Page), corrected Alcabitius, Equal-from-MC, Natural Houses,
-  Bhava Chalit aliases, KP helpers (nakshatra/pada/lord/sub-lord), Gauquelin sectors (provisional).
-
 ACCURACY TARGET (unchanged)
 ≤ 0.003° agreement vs SwissEph/Solar Fire (1900–2650) with NO shortcuts:
 - Apparent sidereal time (GAST) via IAU 2006/2000A (PyERFA)
@@ -21,19 +14,27 @@ ACCURACY TARGET (unchanged)
 - Strict domain checks; optional Placidus diagnostics (iters/residual/last step)
 - GOLD STANDARD: Embedded self-validation, cross-reference testing, error budgeting
 
-NOTES ON ASTROLOGICAL INTERPRETATION LAYERS (non-geometric)
-- Bhāva Chalit vs Cusp-lines (Vedic):
-  * CUSPS are the precise boundary lines (ecliptic longitudes) of the twelve houses.
-  * BHAVA CHALIT is a *placement* convention: planets are assigned to houses using chosen
-    bhāva boundaries (often Sripati midpoints, AKA Madhya Bhāva), which may differ from
-    quadrant cusp-lines used in Western practice. This file exposes both:
-      - 'sripati' cusps (midpoints from Porphyry boundaries)
-      - explicit aliases: 'bhava_chalit_sripati' and 'bhava_chalit_equal_from_mc'
-  Consumers should document clearly whether they display *cusps* or *bhāva boundaries*
-  for Vedic charts, to avoid ambiguity.
+WHAT’S NEW vs v9
+- Intercepted & duplicated sign analysis (house-level diagnostics)
+- House-size analysis (per-house spans + stats)
+- Equal-from-MC & Natural Houses engines (to match façade support)
+- Clearer documentation for Bhāva Chalit (Vedic) vs cusp-lines
+- Retained: true Topocentric (Polich–Page), corrected Alcabitius, KP helpers,
+  provisional Gauquelin sectors
 
-- Gauquelin Sectors: The implementation here is PROVISIONAL (equal hour-angle slices).
-  Scholarly Gauquelin work uses semi-arc scaling and more exact terrestrial geometry.
+INTERPRETATION NOTE (non-geometric)
+- Bhāva Chalit vs Cusp-lines (Vedic):
+  * CUSPS are the precise boundary longitudes of the 12 houses.
+  * BHĀVA CHALIT is a *placement* convention: planets are assigned to houses using
+    bhāva boundaries (often Sripati midpoints, aka Madhya Bhāva) that may differ from
+    quadrant cusp-lines typical in Western practice.
+  This engine exposes both sets explicitly:
+    - 'sripati' cusps (midpoints of Porphyry boundaries)
+    - aliases: 'bhava_chalit_sripati' and 'bhava_chalit_equal_from_mc'
+  Clients must document whether they present *cusps* or *bhāva boundaries*.
+
+- Gauquelin Sectors: Implementation here is PROVISIONAL (equal hour-angle slices).
+  Scholarly/Gauquelin research uses semi-arc scaling and refined terrestrial geometry.
 
 Policy choices (fallbacks/lat gating) live in app/core/house.py.
 
@@ -44,10 +45,12 @@ These raise NotImplementedError (map to HTTP 501).
 """
 
 from __future__ import annotations
+
 import math
+import os
 import sys
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Any, NamedTuple, Callable
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import erfa  # PyERFA (BSD) — IAU SOFA routines
 
@@ -55,7 +58,7 @@ import erfa  # PyERFA (BSD) — IAU SOFA routines
 
 TAU_R = 2.0 * math.pi
 DEG_R = math.pi / 180.0
-EPS_NUM = 4.0 * sys.float_info.epsilon  # ULP-aware tolerance for domain checks
+EPS_NUM = 4.0 * sys.float_info.epsilon  # ULP-aware domain slack
 
 def _norm_deg(x: float) -> float:
     r = math.fmod(x, 360.0)
@@ -101,13 +104,13 @@ def _midpoint_wrap(a: float, b: float) -> float:
     return _norm_deg(a + 0.5 * d)
 
 def _kahan_sum(values: List[float]) -> float:
-    sum_val = c = 0.0
-    for val in values:
-        y = val - c
-        t = sum_val + y
-        c = (t - sum_val) - y
-        sum_val = t
-    return sum_val
+    s = c = 0.0
+    for v in values:
+        y = v - c
+        t = s + y
+        c = (t - s) - y
+        s = t
+    return s
 
 def _stable_angle_sum(angles: List[float]) -> float:
     return _norm_deg(_kahan_sum(angles))
@@ -136,7 +139,7 @@ def _asc_longitude_deg(phi: float, ramc: float, eps: float) -> float:
     # ASC = arccot( - ( tan φ * sin ε + sin RAMC * cos ε ) / cos RAMC )
     num = -((_tand(phi) * _sind(eps)) + (_sind(ramc) * _cosd(eps)))
     den = _cosd(ramc)
-    return _acotd(num / max(1e-15, den))
+    return _acotd(num / (den if abs(den) > 1e-15 else 1e-15))
 
 def _eastpoint_longitude_deg(ramc: float, eps: float) -> float:
     ra = _norm_deg(ramc + 90.0)
@@ -147,7 +150,7 @@ def _vertex_longitude_deg(phi: float, ramc: float, eps: float) -> float:
     cot_phi = (1.0 / tphi) if abs(tphi) > 1e-15 else 1e15
     num = -((cot_phi * _sind(eps)) - (_sind(ramc) * _cosd(eps)))
     den = _cosd(ramc)
-    return _acotd(num / max(1e-15, den))
+    return _acotd(num / (den if abs(den) > 1e-15 else 1e-15))
 
 # --------------------------- common cusp helpers ---------------------------
 
@@ -162,10 +165,9 @@ def _fill_opposites(cusps: List[Optional[float]]) -> List[float]:
         elif cusps[b] is not None and cusps[a] is None:
             cusps[a] = _norm_deg(cusps[b] + 180.0)
     out = [float(_norm_deg(c)) for c in cusps]  # type: ignore
-    for i in range(6):  # enforce exact opposition if tiny drift
-        opp = _norm_deg(out[i] + 180.0)
-        if _wrap_diff_deg(out[i + 6], opp) > 1e-9:
-            out[i + 6] = opp
+    # enforce exact opposition if any tiny drift slipped in
+    for i in range(6):
+        out[i + 6] = _norm_deg(out[i] + 180.0)
     return out
 
 # --------------------------- exact house engines (closed/solved) ---------------------------
@@ -183,11 +185,13 @@ def _porphyry(asc: float, mc: float) -> List[float]:
     M = cusps[9] = _norm_deg(mc)
     D = cusps[6] = _norm_deg(asc + 180.0)
     I = cusps[3] = _norm_deg(mc + 180.0)
+
     def span(start: float, end: float) -> float: return _norm_deg(end - start)
-    s = span(A, M); cusps[11]=_norm_deg(A+s/3);  cusps[10]=_norm_deg(A+2*s/3)
-    s = span(M, D); cusps[8] =_norm_deg(M+s/3);  cusps[7] =_norm_deg(M+2*s/3)
-    s = span(D, I); cusps[5] =_norm_deg(D+s/3);  cusps[4] =_norm_deg(D+2*s/3)
-    s = span(I, A); cusps[2] =_norm_deg(I+s/3);  cusps[1] =_norm_deg(I+2*s/3)
+
+    s = span(A, M); cusps[11] = _norm_deg(A + s / 3.0); cusps[10] = _norm_deg(A + 2.0 * s / 3.0)
+    s = span(M, D); cusps[8]  = _norm_deg(M + s / 3.0); cusps[7]  = _norm_deg(M + 2.0 * s / 3.0)
+    s = span(D, I); cusps[5]  = _norm_deg(D + s / 3.0); cusps[4]  = _norm_deg(D + 2.0 * s / 3.0)
+    s = span(I, A); cusps[2]  = _norm_deg(I + s / 3.0); cusps[1]  = _norm_deg(I + 2.0 * s / 3.0)
     return _fill_opposites(cusps)
 
 def _morinus(ramc: float, eps: float) -> List[float]:
@@ -195,20 +199,27 @@ def _morinus(ramc: float, eps: float) -> List[float]:
         F = _norm_deg(ramc + ad)
         return _atan2d(_tand(F) * _cosd(eps), 1.0)
     cusps = _blank()
-    cusps[9]=cusp(0.0);  cusps[10]=cusp(30.0); cusps[11]=cusp(60.0)
-    cusps[0]=cusp(90.0); cusps[1] =cusp(120.0);cusps[2] =cusp(150.0)
+    cusps[9]  = cusp(0.0)
+    cusps[10] = cusp(30.0)
+    cusps[11] = cusp(60.0)
+    cusps[0]  = cusp(90.0)
+    cusps[1]  = cusp(120.0)
+    cusps[2]  = cusp(150.0)
     return _fill_opposites(cusps)
 
 def _regiomontanus(phi: float, ramc: float, eps: float, asc: float, mc: float) -> List[float]:
     def block(H: float) -> float:
         F = _norm_deg(ramc + H)
-        P = math.degrees(math.atan((_tand(phi) if H in (30.0,60.0) else _sind(phi)) * _sind(H)))
+        P = math.degrees(math.atan((_tand(phi) if H in (30.0, 60.0) else _sind(phi)) * _sind(H)))
         M = math.degrees(math.atan(_tand(P) / _cosd(F)))
         R = math.degrees(math.atan((_tand(F) * _cosd(M)) / _cosd(M + eps)))
         return R
-    cusps=_blank(); cusps[0],cusps[9]=asc,mc
-    cusps[10]=_norm_deg(mc+block(30.0)); cusps[11]=_norm_deg(mc+block(60.0))
-    cusps[1] =_norm_deg(mc+block(120.0));cusps[2] =_norm_deg(mc+block(150.0))
+    cusps = _blank()
+    cusps[0], cusps[9] = asc, mc
+    cusps[10] = _norm_deg(mc + block(30.0))
+    cusps[11] = _norm_deg(mc + block(60.0))
+    cusps[1]  = _norm_deg(mc + block(120.0))
+    cusps[2]  = _norm_deg(mc + block(150.0))
     return _fill_opposites(cusps)
 
 def _campanus(phi: float, ramc: float, eps: float, asc: float, mc: float) -> List[float]:
@@ -219,9 +230,12 @@ def _campanus(phi: float, ramc: float, eps: float, asc: float, mc: float) -> Lis
         M = math.degrees(math.atan(_tand(P) / _cosd(F)))
         R = math.degrees(math.atan((_tand(F) * _cosd(M)) / _cosd(M + eps)))
         return R
-    cusps=_blank(); cusps[0],cusps[9]=asc,mc
-    cusps[10]=_norm_deg(mc+block(30.0)); cusps[11]=_norm_deg(mc+block(60.0))
-    cusps[1] =_norm_deg(mc+block(120.0));cusps[2] =_norm_deg(mc+block(150.0))
+    cusps = _blank()
+    cusps[0], cusps[9] = asc, mc
+    cusps[10] = _norm_deg(mc + block(30.0))
+    cusps[11] = _norm_deg(mc + block(60.0))
+    cusps[1]  = _norm_deg(mc + block(120.0))
+    cusps[2]  = _norm_deg(mc + block(150.0))
     return _fill_opposites(cusps)
 
 def _koch(phi: float, eps: float, ramc: float, mc: float) -> List[float]:
@@ -237,13 +251,17 @@ def _koch(phi: float, eps: float, ramc: float, mc: float) -> List[float]:
     def cusp_from_H(H: float) -> float:
         num = -((_tand(phi) * _sind(eps)) + (_sind(H) * _cosd(eps)))
         den = _cosd(H)
-        return _acotd(num / max(1e-15, den))
-    cusps=_blank()
-    cusps[9]=mc; cusps[10]=cusp_from_H(H11); cusps[11]=cusp_from_H(H12)
-    cusps[0]=cusp_from_H(H1);  cusps[1]=cusp_from_H(H2);  cusps[2]=cusp_from_H(H3)
+        return _acotd(num / (den if abs(den) > 1e-15 else 1e-15))
+    cusps = _blank()
+    cusps[9]  = mc
+    cusps[10] = cusp_from_H(H11)
+    cusps[11] = cusp_from_H(H12)
+    cusps[0]  = cusp_from_H(H1)
+    cusps[1]  = cusp_from_H(H2)
+    cusps[2]  = cusp_from_H(H3)
     return _fill_opposites(cusps)
 
-# --------- Shared trigonometric blocks for Placidus & Topocentric (PP) ----------
+# --------- shared trig blocks for Placidus & Topocentric (PP) ----------
 
 def _decl_of_lambda_deg(lam: float, eps: float) -> float:
     return _asin_strict_deg(_sind(eps) * _sind(lam), "decl(lambda)")
@@ -257,14 +275,18 @@ def _sda_deg(dec: float, phi: float) -> float:
 
 def _sda_topocentric_deg(dec: float, phi: float) -> float:
     # PP: tan φ' = tan φ / cos δ  → SDA = acos( -tan φ' * tan δ )
-    cosd_dec = _cosd(dec)
-    if abs(cosd_dec) < 1e-15:
-        cosd_dec = 1e-15 if cosd_dec >= 0 else -1e-15
-    tan_phi_eff = _tand(phi) / cosd_dec
+    c = _cosd(dec)
+    if abs(c) < 1e-15:
+        c = 1e-15 if c >= 0.0 else -1e-15
+    tan_phi_eff = _tand(phi) / c
     t = -tan_phi_eff * _tand(dec)
     return _acos_strict_deg(t, "sda_pp")
 
 # --------------------------- Placidus & PP numeric solver ---------------------------
+
+# Tolerances can be overridden for debugging via env (degrees)
+_TOL_F = float(os.getenv("ASTRO_PLACIDUS_TOLF", "1e-10"))
+_TOL_STEP = float(os.getenv("ASTRO_PLACIDUS_TOLSTEP", "1e-9"))
 
 def _placidus_secant_solver(
     eq_func: Callable[[float], float],
@@ -273,43 +295,54 @@ def _placidus_secant_solver(
     _diag: Optional[dict] = None
 ) -> float:
     MAX_ITERS = 30
-    TOL_F = 1e-10
-    TOL_STEP = 1e-9
-    best_result = None; best_error = float('inf')
-    used=None; iters=0; last_step=None
+    best_result = None
+    best_error = float('inf')
+    used = None
+    iters = 0
+    last_step = 0.0
+
     for i, seed in enumerate(seeds):
         try:
-            x0=_norm_deg(seed); x1=_norm_deg(seed+1.0)
-            f0=eq_func(x0); f1=eq_func(x1)
-            it=0
+            x0 = _norm_deg(seed)
+            x1 = _norm_deg(seed + 1.0)
+            f0 = eq_func(x0)
+            f1 = eq_func(x1)
+            it = 0
             while it < MAX_ITERS:
-                it+=1
-                denom=(f1-f0)
+                it += 1
+                denom = (f1 - f0)
                 if abs(denom) < 1e-15:
-                    x1=_norm_deg(x1+1e-7); f1=eq_func(x1); continue
-                x2=_norm_deg((x0*f1 - x1*f0)/denom)
-                f2=eq_func(x2)
-                step=abs(_norm_deg(x2 - x1))
-                if abs(f2) < TOL_F or step < TOL_STEP:
+                    x1 = _norm_deg(x1 + 1e-7)
+                    f1 = eq_func(x1)
+                    continue
+                x2 = _norm_deg((x0 * f1 - x1 * f0) / denom)
+                f2 = eq_func(x2)
+                step = abs(_norm_deg(x2 - x1))
+                if abs(f2) < _TOL_F or step < _TOL_STEP:
                     if abs(f2) < best_error:
-                        best_result=x2; best_error=abs(f2)
-                        used=(i, seed); iters=it; last_step=step
+                        best_result = x2
+                        best_error = abs(f2)
+                        used = (i, seed)
+                        iters = it
+                        last_step = step
                     break
-                x0,f0,x1,f1=x1,f1,x2,f2
+                x0, f0, x1, f1 = x1, f1, x2, f2
             if best_result is not None:
                 break
         except Exception:
             continue
+
     if best_result is None:
         raise ValueError(f"solver failed for {label} with all seed strategies")
+
     if _diag is not None:
         _diag[label] = {
             "iters": iters,
             "residual_deg": float(best_error),
-            "last_step_deg": float(last_step or 0.0),
+            "last_step_deg": float(last_step),
             "converged": True,
-            "seed_deg": float(used[1]) if used else None,  # type: ignore
-            "seed_strategy": used[0] if used else None,   # type: ignore
+            "seed_deg": float(used[1]) if used else None,  # type: ignore[index]
+            "seed_strategy": used[0] if used else None,    # type: ignore[index]
         }
     return _norm_deg(best_result)
 
@@ -331,25 +364,34 @@ def _solve_time_division_cusps(
     def eq_builder(target_frac: float, side: str) -> Callable[[float], float]:
         sign = -1.0 if side == 'pre' else +1.0
         def f(lambda_guess: float) -> float:
-            lam=lambda_guess
-            ra=_ra_of_lambda_deg(lam, eps)
-            dec=_decl_of_lambda_deg(lam, eps)
-            half=sda_fn(dec, phi)
-            dra=_norm_deg(ra - ramc)
-            if dra > 180.0: dra -= 360.0
+            lam = lambda_guess
+            ra = _ra_of_lambda_deg(lam, eps)
+            dec = _decl_of_lambda_deg(lam, eps)
+            half = sda_fn(dec, phi)
+            dra = _norm_deg(ra - ramc)
+            if dra > 180.0:
+                dra -= 360.0
             return dra - sign * (half * target_frac)
         return f
-    por=_porphyry(asc, mc); eq_seeds=_equal(asc)
-    def seeds_for(i_por:int,i_eq:int)->List[float]:
-        s0=por[i_por]; s1=eq_seeds[i_eq]
-        return [s0, s1, _norm_deg(s0+5.0), _norm_deg(s0-5.0), _norm_deg(s1+10.0)]
+
+    por = _porphyry(asc, mc)   # good primary seeds
+    eq_seeds = _equal(asc)     # secondary seeds
+
+    def seeds_for(i_por: int, i_eq: int) -> List[float]:
+        s0 = por[i_por]; s1 = eq_seeds[i_eq]
+        return [s0, s1, _norm_deg(s0 + 5.0), _norm_deg(s0 - 5.0), _norm_deg(s1 + 10.0)]
+
     diag = {} if diag_store is not None else None
-    C11=_placidus_secant_solver(eq_builder(frac_pre_11,'pre'),  seeds_for(10,10), f"{label_prefix}C11", diag)
-    C12=_placidus_secant_solver(eq_builder(frac_pre_12,'pre'),  seeds_for(11,11), f"{label_prefix}C12", diag)
-    C2 =_placidus_secant_solver(eq_builder(frac_post_2,'post'), seeds_for(1,1),   f"{label_prefix}C2",  diag)
-    C3 =_placidus_secant_solver(eq_builder(frac_post_3,'post'), seeds_for(2,2),   f"{label_prefix}C3",  diag)
-    cusps=_blank(); cusps[0],cusps[9]=asc,mc
-    cusps[10],cusps[11]=C11,C12; cusps[1],cusps[2]=C2,C3
+    C11 = _placidus_secant_solver(eq_builder(frac_pre_11, 'pre'),  seeds_for(10, 10), f"{label_prefix}C11", diag)
+    C12 = _placidus_secant_solver(eq_builder(frac_pre_12, 'pre'),  seeds_for(11, 11), f"{label_prefix}C12", diag)
+    C2  = _placidus_secant_solver(eq_builder(frac_post_2, 'post'), seeds_for(1, 1),   f"{label_prefix}C2",  diag)
+    C3  = _placidus_secant_solver(eq_builder(frac_post_3, 'post'), seeds_for(2, 2),   f"{label_prefix}C3",  diag)
+
+    cusps = _blank()
+    cusps[0], cusps[9] = asc, mc
+    cusps[10], cusps[11] = C11, C12
+    cusps[1],  cusps[2]  = C2,  C3
+
     if diag_store is not None and isinstance(diag, dict):
         diag_store.update(diag)
     return _fill_opposites(cusps)
@@ -370,55 +412,60 @@ def _topocentric_pp(phi: float, eps: float, ramc: float, asc: float, mc: float, 
 
 def _alcabitius(phi: float, eps: float, asc: float, mc: float) -> List[float]:
     ramc = _ra_of_lambda_deg(mc, eps)
+
     def eq_builder(target_frac: float, side: str) -> Callable[[float], float]:
         sign = -1.0 if side == 'pre' else +1.0
         def f(lambda_guess: float) -> float:
-            lam=lambda_guess
-            ra=_ra_of_lambda_deg(lam, eps)
-            dec=_decl_of_lambda_deg(lam, eps)
-            half=_sda_deg(dec, phi)
-            dra=_norm_deg(ra - ramc)
-            if dra > 180.0: dra -= 360.0
+            lam = lambda_guess
+            ra = _ra_of_lambda_deg(lam, eps)
+            dec = _decl_of_lambda_deg(lam, eps)
+            half = _sda_deg(dec, phi)
+            dra = _norm_deg(ra - ramc)
+            if dra > 180.0:
+                dra -= 360.0
             return dra - sign * (half * target_frac)
         return f
-    por=_porphyry(asc, mc); eq_seeds=_equal(asc)
-    def seeds_for(i_por:int,i_eq:int)->List[float]:
-        s0=por[i_por]; s1=eq_seeds[i_eq]
-        return [s0, s1, _norm_deg(s0+5.0), _norm_deg(s0-5.0)]
-    C11=_placidus_secant_solver(eq_builder(1/3,'pre'),  seeds_for(10,10), "A:C11", None)
-    C12=_placidus_secant_solver(eq_builder(2/3,'pre'),  seeds_for(11,11), "A:C12", None)
-    C2 =_placidus_secant_solver(eq_builder(2/3,'post'), seeds_for(1,1),   "A:C2",  None)
-    C3 =_placidus_secant_solver(eq_builder(1/3,'post'), seeds_for(2,2),   "A:C3",  None)
-    cusps=_blank(); cusps[9],cusps[0]=mc,asc
-    cusps[10],cusps[11]=C11,C12; cusps[1],cusps[2]=C2,C3
+
+    por = _porphyry(asc, mc); eqs = _equal(asc)
+
+    def seeds_for(i_por: int, i_eq: int) -> List[float]:
+        s0 = por[i_por]; s1 = eqs[i_eq]
+        return [s0, s1, _norm_deg(s0 + 5.0), _norm_deg(s0 - 5.0)]
+
+    C11 = _placidus_secant_solver(eq_builder(1/3, 'pre'),  seeds_for(10, 10), "A:C11", None)
+    C12 = _placidus_secant_solver(eq_builder(2/3, 'pre'),  seeds_for(11, 11), "A:C12", None)
+    C2  = _placidus_secant_solver(eq_builder(2/3, 'post'), seeds_for(1, 1),   "A:C2",  None)
+    C3  = _placidus_secant_solver(eq_builder(1/3, 'post'), seeds_for(2, 2),   "A:C3",  None)
+
+    cusps = _blank()
+    cusps[9], cusps[0] = mc, asc
+    cusps[10], cusps[11] = C11, C12
+    cusps[1],  cusps[2]  = C2,  C3
     return _fill_opposites(cusps)
 
 # --------------------------- NEW exact engines / styles ---------------------------
 
 def _vehlow_equal(asc: float) -> List[float]:
-    start=_norm_deg(asc - 15.0)
-    return [_norm_deg(start + 30.0*i) for i in range(12)]
+    start = _norm_deg(asc - 15.0)
+    return [_norm_deg(start + 30.0 * i) for i in range(12)]
 
 def _sripati(_phi: float, _eps: float, asc: float, mc: float) -> List[float]:
-    por=_porphyry(asc, mc)
-    cusps=[0.0]*12
+    por = _porphyry(asc, mc)
+    cusps = [0.0] * 12
     for i in range(12):
-        prev=(i-1)%12
-        cusps[i]=_midpoint_wrap(por[prev], por[i])
+        prev = (i - 1) % 12
+        cusps[i] = _midpoint_wrap(por[prev], por[i])
     return _fill_opposites(cusps)
 
 def _equal_from_mc(mc: float) -> List[float]:
-    cusps=_blank()
-    cusps[9]=_norm_deg(mc)            # 10th
-    cusps[0]=_norm_deg(mc - 90.0)     # 1st = MC - 90°
-    for i in (1,2,3,4,5,6,7,8,10,11):
-        cusps[i]=_norm_deg(cusps[0] + 30.0*i)
-    return _fill_opposites(cusps)
+    """Equal houses anchored on MC (cusp 10 = MC, cusp 1 = MC - 90°)."""
+    c1 = _norm_deg(mc - 90.0)
+    return [_norm_deg(c1 + 30.0 * i) for i in range(12)]
 
 def _natural_houses() -> List[float]:
-    # Aries = 1st cusp; whole-sign from zodiac origin (0° Aries)
-    base=0.0
-    return [_norm_deg(base + 30.0*i) for i in range(12)]
+    """Aries = 1st cusp; whole-sign from 0° Aries."""
+    base = 0.0
+    return [_norm_deg(base + 30.0 * i) for i in range(12)]
 
 # --------------------------- declared but intentionally gated ---------------------------
 
@@ -441,8 +488,8 @@ class GoldTestVector(NamedTuple):
     longitude: float
     system: str
     expected_cusps: Optional[List[float]]  # None → derive from rule
-    tolerance: float  # degrees
-    source: str       # "Analytical" or external tag
+    tolerance: float                       # degrees
+    source: str                            # "Analytical" or external tag
 
 ANALYTICAL_VECTORS = [
     GoldTestVector("Equal_From_Asc", 2451545.0, 2451545.0, 0.0, 0.0, "equal", None, 1e-6, "Analytical"),
@@ -456,34 +503,34 @@ def load_external_test_vectors(filepath: Optional[str] = None) -> List[GoldTestV
         return []
     try:
         import json
-        with open(filepath, 'r') as f:
+        with open(filepath, "r") as f:
             data = json.load(f)
-        vectors=[]
+        out: List[GoldTestVector] = []
         for item in data:
-            vectors.append(GoldTestVector(
-                name=item['name'],
-                jd_tt=item['jd_tt'],
-                jd_ut1=item['jd_ut1'],
-                latitude=item['latitude'],
-                longitude=item['longitude'],
-                system=item['system'],
-                expected_cusps=item.get('expected_cusps'),
-                tolerance=item['tolerance'],
-                source=item.get('source','External')
+            out.append(GoldTestVector(
+                name=item["name"],
+                jd_tt=item["jd_tt"],
+                jd_ut1=item["jd_ut1"],
+                latitude=item["latitude"],
+                longitude=item["longitude"],
+                system=item["system"],
+                expected_cusps=item.get("expected_cusps"),
+                tolerance=item["tolerance"],
+                source=item.get("source", "External"),
             ))
-        return vectors
+        return out
     except Exception:
         return []
 
 def get_test_vectors(external_file: Optional[str] = None) -> List[GoldTestVector]:
-    v=list(ANALYTICAL_VECTORS)
+    v = list(ANALYTICAL_VECTORS)
     v.extend(load_external_test_vectors(external_file))
     return v
 
 def _expected_from_rule(system: str, asc: float, mc: float) -> Optional[List[float]]:
-    s=system.lower()
+    s = system.lower()
     if s == "equal": return _equal(asc)
-    if s in ("whole_sign","whole"): return _whole(asc)
+    if s in ("whole_sign", "whole"): return _whole(asc)
     if s == "vehlow_equal": return _vehlow_equal(asc)
     if s == "natural_houses": return _natural_houses()
     if s == "equal_from_mc": return _equal_from_mc(mc)
@@ -499,8 +546,8 @@ class ErrorBudget:
     reference_comparison: float = 0.0
     total_rss: float = 0.0
     def compute_total(self) -> float:
-        comps=[self.coordinate_precision,self.algorithm_truncation,self.time_scale_uncertainty,self.reference_comparison]
-        self.total_rss = math.sqrt(sum(x*x for x in comps))
+        comps = [self.coordinate_precision, self.algorithm_truncation, self.time_scale_uncertainty, self.reference_comparison]
+        self.total_rss = math.sqrt(sum(x * x for x in comps))
         return self.total_rss
     def certify_accuracy(self, target_arcsec: float = 18.0) -> bool:
         self.compute_total()
@@ -528,13 +575,13 @@ class HouseData:
     solver_stats: Optional[Dict[str, Any]] = None
     validation_results: List[ValidationResult] = field(default_factory=list)
     error_budget: Optional[ErrorBudget] = None
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.warnings is None:
             self.warnings = []
 
 # --------------------------- supported systems ---------------------------
 
-# 24 declared (added equal_from_mc, natural_houses, bhava_* aliases + keeping gated)
+# Declared (aligned with façade): 24 total
 SUPPORTED_HOUSE_SYSTEMS = [
     "placidus","koch","regiomontanus","campanus",
     "equal","whole_sign","porphyry","alcabitius",
@@ -542,7 +589,6 @@ SUPPORTED_HOUSE_SYSTEMS = [
     "carter_pe","sunshine","vehlow_equal","sripati",
     "krusinski","pullen_sd","equal_from_mc","natural_houses",
     "bhava_chalit_sripati","bhava_chalit_equal_from_mc",
-    # future placeholders could be added here
 ]
 
 # Implemented subset
@@ -559,7 +605,7 @@ class PreciseHouseCalculator:
     """
     Exact house computations with apparent sidereal time and true obliquity.
     STRICT by default: both jd_tt and jd_ut1 required.
-    Declares many systems; some gated.
+    Declares many systems; some are intentionally gated (501).
     """
 
     def __init__(self, require_strict_timescales: bool = True, enable_diagnostics: bool = False,
@@ -583,12 +629,13 @@ class PreciseHouseCalculator:
                     jd_ut=vector.jd_ut1, house_system=vector.system,
                     jd_tt=vector.jd_tt, jd_ut1=vector.jd_ut1
                 )
-                expected = ( _expected_from_rule(vector.system, hd.ascendant, hd.midheaven)
-                             if vector.source=="Analytical" else vector.expected_cusps )
+                expected = (_expected_from_rule(vector.system, hd.ascendant, hd.midheaven)
+                            if vector.source == "Analytical" else vector.expected_cusps)
                 if not expected:
                     continue
-                errors=[_wrap_diff_deg(c,e) for c,e in zip(hd.cusps, expected)]
-                max_err=max(errors); max_arc=max_err*3600.0
+                errors = [_wrap_diff_deg(c, e) for c, e in zip(hd.cusps, expected)]
+                max_err = max(errors)
+                max_arc = max_err * 3600.0
                 eb = ErrorBudget(
                     coordinate_precision=sys.float_info.epsilon * 57.2958,
                     algorithm_truncation=1e-10,
@@ -596,21 +643,22 @@ class PreciseHouseCalculator:
                     reference_comparison=max_err
                 )
                 eb.compute_total()
-                results.append(ValidationResult(vector.name, vector.system, max_err, max_arc, max_err<=vector.tolerance, eb))
+                results.append(ValidationResult(vector.name, vector.system, max_err, max_arc, max_err <= vector.tolerance, eb))
             except Exception:
                 results.append(ValidationResult(vector.name, vector.system, float('inf'), float('inf'), False, ErrorBudget()))
         return results
 
     def cross_validate_implementation(self, latitude: float, longitude: float,
                                       jd_tt: float, jd_ut1: float, house_system: str) -> ErrorBudget:
-        eb=ErrorBudget()
-        phi_rad=math.radians(latitude)
-        condition=max(1.0, abs(1.0 / max(1e-15, math.cos(phi_rad))))
-        eb.coordinate_precision=condition * sys.float_info.epsilon * 57.2958
-        eb.algorithm_truncation=1e-10 if house_system=="placidus" else 1e-15
-        dt_unc=0.1/86400.0; sid_rate=1.002737909350795
-        eb.time_scale_uncertainty=dt_unc * sid_rate * 15.0
-        eb.reference_comparison=0.0
+        eb = ErrorBudget()
+        phi_rad = math.radians(latitude)
+        condition = max(1.0, abs(1.0 / (math.cos(phi_rad) if abs(math.cos(phi_rad)) > 1e-15 else 1e-15)))
+        eb.coordinate_precision = condition * sys.float_info.epsilon * 57.2958
+        eb.algorithm_truncation = 1e-10 if house_system == "placidus" else 1e-15
+        dt_unc = 0.1 / 86400.0  # ~0.1 s TT-UT1
+        sid_rate = 1.002737909350795
+        eb.time_scale_uncertainty = dt_unc * sid_rate * 15.0
+        eb.reference_comparison = 0.0
         eb.compute_total()
         return eb
 
@@ -625,30 +673,37 @@ class PreciseHouseCalculator:
         jd_ut1: Optional[float] = None,
     ) -> HouseData:
 
-        if not (latitude > -90.0 and latitude < 90.0):
+        # ---- latitude checks ----
+        if not (-90.0 < latitude < 90.0):
             raise ValueError("Latitude must be strictly between -90 and 90 degrees; poles undefined for house systems.")
         if math.isnan(latitude) or math.isinf(latitude):
             raise ValueError("Latitude must be a finite number.")
 
+        # ---- system normalization ----
         sys_name = house_system.lower().strip()
-        if sys_name == "whole": sys_name = "whole_sign"
-        if sys_name == "azimuthal": sys_name = "horizon"
+        if sys_name == "whole":
+            sys_name = "whole_sign"
+        if sys_name == "azimuthal":
+            sys_name = "horizon"
         if sys_name not in SUPPORTED_HOUSE_SYSTEMS:
             raise ValueError(f"Unsupported house system: {house_system}")
 
+        # Gate ambiguous / research systems explicitly
         if sys_name in _GATED_VENDOR_VARIANTS or sys_name in _GATED_RESEARCH:
             _raise_gated(sys_name)
 
+        # ---- timescales ----
         if self.require_strict_timescales:
             if jd_tt is None or jd_ut1 is None:
                 raise ValueError("Strict mode requires jd_tt and jd_ut1 (no UT≈UTC shortcuts).")
             tt, ut1 = jd_tt, jd_ut1
         else:
             tt = jd_tt or jd_ut
-            ut1= jd_ut1 or jd_ut
+            ut1 = jd_ut1 or jd_ut
             if tt is None or ut1 is None:
                 raise ValueError("Provide jd_tt and jd_ut1 or disable strict mode explicitly.")
 
+        # ---- angles ----
         eps  = _true_obliquity_deg(tt)
         ramc = _ramc_deg(ut1, tt, longitude)
         mc   = _mc_longitude_deg(ramc, eps)
@@ -659,57 +714,65 @@ class PreciseHouseCalculator:
         warnings: List[str] = []
         solver_stats: Optional[Dict[str, Any]] = {} if self.enable_diagnostics else None
 
+        # ---- dispatch exact systems ----
         if sys_name == "equal":
-            cusps=_equal(asc)
+            cusps = _equal(asc)
         elif sys_name == "whole_sign":
-            cusps=_whole(asc)
+            cusps = _whole(asc)
         elif sys_name == "porphyry":
-            cusps=_porphyry(asc, mc)
+            cusps = _porphyry(asc, mc)
         elif sys_name == "morinus":
-            cusps=_morinus(ramc, eps)
+            cusps = _morinus(ramc, eps)
         elif sys_name == "regiomontanus":
-            cusps=_regiomontanus(latitude, ramc, eps, asc, mc)
+            cusps = _regiomontanus(latitude, ramc, eps, asc, mc)
         elif sys_name == "campanus":
-            cusps=_campanus(latitude, ramc, eps, asc, mc)
+            cusps = _campanus(latitude, ramc, eps, asc, mc)
         elif sys_name == "koch":
-            cusps=_koch(latitude, eps, ramc, mc)
+            cusps = _koch(latitude, eps, ramc, mc)
         elif sys_name == "alcabitius":
-            cusps=_alcabitius(latitude, eps, asc, mc)
+            cusps = _alcabitius(latitude, eps, asc, mc)
         elif sys_name == "vehlow_equal":
-            cusps=_vehlow_equal(asc)
+            cusps = _vehlow_equal(asc)
         elif sys_name == "sripati":
-            cusps=_sripati(latitude, eps, asc, mc)
+            cusps = _sripati(latitude, eps, asc, mc)
         elif sys_name == "equal_from_mc":
-            cusps=_equal_from_mc(mc)
+            cusps = _equal_from_mc(mc)
         elif sys_name == "natural_houses":
-            cusps=_natural_houses()
+            cusps = _natural_houses()
         elif sys_name == "bhava_chalit_sripati":
-            cusps=_sripati(latitude, eps, asc, mc)
+            cusps = _sripati(latitude, eps, asc, mc)
         elif sys_name == "bhava_chalit_equal_from_mc":
-            cusps=_equal_from_mc(mc)
+            cusps = _equal_from_mc(mc)
         elif sys_name == "topocentric":
             diag = {} if self.enable_diagnostics else None
-            cusps=_topocentric_pp(latitude, eps, ramc, asc, mc, _diag=diag)
+            cusps = _topocentric_pp(latitude, eps, ramc, asc, mc, _diag=diag)
             if solver_stats is not None and diag is not None:
-                solver_stats["topocentric"]=diag
-        else:  # placidus
+                solver_stats["topocentric"] = diag
+        else:  # placidus (default)
             diag = {} if self.enable_diagnostics else None
-            cusps=_placidus(latitude, eps, ramc, asc, mc, _diag=diag)
+            cusps = _placidus(latitude, eps, ramc, asc, mc, _diag=diag)
             if solver_stats is not None and diag is not None:
-                solver_stats["placidus"]=diag
+                solver_stats["placidus"] = diag
 
+        # ---- diagnostics → warnings (compact, opt-in) ----
         if self.enable_diagnostics and solver_stats:
-            for group_key in ("placidus","topocentric"):
+            for group_key in ("placidus", "topocentric"):
                 d = solver_stats.get(group_key)
-                if not isinstance(d, dict): continue
-                for label in ("P:C11","P:C12","P:C2","P:C3","PP:C11","PP:C12","PP:C2","PP:C3"):
-                    if label not in d: continue
-                    s = d[label]
-                    warnings.append(
-                        f"[{label}] iters={s.get('iters')} res={s.get('residual_deg'):.3e}° "
-                        f"step={s.get('last_step_deg'):.3e}° seed={s.get('seed_deg')} strat={s.get('seed_strategy')}"
-                    )
+                if not isinstance(d, dict):
+                    continue
+                for label in (f"{'P' if group_key=='placidus' else 'PP'}:C11",
+                              f"{'P' if group_key=='placidus' else 'PP'}:C12",
+                              f"{'P' if group_key=='placidus' else 'PP'}:C2",
+                              f"{'P' if group_key=='placidus' else 'PP'}:C3"):
+                    s = d.get(label)
+                    if isinstance(s, dict):
+                        warnings.append(
+                            f"[{label}] iters={s.get('iters')} "
+                            f"res={s.get('residual_deg'):.3e}° step={s.get('last_step_deg'):.3e}° "
+                            f"seed={s.get('seed_deg')} strat={s.get('seed_strategy')}"
+                        )
 
+        # ---- GOLD STANDARD: validation & error budgeting ----
         validation_results: List[ValidationResult] = []
         error_budget: Optional[ErrorBudget] = None
         if self.enable_validation:
@@ -721,11 +784,16 @@ class PreciseHouseCalculator:
                 warnings.append(f"Error budget warning: {error_budget.total_rss*3600:.1f}\" exceeds 18\" target")
 
         return HouseData(
-            system=sys_name, cusps=cusps, ascendant=asc, midheaven=mc,
-            vertex=vtx, eastpoint=east, warnings=warnings,
+            system=sys_name,
+            cusps=cusps,
+            ascendant=asc,
+            midheaven=mc,
+            vertex=vtx,
+            eastpoint=east,
+            warnings=warnings,
             solver_stats=solver_stats if self.enable_diagnostics else None,
             validation_results=validation_results if self.enable_validation else [],
-            error_budget=error_budget
+            error_budget=error_budget,
         )
 
 # --------------------------- integration helper ---------------------------
@@ -739,6 +807,10 @@ def compute_house_system(
     jd_tt: Optional[float] = None,
     jd_ut1: Optional[float] = None,
 ) -> Dict[str, Any]:
+    """
+    Back-compat helper returning a stable dict payload (angles + cusps + extras).
+    Strict mode is enforced (jd_tt & jd_ut1 required); will raise if missing.
+    """
     calc = PreciseHouseCalculator(require_strict_timescales=True, enable_diagnostics=False)
     hd = calc.calculate_houses(
         latitude=latitude, longitude=longitude, jd_ut=jd_ut,
@@ -764,7 +836,7 @@ def compute_house_system(
             "time_scale_uncertainty": hd.error_budget.time_scale_uncertainty,
             "reference_comparison": hd.error_budget.reference_comparison,
             "total_rss": hd.error_budget.total_rss,
-            "certified": hd.error_budget.certify_accuracy()
+            "certified": hd.error_budget.certify_accuracy(),
         }
     return payload
 
@@ -777,21 +849,21 @@ def assign_houses(longitudes_deg: List[float], cusps_deg: List[float]) -> List[i
     """
     if len(cusps_deg) != 12:
         raise ValueError("cusps_deg must have length 12")
-    ordered=[_norm_deg(c) for c in cusps_deg]
-    res=[]
+    ordered = [_norm_deg(c) for c in cusps_deg]
+    res: List[int] = []
     for L in longitudes_deg:
-        lam=_norm_deg(L)
-        idx=0
-        while idx<12:
-            start=ordered[idx]
-            end=_norm_deg(ordered[(idx+1)%12])
-            span=_norm_deg(end - start)
-            delta=_norm_deg(lam - start)
-            if delta < span or span==0.0:
-                res.append(idx+1)
+        lam = _norm_deg(L)
+        idx = 0
+        while idx < 12:
+            start = ordered[idx]
+            end = _norm_deg(ordered[(idx + 1) % 12])
+            span = _norm_deg(end - start)
+            delta = _norm_deg(lam - start)
+            if delta < span or span == 0.0:
+                res.append(idx + 1)
                 break
-            idx+=1
-        if idx==12:
+            idx += 1
+        if idx == 12:
             res.append(12)
     return res
 
@@ -810,15 +882,15 @@ def _house_of_longitude(cusps_deg: List[float], lon_deg: float) -> int:
     """Return 1..12 house index for a longitude with forward-wrap intervals."""
     if len(cusps_deg) != 12:
         raise ValueError("cusps_deg must have length 12")
-    ordered=[_norm_deg(c) for c in cusps_deg]
-    lam=_norm_deg(lon_deg)
+    ordered = [_norm_deg(c) for c in cusps_deg]
+    lam = _norm_deg(lon_deg)
     for i in range(12):
-        start=ordered[i]
-        end=_norm_deg(ordered[(i+1)%12])
-        span=_norm_deg(end - start)
-        delta=_norm_deg(lam - start)
-        if delta < span or span==0.0:
-            return i+1
+        start = ordered[i]
+        end = _norm_deg(ordered[(i + 1) % 12])
+        span = _norm_deg(end - start)
+        delta = _norm_deg(lam - start)
+        if delta < span or span == 0.0:
+            return i + 1
     return 12
 
 def analyze_interceptions(cusps_deg: List[float]) -> Dict[str, Any]:
@@ -826,9 +898,6 @@ def analyze_interceptions(cusps_deg: List[float]) -> Dict[str, Any]:
     Determine intercepted signs (entire sign contained within a single house span)
     and duplicated signs (two distinct cusps within the same sign). Also returns
     per-house spans and cusp-sign labels.
-
-    Typical for quadrant systems at certain latitudes: up to two intercepted signs,
-    with corresponding duplicated signs on opposite houses.
 
     Returns:
       {
@@ -841,29 +910,30 @@ def analyze_interceptions(cusps_deg: List[float]) -> Dict[str, Any]:
     if len(cusps_deg) != 12:
         raise ValueError("cusps_deg must have length 12")
 
-    cusps=[_norm_deg(x) for x in cusps_deg]
+    cusps = [_norm_deg(x) for x in cusps_deg]
+
     # spans
-    spans=[]
+    spans: List[float] = []
     for i in range(12):
-        start=cusps[i]
-        end=_norm_deg(cusps[(i+1)%12])
+        start = cusps[i]
+        end = _norm_deg(cusps[(i + 1) % 12])
         spans.append(_norm_deg(end - start))
 
-    cusp_signs=[_ZODIAC_SIGNS[_sign_index(x)] for x in cusps]
+    cusp_signs = [_ZODIAC_SIGNS[_sign_index(x)] for x in cusps]
 
     # duplicated signs: count cusps per sign
-    counts=[0]*12
+    counts = [0] * 12
     for c in cusps:
         counts[_sign_index(c)] += 1
-    duplicated=[_ZODIAC_SIGNS[i] for i,n in enumerate(counts) if n>=2]
+    duplicated = [_ZODIAC_SIGNS[i] for i, n in enumerate(counts) if n >= 2]
 
     # intercepted: signs with zero cusps AND fully contained within a single house span
-    intercepted=[]
+    intercepted: List[Dict[str, Any]] = []
     for s in range(12):
         if counts[s] != 0:
             continue
-        start_s = s*30.0
-        end_s   = _norm_deg(start_s + 30.0)
+        start_s = s * 30.0
+        end_s = _norm_deg(start_s + 30.0)
         # test just inside the boundaries to avoid cusp coincidence
         eps = 1e-8
         h1 = _house_of_longitude(cusps, _norm_deg(start_s + eps))
@@ -894,16 +964,16 @@ def analyze_house_sizes(cusps_deg: List[float]) -> Dict[str, Any]:
     """
     if len(cusps_deg) != 12:
         raise ValueError("cusps_deg must have length 12")
-    c=[_norm_deg(x) for x in cusps_deg]
-    spans=[]
+    c = [_norm_deg(x) for x in cusps_deg]
+    spans: List[float] = []
     for i in range(12):
-        start=c[i]
-        end=_norm_deg(c[(i+1)%12])
+        start = c[i]
+        end = _norm_deg(c[(i + 1) % 12])
         spans.append(_norm_deg(end - start))
-    mean=sum(spans)/12.0
-    var=sum((s-mean)**2 for s in spans)/12.0
-    std=math.sqrt(var)
-    dev=[abs(s-30.0) for s in spans]
+    mean = sum(spans) / 12.0
+    var = sum((s - mean) ** 2 for s in spans) / 12.0
+    std = math.sqrt(var)
+    dev = [abs(s - 30.0) for s in spans]
     return {
         "spans_deg": spans,
         "mean_deg": mean,
@@ -919,7 +989,7 @@ def analyze_house_sizes(cusps_deg: List[float]) -> Dict[str, Any]:
 # Vimshottari order (KP convention starts from Ketu)
 _VIM_ORDER = ["ketu","venus","sun","moon","mars","rahu","jupiter","saturn","mercury"]
 _VIM_YEARS = {"ketu":7,"venus":20,"sun":6,"moon":10,"mars":7,"rahu":18,"jupiter":16,"saturn":19,"mercury":17}
-_NAK_WIDTH = 360.0/27.0  # 13°20' = 13.333...°
+_NAK_WIDTH = 360.0 / 27.0  # 13°20' = 13.333...°
 
 def _kp_nakshatra_index(nirayana_lon: float) -> int:
     """1..27 (Ashwini=1)"""
@@ -929,10 +999,10 @@ def _kp_nak_lord(nak_index: int) -> str:
     return _VIM_ORDER[(nak_index - 1) % 9]
 
 def _cycle_from(lord: str) -> List[str]:
-    i=_VIM_ORDER.index(lord)
+    i = _VIM_ORDER.index(lord)
     return _VIM_ORDER[i:] + _VIM_ORDER[:i]
 
-def kp_details(longitude_deg: float, *, zodiac_mode: str="sidereal", ayanamsa_deg: float=0.0) -> Dict[str, Any]:
+def kp_details(longitude_deg: float, *, zodiac_mode: str = "sidereal", ayanamsa_deg: float = 0.0) -> Dict[str, Any]:
     """
     KP nakshatra/pada/lord/sub-lord for a given longitude.
     If zodiac_mode="sidereal", longitude is tropical and we subtract ayanamsa to get nirayana.
@@ -944,10 +1014,11 @@ def kp_details(longitude_deg: float, *, zodiac_mode: str="sidereal", ayanamsa_de
     pos_in_nak = _norm_deg(lon - nak_start)
     pada = int(math.floor((pos_in_nak / _NAK_WIDTH) * 4.0)) + 1  # 1..4
     # Sub-lord subdivision: 9 parts proportional to Vimshottari years, starting at nak_lord
-    cycle=_cycle_from(nak_lord)
+    cycle = _cycle_from(nak_lord)
     total_years = 120.0
-    sub_lengths = [(_VIM_YEARS[p]/total_years) * _NAK_WIDTH for p in cycle]
-    cum=0.0; sublord=cycle[-1]
+    sub_lengths = [(_VIM_YEARS[p] / total_years) * _NAK_WIDTH for p in cycle]
+    cum = 0.0
+    sublord = cycle[-1]
     for p, seg in zip(cycle, sub_lengths):
         if pos_in_nak < cum + seg:
             sublord = p
@@ -963,13 +1034,11 @@ def kp_details(longitude_deg: float, *, zodiac_mode: str="sidereal", ayanamsa_de
         "offset_within_nak_deg": pos_in_nak,
     }
 
-def kp_assign_for_points(points_deg: Dict[str,float], *, zodiac_mode: str="sidereal", ayanamsa_deg: float=0.0) -> Dict[str, Dict[str, Any]]:
-    """
-    Compute KP details per named point (planets/cusps). points_deg: {"Moon": 123.4, "Cusp1": ...}
-    """
-    out={}
+def kp_assign_for_points(points_deg: Dict[str, float], *, zodiac_mode: str = "sidereal", ayanamsa_deg: float = 0.0) -> Dict[str, Dict[str, Any]]:
+    """Compute KP details per named point (planets/cusps). points_deg: {"Moon": 123.4, "Cusp1": ...}"""
+    out: Dict[str, Dict[str, Any]] = {}
     for name, lon in points_deg.items():
-        out[name]=kp_details(lon, zodiac_mode=zodiac_mode, ayanamsa_deg=ayanamsa_deg)
+        out[name] = kp_details(lon, zodiac_mode=zodiac_mode, ayanamsa_deg=ayanamsa_deg)
     return out
 
 # --------------------------- Gauquelin sectors (provisional) ---------------------------
@@ -1002,31 +1071,31 @@ def run_comprehensive_validation(external_vectors_file: Optional[str] = None) ->
                 jd_ut=vector.jd_ut1, house_system=vector.system,
                 jd_tt=vector.jd_tt, jd_ut1=vector.jd_ut1
             )
-            expected = _expected_from_rule(vector.system, hd.ascendant, hd.midheaven) if vector.source=="Analytical" else vector.expected_cusps
+            expected = _expected_from_rule(vector.system, hd.ascendant, hd.midheaven) if vector.source == "Analytical" else vector.expected_cusps
             if not expected:
                 continue
-            errors=[_wrap_diff_deg(c,e) for c,e in zip(hd.cusps, expected)]
-            max_err=max(errors); max_arc=max_err*3600.0
+            errors = [_wrap_diff_deg(c, e) for c, e in zip(hd.cusps, expected)]
+            max_err = max(errors); max_arc = max_err * 3600.0
             eb = ErrorBudget(
                 coordinate_precision=sys.float_info.epsilon * 57.2958,
                 algorithm_truncation=1e-10,
                 time_scale_uncertainty=0.0001,
                 reference_comparison=max_err
             ); eb.compute_total()
-            res = ValidationResult(vector.name, vector.system, max_err, max_arc, max_err<=vector.tolerance, eb)
+            res = ValidationResult(vector.name, vector.system, max_err, max_arc, max_err <= vector.tolerance, eb)
             all_results.append(res)
-            st = system_stats.setdefault(vector.system, {'tested':0,'passed':0,'max_error':0.0,'avg_error':0.0})
+            st = system_stats.setdefault(vector.system, {'tested': 0, 'passed': 0, 'max_error': 0.0, 'avg_error': 0.0})
             st['tested'] += 1
             if res.passed: st['passed'] += 1
             st['max_error'] = max(st['max_error'], res.max_error_arcsec)
-            st['avg_error'] = (st['avg_error']*(st['tested']-1) + res.max_error_arcsec)/st['tested']
+            st['avg_error'] = (st['avg_error'] * (st['tested'] - 1) + res.max_error_arcsec) / st['tested']
         except Exception:
             all_results.append(ValidationResult(vector.name, vector.system, float('inf'), float('inf'), False, ErrorBudget()))
 
-    total=len(all_results); passed=sum(1 for r in all_results if r.passed)
-    pass_rate=(passed/total) if total>0 else 0.0
-    max_arc=max((r.max_error_arcsec for r in all_results), default=0.0)
-    avg_arc=sum(r.max_error_arcsec for r in all_results)/total if total>0 else 0.0
+    total = len(all_results); passed = sum(1 for r in all_results if r.passed)
+    pass_rate = (passed / total) if total > 0 else 0.0
+    max_arc = max((r.max_error_arcsec for r in all_results), default=0.0)
+    avg_arc = sum(r.max_error_arcsec for r in all_results) / total if total > 0 else 0.0
     return {
         'validation_summary': {
             'total_tests': total, 'passed_tests': passed, 'pass_rate': pass_rate,
@@ -1039,21 +1108,4 @@ def run_comprehensive_validation(external_vectors_file: Optional[str] = None) ->
 
 # --------------------------- CLI ---------------------------
 
-if __name__ == "__main__":
-    report = run_comprehensive_validation()
-    print("=== GOLD STANDARD VALIDATION REPORT ===")
-    summary = report['validation_summary']
-    print(f"Tests: {summary['passed_tests']}/{summary['total_tests']} passed ({summary['pass_rate']:.1%})")
-    print(f"Max error: {summary['max_error_arcsec']:.1f}\"  Avg error: {summary['avg_error_arcsec']:.1f}\"")
-    print(f"Gold standard certified: {summary['gold_standard_certified']}")
-    for system, stats in report['system_statistics'].items():
-        print(f"{system}: {int(stats['passed'])}/{int(stats['tested'])} passed, max_err={stats['max_error']:.1f}\"")
-
-    # Demo: interception & size analysis (synthetic)
-    # (Remove or adapt in production)
-    print("\n=== DIAGNOSTICS (example) ===")
-    # Fake cusps equally spaced at 0,30,... (no interceptions)
-    eq_cusps = [i*30.0 for i in range(12)]
-    print("Intercepts:", analyze_interceptions(eq_cusps))
-    print("Sizes:", analyze_house_sizes(eq_cusps))
-    print("\nNOTE: Use external private vectors for full SwissEph/Solar Fire parity.")
+if __name__ ==
