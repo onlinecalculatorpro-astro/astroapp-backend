@@ -1,75 +1,33 @@
 # app/core/house.py
 from __future__ import annotations
 
+"""
+Policy façade for house-system computation.
+
+This module normalizes public house-system names, enforces strict time-scales,
+applies a clear polar-latitude policy, and executes the gold-standard engine
+(app.core.houses_advanced.PreciseHouseCalculator) with a numeric fallback chain.
+
+POLAR POLICY (decision tree — high visibility)
+1) Validate latitude within (-90, 90); hard-guard near poles (±89.999999°).
+2) If requested system ∈ HARD_REJECT and |lat| ≥ hard_limit (default 80°):
+     - Record a warning and attempt fallbacks (do not compute with the requested).
+3) If policy == "reject_above_66deg" and requested ∈ RISKY and |lat| > soft_limit (default 66°):
+     - Reject early with an explanatory error.
+4) Otherwise, build the fallback chain:
+     - requested → env-provided chain → similarity-based defaults → robust systems tail
+     - If policy == "fallback_to_equal_above_66deg" AND requested is RISKY at |lat|>soft_limit:
+         bias the chain to robust families first:
+           {equal, whole, equal_from_mc, natural_houses} then porphyry, then others.
+5) Iterate over the chain (unless fallbacks disabled), returning the first success.
+"""
+
+import difflib
 import json
 import os
 from typing import Any, Dict, List, Optional, Tuple, Final
 
-# ───────────────────────── Public ↔ Engine names ─────────────────────────
-
-# Public names accepted by the API (include common aliases).
-# We list all 18 so the API never 400's for a declared name.
-SUPPORTED_HOUSE_SYSTEMS: Final[Tuple[str, ...]] = (
-    # classical/modern (implemented)
-    "placidus", "koch", "regiomontanus", "campanus",
-    "porphyry", "alcabitius", "morinus", "topocentric",
-    "equal",
-    # whole-sign & aliases (implemented)
-    "whole", "whole_sign", "whole-sign", "whole sign",
-    # additional implemented
-    "vehlow_equal", "sripati",
-    # vendor-variant / research (gated → 501 Not Implemented)
-    "meridian", "horizon", "carter_pe", "sunshine", "krusinski", "pullen_sd",
-)
-
-# Public/alias → engine canonical
-_ALIAS_TO_ENGINE: Final[Dict[str, str]] = {
-    "whole": "whole_sign",
-    "whole_sign": "whole_sign",
-    "whole-sign": "whole_sign",
-    "whole sign": "whole_sign",
-}
-
-# Engine canonical → preferred public label
-_ENGINE_TO_PUBLIC: Final[Dict[str, str]] = {
-    "whole_sign": "whole",
-}
-
-# Systems intentionally not implemented yet (HTTP layer maps to 501)
-GATED_NOT_IMPLEMENTED: Final[frozenset[str]] = frozenset({
-    # vendor-variant (ambiguous specs)
-    "horizon", "carter_pe", "sunshine", "pullen_sd",
-    # research-claimed (awaiting gold vectors/spec)
-    "meridian", "krusinski",
-})
-
-# ───────────────────────── Env / Policy knobs ─────────────────────────
-
-POLAR_SOFT_LIMIT_DEG: Final[float] = float(os.getenv("ASTRO_POLAR_SOFT_LAT", "66.0"))
-POLAR_HARD_LIMIT_DEG: Final[float] = float(os.getenv("ASTRO_POLAR_HARD_LAT", "80.0"))
-POLAR_ABSOLUTE_LIMIT_DEG: Final[float] = 89.999999  # guard near poles
-POLAR_POLICY: Final[str] = os.getenv("ASTRO_POLAR_POLICY", "fallback_to_equal_above_66deg")
-
-# Systems that misbehave near the poles (time-division/numeric issues)
-_HARD_REJECT_AT_POLAR: Final[frozenset[str]] = frozenset({"placidus", "koch", "topocentric", "alcabitius"})
-_RISKY_AT_POLAR: Final[frozenset[str]] = frozenset({
-    "placidus", "koch", "regiomontanus", "campanus", "topocentric", "alcabitius", "morinus",
-    # robust angular/segment systems intentionally omitted: equal/whole/porphyry/vehlow_equal/sripati
-})
-
-# Numeric multi-fallback enabled?
-NUMERIC_FALLBACK_ENABLED: Final[bool] = os.getenv("ASTRO_HOUSES_NUMERIC_FALLBACK", "1").lower() in ("1", "true", "yes", "on")
-
-# Optional JSON mapping of custom fallback chains:
-#   ASTRO_HOUSES_FALLBACK_JSON='{"placidus":["koch","regiomontanus","campanus","porphyry","equal","whole"]}'
-_FALLBACK_JSON: Optional[str] = os.getenv("ASTRO_HOUSES_FALLBACK_JSON")
-
-# Defaults for diagnostics/validation passthrough to the engine
-DEFAULT_DIAGNOSTICS: Final[bool] = os.getenv("ASTRO_HOUSES_DEBUG", "").lower() in ("1", "true", "yes", "on")
-DEFAULT_VALIDATION: Final[bool] = os.getenv("ASTRO_HOUSES_VALIDATE", "").lower() in ("1", "true", "yes", "on")
-
 # ───────────────────────── Engine import ─────────────────────────
-
 try:
     from app.core.houses_advanced import PreciseHouseCalculator, HouseData
 except Exception as _e:  # pragma: no cover
@@ -79,7 +37,6 @@ except Exception as _e:  # pragma: no cover
     ) from _e
 
 # ───────────────────────── Metrics (lazy; avoid cycles) ─────────────────────────
-
 def _met_warn(kind: str) -> None:
     try:
         from app.main import MET_WARNINGS  # type: ignore
@@ -94,38 +51,147 @@ def _met_fallback(requested: str, fallback: str) -> None:
     except Exception:
         pass
 
-# ───────────────────────── Utilities ─────────────────────────
+# ───────────────────────── Env / Policy knobs ─────────────────────────
+POLAR_SOFT_LIMIT_DEG: Final[float] = float(os.getenv("ASTRO_POLAR_SOFT_LAT", "66.0"))
+POLAR_HARD_LIMIT_DEG: Final[float] = float(os.getenv("ASTRO_POLAR_HARD_LAT", "80.0"))
+POLAR_ABSOLUTE_LIMIT_DEG: Final[float] = 89.999999  # guard near poles
+POLAR_POLICY: Final[str] = os.getenv("ASTRO_POLAR_POLICY", "fallback_to_equal_above_66deg")
 
-def list_supported_house_systems() -> List[str]:
-    """Return the public list (includes accepted aliases)."""
-    return list(SUPPORTED_HOUSE_SYSTEMS)
+# Systems that misbehave near the poles (time-division/numeric issues)
+_HARD_REJECT_AT_POLAR: Final[frozenset[str]] = frozenset({"placidus", "koch", "topocentric", "alcabitius"})
+_RISKY_AT_POLAR: Final[frozenset[str]] = frozenset({
+    "placidus", "koch", "regiomontanus", "campanus", "topocentric", "alcabitius", "morinus"
+    # robust angular/segment systems intentionally omitted:
+    # equal, whole, porphyry, vehlow_equal, sripati, equal_from_mc, natural_houses
+})
+
+# Numeric multi-fallback enabled?
+NUMERIC_FALLBACK_ENABLED: Final[bool] = os.getenv("ASTRO_HOUSES_NUMERIC_FALLBACK", "1").lower() in ("1", "true", "yes", "on")
+
+# Optional JSON mapping of custom fallback chains:
+#   ASTRO_HOUSES_FALLBACK_JSON='{"placidus":["koch","regiomontanus","campanus","porphyry","equal","whole"]}'
+_FALLBACK_JSON: Optional[str] = os.getenv("ASTRO_HOUSES_FALLBACK_JSON")
+
+# Defaults for diagnostics/validation passthrough to the engine
+DEFAULT_DIAGNOSTICS: Final[bool] = os.getenv("ASTRO_HOUSES_DEBUG", "").lower() in ("1", "true", "yes", "on")
+DEFAULT_VALIDATION: Final[bool] = os.getenv("ASTRO_HOUSES_VALIDATE", "").lower() in ("1", "true", "yes", "on")
+
+# ───────────────────────── Public Systems (canonical) ─────────────────────────
+# We expose a compact, canonical list for docs/clients. Aliases (spaces/hyphens/case)
+# are handled by the slug canonicalizer below.
+SUPPORTED_HOUSE_SYSTEMS: Final[Tuple[str, ...]] = (
+    # classical/modern (implemented)
+    "placidus", "koch", "regiomontanus", "campanus",
+    "porphyry", "alcabitius", "morinus", "topocentric",
+    "equal", "whole",
+    # additional implemented
+    "vehlow_equal", "sripati",
+    # v10 additions
+    "equal_from_mc", "natural_houses",
+    "bhava_chalit_sripati", "bhava_chalit_equal_from_mc",
+    # declared but gated (501)
+    "meridian", "horizon", "carter_pe", "sunshine", "krusinski", "pullen_sd",
+)
+
+# Systems intentionally not implemented yet (HTTP layer maps to 501)
+GATED_NOT_IMPLEMENTED: Final[frozenset[str]] = frozenset({
+    # vendor-variant (ambiguous specs)
+    "horizon", "carter_pe", "sunshine", "pullen_sd",
+    # research-claimed (awaiting gold vectors/spec)
+    "meridian", "krusinski",
+})
+
+# ───────────────────────── Alias Canonicalization ─────────────────────────
+# Simplify aliases: lowercase + strip non-alphanumerics → slug, then map to canonical public label.
+# Examples:
+#   "Whole Sign" / "whole-sign" / "WHOLE_SIGN" → slug "wholesign" → "whole"
+#   "equal-from-mc" / "Equal From MC" → slug "equalfrommc" → "equal_from_mc"
+
+def _slug(s: str) -> str:
+    return "".join(ch for ch in s.lower() if ch.isalnum())
+
+def _assert_unique_slugs(names: List[str]) -> None:
+    """Dev-time guard: raise if two public labels collapse to the same slug."""
+    seen: Dict[str, str] = {}
+    for n in names:
+        sl = _slug(n)
+        if sl in seen and seen[sl] != n:
+            raise RuntimeError(
+                f"Slug collision: public labels '{n}' and '{seen[sl]}' both map to '{sl}'. "
+                "Adjust a label to avoid ambiguity."
+            )
+        seen[sl] = n
+
+# Run the guard at import (cheap; helps catch future additions)
+_assert_unique_slugs(list(SUPPORTED_HOUSE_SYSTEMS))
+
+_CANON_FROM_SLUG: Final[Dict[str, str]] = {
+    # implemented
+    "placidus":"placidus", "koch":"koch", "regiomontanus":"regiomontanus", "campanus":"campanus",
+    "porphyry":"porphyry", "alcabitius":"alcabitius", "morinus":"morinus", "topocentric":"topocentric",
+    "equal":"equal",
+    # whole sign family
+    "whole":"whole", "wholesign":"whole",
+    # extras
+    "vehlowequal":"vehlow_equal", "sripati":"sripati",
+    # v10 additions
+    "equalfrommc":"equal_from_mc",
+    "naturalhouses":"natural_houses",
+    "bhavachalitsripati":"bhava_chalit_sripati",
+    "bhavachalitequalfrommc":"bhava_chalit_equal_from_mc",
+    # gated
+    "meridian":"meridian","horizon":"horizon","carterpe":"carter_pe","sunshine":"sunshine",
+    "krusinski":"krusinski","pullensd":"pullen_sd",
+}
+
+def _suggest_systems(name: str, n: int = 5) -> List[str]:
+    """
+    Suggest closest canonical public labels for an unrecognized input.
+    Uses both raw names and their slugs for friendlier messages.
+    """
+    slug = _slug(name)
+    # compare against canonical names
+    candidates = list(SUPPORTED_HOUSE_SYSTEMS)
+    scored = difflib.get_close_matches(name.lower(), candidates, n=n, cutoff=0.6)
+    # also consider slugs → map back to canonical
+    slug_candidates = list(_CANON_FROM_SLUG.keys())
+    slug_hits = difflib.get_close_matches(slug, slug_candidates, n=n, cutoff=0.6)
+    for sh in slug_hits:
+        canon = _CANON_FROM_SLUG.get(sh)
+        if canon and canon not in scored:
+            scored.append(canon)
+    return scored[:n]
 
 def _normalize_public_name(name: Optional[str]) -> str:
     """
-    Normalize a user-facing house-system to our *public* label.
-    (Still public, not engine; aliases collapse to a single label.)
+    Normalize a user-facing house-system to a canonical *public* label.
+    (Aliases collapse to one label via slug mapping; no long alias lists.)
     """
     if not name:
         return "placidus"
-    key = name.strip().lower()
-    if key not in SUPPORTED_HOUSE_SYSTEMS:
-        raise ValueError(f"unsupported house system: {name}")
-    return "whole" if key in {"whole_sign", "whole-sign", "whole sign"} else key
+    slug = _slug(name)
+    canon = _CANON_FROM_SLUG.get(slug)
+    if not canon:
+        suggestions = _suggest_systems(name, n=5)
+        hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+        raise ValueError(f"unsupported house system: '{name}' (slug='{slug}').{hint}")
+    return canon
 
 def _public_to_engine(system_public: str) -> str:
-    """Public normalized name → engine canonical."""
-    return _ALIAS_TO_ENGINE.get(system_public, system_public)
+    """Public normalized name → engine canonical (the math name)."""
+    return "whole_sign" if system_public == "whole" else system_public
 
 def _engine_to_public(system_engine: str) -> str:
     """Engine canonical → preferred public label."""
-    return _ENGINE_TO_PUBLIC.get(system_engine, system_engine)
+    return "whole" if system_engine == "whole_sign" else system_engine
 
-def _needs_polar_fallback(public_system: str, latitude: float, limit: float) -> bool:
-    return abs(latitude) > limit and public_system in _RISKY_AT_POLAR
+def list_supported_house_systems() -> List[str]:
+    """Return the canonical public list (aliases are accepted via slug normalization)."""
+    return list(SUPPORTED_HOUSE_SYSTEMS)
 
-def _allowed_at_lat(public_system: str, lat: float, hard_lim: float) -> bool:
-    """True if we should attempt this system at the given latitude."""
-    return not (abs(lat) >= hard_lim and public_system in _HARD_REJECT_AT_POLAR)
+# ───────────────────────── Fallback Chains ─────────────────────────
+# Design principle: fall back to mathematically similar time-division systems first,
+# then to robust angular/segment families.
 
 def _dedupe(seq: List[str]) -> List[str]:
     seen, out = set(), []
@@ -135,30 +201,32 @@ def _dedupe(seq: List[str]) -> List[str]:
     return out
 
 def _default_fallback_chain_for(requested_public: str) -> List[str]:
-    """
-    Opinionated fallback chain per system.
-    Prioritize “similar” time-division engines first, then robust angular ones.
-    """
     chains: Dict[str, List[str]] = {
-        "placidus":      ["koch", "regiomontanus", "campanus", "porphyry", "equal", "whole"],
-        "koch":          ["placidus", "regiomontanus", "campanus", "porphyry", "equal", "whole"],
-        "topocentric":   ["placidus", "koch", "regiomontanus", "campanus", "porphyry", "equal", "whole"],
-        "alcabitius":    ["regiomontanus", "campanus", "porphyry", "equal", "whole"],
-        "morinus":       ["regiomontanus", "campanus", "porphyry", "equal", "whole"],
-        "regiomontanus": ["campanus", "porphyry", "equal", "whole"],
-        "campanus":      ["regiomontanus", "porphyry", "equal", "whole"],
-        "porphyry":      ["equal", "whole"],
-        "equal":         ["porphyry", "whole"],
-        "whole":         ["equal", "porphyry"],
-        "vehlow_equal":  ["equal", "whole"],
-        "sripati":       ["porphyry", "equal", "whole"],
+        "placidus":      ["koch", "regiomontanus", "campanus", "porphyry", "equal_from_mc", "natural_houses", "equal", "whole"],
+        "koch":          ["placidus", "regiomontanus", "campanus", "porphyry", "equal_from_mc", "natural_houses", "equal", "whole"],
+        "topocentric":   ["placidus", "koch", "regiomontanus", "campanus", "porphyry", "equal_from_mc", "natural_houses", "equal", "whole"],
+        "alcabitius":    ["regiomontanus", "campanus", "porphyry", "equal_from_mc", "natural_houses", "equal", "whole"],
+        "morinus":       ["regiomontanus", "campanus", "porphyry", "equal_from_mc", "natural_houses", "equal", "whole"],
+        "regiomontanus": ["campanus", "porphyry", "equal_from_mc", "natural_houses", "equal", "whole"],
+        "campanus":      ["regiomontanus", "porphyry", "equal_from_mc", "natural_houses", "equal", "whole"],
+        "porphyry":      ["equal_from_mc", "natural_houses", "equal", "whole"],
+        "equal":         ["equal_from_mc", "natural_houses", "porphyry", "whole"],
+        "whole":         ["equal", "equal_from_mc", "natural_houses", "porphyry"],
+        "vehlow_equal":  ["equal", "equal_from_mc", "natural_houses", "whole"],
+        "sripati":       ["porphyry", "equal_from_mc", "natural_houses", "equal", "whole"],
+        "equal_from_mc": ["natural_houses", "equal", "whole", "porphyry"],
+        "natural_houses":["equal", "equal_from_mc", "porphyry", "whole"],
+        "bhava_chalit_sripati": ["sripati", "porphyry", "equal", "whole"],
+        "bhava_chalit_equal_from_mc": ["equal_from_mc", "natural_houses", "equal", "whole"],
     }
-    return chains.get(requested_public, ["equal", "whole"])
+    return chains.get(requested_public, ["equal_from_mc", "natural_houses", "equal", "whole"])
 
 def _fallback_chain(requested_public: str) -> List[str]:
     """
-    Merge env-provided chain (if any) with defaults; always end with equal/whole.
-    The chain is returned as *public* labels (aliases normalized).
+    Build the fallback chain (public labels), merging env-provided chain (if any)
+    with defaults and a robust tail. Duplicates are removed in order.
+
+    See module docstring for the full polar policy decision tree.
     """
     requested_public = _normalize_public_name(requested_public)
     default_chain = _default_fallback_chain_for(requested_public)
@@ -169,19 +237,22 @@ def _fallback_chain(requested_public: str) -> List[str]:
             mapping = json.loads(_FALLBACK_JSON)
             maybe = mapping.get(requested_public)
             if isinstance(maybe, list):
-                env_chain = [
-                    _normalize_public_name(str(x))
-                    for x in maybe
-                    if str(x).lower() in SUPPORTED_HOUSE_SYSTEMS
-                ]
+                env_chain = [_normalize_public_name(str(x)) for x in maybe]
         except Exception:
             pass
 
-    chain = [requested_public] + env_chain + default_chain + ["equal", "whole"]
-    return _dedupe([_normalize_public_name(x) for x in chain])
+    chain = [requested_public] + env_chain + default_chain + ["equal_from_mc", "natural_houses", "equal", "whole"]
+    return _dedupe(chain)
+
+# ───────────────────────── Polar helpers ─────────────────────────
+def _needs_polar_fallback(public_system: str, latitude: float, limit: float) -> bool:
+    return abs(latitude) > limit and public_system in _RISKY_AT_POLAR
+
+def _allowed_at_lat(public_system: str, lat: float, hard_lim: float) -> bool:
+    """True if we should attempt this system at the given latitude."""
+    return not (abs(lat) >= hard_lim and public_system in _HARD_REJECT_AT_POLAR)
 
 # ───────────────────────── Policy façade ─────────────────────────
-
 def compute_houses_with_policy(
     *,
     # primary
@@ -231,8 +302,8 @@ def compute_houses_with_policy(
     if abs(lat_f) >= POLAR_ABSOLUTE_LIMIT_DEG:
         raise ValueError(f"latitude {lat_f:.8f}° is at/near the pole; house systems are undefined")
 
-    requested_public = system if system is not None else requested_house_system
-    requested_public = _normalize_public_name(requested_public)
+    requested_public_in = system if system is not None else requested_house_system
+    requested_public = _normalize_public_name(requested_public_in)
 
     # Gate vendor-variant / research systems for clear 501
     if requested_public in GATED_NOT_IMPLEMENTED:
@@ -262,7 +333,7 @@ def compute_houses_with_policy(
 
     warnings: List[str] = []
 
-    # ---- polar rules
+    # ---- polar rules (stage 1: hard-limit filter)
     if abs(lat_f) >= hard_lim and requested_public in _HARD_REJECT_AT_POLAR:
         warnings.append(
             f"Requested '{requested_public}' is undefined/unstable at latitude {lat_f:.2f}° "
@@ -274,16 +345,18 @@ def compute_houses_with_policy(
         _met_warn("polar_reject_strict")
         raise ValueError(f"house_system '{requested_public}' is unstable above |lat|>{soft_lim}°")
 
-    # Build the chain and filter by hard-limit allowance
-    chain_public = [s for s in _fallback_chain(requested_public) if _allowed_at_lat(s, lat_f, hard_lim)]
+    # ---- build & bias the fallback chain
+    chain_public_all = _fallback_chain(requested_public)
+    chain_public = [s for s in chain_public_all if _allowed_at_lat(s, lat_f, hard_lim)]
     if not chain_public:
         raise ValueError("no allowed house systems at this latitude under current policy")
 
-    # If soft policy and requested is risky, prefer robust systems first
     if polar_policy == "fallback_to_equal_above_66deg" and _needs_polar_fallback(chain_public[0], lat_f, soft_lim):
         def robust_rank(s: str) -> int:
-            if s in ("equal", "whole"): return 0
-            if s == "porphyry": return 1
+            if s in ("equal", "whole", "equal_from_mc", "natural_houses"):
+                return 0
+            if s == "porphyry":
+                return 1
             return 2
         chain_public.sort(key=robust_rank)
         warnings.append(
@@ -314,7 +387,7 @@ def compute_houses_with_policy(
         )
 
     for sys_public in chain_public:
-        # obey the toggle: only the first item if fallback disabled
+        # Obey toggle: only the first item if fallback disabled
         if sys_public != chain_public[0] and not NUMERIC_FALLBACK_ENABLED:
             break
         try:
@@ -345,10 +418,7 @@ def compute_houses_with_policy(
         "asc": hd.ascendant, "mc": hd.midheaven,
         "asc_deg": hd.ascendant, "mc_deg": hd.midheaven,  # legacy
         "cusps": hd.cusps, "cusps_deg": hd.cusps,         # legacy alias
-        "angles": {
-            "ASC": {"deg": hd.ascendant},
-            "MC":  {"deg": hd.midheaven},
-        },
+        "angles": {"ASC": {"deg": hd.ascendant}, "MC": {"deg": hd.midheaven}},
         # auxiliary points
         "vertex": hd.vertex,
         "eastpoint": hd.eastpoint,
@@ -361,7 +431,7 @@ def compute_houses_with_policy(
             "hard_reject_systems_at_polar": sorted(_HARD_REJECT_AT_POLAR),
             "risky_at_polar": sorted(_RISKY_AT_POLAR),
             "numeric_fallback_enabled": NUMERIC_FALLBACK_ENABLED,
-            "fallback_chain_tried": chain_public,
+            "fallback_chain_tried": chain_public_all,  # include pre-filter for transparency
         },
         # timescale echo (useful for client sanity checks)
         "meta": {
@@ -381,7 +451,6 @@ def compute_houses_with_policy(
     if getattr(hd, "solver_stats", None):
         payload["solver_stats"] = hd.solver_stats
     if getattr(hd, "validation_results", None):
-        # keep it compact; clients can opt to display summary
         payload["validation_results"] = [r._asdict() for r in hd.validation_results]
     if getattr(hd, "error_budget", None):
         eb = hd.error_budget
@@ -397,7 +466,6 @@ def compute_houses_with_policy(
     return payload
 
 # ───────────────────────── Public API ─────────────────────────
-
 __all__ = [
     "compute_houses_with_policy",
     "list_supported_house_systems",
