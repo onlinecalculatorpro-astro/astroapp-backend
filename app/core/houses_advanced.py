@@ -1,6 +1,6 @@
 # app/core/houses_advanced.py
 """
-Professional House System Calculations — v11 GOLD STANDARD (research-grade; 24 declared)
+Professional House System Calculations — v11 GOLD STANDARD (research-grade; 22 declared)
 
 WHAT’S NEW vs v10
 - Unified certification thresholds:
