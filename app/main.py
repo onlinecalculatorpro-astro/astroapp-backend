@@ -14,7 +14,7 @@ from flask_cors import CORS
 from werkzeug.exceptions import HTTPException, BadRequest
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-# Optional blueprints
+# ───────────────────────── Optional blueprints ─────────────────────────
 _routes_import_err: str | None = None
 _pred_import_err: str | None = None
 
@@ -35,14 +35,14 @@ except Exception as e:  # pragma: no cover
     print("WARNING: predictions blueprint failed to import:", _pred_import_err, file=sys.stderr)
     traceback.print_exc()
 
-# Config loader (optional)
+# ───────────────────────── Optional config loader ─────────────────────────
 try:
     from app.utils.config import load_config  # type: ignore
 except Exception as e:  # pragma: no cover
     print("INFO: app.utils.config.load_config not available:", repr(e), file=sys.stderr)
     load_config = None  # type: ignore
 
-# Core engines
+# ───────────────────────── Core engines & policy façade ─────────────────────────
 from app.core.astronomy import compute_chart
 from app.core import timescales as _ts
 from app.core.house import (
@@ -61,17 +61,32 @@ try:
 except Exception:
     _ADV_OK = False
 
-# Prometheus metrics
-from prometheus_client import (
-    Counter,
-    Gauge,
-    Histogram,
-    CONTENT_TYPE_LATEST,
-    REGISTRY,
-    generate_latest,
-)
+# ───────────────────────── Prometheus (with safe shim) ─────────────────────────
+try:
+    from prometheus_client import (  # type: ignore
+        Counter,
+        Gauge,
+        Histogram,
+        CONTENT_TYPE_LATEST,
+        REGISTRY,
+        generate_latest,
+    )
+except Exception:  # pragma: no cover
+    # Minimal no-op shim that preserves the interface used below and by house.py
+    class _NoOpMetric:
+        def labels(self, **_kwargs): return self
+        def inc(self, *_a, **_k): return None
+        def observe(self, *_a, **_k): return None
+        def set(self, *_a, **_k): return None
+    def Counter(_n: str, _h: str, _lbls: list[str] | tuple[str, ...]): return _NoOpMetric()  # type: ignore
+    def Gauge(_n: str, _h: str): return _NoOpMetric()  # type: ignore
+    def Histogram(_n: str, _h: str, _lbls: list[str] | tuple[str, ...]): return _NoOpMetric()  # type: ignore
+    CONTENT_TYPE_LATEST = "text/plain; version=0.0.4; charset=utf-8"  # type: ignore
+    class _NoRegistry: pass
+    REGISTRY = _NoRegistry()  # type: ignore
+    def generate_latest(_reg=None): return b""  # type: ignore
 
-# ───────────────────────────── metrics ─────────────────────────────
+# Metrics used by house.py via lazy import (keep names stable!)
 MET_REQUESTS: Final = Counter("astro_api_requests_total", "API requests", ["route"])
 MET_FALLBACKS: Final = Counter(
     "astro_house_fallback_total", "House fallbacks at high latitude", ["requested", "fallback"]
@@ -81,12 +96,13 @@ GAUGE_DUT1: Final = Gauge("astro_dut1_broadcast_seconds", "DUT1 broadcast second
 GAUGE_APP_UP: Final = Gauge("astro_app_up", "1 if app is running")
 REQ_LATENCY: Final = Histogram("astro_request_seconds", "API request latency", ["route"])
 
-# ───────────────────────────── policy façade labels ─────────────────────────────
+# ───────────────────────── policy façade label ─────────────────────────
 ENGINE_LABEL: Final[str] = (
     os.getenv("HOUSES_ENGINE_NAME")
     or ("houses-advanced" if _ADV_OK else "proto-basic")
 )
 
+# ───────────────────────── helpers: logging & errors ─────────────────────────
 def _configure_logging(app: Flask) -> None:
     gerr = logging.getLogger("gunicorn.error")
     if gerr.handlers:
@@ -120,6 +136,7 @@ def _register_errors(app: Flask) -> None:
             path=request.path,
         ), 500
 
+# ───────────────────────── health & utils ─────────────────────────
 def _register_health(app: Flask) -> None:
     @app.route("/", methods=["GET"])
     def root():
@@ -193,7 +210,7 @@ def _timescales_meta_from_chart(chart: Dict[str, Any]) -> Dict[str, Any]:
     dut1_sec = (jd_ut1 - jd_ut) * 86400.0
     return {"jd_utc": jd_ut, "jd_tt": jd_tt, "jd_ut1": jd_ut1, "delta_t": delta_t_sec, "delta_at": 0.0, "dut1": dut1_sec}
 
-# ───────────────────────────── system/policy endpoints ─────────────────────────────
+# ───────────────────────── system/policy endpoints ─────────────────────────
 def _houses_policy_blob() -> Dict[str, Any]:
     return {
         "houses_engine": ENGINE_LABEL,
@@ -307,21 +324,21 @@ def _register_core_api(app: Flask) -> None:
                 validation=validation,
             )
         except NotImplementedError as e:
-            # 6 gated systems → 501
+            # 501 for gated systems
             return jsonify({
                 "ok": False,
                 "error": "house_system_gated",
                 "details": {"system": system_req.strip().lower(), "note": str(e)},
             }), 501
         except ValueError as e:
-            # Policy rejections (e.g., polar absolute) or bad inputs → 422
+            # Policy rejections / bad inputs → 422
             return jsonify({
                 "ok": False,
                 "error": "house_engine_failed",
                 "details": {"system": system_req.strip().lower(), "note": str(e)},
             }), 422
         except Exception as e:
-            # If every fallback failed or engine blew up → 422 (not 500)
+            # Engine blow-ups / all fallbacks failed → 422
             return jsonify({
                 "ok": False,
                 "error": "house_engine_failed",
@@ -338,7 +355,7 @@ def _register_core_api(app: Flask) -> None:
     for alias in ("/calculate", "/api/calc", "/calc"):
         app.add_url_rule(alias, f"calculate_alias_{alias}", _calculate_handler, methods=["POST"])
 
-# ───────────────────────────── app factory ─────────────────────────────
+# ───────────────────────── app factory ─────────────────────────
 def create_app() -> Flask:
     app = Flask(__name__)
     app.config["JSON_SORT_KEYS"] = False
@@ -451,11 +468,13 @@ def create_app() -> Flask:
         data = generate_latest(REGISTRY)
         return Response(data, mimetype=CONTENT_TYPE_LATEST)
 
-    app.logger.info("App initialized; houses_engine=%s; routes_loaded=%s, predictions_loaded=%s",
-                    ENGINE_LABEL, bool(_routes_bp), bool(_pred_bp))
+    app.logger.info(
+        "App initialized; houses_engine=%s; routes_loaded=%s, predictions_loaded=%s",
+        ENGINE_LABEL, bool(_routes_bp), bool(_pred_bp)
+    )
     return app
 
-# ───────────────────────────── app instance ─────────────────────────────
+# ───────────────────────── app instance ─────────────────────────
 app = create_app()
 
 # CORS for browser UIs
