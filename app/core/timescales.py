@@ -172,20 +172,27 @@ def _utc_calendar_to_jd_utc(
     iy: int, im: int, iday: int, ih: int, imin: int, isec: int, ifrac: int
 ) -> float:
     """
-    Produce JD(UTC) via ERFA dtf2d, robust across pyERFA builds:
-    1) ihmsf[4] variant (most portable),
-    2) positional 8-arg (iy,im,id,ih,imn,sec,f).
+    Produce JD(UTC) via ERFA dtf2d.
+
+    Try the 5-arg ihmsf[4] form first (most universally supported across
+    pyERFA builds), then fall back to the 8-positional-arg form.
     """
-    ihmsf = [int(ih), int(imin), int(isec), int(ifrac)]
-    # 1) ihmsf[4]
+    # 1) ihmsf[4] form: ["hour","min","sec","1e-4 sec"]
     try:
+        ihmsf = [int(ih), int(imin), int(isec), int(ifrac)]
         utc1, utc2 = erfa.dtf2d("UTC", int(iy), int(im), int(iday), ihmsf)
         return math.fsum((utc1, utc2))
-    except Exception:
-        pass
-    # 2) Positional 8-arg
-    utc1, utc2 = erfa.dtf2d("UTC", int(iy), int(im), int(iday), int(ih), int(imin), int(isec), int(ifrac))
-    return math.fsum((utc1, utc2))
+    except Exception as e1:
+        pass  # try the positional 8-arg form next
+
+    # 2) 8 positional args: iy, im, id, ih, min, sec, f(1e-4s)
+    try:
+        utc1, utc2 = erfa.dtf2d(
+            "UTC", int(iy), int(im), int(iday), int(ih), int(imin), int(isec), int(ifrac)
+        )
+        return math.fsum((utc1, utc2))
+    except Exception as e2:
+        raise ValueError(f"ERFA dtf2d failed (ihmsf & positional): {e2}")
 
 def _delta_t_seconds_from_parts(tt1: float, tt2: float, ut11: float, ut12: float) -> float:
     """Two-part difference BEFORE collapsing — preserves precision."""
