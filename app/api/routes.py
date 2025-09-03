@@ -235,7 +235,7 @@ def _compute_timescales_from_local(
     # Build timescales, map domain ValueError → API ValidationError with field hints
     try:
         ts: TimeScales = build_timescales(date_str, time_str, tz_name, dut1_seconds)
-        except ValueError as e:
+    except ValueError as e:
         msg = str(e)
         if "DUT1" in msg:
             raise ValidationError({"dut1": msg})
@@ -567,6 +567,7 @@ def calculate():
         "houses_engine": _HOUSES_KIND,
     }
     return jsonify({"ok": True, "timescales": ts, "chart": chart, "houses": houses, "meta": meta}), 200
+
 @api.post("/api/report")
 def report():
     try:
