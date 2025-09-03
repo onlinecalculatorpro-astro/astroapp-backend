@@ -13,6 +13,13 @@ services:
       pip install --prefer-binary "numpy==1.26.4" "pyerfa>=2.0.1"
       # Project dependencies
       pip install --prefer-binary -r requirements.txt
+      # ---- run tests remotely on Render when enabled ----
+      if [ "${RUN_TESTS:-0}" = "1" ]; then
+        pip install pytest hypothesis tzdata
+        # Use the CI hypothesis profile (set below) and keep scope tight for speed
+        pytest -q tests/test_timescales.py
+      fi
+      # ---------------------------------------------------
     startCommand: >
       gunicorn app.main:app
       --bind 0.0.0.0:$PORT
@@ -30,6 +37,15 @@ services:
     healthCheckPath: /api/health
     autoDeploy: true
     envVars:
+      # Toggle remote test gate during build (1=run tests, 0=skip)
+      - key: RUN_TESTS
+        value: "1"
+      # Ensure deterministic tests & CI settings
+      - key: HYPOTHESIS_PROFILE
+        value: ci
+      - key: TZ
+        value: UTC
+
       - key: FLASK_ENV
         value: production
       - key: NETLIFY_ORIGIN
@@ -46,6 +62,7 @@ services:
         value: "0"
       - key: ASTRO_DEBUG_VERBOSE
         value: "0"
+
       # (optional) make logs flush immediately
       - key: PYTHONUNBUFFERED
         value: "1"
