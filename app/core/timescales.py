@@ -36,9 +36,7 @@ __all__ = [
     "jd_ut1_from_utc_jd",
 ]
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Dataclass
-# ──────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────── Dataclass ─────────────────────────────
 
 @dataclass(frozen=True)
 class TimeScales:
@@ -56,15 +54,10 @@ class TimeScales:
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Internal helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────── Internal helpers ─────────────────────────────
 
 def _parse_date_str(date_str: str) -> Tuple[int, int, int, List[str]]:
-    """
-    Parse 'YYYY-MM-DD' → (iy, im, id) with a broad sanity warning
-    for dates far outside the typical modern range.
-    """
+    """Parse 'YYYY-MM-DD' → (iy, im, id) and add a broad-range warning."""
     warnings: List[str] = []
     try:
         y, m, d = date_str.strip().split("-")
@@ -78,8 +71,7 @@ def _parse_date_str(date_str: str) -> Tuple[int, int, int, List[str]]:
 
 def _parse_time_to_ihmsf(time_str: str) -> Tuple[int, int, int, int]:
     """
-    Parse 'HH:MM:SS' or 'HH:MM:SS.sss...' → (ih, im, is, ifrac)
-    where 'ifrac' is in 1e-4 seconds (SOFA convention). All ints.
+    Parse 'HH:MM:SS' or 'HH:MM:SS.sss...' → (ih, im, is, ifrac) in 1e-4 s units.
     Accepts leap seconds (ss == 60).
     """
     t = time_str.strip()
@@ -94,17 +86,14 @@ def _parse_time_to_ihmsf(time_str: str) -> Tuple[int, int, int, int]:
     else:
         s_part, ifrac = ss_s, 0
 
-    ih = int(hh_s)
-    im = int(mm_s)
-    isec = int(s_part)
-
+    ih = int(hh_s); im = int(mm_s); isec = int(s_part)
     if not (0 <= ih <= 24 and 0 <= im <= 59 and 0 <= isec <= 60 and 0 <= ifrac <= 9999):
         raise ValueError(f"Invalid time fields: hh={ih}, mm={im}, ss={isec}, frac_1e4s={ifrac}")
     return ih, im, isec, ifrac
 
 def _fold_offsets(z: ZoneInfo, naive_local: datetime) -> Tuple[int, List[str]]:
     """
-    Compute tz offset seconds for the given naive local datetime.
+    Compute tz offset seconds for a naive local datetime.
     Detect DST ambiguity; prefer fold=0 but warn if fold=1 differs.
     """
     warnings: List[str] = []
@@ -130,7 +119,7 @@ def _local_to_utc_calendar(
     Convert local civil time (in tz) to UTC calendar fields suitable for ERFA.
     Returns: (iy, im, id, ih, imin, isec, ifrac, tz_offset_seconds, warnings[])
 
-    Leap seconds: if the input second == 60, we:
+    Leap seconds: if input second == 60, we:
       • Build datetime at second=59 (Python limitation) to resolve tz offset / UTC Y-M-D-H-M.
       • Use those Y/M/D/H/M from UTC, but set second=60 and ifrac=original for ERFA.
       • No +1s shift is applied (we represent the leap second itself).
@@ -142,7 +131,7 @@ def _local_to_utc_calendar(
     leap_sec = (isec_in == 60)
     build_sec = 59 if leap_sec else isec_in
 
-    # Convert 1e-4 s → microseconds (int). Validate/clamp.
+    # 1e-4 s → microseconds with clamp
     computed_micro = int(round(ifrac_in * 100))
     micro = min(999_999, computed_micro)
     if computed_micro != ifrac_in * 100 or computed_micro >= 1_000_000:
@@ -165,11 +154,11 @@ def _local_to_utc_calendar(
     ih_u, in_u, is_u = aware_utc.hour, aware_utc.minute, aware_utc.second
 
     if leap_sec:
-        # Represent the leap second itself at 23:59:60.x — keep Y/M/D/H/M from the 59s instant.
+        # Represent the leap second itself at 23:59:60.x
         ifrac_u = int(ifrac_in)
         is_u = 60
     else:
-        # Normal case: microsec → 1e-4 s with carry protection
+        # Normal: microsec → 1e-4 s with carry protection
         ifrac_u = int(round(aware_utc.microsecond / 100))
         if ifrac_u >= 10000:
             aware_utc = aware_utc + timedelta(microseconds=100)
@@ -188,7 +177,7 @@ def _utc_calendar_to_jd_utc(
     2) positional 8-arg,
     3) 5-arg ihmsf[4] variant.
     """
-    # 1) Keyword 8-arg (most robust on builds that expose argument names)
+    # 1) Keyword 8-arg (builds that expose named params: iy, im, id, ih, imn, sec, f)
     try:
         utc1, utc2 = erfa.dtf2d(
             "UTC",
@@ -201,20 +190,13 @@ def _utc_calendar_to_jd_utc(
 
     # 2) Positional 8-arg
     try:
-        utc1, utc2 = erfa.dtf2d(
-            "UTC",
-            int(iy), int(im), int(iday), int(ih), int(imin), int(isec), int(ifrac)
-        )
+        utc1, utc2 = erfa.dtf2d("UTC", int(iy), int(im), int(iday), int(ih), int(imin), int(isec), int(ifrac))
         return math.fsum((utc1, utc2))
     except TypeError:
         pass
 
-    # 3) 5-arg ihmsf[4]
-    utc1, utc2 = erfa.dtf2d(
-        "UTC",
-        int(iy), int(im), int(iday),
-        [int(ih), int(imin), int(isec), int(ifrac)],
-    )
+    # 3) ihmsf[4]
+    utc1, utc2 = erfa.dtf2d("UTC", int(iy), int(im), int(iday), [int(ih), int(imin), int(isec), int(ifrac)])
     return math.fsum((utc1, utc2))
 
 def _delta_t_seconds_from_parts(tt1: float, tt2: float, ut11: float, ut12: float) -> float:
@@ -222,10 +204,7 @@ def _delta_t_seconds_from_parts(tt1: float, tt2: float, ut11: float, ut12: float
     return ((tt1 - ut11) + (tt2 - ut12)) * 86400.0
 
 def _dat_seconds(iy: int, im: int, iday: int, ih: int, imin: int, isec: int, ifrac: int) -> float:
-    """
-    ERFA ΔAT = TAI − UTC for the given UTC calendar instant.
-    erfa.dat expects fractional day in [0,1).
-    """
+    """ERFA ΔAT = TAI − UTC for the given UTC calendar instant."""
     seconds = ih * 3600 + imin * 60 + min(isec, 59) + (ifrac / 1e4)
     fd = seconds / 86400.0
     return float(erfa.dat(int(iy), int(im), int(iday), float(fd)))
@@ -235,9 +214,7 @@ def _split_jd(jd: float) -> Tuple[float, float]:
     d2 = jd - d1
     return float(d1), float(d2)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Public API
-# ──────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────── Public API ─────────────────────────────
 
 def build_timescales(
     date_str: str,
@@ -245,15 +222,13 @@ def build_timescales(
     tz_name: str,
     dut1_seconds: float,
 ) -> TimeScales:
-    """
-    Compute research-grade time scales for a local civil instant.
-    """
+    """Compute research-grade time scales for a local civil instant."""
     warnings: List[str] = []
 
     # DUT1 policy
     if not isinstance(dut1_seconds, (int, float)):
         raise TypeError("dut1_seconds must be a number (float seconds).")
-    if abs(dut1_seconds) > 0.9 + 1e-9:  # practical tolerance
+    if abs(dut1_seconds) > 0.9 + 1e-9:
         raise ValueError(f"dut1_seconds out of range (|DUT1| ≤ 0.9 s): {dut1_seconds}")
 
     # Local → UTC calendar fields
@@ -303,9 +278,7 @@ def build_timescales(
         precision=precision,
     )
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Deprecated convenience helpers (kept for backward compatibility)
-# ──────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────── Deprecated helpers ─────────────────────────────
 
 def julian_day_utc(date_str: str, time_str: str, tz_name: str) -> float:
     """DEPRECATED. Prefer build_timescales(...)."""
