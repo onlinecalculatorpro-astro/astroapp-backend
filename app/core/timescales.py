@@ -180,14 +180,13 @@ def _utc_calendar_to_jd_utc(
     sig = getattr(erfa.dtf2d, "__text_signature__", "") or (erfa.dtf2d.__doc__ or "")
     msgs = []
 
-    # Prefer what the signature hints at
-    try_order = []
+    # Choose a likely-good order based on the signature
     if "ihmsf" in sig:
         try_order = ["array", "pos", "kw"]
     elif ("imn" in sig) and ("sec" in sig):
         try_order = ["pos", "array", "kw"]
     else:
-        try_order = ["pos", "array", "kw"]  # safest default
+        try_order = ["pos", "array", "kw"]
 
     for mode in try_order:
         try:
@@ -199,11 +198,11 @@ def _utc_calendar_to_jd_utc(
                 )
             elif mode == "array":
                 utc1, utc2 = erfa.dtf2d(
-                    "UTC", int(iy), int(im), int(iday),
+                    "UTC",
+                    int(iy), int(im), int(iday),
                     [int(ih), int(imin), int(isec), int(ifrac)],
                 )
             else:  # "kw"
-                # Some builds accept keywords; many do not.
                 utc1, utc2 = erfa.dtf2d(
                     "UTC",
                     iy=int(iy), im=int(im), id=int(iday),
@@ -213,12 +212,8 @@ def _utc_calendar_to_jd_utc(
         except Exception as e:
             msgs.append(f"{mode}={e!s}")
 
-    # If all attempts failed, surface a clear error
     raise ValueError(f"ERFA dtf2d failed (tried {', '.join(try_order)}): " + " ; ".join(msgs))
-    except Exception as e:
-            msgs.append(f"{mode}={e!s}")
 
-    raise ValueError(f"ERFA dtf2d failed (tried {', '.join(try_order)}): " + " ; ".join(msgs))
     
     # C) Try keyword 8-arg (some builds expose named params)
     try:
