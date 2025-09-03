@@ -5,17 +5,17 @@ Lightweight legacy façade used by astronomy.py and older call-sites.
 
 Public helpers (return ASC, MC, cusps in degrees):
   • asc_mc_equal_houses
-  • asc_mc_placidus_houses      (numeric fallback → Equal when enabled)
+  • asc_mc_placidus_houses      (numeric fallback → Equal when enabled on legacy path)
   • asc_mc_houses               (minimal aliasing for a few common labels)
 
 STRICT path (preferred):
   If jd_tt & jd_ut1 are provided, we delegate to
-  app.core.house.compute_houses_with_policy to keep alias normalization,
-  polar rules, and robust fallback behavior **exactly** in line with the main API.
+  app.core.house.compute_houses_with_policy so alias normalization, polar rules,
+  and robust fallback behavior are **identical** to the main API.
 
 LEGACY path:
-  If strict timescales are absent but jd_ut is provided, we call
-  PreciseHouseCalculator with require_strict_timescales=False.
+  If strict timescales are absent but jd_ut is provided, we call the precise
+  engine with require_strict_timescales=False.
   For "placidus" only, this wrapper keeps the historic numeric fallback → "equal"
   when ASTRO_HOUSES_NUMERIC_FALLBACK is enabled.
 
@@ -31,7 +31,7 @@ import os
 
 logger = logging.getLogger(__name__)
 
-# ------------------------- Config / Env toggles -------------------------
+# ───────────────────────── Config / Env toggles ─────────────────────────
 
 NUMERIC_FALLBACK_ENABLED: bool = os.getenv(
     "ASTRO_HOUSES_NUMERIC_FALLBACK", "1"
@@ -41,23 +41,22 @@ REQUIRE_POLICY_FOR_STRICT: bool = os.getenv(
     "ASTRO_REQUIRE_POLICY_FOR_STRICT", "0"
 ).lower() in ("1", "true", "yes", "on")
 
-# ------------------------- Prefer the policy façade ----------------------
-
+# ───────────────────────── Prefer the policy façade ──────────────────────
 try:
-    from app.core.house import compute_houses_with_policy as _policy_compute  # aligned behavior
+    # Keep behavior aligned with app/core/house.py when strict timescales are used
+    from app.core.house import compute_houses_with_policy as _policy_compute
     _HAS_POLICY = True
 except Exception:
     _HAS_POLICY = False
 
-# emit a one-time import-time log (info/warn) so ops can spot config issues
+# Emit a one-time import-time log (info/warn) so ops can spot config issues
 if not _HAS_POLICY:
     logger.warning(
         "house policy façade unavailable; strict calls may fall back to direct engine path. "
         "Set ASTRO_REQUIRE_POLICY_FOR_STRICT=1 to fail fast in prod."
     )
 
-# ------------------------- Precise backend (legacy path) -----------------
-
+# ───────────────────────── Precise backend (legacy path) ─────────────────
 try:
     from app.core.houses_advanced import PreciseHouseCalculator, HouseData
     _IMPORT_ERR = None
@@ -73,15 +72,14 @@ def _require_backend() -> None:
         ) from _IMPORT_ERR  # type: ignore
 
 
-# ------------------------- Minimal aliasing for this wrapper --------------
-
+# ───────────────────────── Minimal aliasing for this wrapper ─────────────
 # Keep this surface intentionally small; for a full alias surface & policy,
 # call app.core.house.compute_houses_with_policy directly.
 _WRAPPER_SUPPORTED_PUBLIC = {
     "equal",
     "placidus",
     "whole",             # maps to engine "whole_sign" on the legacy (direct) path
-    # conveniences (supported when strict path uses policy façade; direct path passes through)
+    # conveniences (supported both on strict path via façade and direct engine)
     "equal_from_mc",
     "natural_houses",
 }
@@ -94,7 +92,7 @@ _CANON_FROM_SLUG = {
     "equal": "equal",
     "placidus": "placidus",
     "whole": "whole",
-    "wholesign": "whole",             # common alias
+    "wholesign": "whole",             # common alias family
     "equalfrommc": "equal_from_mc",
     "naturalhouses": "natural_houses",
 }
@@ -124,7 +122,7 @@ def _public_to_engine_legacy(public: str) -> str:
     return "whole_sign" if public == "whole" else public
 
 
-# ------------------------- Core executor ----------------------------------
+# ───────────────────────── Core executor ─────────────────────────────────
 
 _warned_no_policy_strict_once = False
 
@@ -227,7 +225,7 @@ def _calc_core(
     return float(hd.ascendant), float(hd.midheaven), list(hd.cusps)
 
 
-# ------------------------- Public helpers ---------------------------------
+# ───────────────────────── Public helpers ────────────────────────────────
 
 def asc_mc_equal_houses(
     lat: float,
@@ -292,8 +290,8 @@ def asc_mc_houses(
       • "equal"                 → Equal
       • "placidus"              → Placidus (numeric fallback → Equal on legacy path)
       • "whole"/"whole_sign"    → Whole-sign
-      • "equal_from_mc"         → Equal-from-MC  (strict path uses policy façade)
-      • "natural_houses"        → Natural Houses (strict path uses policy façade)
+      • "equal_from_mc"         → Equal-from-MC
+      • "natural_houses"        → Natural Houses
 
     For a richer alias surface and policy/fallback control, call
     app.core.house.compute_houses_with_policy directly.
