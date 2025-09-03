@@ -25,6 +25,9 @@ from app.core.validators import (
     parse_ephemeris_payload,
 )
 
+# Use the new predictions engine (structured output)
+from app.core.predict import predict as predict_engine
+
 log = logging.getLogger(__name__)
 api = Blueprint("api", __name__)
 DEBUG_VERBOSE = os.getenv("ASTRO_DEBUG_VERBOSE", "0").lower() in ("1", "true", "yes", "on")
@@ -626,6 +629,7 @@ def report():
 def predictions_route():
     body = request.get_json(force=True) or {}
     try:
+        # Keep your validator contract: returns (payload, horizon)
         payload, horizon = parse_prediction_payload(body)
         hs = str(body.get("house_system", "")).strip()
         if hs:
@@ -660,6 +664,7 @@ def predictions_route():
     if chart is None:
         return _json_error("chart_internal", chart_error or "internal_error", 500)
 
+    # Sidereal rotation of house angles/cusps to chart ayanamsa (if set)
     mode = (payload.get("mode") or "tropical").lower()
     if mode == "sidereal":
         ay = _extract_ayanamsa_from_chart(chart)
@@ -677,15 +682,22 @@ def predictions_route():
             if isinstance(houses.get("cusps_deg"), list):
                 houses["cusps_deg"] = [rot(c) for c in houses["cusps_deg"]]
 
+    # ERFA-first parity correction of ASC/MC
     houses = _recompute_houses_angles_if_needed(houses, ts, payload, chart)
+
     chart_for_predict = _prepare_chart_for_predict(chart)
 
+    # Call the structured predictions engine
     try:
-        from app.core.predict import predict  # local import to avoid cycles
-        preds_raw = predict(chart_for_predict, houses, horizon)
+        result = predict_engine(chart_for_predict, houses, horizon)
+        # Support both shapes: dict with "predictions" (new) or list (legacy)
+        raw_preds = result.get("predictions") if isinstance(result, dict) else result
+        if not isinstance(raw_preds, list):
+            raise TypeError("predict() returned unexpected shape")
     except Exception as e:
         return jsonify({"ok": False, "error": "internal_error", "message": str(e), "type": type(e).__name__}), 500
 
+    # Load HC thresholds (with overrides)
     th_path = os.environ.get("ASTRO_HC_THRESHOLDS", "config/hc_thresholds.json")
     try:
         with open(th_path, "r", encoding="utf-8") as f:
@@ -716,29 +728,32 @@ def predictions_route():
         except Exception:
             pass
 
-    preds = []
-    for i, pr in enumerate(preds_raw):
+    # Map engine outputs to HC-ready records
+    preds: List[Dict[str, Any]] = []
+    for i, pr in enumerate(raw_preds):
         p = float(pr.get("probability", 0.0))
         abstained = p < floor
         hc_flag = (not abstained) and (p >= tau)
+        interval = pr.get("interval") or {}
         preds.append(
             {
                 "prediction_id": f"pred_{i}",
                 "domain": pr.get("domain"),
                 "horizon": horizon,
-                "interval_start_utc": pr.get("interval", {}).get("start"),
-                "interval_end_utc": pr.get("interval", {}).get("end"),
+                "interval_start_utc": interval.get("start"),
+                "interval_end_utc": interval.get("end"),
                 "probability_calibrated": p,
                 "hc_flag": hc_flag,
                 "abstained": abstained,
                 "evidence": pr.get("evidence"),
                 "mode": chart.get("mode") if chart else None,
-                "ayanamsa_deg": (chart or {}).get("ayanamsa_deg") or (chart and _extract_ayanamsa_from_chart(chart)),
+                "ayanamsa_deg": (chart or {}).get("ayanamsa_deg") or _extract_ayanamsa_from_chart(chart) if chart else None,
                 "notes": "QIA+calibrated placeholder; subject to M3 tuning "
                          + ("abstained" if abstained else "accepted"),
             }
         )
 
+    # Optional HC auto-flagging (if no explicit overrides)
     if not overrides and not os.environ.get("ASTRO_HC_DEBUG_OVERRIDES"):
         try:
             preds = flag_predictions(preds, _freeze_horizon(horizon), th_path)
