@@ -184,11 +184,7 @@ def _utc_calendar_to_jd_utc(
     except Exception as e:
         # Surface the precise failure up the stack (becomes HTTP 400 JSON)
         raise ValueError(f"ERFA dtf2d failed: {e}")
-    return math.fsum((utc1, utc2))
-
-    except Exception as e2:
-        raise ValueError(f"ERFA dtf2d failed (ihmsf & positional): {e2}")
-
+        
 def _delta_t_seconds_from_parts(tt1: float, tt2: float, ut11: float, ut12: float) -> float:
     """Two-part difference BEFORE collapsing — preserves precision."""
     return ((tt1 - ut11) + (tt2 - ut12)) * 86400.0
