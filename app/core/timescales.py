@@ -173,30 +173,18 @@ def _utc_calendar_to_jd_utc(
 ) -> float:
     """
     Produce JD(UTC) via ERFA dtf2d, robust across pyERFA builds:
-    1) keyword 8-arg (iy,im,id,ih,imn,sec,f),
-    2) positional 8-arg,
-    3) 5-arg ihmsf[4] variant.
+    1) ihmsf[4] variant (most portable),
+    2) positional 8-arg (iy,im,id,ih,imn,sec,f).
     """
-    # 1) Keyword 8-arg (builds that expose named params: iy, im, id, ih, imn, sec, f)
+    ihmsf = [int(ih), int(imin), int(isec), int(ifrac)]
+    # 1) ihmsf[4]
     try:
-        utc1, utc2 = erfa.dtf2d(
-            "UTC",
-            iy=int(iy), im=int(im), id=int(iday),
-            ih=int(ih), imn=int(imin), sec=int(isec), f=int(ifrac),
-        )
+        utc1, utc2 = erfa.dtf2d("UTC", int(iy), int(im), int(iday), ihmsf)
         return math.fsum((utc1, utc2))
-    except TypeError:
+    except Exception:
         pass
-
     # 2) Positional 8-arg
-    try:
-        utc1, utc2 = erfa.dtf2d("UTC", int(iy), int(im), int(iday), int(ih), int(imin), int(isec), int(ifrac))
-        return math.fsum((utc1, utc2))
-    except TypeError:
-        pass
-
-    # 3) ihmsf[4]
-    utc1, utc2 = erfa.dtf2d("UTC", int(iy), int(im), int(iday), [int(ih), int(imin), int(isec), int(ifrac)])
+    utc1, utc2 = erfa.dtf2d("UTC", int(iy), int(im), int(iday), int(ih), int(imin), int(isec), int(ifrac))
     return math.fsum((utc1, utc2))
 
 def _delta_t_seconds_from_parts(tt1: float, tt2: float, ut11: float, ut12: float) -> float:
