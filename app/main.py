@@ -7,7 +7,7 @@ import sys
 import traceback
 from datetime import datetime
 from time import perf_counter
-from typing import Any, Dict, Final, List, Optional
+from typing import Any, Dict, Final
 
 from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
@@ -71,7 +71,6 @@ try:
         generate_latest,
     )
 except Exception:  # pragma: no cover
-    # Minimal no-op shim that preserves the interface used below and by house.py
     class _NoOpMetric:
         def labels(self, **_kwargs): return self
         def inc(self, *_a, **_k): return None
@@ -164,42 +163,59 @@ def _body_json() -> Dict[str, Any]:
         raise BadRequest("JSON body must be an object")
     return data
 
-def _normalize_time_hms(s: str) -> str:
-    s = s.strip()
-    parts = s.split(":")
-    if len(parts) == 2:
-        hh, mm = parts
-        return f"{int(hh):02d}:{int(mm):02d}:00"
-    if len(parts) == 3:
-        hh, mm, ss = parts
-        return f"{int(hh):02d}:{int(mm):02d}:{int(ss):02d}"
-    raise BadRequest("time must be 'HH:MM' or 'HH:MM:SS'")
+# ───────────────────────── time string normalizer (fraction-safe) ─────────────────────────
+import re as _re
+_TIME_RE = _re.compile(r"^\s*(?P<h>\d{1,2}):(?P<m>\d{2}):(?P<s>\d{2})(?:\.(?P<f>\d+))?\s*$")
+def _normalize_time_hms(time_s: str) -> str:
+    """
+    Accepts 'HH:MM:SS' or 'HH:MM:SS.frac' and returns canonical string.
+    - Hours/minutes are integers.
+    - Seconds may carry a fractional part.
+    - Allows leap second 'SS==60' (fraction allowed).
+    - Disallows 24:00:00.* except exact '24:00:00'.
+    """
+    m = _TIME_RE.match(time_s or "")
+    if not m:
+        # allow 'HH:MM' by filling ':00'
+        mm_match = _re.match(r"^\s*(\d{1,2}):(\d{2})\s*$", time_s or "")
+        if mm_match:
+            hh = int(mm_match.group(1)); mm = int(mm_match.group(2))
+            if not (0 <= hh <= 24 and 0 <= mm <= 59):
+                raise BadRequest("time fields out of range")
+            if hh == 24 and mm != 0:
+                raise BadRequest("24:00:00 is only allowed exactly")
+            return f"{hh:02d}:{mm:02d}:00"
+        raise BadRequest("time must be 'HH:MM' or 'HH:MM:SS[.frac]'")
 
-def _compute_timescales_payload(date: str, time_s: str, tz: str) -> Dict[str, Any]:
-    """Civil date/time/tz → {jd_ut, jd_tt, jd_ut1, utc, dut1} using app.core.timescales."""
-    from zoneinfo import ZoneInfo
-    time_norm = _normalize_time_hms(time_s)
+    hh = int(m.group("h")); mm = int(m.group("m")); ss = int(m.group("s"))
+    frac = (m.group("f") or "")
+    if not (0 <= hh <= 24 and 0 <= mm <= 59 and 0 <= ss <= 60):
+        raise BadRequest("time fields out of range")
+    if hh == 24:
+        if not (mm == 0 and ss == 0 and frac == ""):
+            raise BadRequest("24:00:00 is only allowed exactly")
+        return "24:00:00"
+    frac = "".join(ch for ch in frac if ch.isdigit())
+    return f"{hh:02d}:{mm:02d}:{ss:02d}" + (f".{frac}" if frac else "")
 
-    utc_iso = _ts.to_utc_iso(date, time_norm, tz)
-    jd_ut = _ts.julian_day_utc(date, time_norm, tz)
+# ───────────────────────── timescales computation using core builder ─────────────────────────
+def _compute_timescales_payload(date: str, time_s: str, tz: str, dut1_val: float | None) -> Dict[str, Any]:
+    """
+    Returns {timescales: {...}} with jd_utc, jd_tt, jd_ut1, delta_t, dat, delta_at, dut1, tz_offset_seconds, timezone, warnings, precision.
+    """
+    # Prefer request DUT1; fall back to environment broadcast if absent
+    if dut1_val is None:
+        dut1_env = os.getenv("ASTRO_DUT1_BROADCAST", os.getenv("ASTRO_DUT1", "0.0")) or "0.0"
+        try:
+            dut1_val = float(dut1_env)
+        except Exception:
+            dut1_val = 0.0
 
-    dt_utc = (
-        datetime.fromisoformat(f"{date}T{time_norm}")
-        .replace(tzinfo=ZoneInfo(tz))
-        .astimezone(ZoneInfo("UTC"))
-    )
-    jd_tt = _ts.jd_tt_from_utc_jd(jd_ut, dt_utc.year, dt_utc.month)
-
-    dut1 = float(os.getenv("ASTRO_DUT1_BROADCAST", os.getenv("ASTRO_DUT1", "0.0")) or 0.0)
-    jd_ut1 = jd_ut + (dut1 / 86400.0)
-
-    return {
-        "utc": utc_iso,
-        "jd_ut": float(jd_ut),
-        "jd_tt": float(jd_tt),
-        "jd_ut1": float(jd_ut1),
-        "dut1": float(dut1),
-    }
+    ts = _ts.build_timescales(date, _normalize_time_hms(time_s), tz, float(dut1_val))
+    pkt = ts.to_dict()
+    # Provide compatibility alias
+    pkt["delta_at"] = pkt.get("dat")
+    return {"timescales": pkt}
 
 def _timescales_meta_from_chart(chart: Dict[str, Any]) -> Dict[str, Any]:
     jd_ut = float(chart.get("jd_ut"))
@@ -207,7 +223,14 @@ def _timescales_meta_from_chart(chart: Dict[str, Any]) -> Dict[str, Any]:
     jd_ut1 = float(chart.get("jd_ut1"))
     delta_t_sec = (jd_tt - jd_ut) * 86400.0
     dut1_sec = (jd_ut1 - jd_ut) * 86400.0
-    return {"jd_utc": jd_ut, "jd_tt": jd_tt, "jd_ut1": jd_ut1, "delta_t": delta_t_sec, "delta_at": 0.0, "dut1": dut1_sec}
+    return {
+        "jd_utc": jd_ut,
+        "jd_tt": jd_tt,
+        "jd_ut1": jd_ut1,
+        "delta_t": delta_t_sec,
+        "delta_at": 0.0,
+        "dut1": dut1_sec,
+    }
 
 # ───────────────────────── system/policy endpoints ─────────────────────────
 def _houses_policy_blob() -> Dict[str, Any]:
@@ -233,14 +256,22 @@ def _register_core_api(app: Flask) -> None:
         data = _body_json()
         date = data.get("date")
         time_s = data.get("time")
-        tz = data.get("tz") or data.get("place_tz")
+        tz = data.get("tz") or data.get("place_tz") or data.get("timezone")
+        dut1 = data.get("dut1", None)
         if not (isinstance(date, str) and isinstance(time_s, str) and isinstance(tz, str)):
             raise BadRequest("Provide 'date', 'time', and 'tz' (IANA)")
-        out = _compute_timescales_payload(date, time_s, tz)
+        # accept dut1 as string or number
+        if dut1 is not None and not isinstance(dut1, (int, float, str)):
+            raise BadRequest("dut1 must be a number")
+        try:
+            dut1_f = float(dut1) if dut1 is not None else None
+        except Exception:
+            raise BadRequest("dut1 must be parseable as float")
+        out = _compute_timescales_payload(date, time_s, tz, dut1_f)
         return jsonify({"ok": True, **out}), 200
 
-    app.add_url_rule("/api/time/timescales", "timescales", _timescales_handler, methods=["POST"])
-    for alias in ("/api/timescales", "/time/timescales", "/timescales", "/api/time/convert"):
+    app.add_url_rule("/api/timescales", "timescales", _timescales_handler, methods=["POST"])
+    for alias in ("/api/time/timescales", "/time/timescales", "/timescales", "/api/time/convert"):
         app.add_url_rule(alias, f"timescales_alias_{alias}", _timescales_handler, methods=["POST"])
 
     # chart only
@@ -252,10 +283,15 @@ def _register_core_api(app: Flask) -> None:
         if not have_all_jd:
             date = payload.get("date")
             time_s = payload.get("time")
-            tz = payload.get("tz") or payload.get("place_tz")
+            tz = payload.get("tz") or payload.get("place_tz") or payload.get("timezone")
             if isinstance(date, str) and isinstance(time_s, str) and isinstance(tz, str):
-                ts = _compute_timescales_payload(date, time_s, tz)
-                payload.update({k: ts[k] for k in ("jd_ut", "jd_tt", "jd_ut1")})
+                # best-effort DUT1
+                dut1_in = payload.get("dut1", None)
+                dut1_f = float(dut1_in) if isinstance(dut1_in, (int, float, str)) else None
+                ts = _compute_timescales_payload(date, time_s, tz, dut1_f)["timescales"]
+                payload.update({
+                    "jd_ut": ts["jd_utc"], "jd_tt": ts["jd_tt"], "jd_ut1": ts["jd_ut1"]
+                })
             else:
                 raise BadRequest("Provide either jd_ut/jd_tt/jd_ut1 or civil 'date'+'time'+'tz'")
 
@@ -269,8 +305,6 @@ def _register_core_api(app: Flask) -> None:
     app.add_url_rule("/api/chart", "chart", _chart_handler, methods=["POST"])
     for alias in ("/chart", "/api/compute_chart", "/compute_chart", "/api/astronomy/chart", "/astronomy/chart", "/api/astro/chart"):
         app.add_url_rule(alias, f"chart_alias_{alias}", _chart_handler, methods=["POST"])
-
-    # NOTE: /api/calculate lives in the blueprint (app/api/routes.py) to avoid duplication.
 
 # ───────────────────────── app factory ─────────────────────────
 def create_app() -> Flask:
@@ -292,7 +326,7 @@ def create_app() -> Flask:
     seeded_routes = (
         "/", "/api/health-check",
         "/api/chart",
-        "/api/time/timescales",
+        "/api/timescales",
         "/health", "/healthz", "/metrics", "/system-validation"
     )
     for route in seeded_routes:
