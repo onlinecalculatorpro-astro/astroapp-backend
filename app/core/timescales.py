@@ -215,11 +215,11 @@ def _utc_calendar_to_jd_utc(
 
     # If all attempts failed, surface a clear error
     raise ValueError(f"ERFA dtf2d failed (tried {', '.join(try_order)}): " + " ; ".join(msgs))
+    except Exception as e:
+            msgs.append(f"{mode}={e!s}")
 
-    except Exception as e_arr:
-            # Both failed
-            raise ValueError(f"ERFA dtf2d failed with both conventions: individual={e_individual}; array={e_arr}")
-
+    raise ValueError(f"ERFA dtf2d failed (tried {', '.join(try_order)}): " + " ; ".join(msgs))
+    
     # C) Try keyword 8-arg (some builds expose named params)
     try:
         utc1, utc2 = erfa.dtf2d(
