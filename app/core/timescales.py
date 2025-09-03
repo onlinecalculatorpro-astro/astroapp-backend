@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, asdict
 from typing import Tuple, List, Dict, Any
-from datetime import datetime, date as _date, time as _time, timezone, timedelta
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import math
 
@@ -130,10 +130,10 @@ def _local_to_utc_calendar(
     Convert local civil time (in tz) to UTC calendar fields suitable for ERFA.
     Returns: (iy, im, id, ih, imin, isec, ifrac, tz_offset_seconds, warnings[])
 
-    Leap seconds: we DO NOT pre-normalize. If the input second == 60, we:
+    Leap seconds: if the input second == 60, we:
       • Build datetime at second=59 (Python limitation) to resolve tz offset / UTC Y-M-D-H-M.
-      • Use those Y-M-D-H-M from UTC, but set second=60 and ifrac=original for ERFA.
-      • No +1s shift is applied (we're representing the leap second itself).
+      • Use those Y/M/D/H/M from UTC, but set second=60 and ifrac=original for ERFA.
+      • No +1s shift is applied (we represent the leap second itself).
     """
     iy, im, iday, warn_date = _parse_date_str(date_str)
     ih, imin, isec_in, ifrac_in = _parse_time_to_ihmsf(time_str)
@@ -142,7 +142,7 @@ def _local_to_utc_calendar(
     leap_sec = (isec_in == 60)
     build_sec = 59 if leap_sec else isec_in
 
-    # Convert 1e-4 s → microseconds (int). Validate/clamp as requested.
+    # Convert 1e-4 s → microseconds (int). Validate/clamp.
     computed_micro = int(round(ifrac_in * 100))
     micro = min(999_999, computed_micro)
     if computed_micro != ifrac_in * 100 or computed_micro >= 1_000_000:
@@ -184,17 +184,20 @@ def _utc_calendar_to_jd_utc(
 ) -> float:
     """
     Produce JD(UTC) via ERFA dtf2d.
-    Prefer the 7-argument form (iy,im,id,ih,min,sec,frac); fall back to the
-    ihmsf[4] variant if needed (platform compatibility).
+    Prefer the 7-argument form; fall back to the ihmsf[4] variant if needed.
     """
     try:
-        utc1, utc2 = erfa.dtf2d("UTC", int(iy), int(im), int(iday), int(ih), int(imin), int(isec), int(ifrac))
+        utc1, utc2 = erfa.dtf2d("UTC",
+                                int(iy), int(im), int(iday),
+                                int(ih), int(imin), int(isec), int(ifrac))
     except TypeError:
-        utc1, utc2 = erfa.dtf2d("UTC", int(iy), int(im), int(iday), [int(ih), int(imin), int(isec), int(ifrac)])
+        utc1, utc2 = erfa.dtf2d("UTC",
+                                int(iy), int(im), int(iday),
+                                [int(ih), int(imin), int(isec), int(ifrac)])
     return math.fsum((utc1, utc2))
 
 def _delta_t_seconds_from_parts(tt1: float, tt2: float, ut11: float, ut12: float) -> float:
-    # Two-part difference BEFORE collapsing — preserves precision
+    """Two-part difference BEFORE collapsing — preserves precision."""
     return ((tt1 - ut11) + (tt2 - ut12)) * 86400.0
 
 def _dat_seconds(iy: int, im: int, iday: int, ih: int, imin: int, isec: int, ifrac: int) -> float:
