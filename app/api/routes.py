@@ -132,7 +132,7 @@ def _cosd(a: float) -> float:
 
 def _atan2d(y: float, x: float) -> float:
     import math
-    if x == 0.0 and y == 0.0:
+    if abs(x) < 1e-18 and abs(y) < 1e-18:
         raise ValueError("atan2(0,0) undefined")
     return _wrap360(math.degrees(math.atan2(y, x)))
 
@@ -235,14 +235,13 @@ def _compute_timescales_from_local(
     # Build timescales, map domain ValueError → API ValidationError with field hints
     try:
         ts: TimeScales = build_timescales(date_str, time_str, tz_name, dut1_seconds)
-    except ValueError as e:
+        except ValueError as e:
         msg = str(e)
-        # heuristic field mapping for better UX
         if "DUT1" in msg:
             raise ValidationError({"dut1": msg})
-        if "UTC before 1960" in msg or "pre-1960" in msg:
+        if ("UTC dates before 1960" in msg) or ("1960-01-01" in msg) or ("pre-1960" in msg):
             raise ValidationError({"date": msg})
-        if "leap" in msg.lower() or "ΔAT" in msg or "TAI-UTC" in msg:
+        if ("leap" in msg.lower()) or ("ΔAT" in msg) or ("TAI − UTC" in msg) or ("TAI-UTC" in msg):
             raise ValidationError({"timescales": msg})
         raise ValidationError({"timescales": msg})
 
@@ -567,8 +566,7 @@ def calculate():
         "chart_engine": _CHART_ENGINE_NAME,
         "houses_engine": _HOUSES_KIND,
     }
-    return jsonify({"ok": True, "chart": chart, "houses": houses, "meta": meta}), 200
-
+    return jsonify({"ok": True, "timescales": ts, "chart": chart, "houses": houses, "meta": meta}), 200
 @api.post("/api/report")
 def report():
     try:
