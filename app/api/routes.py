@@ -1,788 +1,1125 @@
-# app/core/ephemeris_adapter.py
-# -----------------------------------------------------------------------------
-# Ephemeris adapter (no house-engine coupling).
-# - Skyfield + local DE421 for majors (Sun..Pluto, barycenters as needed)
-# - Optional SPICE for selected small bodies (geocentric only)
-# - Lunar nodes: mean/true (geocentric)
-# - Frames: "ecliptic-of-date" (default) or "ecliptic-J2000"
-# - Topocentric supported via WGS84 (lat/lon/elevation)
-#
-# RETURN SHAPE (always a list of rows):
-#   [{"name": <as requested>, "longitude": <deg>, "velocity": <deg/day>?, ...}, ...]
-# Back-compat: rows also include "lon" (same as longitude) and "speed" (same as velocity).
-# -----------------------------------------------------------------------------
+# app/api/routes.py
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Optional, Tuple
-from functools import lru_cache
+import inspect
+import json
 import os
-import math
 import logging
+from dataclasses import asdict, is_dataclass
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional, List
+from zoneinfo import ZoneInfo
+
+from flask import Blueprint, jsonify, request
+
+from app.version import VERSION
+from app.utils.config import load_config
+from app.utils.hc import flag_predictions
+from app.utils.metrics import metrics
+from app.utils.ratelimit import rate_limit
+from app.core.validators import (
+    ValidationError,
+    parse_chart_payload,
+    parse_prediction_payload,
+    parse_rectification_payload,
+    parse_ephemeris_payload,
+)
 
 log = logging.getLogger(__name__)
+api = Blueprint("api", __name__)
+DEBUG_VERBOSE = os.getenv("ASTRO_DEBUG_VERBOSE", "0").lower() in ("1", "true", "yes", "on")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Config (env)
-# ─────────────────────────────────────────────────────────────────────────────
-EPHEMERIS_NAME = "de421"
-
-_SPEED_STEP_DEFAULT = float(os.getenv("OCP_SPEED_STEP_DEFAULT", "0.5"))   # ±12h
-_SPEED_STEP_FAST    = float(os.getenv("OCP_SPEED_STEP_FAST", "0.05"))     # ±1.2h (Moon)
-_NODE_MODEL         = os.getenv("OCP_NODE_MODEL", "true").strip().lower() # {"true","mean"}
-_ENABLE_SMALLS      = os.getenv("OCP_ENABLE_SMALL_BODIES", "0").lower() in ("1","true","yes","on")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Optional backends
-# ─────────────────────────────────────────────────────────────────────────────
-def _skyfield_available() -> bool:
-    try:
-        import skyfield  # noqa: F401
-        return True
-    except Exception:
-        return False
-
-try:
-    import spiceypy as sp  # optional
-    _SPICE_OK = True
-except Exception:
-    sp = None  # type: ignore
-    _SPICE_OK = False
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Runtime singletons / state
-# ─────────────────────────────────────────────────────────────────────────────
-_TS = None                 # Skyfield timescale
-_MAIN = None               # Main DE421 kernel (Skyfield)
-_EXTRA: List[Any] = []     # Extra SPKs Skyfield can read (often none)
-_KERNEL_PATHS: List[str] = []
-
-_SPICE_READY = False
-_SPICE_KERNELS: List[str] = []
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Body catalogs & canonicalization
-# ─────────────────────────────────────────────────────────────────────────────
-_PLANET_KEYS: Dict[str, str] = {
-    "Sun": "sun",
-    "Moon": "moon",
-    "Mercury": "mercury",
-    "Venus": "venus",
-    "Mars": "mars",
-    "Jupiter": "jupiter barycenter",
-    "Saturn": "saturn barycenter",
-    "Uranus": "uranus barycenter",
-    "Neptune": "neptune barycenter",
-    "Pluto": "pluto barycenter",
-}
-_MAJOR_CANON = {k.lower(): k for k in _PLANET_KEYS.keys()}
-
-_NODE_CANON  = {"north node": "North Node", "south node": "South Node"}
-_NODE_NAMES = set(_NODE_CANON.values())
-
-_SMALL_CANON = {"ceres": "Ceres", "pallas": "Pallas", "juno": "Juno", "vesta": "Vesta", "chiron": "Chiron"}
-_SMALLBODY_HINTS: Dict[str, List[str]] = {
-    "Ceres":  ["1 Ceres", "Ceres", "00001 Ceres", "2000001", "1"],
-    "Pallas": ["2 Pallas", "Pallas", "00002 Pallas", "2000002", "2"],
-    "Juno":   ["3 Juno", "Juno", "00003 Juno", "2000003", "3"],
-    "Vesta":  ["4 Vesta", "Vesta", "00004 Vesta", "2000004", "4"],
-    "Chiron": ["2060 Chiron", "Chiron", "2002060", "2060", "95P/Chiron"],
-}
-
-def _canon_name(nm: str) -> Tuple[str, str]:
-    """Return (canonical_name, kind) where kind in {'major','node','small','unknown'}."""
-    s = (nm or "").strip()
-    low = s.lower()
-    if low in _MAJOR_CANON:
-        return _MAJOR_CANON[low], "major"
-    if low in _NODE_CANON:
-        return _NODE_CANON[low], "node"
-    if low in _SMALL_CANON:
-        return _SMALL_CANON[low], "small"
-    return s, "unknown"
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Math helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────── numeric helpers ─────────────────────────────
 def _wrap360(x: float) -> float:
-    v = float(x) % 360.0
-    return 0.0 if abs(v) < 1e-12 else v
+    try:
+        v = float(x) % 360.0
+        return 0.0 if abs(v) < 1e-12 else v
+    except Exception:
+        return x
 
-def _atan2deg(y: float, x: float) -> float:
+def _shortest_delta_deg(a2: float, a1: float) -> float:
+    d = (float(a2) - float(a1) + 540.0) % 360.0 - 180.0
+    return -180.0 if d == 180.0 else d
+
+def _delta_arcsec(a: float, b: float) -> float:
+    return abs(_shortest_delta_deg(a, b)) * 3600.0
+
+ARCSEC_TOL = float(os.getenv("ASTRO_ASC_TOL_ARCSEC", "3.6"))  # 0.001°
+
+# ───────────────────────────── Chart engine (primary + fallback) ─────────────────────────────
+_compute_chart = None  # type: ignore
+_CHART_ENGINE_NAME: Optional[str] = None
+try:  # pragma: no cover
+    from app.core.astronomy import compute_chart as _compute_chart  # type: ignore
+    _CHART_ENGINE_NAME = "app.core.astronomy.compute_chart"
+except Exception as e1:  # pragma: no cover
+    try:
+        from app.core.chart import compute_chart as _compute_chart  # type: ignore
+        _CHART_ENGINE_NAME = "app.core.chart.compute_chart"
+        log.warning("Primary astronomy.compute_chart missing; fallback chart.compute_chart in use. err=%r", e1)
+    except Exception as e2:
+        _compute_chart = None  # type: ignore
+        _CHART_ENGINE_NAME = None
+        log.error("No compute_chart available: astronomy failed=%r, chart failed=%r", e1, e2)
+
+# ───────────────────────────── Houses: prefer policy façade ─────────────────────
+_HOUSES_KIND = "policy"
+_can_sys = None  # canonicalizer (if policy façade is present)
+try:
+    from app.core.house import (
+        compute_houses_with_policy as _houses_fn,
+        canonicalize_system as _can_sys,  # ← system alias canonicalizer
+        POLAR_SOFT_LIMIT_DEG,
+        POLAR_HARD_LIMIT_DEG,
+    )  # type: ignore
+except Exception:
+    try:
+        from app.core.houses_advanced import compute_house_system as _houses_fn  # type: ignore
+        _HOUSES_KIND = "legacy"
+        POLAR_SOFT_LIMIT_DEG = float(os.getenv("ASTRO_POLAR_SOFT_LAT", "66.0"))  # fallback constants
+        POLAR_HARD_LIMIT_DEG = float(os.getenv("ASTRO_POLAR_HARD_LAT", "80.0"))
+    except Exception as e:
+        _houses_fn = None  # type: ignore
+        _HOUSES_KIND = "unavailable"
+        POLAR_SOFT_LIMIT_DEG = float(os.getenv("ASTRO_POLAR_SOFT_LAT", "66.0"))
+        POLAR_HARD_LIMIT_DEG = float(os.getenv("ASTRO_POLAR_HARD_LAT", "80.0"))
+        log.error("No house engine available: %r", e)
+
+# Timescales
+from app.core import timescales as _ts  # type: ignore
+
+# Optional leap-seconds helper
+try:  # pragma: no cover
+    from app.core import leapseconds as _leaps  # type: ignore
+except Exception:  # pragma: no cover
+    _leaps = None  # type: ignore
+
+# ───────────────────────────── ERFA-first angle helpers ─────────────────────────────
+def _split_jd(jd: float) -> tuple[float, float]:
+    d = int(jd // 1)
+    return float(d), float(jd - d)
+
+def _sind(a: float) -> float:
+    import math
+    return math.sin(math.radians(a))
+
+def _cosd(a: float) -> float:
+    import math
+    return math.cos(math.radians(a))
+
+def _atan2d(y: float, x: float) -> float:
+    import math
+    if x == 0.0 and y == 0.0:
+        raise ValueError("atan2(0,0) undefined")
     return _wrap360(math.degrees(math.atan2(y, x)))
 
-def _wrap_diff_deg(a: float, b: float) -> float:
-    return ((a - b + 540.0) % 360.0) - 180.0
-
-def _speed_step_for(name: str) -> float:
-    return _SPEED_STEP_FAST if name == "Moon" else _SPEED_STEP_DEFAULT
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Kernel I/O (no network)
-# ─────────────────────────────────────────────────────────────────────────────
-def _resolve_kernel_path() -> Optional[str]:
-    path = os.getenv("OCP_EPHEMERIS")
-    if path and os.path.isfile(path):
-        return path
-    fallback = os.path.join(os.getcwd(), "app", "data", "de421.bsp")
-    return fallback if os.path.isfile(fallback) else None
-
-def _extra_spk_paths() -> List[str]:
-    files = os.getenv("OCP_EXTRA_SPK_FILES")
-    if files:
-        out = [p.strip() for p in files.split(",") if p.strip()]
-        return [p for p in out if os.path.isfile(p)]
-    root = os.getenv("OCP_EXTRA_SPK_DIR", os.path.join(os.getcwd(), "app", "data", "spk"))
-    paths: List[str] = []
+def _gast_deg(jd_ut1: float, jd_tt: float) -> float:
     try:
-        if os.path.isdir(root):
-            for fn in sorted(os.listdir(root)):
-                if fn.lower().endswith(".bsp"):
-                    paths.append(os.path.join(root, fn))
-    except Exception as e:
-        log.debug("extras scan failed: %s", e)
-    return paths
-
-def _get_timescale():
-    global _TS
-    if _TS is not None:
-        return _TS
-    if not _skyfield_available():
-        return None
-    try:
-        from skyfield.api import load
-        _TS = load.timescale()
-        return _TS
-    except Exception as e:
-        log.warning("Skyfield timescale unavailable: %s", e)
-        return None
-
-def _load_kernel(path: str):
-    try:
-        from skyfield.api import load
-        return load(path)
-    except Exception as e:
-        log.info("Skyfield failed to load %s (ok for small-body SPKs): %s", path, e)
-        return None
-
-def _get_kernels():
-    global _MAIN, _EXTRA, _KERNEL_PATHS, EPHEMERIS_NAME
-    if _MAIN is not None:
-        return _MAIN, _EXTRA
-    if not _skyfield_available():
-        log.warning("Skyfield not installed; disabling Skyfield path")
-        return None, []
-
-    path = _resolve_kernel_path()
-    if path:
-        _MAIN = _load_kernel(path)
-        if _MAIN:
-            _KERNEL_PATHS.append(path)
-    else:
-        log.warning("No local DE421 found (OCP_EPHEMERIS/app/data/de421.bsp)")
-        _MAIN = None
-
-    _EXTRA = []
-    for p in _extra_spk_paths():
-        k = _load_kernel(p)
-        if k:
-            _EXTRA.append(k)
-            _KERNEL_PATHS.append(p)
-
-    if _EXTRA:
-        EPHEMERIS_NAME = f"de421+{len(_EXTRA)}spk"
-    return _MAIN, _EXTRA
-
-def current_kernel_name() -> str:
-    if _KERNEL_PATHS:
-        return ", ".join(os.path.basename(p) for p in _KERNEL_PATHS)
-    return EPHEMERIS_NAME
-
-def load_kernel(kernel_name: str = "de421"):
-    k, _ = _get_kernels()
-    return k, current_kernel_name()
-
-def _to_tts(jd_tt: float):
-    ts = _get_timescale()
-    if ts is None:
-        return None
-    try:
-        return ts.tt_jd(jd_tt)
+        import erfa  # type: ignore
+        d1u, d2u = _split_jd(jd_ut1)
+        d1t, d2t = _split_jd(jd_tt)
+        gst_rad = erfa.gst06a(d1u, d2u, d1t, d2t)
+        import math
+        return _wrap360(math.degrees(gst_rad))
     except Exception:
-        return None
+        import math
+        T = (float(jd_ut1) - 2451545.0) / 36525.0
+        theta = (
+            280.46061837
+            + 360.98564736629 * (float(jd_ut1) - 2451545.0)
+            + 0.000387933 * (T**2)
+            - (T**3) / 38710000.0
+        )
+        return _wrap360(theta)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SPICE helpers (optional small bodies)
-# ─────────────────────────────────────────────────────────────────────────────
-def _looks_like_lfs_pointer(path: str) -> bool:
+def _true_obliquity_deg(jd_tt: float) -> float:
     try:
-        if os.path.getsize(path) <= 512:
-            with open(path, "rb") as f:
-                head = f.read(128)
-            return head.startswith(b"version https://git-lfs.github.com/spec/v1")
+        import erfa  # type: ignore
+        d1, d2 = _split_jd(jd_tt)
+        eps0 = erfa.obl06(d1, d2)
+        _dpsi, deps = erfa.nut06a(d1, d2)
+        import math
+        return math.degrees(eps0 + deps)
     except Exception:
-        pass
-    return False
-
-def _spice_bootstrap() -> bool:
-    global _SPICE_READY, _SPICE_KERNELS
-    if _SPICE_READY:
-        return True
-    if not _SPICE_OK:
-        return False
-    try:
-        try:
-            sp.kclear()
-        except Exception:
-            pass
-        furnished: List[str] = []
-
-        de421_path = _resolve_kernel_path()
-        if de421_path and os.path.isfile(de421_path):
-            if _looks_like_lfs_pointer(de421_path):
-                log.warning("SPICE: %s looks like a Git LFS pointer", de421_path)
-            try:
-                sp.furnsh(de421_path)
-                furnished.append(de421_path)
-            except Exception as e:
-                log.warning("SPICE failed to furnish %s: %s", de421_path, e)
-
-        for p in _extra_spk_paths():
-            if _looks_like_lfs_pointer(p):
-                log.warning("SPICE: %s looks like a Git LFS pointer", p)
-            try:
-                sp.furnsh(p)
-                furnished.append(p)
-            except Exception as e:
-                log.warning("SPICE failed to furnish %s: %s", p, e)
-
-        _SPICE_KERNELS = furnished
-        _SPICE_READY = True
-        return True
-    except Exception as e:
-        log.warning("SPICE bootstrap failed: %s", e)
-        _SPICE_READY = False
-        _SPICE_KERNELS = []
-        return False
-
-def _et_from_jd_tt(jd_tt: float) -> float:
-    return (float(jd_tt) - 2451545.0) * 86400.0
-
-def _rotate_to_ecliptic_xyz(frame: str, jd_tt: float, x: float, y: float, z: float) -> Tuple[float, float, float]:
-    """Rotate equatorial J2000/of-date -> requested ecliptic frame."""
-    try:
-        import erfa
-        if frame and frame.lower() in ("ecliptic-j2000", "j2000", "ecl-j2000"):
-            eps = math.radians(23.439291111)  # mean obliquity at J2000
-        else:
-            d = math.floor(jd_tt); f = jd_tt - d
-            eps0 = erfa.obl06(d, f)
-            _dpsi, deps = erfa.nut06a(d, f)
-            eps = float(eps0 + deps)
-        ce, se = math.cos(eps), math.sin(eps)
-        return x, y*ce + z*se, -y*se + z*ce
-    except Exception:
-        # Simple IAU 2006 polynomial fallback
+        import math
         T = (float(jd_tt) - 2451545.0) / 36525.0
-        eps_arcsec = 84381.448 - 46.8150*T - 0.00059*(T**2) + 0.001813*(T**3)
-        eps = math.radians(eps_arcsec / 3600.0)
-        ce, se = math.cos(eps), math.sin(eps)
-        return x, y*ce + z*se, -y*se + z*ce
+        eps_arcsec = 84381.448 - 46.8150 * T - 0.00059 * (T**2) + 0.001813 * (T**3)
+        return eps_arcsec / 3600.0
 
-def _spice_try_id(s: str) -> Optional[int]:
-    if not _SPICE_READY:
+def _ramc_deg(jd_ut1: float, jd_tt: float, lon_east_deg: float) -> float:
+    return _wrap360(_gast_deg(jd_ut1, jd_tt) + float(lon_east_deg))
+
+def _mc_from_ramc(ramc: float, eps: float) -> float:
+    return _atan2d(_sind(ramc) * _cosd(eps), _cosd(ramc))
+
+def _asc_from_phi_ramc(phi: float, ramc: float, eps: float) -> float:
+    import math
+    def _acotd(x: float) -> float:
+        return _wrap360(math.degrees(math.atan2(1.0, x)))
+    num = -((math.tan(math.radians(phi)) * _sind(eps)) + (_sind(ramc) * _cosd(eps)))
+    den = _cosd(ramc)
+    den = den if abs(den) > 1e-15 else math.copysign(1e-15, den if den != 0 else 1.0)
+    return _acotd(num / den)
+
+def _recompute_angles_exact(
+    *, jd_ut1: float, jd_tt: float, latitude: Optional[float], longitude_east: Optional[float],
+    mode: str, ayanamsa_deg: Optional[float],
+) -> Optional[Dict[str, float]]:
+    if latitude is None or longitude_east is None:
         return None
+    eps = _true_obliquity_deg(jd_tt)
+    ramc = _ramc_deg(jd_ut1, jd_tt, float(longitude_east))
+    mc = _mc_from_ramc(ramc, eps)
+    asc = _asc_from_phi_ramc(float(latitude), ramc, eps)
+    if (mode or "tropical").lower() == "sidereal" and isinstance(ayanamsa_deg, (int, float)):
+        asc = _wrap360(asc - float(ayanamsa_deg))
+        mc = _wrap360(mc - float(ayanamsa_deg))
+    return {"asc_deg": asc, "mc_deg": mc}
+
+# ───────────────────────────── Timescales helpers ─────────────────────────────
+def _compute_timescales_from_local(date_str: str, time_str: str, tz_name: str) -> Dict[str, Any]:
     try:
-        try:
-            return int(s)
-        except Exception:
-            pass
-        return int(sp.bodn2c(s))  # type: ignore[attr-defined]
+        tz = ZoneInfo(tz_name)
     except Exception:
-        return None
+        raise ValidationError({"place_tz": "must be a valid IANA zone like 'Asia/Kolkata'"})
 
-def _spice_id_for_name(name: str) -> Optional[int]:
-    if not _SPICE_READY:
-        return None
-    i = _spice_try_id(name)
-    if i is not None:
-        return i
-    for cand in _SMALLBODY_HINTS.get(name.capitalize(), []):
-        i = _spice_try_id(cand)
-        if i is not None:
-            return i
-    fallback = {"ceres": 2000001, "pallas": 2000002, "juno": 2000003, "vesta": 2000004, "chiron": 2002060}
-    return fallback.get(name.strip().lower())
+    def _norm_hms(s: str) -> str:
+        s = str(s).strip()
+        parts = s.split(":")
+        if len(parts) == 2:
+            hh, mm = parts
+            return f"{int(hh):02d}:{int(mm):02d}:00"
+        if len(parts) == 3:
+            hh, mm, ss = parts
+            return f"{int(hh):02d}:{int(mm):02d}:{int(ss):02d}"
+        raise ValidationError({"time": "must be 'HH:MM' or 'HH:MM:SS'"})
 
-def _spice_lon_lat_speed(jd_tt: float, name: str, *, frame: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    """Geocentric lon, lat, speed via SPICE (deg, deg, deg/day)."""
-    if not (_SPICE_OK and _ENABLE_SMALLS and _SPICE_READY):
-        return None, None, None
-    tid = _spice_id_for_name(name)
-    if tid is None:
-        return None, None, None
+    time_norm = _norm_hms(time_str)
+    fmt = "%Y-%m-%d %H:%M:%S"
+
+    dt_local = datetime.strptime(f"{date_str} {time_norm}", fmt).replace(tzinfo=tz)
+    dt_utc = dt_local.astimezone(timezone.utc)
+
+    jd_utc = _ts.julian_day_utc(date_str, time_norm, tz_name)
+    jd_tt = _ts.jd_tt_from_utc_jd(jd_utc, dt_utc.year, dt_utc.month)
+
+    dut1 = float(os.getenv("ASTRO_DUT1_BROADCAST", os.getenv("ASTRO_DUT1", "0.0")))
+    jd_ut1 = float(jd_utc) + dut1 / 86400.0
+
     try:
-        et = _et_from_jd_tt(jd_tt)
-        pos, _lt = sp.spkpos(str(tid), et, "J2000", "NONE", "399")  # type: ignore
-        x, y, z = float(pos[0]), float(pos[1]), float(pos[2])
-        x2, y2, z2 = _rotate_to_ecliptic_xyz(frame, jd_tt, x, y, z)
-        lon = _atan2deg(y2, x2)
-        lat = math.degrees(math.atan2(z2, math.hypot(x2, y2)))
-        # speed by central diff
-        step = _speed_step_for(name)
-        et_m = _et_from_jd_tt(jd_tt - step); et_p = _et_from_jd_tt(jd_tt + step)
-        pos_m, _ = sp.spkpos(str(tid), et_m, "J2000", "NONE", "399")  # type: ignore
-        pos_p, _ = sp.spkpos(str(tid), et_p, "J2000", "NONE", "399")  # type: ignore
-        xm, ym, zm = float(pos_m[0]), float(pos_m[1]), float(pos_m[2])
-        xp, yp, zp = float(pos_p[0]), float(pos_p[1]), float(pos_p[2])
-        xm2, ym2, zm2 = _rotate_to_ecliptic_xyz(frame, jd_tt - step, xm, ym, zm)
-        xp2, yp2, zp2 = _rotate_to_ecliptic_xyz(frame, jd_tt + step, xp, yp, zp)
-        lon_m = _atan2deg(ym2, xm2); lon_p = _atan2deg(yp2, xp2)
-        spd = _wrap_diff_deg(lon_p, lon_m) / (2.0 * step)
-        return lon, lat, spd
-    except Exception as e:
-        log.debug("SPICE position failed for %s (ID %s): %s", name, tid, e)
-        return None, None, None
-
-def _spice_ecliptic_longitude_speed(jd_tt: float, name: str, *, frame: str) -> Tuple[Optional[float], Optional[float]]:
-    """Wrapper for LV path: returns (longitude, velocity) for SPICE small-bodies."""
-    lon, _lat, spd = _spice_lon_lat_speed(jd_tt, name, frame=frame)
-    return lon, spd
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Skyfield helpers
-# ─────────────────────────────────────────────────────────────────────────────
-def _get_ecliptic_frame(frame: str):
-    try:
-        from skyfield import framelib as _fl
-        if frame and frame.lower() in ("ecliptic-j2000", "j2000", "ecl-j2000"):
-            return getattr(_fl, "ecliptic_J2000_frame", None)
-        return getattr(_fl, "ecliptic_frame", None)
+        delta_t = float(_ts.delta_t_seconds(dt_utc.year, dt_utc.month))  # type: ignore[attr-defined]
     except Exception:
-        return None
+        delta_t = None
 
-def _frame_latlon(geo, ecliptic_frame) -> Tuple[float, float]:
-    lat, lon, _ = geo.frame_latlon(ecliptic_frame)
-    return float(lon.degrees) % 360.0, float(lat.degrees)
-
-def _cross(a, b):
-    ax, ay, az = a; bx, by, bz = b
-    return (ay*bz - az*by, az*bx - ax*bz, ax*by - ay*bz)
-
-def _observer(main, *, topocentric: bool, latitude: Optional[float], longitude: Optional[float], elevation_m: Optional[float]):
-    if main is None:
-        return None
-    if topocentric and (latitude is None or longitude is None):
-        log.debug("topocentric requested but latitude/longitude missing — using geocentric observer")
-    if topocentric and latitude is not None and longitude is not None:
-        try:
-            from skyfield.api import wgs84
-            return wgs84.latlon(float(latitude), float(longitude), elevation_m=float(elevation_m or 0.0))
-        except Exception as e:
-            log.debug("Topocentric build failed: %s", e)
-    try:
-        return main["earth"]
-    except Exception:
-        return None
-
-def _kernels_iter() -> Iterable[Any]:
-    main, extra = _get_kernels()
-    if main:
-        yield main
-    for k in extra:
-        yield k
-
-@lru_cache(maxsize=2048)
-def _all_kernel_labels(k) -> List[str]:
-    labels: List[str] = []
-    for attr in ("names", "aliases", "bodies"):
-        try:
-            obj = getattr(k, attr, None)
-            if isinstance(obj, dict):
-                labels.extend(list(obj.keys()))
-        except Exception:
-            pass
-    for lst in _SMALLBODY_HINTS.values():
-        labels.extend(lst)
-    seen = set(); out: List[str] = []
-    for s in labels:
-        if s not in seen:
-            seen.add(s); out.append(s)
-    return out
-
-@lru_cache(maxsize=2048)
-def _resolve_small_body(name_norm: str):
-    hints = _SMALLBODY_HINTS.get(name_norm, [])
-    for label in hints:
-        for k in _kernels_iter():
-            try:
-                return k[label]
-            except Exception:
-                continue
-    needle = name_norm.lower()
-    for k in _kernels_iter():
-        for lab in _all_kernel_labels(k):
-            try:
-                if needle in lab.lower():
-                    return k[lab]
-            except Exception:
-                continue
-    return None
-
-@lru_cache(maxsize=2048)
-def _get_body(name: str):
-    if name in _PLANET_KEYS:
-        key = _PLANET_KEYS[name]
-        for k in _kernels_iter():
-            try:
-                return k[key]
-            except Exception:
-                continue
-    if name in _SMALL_CANON.values():
-        b = _resolve_small_body(name)
-        if b is not None:
-            return b
-    log.debug("Body not resolved in Skyfield kernels: %s", name)
-    return None
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Lunar nodes (geocentric)
-# ─────────────────────────────────────────────────────────────────────────────
-def _mean_node(jd_tt: float) -> float:
-    T = (jd_tt - 2451545.0) / 36525.0
-    Omega = 125.04452 - 1934.136261 * T + 0.0020708*(T**2) + (T**3)/450000.0
-    return Omega % 360.0
-
-@lru_cache(maxsize=8192)
-def _true_node_geocentric_cached(jd_q: float) -> float:
-    try:
-        from skyfield.framelib import ecliptic_frame
-    except Exception:
-        return _mean_node(jd_q)
-
-    ts = _get_timescale()
-    moon = _get_body("Moon")
-    main, _ = _get_kernels()
-    if ts is None or moon is None or main is None:
-        return _mean_node(jd_q)
-
-    try:
-        earth = main["earth"]
-    except Exception:
-        return _mean_node(jd_q)
-
-    step = _speed_step_for("Moon")
-    try:
-        t0 = ts.tt_jd(jd_q)
-        tp = ts.tt_jd(jd_q + step)
-        tm = ts.tt_jd(jd_q - step)
-        r0 = tuple(map(float, earth.at(t0).observe(moon).apparent().frame_xyz(ecliptic_frame).au))
-        rp = tuple(map(float, earth.at(tp).observe(moon).apparent().frame_xyz(ecliptic_frame).au))
-        rm = tuple(map(float, earth.at(tm).observe(moon).apparent().frame_xyz(ecliptic_frame).au))
-        v = tuple((rp[i] - rm[i]) / (2.0 * step) for i in range(3))
-        h = _cross(r0, v)
-        n = _cross((0.0, 0.0, 1.0), h)
-        norm_xy = math.hypot(n[0], n[1])
-        if norm_xy < 1e-12:
-            return _mean_node(jd_q)
-        val = _atan2deg(n[1], n[0])
-        return val
-    except Exception as e:
-        log.debug("True node calc failed at JD %.6f: %s", jd_q, e)
-        return _mean_node(jd_q)
-
-def _node_longitude(name: str, jd_tt: float) -> float:
-    if _NODE_MODEL == "mean":
-        asc = _mean_node(jd_tt)
-    else:
-        jd_q = round(float(jd_tt), 5)  # cache-friendly quantization
-        asc = _true_node_geocentric_cached(jd_q)
-    return asc if name == "North Node" else (asc + 180.0) % 360.0
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Public API
-# ─────────────────────────────────────────────────────────────────────────────
-def ecliptic_longitudes(
-    jd_tt: float,
-    names: Optional[List[str]] = None,
-    *,
-    frame: str = "ecliptic-of-date",
-    topocentric: bool = False,
-    latitude: Optional[float] = None,
-    longitude: Optional[float] = None,
-    elevation_m: Optional[float] = None,
-) -> List[Dict[str, float]]:
-    """
-    RETURN TYPE (always): list of rows
-      [{"name": <as requested>, "longitude": <deg>, "velocity": <deg/day>?, ...}, ...]
-    (Back-compat fields: "lon", "speed")
-    """
-    # Prepare SPICE (no-op if unavailable); only used for small bodies/fallbacks
-    if _SPICE_OK and _ENABLE_SMALLS:
-        _spice_bootstrap()
-
-    # Resolve kernels & frames
-    main, _ = _get_kernels()
-    t = _to_tts(jd_tt) if main is not None else None
-    ef = _get_ecliptic_frame(frame) if main is not None else None
-    obs = _observer(main, topocentric=topocentric, latitude=latitude, longitude=longitude, elevation_m=elevation_m) if main is not None else None
-    ts = _get_timescale()
-
-    wanted = names[:] if names else list(_PLANET_KEYS.keys())
-    rows: List[Dict[str, float]] = []
-
-    for raw in wanted:
-        canon, kind = _canon_name(raw)
-
-        # Lunar nodes (geocentric)
-        if kind == "node":
-            try:
-                lon_val = _node_longitude(canon, jd_tt)
-                # optional speed by finite difference (use same step as Moon)
-                step = _speed_step_for("Moon")
-                lon_m = _node_longitude(canon, jd_tt - step)
-                lon_p = _node_longitude(canon, jd_tt + step)
-                vel_val = _wrap_diff_deg(lon_p, lon_m) / (2.0 * step)
-                row = {"name": raw, "longitude": lon_val, "lon": lon_val, "velocity": vel_val, "speed": vel_val, "lat": 0.0}
-            except Exception:
-                row = {"name": raw, "longitude": 0.0, "lon": 0.0, "lat": 0.0}
-            rows.append(row)
-            continue
-
-        # Majors via Skyfield
-        if kind == "major" and main is not None and t is not None and ef is not None and obs is not None:
-            body = _get_body(canon)
-            if body is not None:
-                try:
-                    geo = obs.at(t).observe(body).apparent()
-                    lon, lat = _frame_latlon(geo, ef)
-                    row: Dict[str, float] = {"name": raw, "longitude": lon, "lon": lon, "lat": lat}
-                    if ts is not None:
-                        step = _speed_step_for(canon)
-                        t0 = ts.tt_jd(jd_tt - step); t1 = ts.tt_jd(jd_tt + step)
-                        lon0, _ = _frame_latlon(obs.at(t0).observe(body).apparent(), ef)
-                        lon1, _ = _frame_latlon(obs.at(t1).observe(body).apparent(), ef)
-                        vel = _wrap_diff_deg(lon1, lon0) / (2.0 * step)
-                        row["velocity"] = vel; row["speed"] = vel
-                    rows.append(row)
-                    continue
-                except Exception as e:
-                    log.debug("Skyfield failed for %s: %s", canon, e)
-
-        # Small bodies via SPICE (geo)
-        if kind == "small" and _SPICE_READY and _ENABLE_SMALLS:
-            lon, lat, spd = _spice_lon_lat_speed(jd_tt, canon, frame=frame)
-            if lon is not None and lat is not None:
-                row = {"name": raw, "longitude": lon, "lon": lon, "lat": lat}
-                if spd is not None:
-                    row["velocity"] = spd; row["speed"] = spd
-                rows.append(row)
-                continue
-
-        # If nothing worked, note and move on
-        log.debug("Ephemeris: unresolved body %s (kind=%s)", raw, kind)
-
-    return rows
-
-def ecliptic_longitudes_and_velocities(
-    jd_tt: float,
-    names: List[str],
-    *,
-    frame: str = "ecliptic-of-date",
-    topocentric: bool = False,
-    latitude: Optional[float] = None,
-    longitude: Optional[float] = None,
-    elevation_m: Optional[float] = None,
-) -> List[Dict[str, float]]:
-    """
-    Return rows (NOT maps) to satisfy the API:
-      [{"name": <as requested>, "longitude": <deg>, "velocity": <deg/day?>, ...}, ...]
-    Notes:
-      • Nodes: geocentric, longitude only (no velocity in this endpoint).
-      • Small bodies (if enabled): provide longitude (+ velocity if available).
-    """
-    # Prepare SPICE (for small bodies only; harmless if unavailable)
-    if _SPICE_OK and _ENABLE_SMALLS:
-        _spice_bootstrap()
-
-    rows: List[Dict[str, float]] = []
-
-    main, _ = _get_kernels()
-    if main is None:
-        return rows
-
-    t  = _to_tts(jd_tt)
-    ef = _get_ecliptic_frame(frame)
-    obs = _observer(
-        main,
-        topocentric=topocentric,
-        latitude=latitude,
-        longitude=longitude,
-        elevation_m=elevation_m,
-    )
-
-    if t is None or ef is None or obs is None:
-        return rows
-
-    ts = _get_timescale()
-
-    for raw in names:
-        canon, kind = _canon_name(raw)
-
-        # Nodes (geocentric only; no velocity here)
-        if kind == "node":
-            try:
-                lon_val = _node_longitude(canon, jd_tt)
-                rows.append({"name": raw, "longitude": float(lon_val), "lon": float(lon_val)})
-            except Exception as e:
-                log.debug("Node computation failed for %s: %s", canon, e)
-            continue
-
-        skyfield_success = False
-        if kind == "major":
-            body = _get_body(canon)
-            if body is not None:
-                try:
-                    geo = obs.at(t).observe(body).apparent()
-                    lon, lat = _frame_latlon(geo, ef)
-                    row: Dict[str, float] = {"name": raw, "longitude": float(lon), "lon": float(lon), "lat": float(lat)}
-                    if ts is not None:
-                        step = _speed_step_for(canon)
-                        t0 = ts.tt_jd(jd_tt - step)
-                        t1 = ts.tt_jd(jd_tt + step)
-                        lon0, _ = _frame_latlon(obs.at(t0).observe(body).apparent(), ef)
-                        lon1, _ = _frame_latlon(obs.at(t1).observe(body).apparent(), ef)
-                        vel = _wrap_diff_deg(lon1, lon0) / (2.0 * step)
-                        row["velocity"] = float(vel); row["speed"] = float(vel)
-                    rows.append(row)
-                    skyfield_success = True
-                except Exception as e:
-                    log.debug("Skyfield failed for %s: %s", canon, e)
-
-        # Optional small-body path (SPICE); lat not guaranteed here
-        if (not skyfield_success) and _SPICE_READY and _ENABLE_SMALLS and kind == "small":
-            lon, vel = _spice_ecliptic_longitude_speed(jd_tt, canon, frame=frame)
-            if lon is not None:
-                row: Dict[str, float] = {"name": raw, "longitude": float(lon), "lon": float(lon)}
-                if vel is not None:
-                    row["velocity"] = float(vel); row["speed"] = float(vel)
-                rows.append(row)
-
-    return rows
-
-
-# Optional utility for any caller that still wants {longitudes, velocities} maps.
-def rows_to_maps(rows: List[Dict[str, float]]) -> Dict[str, Dict[str, float]]:
-    lon_map: Dict[str, float] = {}
-    vel_map: Dict[str, float] = {}
-    for r in rows:
-        nm = r.get("name")
-        if not nm:
-            continue
-        if "longitude" in r:
-            lon_map[nm] = float(r["longitude"])
-        elif "lon" in r:
-            lon_map[nm] = float(r["lon"])
-        if "velocity" in r:
-            vel_map[nm] = float(r["velocity"])
-        elif "speed" in r:
-            vel_map[nm] = float(r["speed"])
-    return {"longitudes": lon_map, "velocities": vel_map}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Diagnostics
-# ─────────────────────────────────────────────────────────────────────────────
-def ephemeris_diagnostics(requested: Optional[List[str]] = None) -> Dict[str, Any]:
-    main, extras = _get_kernels()
-    kernels = [p for p in _KERNEL_PATHS] or [EPHEMERIS_NAME]
-
-    if _SPICE_OK and _spice_bootstrap():
-        kernels = kernels + [f"[spice] {os.path.basename(p)}" for p in _SPICE_KERNELS]
-
-    default_names = list(_PLANET_KEYS.keys()) + ["North Node", "South Node"]
-    if _ENABLE_SMALLS:
-        default_names += ["Ceres", "Pallas", "Juno", "Vesta", "Chiron"]
-
-    wanted = requested or default_names
-
-    resolved: Dict[str, Dict[str, str]] = {}
-    missing: List[str] = []
-
-    for raw in wanted:
-        nm, kind = _canon_name(raw)
-        if kind == "node":
-            resolved[raw] = {"type": "node", "kernel": "computed", "label": nm}
-            continue
-
-        if kind == "small" and _SPICE_READY and _ENABLE_SMALLS and _spice_id_for_name(nm) is not None:
-            resolved[raw] = {"type": "body", "kernel": "spice", "label": str(_spice_id_for_name(nm))}
-            continue
-
-        b = _get_body(nm)
-        if b is not None:
-            used_label = None
-            used_kernel = "main"
-            for k in _kernels_iter():
-                candidates = []
-                if nm in _PLANET_KEYS:
-                    candidates.append(_PLANET_KEYS[nm])
-                candidates += _SMALLBODY_HINTS.get(nm, [])
-                for lab in candidates:
-                    try:
-                        if k[lab] is b:
-                            used_label = lab
-                            used_kernel = "extra" if (k in extras) else "main"
-                            break
-                    except Exception:
-                        pass
-                if used_label:
-                    break
-            resolved[raw] = {"type": "body", "kernel": used_kernel, "label": used_label or "n/a"}
-        else:
-            missing.append(raw)
-
+    tz_offset_seconds = int(dt_local.utcoffset().total_seconds()) if dt_local.utcoffset() else 0
     return {
-        "kernels": kernels,
-        "ephemeris_name": current_kernel_name(),
-        "resolved": resolved,
-        "missing": missing,
-        "node_model": _NODE_MODEL,
-        "smalls_enabled": _ENABLE_SMALLS,
+        "jd_utc": float(jd_utc),
+        "jd_tt": float(jd_tt),
+        "jd_ut1": float(jd_ut1),
+        "delta_t": delta_t,
+        "delta_at": None,
+        "dut1": float(dut1),
+        "timezone": tz_name,
+        "tz_offset_seconds": tz_offset_seconds,
+        "warnings": [],
     }
 
-def clear_adapter_caches() -> None:
+# ─────────────────────── engine call adapters ───────────────────────
+def _sig_accepts(fn, *names: str) -> Dict[str, bool]:
     try:
-        _resolve_small_body.cache_clear()  # type: ignore[attr-defined]
+        params = inspect.signature(fn).parameters
+    except (ValueError, TypeError):
+        return {n: False for n in names}
+    return {n: (n in params) for n in names}
+
+def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str, Any]:
+    if _compute_chart is None:
+        raise RuntimeError("chart_engine_unavailable")
+
+    params = inspect.signature(_compute_chart).parameters
+
+    if "payload" in params:
+        merged = dict(payload)
+        merged["jd_ut"] = ts["jd_utc"]
+        merged["jd_tt"] = ts["jd_tt"]
+        merged["jd_ut1"] = ts["jd_ut1"]
+        chart = _compute_chart(merged)
+        chart.setdefault("meta", {})
+        chart["meta"]["engine"] = _CHART_ENGINE_NAME or "unknown"
+        chart["jd_ut"] = ts["jd_utc"]
+        chart["jd_tt"] = ts["jd_tt"]
+        chart["jd_ut1"] = ts["jd_ut1"]
+        if "mode" not in chart and "mode" in payload:
+            chart["mode"] = payload["mode"]
+        return chart
+
+    def pick(*cands: str) -> Optional[str]:
+        for c in cands:
+            if c in params:
+                return c
+        return None
+
+    name_date = pick("date", "date_s", "date_str")
+    name_time = pick("time", "time_s", "time_str")
+    name_lat  = pick("latitude", "lat")
+    name_lon  = pick("longitude", "lon")
+    name_mode = pick("mode", "system")
+    name_tz   = pick("place_tz", "timezone", "tz_name")
+    name_bods = pick("bodies", "names", "planets")
+    name_aya  = pick("ayanamsa", "ayanamsha", "aya")
+    name_topo = pick("topocentric", "observer_topocentric")
+    name_elev = pick("elevation_m", "elevation")
+
+    kwargs: Dict[str, Any] = {}
+    if name_date: kwargs[name_date] = payload["date"]
+    if name_time: kwargs[name_time] = payload["time"]
+    if name_lat:  kwargs[name_lat]  = payload["latitude"]
+    if name_lon:  kwargs[name_lon]  = payload["longitude"]
+    if name_mode: kwargs[name_mode] = payload["mode"]
+    if name_tz:   kwargs[name_tz]   = payload.get("timezone") or payload.get("place_tz")
+    if name_bods and "bodies" in payload: kwargs[name_bods] = payload["bodies"]
+    if name_aya and "ayanamsa" in payload: kwargs[name_aya] = payload["ayanamsa"]
+    if name_topo and "topocentric" in payload: kwargs[name_topo] = bool(payload["topocentric"])
+    if name_elev and "elevation_m" in payload: kwargs[name_elev] = payload["elevation_m"]
+
+    if "jd_ut" in params:  kwargs["jd_ut"]  = ts["jd_utc"]
+    if "jd_tt" in params:  kwargs["jd_tt"]  = ts["jd_tt"]
+    if "jd_ut1" in params: kwargs["jd_ut1"] = ts["jd_ut1"]
+    if "timescales" in params: kwargs["timescales"] = ts
+
+    chart = _compute_chart(**kwargs)
+    chart["jd_ut"] = ts["jd_utc"]
+    chart["jd_tt"] = ts["jd_tt"]
+    chart["jd_ut1"] = ts["jd_ut1"]
+    if "mode" not in chart and "mode" in payload:
+        chart["mode"] = payload["mode"]
+    chart.setdefault("meta", {})
+    chart["meta"]["engine"] = _CHART_ENGINE_NAME or "unknown"
+    return chart
+
+def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
+    if _houses_fn is None:
+        raise RuntimeError("houses_engine_unavailable")
+
+    lat = float(payload["latitude"])
+    lon = float(payload["longitude"])
+
+    requested_system_raw = (payload.get("house_system") or "").strip()
+    # Canonicalize only if policy façade is present; legacy engine may not support extra aliases
+    requested_system = (
+        _can_sys(requested_system_raw) if (_can_sys and requested_system_raw)
+        else (requested_system_raw.lower() or None)
+    )
+
+    accepts = _sig_accepts(
+        _houses_fn, "lat", "lon", "latitude", "longitude",
+        "system", "requested_house_system", "house_system",
+        "mode", "jd_ut", "jd_tt", "jd_ut1", "diagnostics", "validation",
+    )
+
+    kwargs: Dict[str, Any] = {}
+    if accepts.get("lat"):
+        kwargs["lat"] = lat
+    elif accepts.get("latitude"):
+        kwargs["latitude"] = lat
+    else:
+        kwargs["lat"] = lat
+
+    if accepts.get("lon"):
+        kwargs["lon"] = lon
+    elif accepts.get("longitude"):
+        kwargs["longitude"] = lon
+    else:
+        kwargs["lon"] = lon
+
+    if requested_system:
+        if accepts.get("system"):
+            kwargs["system"] = requested_system
+        elif accepts.get("requested_house_system"):
+            kwargs["requested_house_system"] = requested_system
+        elif accepts.get("house_system"):
+            kwargs["house_system"] = requested_system
+
+    if accepts.get("jd_tt"):
+        kwargs["jd_tt"] = ts["jd_tt"]
+    if accepts.get("jd_ut1"):
+        kwargs["jd_ut1"] = ts["jd_ut1"]
+    if accepts.get("jd_ut") and "jd_tt" not in kwargs and "jd_ut1" not in kwargs:
+        kwargs["jd_ut"] = ts["jd_utc"]
+
+    if accepts.get("diagnostics") and "diagnostics" in payload:
+        kwargs["diagnostics"] = bool(payload["diagnostics"])
+    if accepts.get("validation") and "validation" in payload:
+        kwargs["validation"] = bool(payload["validation"])
+
+    return _houses_fn(**kwargs)
+
+# ───────────────────────────── helpers: sidereal rotation & parity ─────────────────────────────
+def _extract_ayanamsa_from_chart(chart: Dict[str, Any]) -> Optional[float]:
+    if not isinstance(chart, dict):
+        return None
+    meta = chart.get("meta") or {}
+    ay = meta.get("ayanamsa_deg")
+    if isinstance(ay, (int, float)):
+        return float(ay)
+    ay2 = chart.get("ayanamsa_deg")
+    return float(ay2) if isinstance(ay2, (int, float)) else None
+
+def _normalize_houses_payload(h: Any) -> Any:
+    if not isinstance(h, dict):
+        return h
+    if "cusps" not in h and "cusps_deg" in h:
+        h["cusps"] = h["cusps_deg"]
+    if "cusps_deg" not in h and "cusps" in h:
+        h["cusps_deg"] = h["cusps"]
+    if "house_system" not in h and "system" in h:
+        h["house_system"] = h["system"]
+    if "system" not in h and "house_system" in h:
+        h["system"] = h["house_system"]
+    if "asc_deg" not in h and "asc" in h:
+        h["asc_deg"] = h["asc"]
+    if "mc_deg" not in h and "mc" in h:
+        h["mc_deg"] = h["mc"]
+    for k in ("asc", "asc_deg", "mc", "mc_deg", "vertex", "eastpoint", "armc", "ramc"):
+        if k in h and isinstance(h[k], (int, float)):
+            h[k] = _wrap360(h[k])
+    for key in ("cusps", "cusps_deg"):
+        if isinstance(h.get(key), list):
+            h[key] = [_wrap360(c) if isinstance(c, (int, float)) else c for c in h[key]]
+    return h
+
+def _recompute_houses_angles_if_needed(
+    h: Any, ts: Dict[str, Any], payload: Dict[str, Any], chart: Dict[str, Any]
+) -> Any:
+    if not isinstance(h, dict):
+        return h
+    lat = payload.get("latitude")
+    lon = payload.get("longitude")
+    mode = (payload.get("mode") or "tropical").lower()
+    ay = _extract_ayanamsa_from_chart(chart) if mode == "sidereal" else None
+    recomputed = _recompute_angles_exact(
+        jd_ut1=float(ts["jd_ut1"]), jd_tt=float(ts["jd_tt"]),
+        latitude=float(lat) if isinstance(lat, (int, float)) else None,
+        longitude_east=float(lon) if isinstance(lon, (int, float)) else None,
+        mode=mode, ayanamsa_deg=ay,
+    )
+    if not recomputed:
+        return h
+    asc_new, mc_new = recomputed["asc_deg"], recomputed["mc_deg"]
+    asc_old = h.get("asc_deg") if isinstance(h.get("asc_deg"), (int, float)) else h.get("asc")
+    mc_old  = h.get("mc_deg") if isinstance(h.get("mc_deg"), (int, float)) else h.get("mc")
+    warn_list = h.get("warnings") or []
+    changed = False
+    if isinstance(asc_old, (int, float)):
+        d_asc = _delta_arcsec(asc_new, float(asc_old))
+        if d_asc > ARCSEC_TOL:
+            h["asc_deg"] = _wrap360(asc_new); h["asc"] = h["asc_deg"]; changed = True
+            warn_list.append(f"asc_corrected_for_parity({d_asc:.2f}arcsec)")
+    else:
+        h["asc_deg"] = _wrap360(asc_new); h["asc"] = h["asc_deg"]; changed = True
+    if isinstance(mc_old, (int, float)):
+        d_mc = _delta_arcsec(mc_new, float(mc_old))
+        if d_mc > ARCSEC_TOL:
+            h["mc_deg"] = _wrap360(mc_new); h["mc"] = h["mc_deg"]; changed = True
+            warn_list.append(f"mc_corrected_for_parity({d_mc:.2f}arcsec)")
+    else:
+        h["mc_deg"] = _wrap360(mc_new); h["mc"] = h["mc_deg"]; changed = True
+    if changed:
+        h["warnings"] = warn_list
+    return _normalize_houses_payload(h)
+
+# ───────────────────────────── helpers: predictions shape ─────────────────────────────
+def _prepare_chart_for_predict(chart: Dict[str, Any]) -> Dict[str, Any]:
+    ch = dict(chart)
+    bodies = ch.get("bodies")
+    if isinstance(bodies, dict):
+        return ch
+    if isinstance(bodies, list):
+        name_map: Dict[str, Any] = {}
+        for b in bodies:
+            if isinstance(b, dict):
+                nm = b.get("name")
+                if isinstance(nm, str) and nm:
+                    name_map[nm] = b
+        if name_map:
+            ch["bodies_list"] = bodies
+            ch["bodies"] = name_map
+    return ch
+
+def _freeze_horizon(h: Any) -> Any:
+    if isinstance(h, dict):
+        return tuple(sorted((k, _freeze_horizon(v)) for k, v in h.items()))
+    if isinstance(h, (list, tuple)):
+        return tuple(_freeze_horizon(v) for v in h)
+    return h
+
+# ───────────────────────────── error helper ─────────────────────────────
+def _json_error(code: str, details: Any = None, http: int = 400):
+    out: Dict[str, Any] = {"ok": False, "error": code}
+    if details is not None:
+        out["details"] = details
+    return jsonify(out), http
+
+# ───────────────────────────── endpoints: health & chart/report/pred ─────────────────────────────
+@api.get("/api/health")
+def health():
+    return jsonify({"ok": True, "status": "up", "version": VERSION}), 200
+
+@api.post("/api/calculate")
+def calculate():
+    try:
+        body = request.get_json(force=True) or {}
+        payload = parse_chart_payload(body)
+        hs = str(body.get("house_system", "")).strip()
+        if hs:
+            payload["house_system"] = hs
+        for k in ("bodies", "ayanamsa", "topocentric", "elevation_m"):
+            if k in body:
+                payload[k] = body[k]
+    except ValidationError as e:
+        return _json_error("validation_error", e.errors(), 400)
+    except Exception as e:
+        return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
+
+    tz_name = payload.get("place_tz") or payload.get("timezone") or "UTC"
+    ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name)
+
+    chart: Dict[str, Any]
+    chart_warnings: List[str] = []
+    try:
+        chart = _call_compute_chart(payload, ts)
+    except Exception as e:
+        chart = {
+            "mode": payload.get("mode"),
+            "jd_ut": ts["jd_utc"],
+            "jd_tt": ts["jd_tt"],
+            "jd_ut1": ts["jd_ut1"],
+            "meta": {"engine": _CHART_ENGINE_NAME, "warnings": ["chart_failed"]},
+        }
+        chart_warnings.append("chart_failed")
+        if DEBUG_VERBOSE:
+            chart["error"] = str(e)
+
+    # Houses
+    try:
+        houses = _call_compute_houses(payload, ts)
+        houses = _normalize_houses_payload(houses)
+    except NotImplementedError as e:
+        return _json_error("houses_not_implemented", str(e) if DEBUG_VERBOSE else None, 501)
+    except ValueError as e:
+        # Policy/validation rejections → 422
+        return _json_error("houses_error", str(e), 422)
+    except Exception as e:
+        return _json_error("houses_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+
+    # Sidereal alignment
+    mode = (payload.get("mode") or "tropical").lower()
+    if mode == "sidereal":
+        ay = _extract_ayanamsa_from_chart(chart)
+        if isinstance(ay, (int, float)) and isinstance(houses, dict):
+            def rot(v: Optional[float]) -> Optional[float]:
+                if v is None:
+                    return None
+                x = (float(v) - float(ay)) % 360.0
+                return 0.0 if abs(x) < 1e-12 else x
+            for k in ("asc", "asc_deg", "mc", "mc_deg", "vertex", "eastpoint"):
+                if k in houses and isinstance(houses[k], (int, float)):
+                    houses[k] = rot(houses[k])
+            if isinstance(houses.get("cusps"), list):
+                houses["cusps"] = [rot(c) for c in houses["cusps"]]
+            if isinstance(houses.get("cusps_deg"), list):
+                houses["cusps_deg"] = [rot(c) for c in houses["cusps_deg"]]
+
+    # Parity/precision correction
+    houses = _recompute_houses_angles_if_needed(houses, ts, payload, chart)
+
+    if chart_warnings:
+        chart["warnings"] = chart.get("warnings", []) + chart_warnings
+
+    meta = {
+        "timescales": ts,
+        "timescales_locked": True,
+        "chart_engine": _CHART_ENGINE_NAME,
+        "houses_engine": _HOUSES_KIND,
+    }
+    return jsonify({"ok": True, "chart": chart, "houses": houses, "meta": meta}), 200
+
+@api.post("/api/report")
+def report():
+    try:
+        body = request.get_json(force=True) or {}
+        payload = parse_chart_payload(body)
+        hs = str(body.get("house_system", "")).strip()
+        if hs:
+            payload["house_system"] = hs
+        for k in ("bodies", "ayanamsa", "topocentric", "elevation_m"):
+            if k in body:
+                payload[k] = body[k]
+    except ValidationError as e:
+        return _json_error("validation_error", e.errors(), 400)
+
+    tz_name = payload.get("place_tz") or payload.get("timezone") or "UTC"
+    ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name)
+
+    chart: Dict[str, Any]
+    chart_warnings: List[str] = []
+    try:
+        chart = _call_compute_chart(payload, ts)
+    except Exception as e:
+        chart = {
+            "mode": payload.get("mode"),
+            "jd_ut": ts["jd_utc"],
+            "jd_tt": ts["jd_tt"],
+            "jd_ut1": ts["jd_ut1"],
+            "meta": {"engine": _CHART_ENGINE_NAME, "warnings": ["chart_failed"]},
+        }
+        chart_warnings.append("chart_failed")
+        if DEBUG_VERBOSE:
+            chart["error"] = str(e)
+
+    try:
+        houses = _call_compute_houses(payload, ts)
+        houses = _normalize_houses_payload(houses)
+    except NotImplementedError as e:
+        return _json_error("houses_not_implemented", str(e) if DEBUG_VERBOSE else None, 501)
+    except ValueError as e:
+        return _json_error("houses_error", str(e), 422)
+    except Exception as e:
+        return _json_error("houses_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+
+    mode = (payload.get("mode") or "tropical").lower()
+    if mode == "sidereal":
+        ay = _extract_ayanamsa_from_chart(chart)
+        if isinstance(ay, (int, float)) and isinstance(houses, dict):
+            def rot(v: Optional[float]) -> Optional[float]:
+                if v is None:
+                    return None
+                x = (float(v) - float(ay)) % 360.0
+                return 0.0 if abs(x) < 1e-12 else x
+            for k in ("asc", "asc_deg", "mc", "mc_deg", "vertex", "eastpoint"):
+                if k in houses and isinstance(houses[k], (int, float)):
+                    houses[k] = rot(houses[k])
+            if isinstance(houses.get("cusps"), list):
+                houses["cusps"] = [rot(c) for c in houses["cusps"]]
+            if isinstance(houses.get("cusps_deg"), list):
+                houses["cusps_deg"] = [rot(c) for c in houses["cusps_deg"]]
+
+    houses = _recompute_houses_angles_if_needed(houses, ts, payload, chart)
+
+    if chart_warnings:
+        chart["warnings"] = chart.get("warnings", []) + chart_warnings
+
+    narrative = (
+        "This is a placeholder narrative aligned to your mode and computed houses. "
+        "Evidence will accompany predictions in /predictions."
+    )
+
+    meta = {
+        "timescales": ts,
+        "timescales_locked": True,
+        "chart_engine": _CHART_ENGINE_NAME,
+        "houses_engine": _HOUSES_KIND,
+    }
+    return jsonify({"ok": True, "chart": chart, "houses": houses, "narrative": narrative, "meta": meta}), 200
+
+@api.post("/predictions")
+def predictions_route():
+    body = request.get_json(force=True) or {}
+    try:
+        payload, horizon = parse_prediction_payload(body)
+        hs = str(body.get("house_system", "")).strip()
+        if hs:
+            payload["house_system"] = hs
+        for k in ("bodies", "ayanamsa", "topocentric", "elevation_m"):
+            if k in body:
+                payload[k] = body[k]
+    except ValidationError as e:
+        return _json_error("validation_error", e.errors(), 400)
+
+    tz_name = payload.get("place_tz") or payload.get("timezone") or "UTC"
+    ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name)
+
+    chart: Optional[Dict[str, Any]]
+    chart_error: Optional[str] = None
+    try:
+        chart = _call_compute_chart(payload, ts)
+    except Exception as e:
+        chart = None
+        chart_error = str(e) if DEBUG_VERBOSE else "chart_failed"
+
+    try:
+        houses = _call_compute_houses(payload, ts)
+        houses = _normalize_houses_payload(houses)
+    except NotImplementedError as e:
+        return _json_error("houses_not_implemented", str(e) if DEBUG_VERBOSE else None, 501)
+    except ValueError as e:
+        return _json_error("houses_error", str(e), 422)
+    except Exception as e:
+        return _json_error("houses_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+
+    if chart is None:
+        return _json_error("chart_internal", chart_error or "internal_error", 500)
+
+    mode = (payload.get("mode") or "tropical").lower()
+    if mode == "sidereal":
+        ay = _extract_ayanamsa_from_chart(chart)
+        if isinstance(ay, (int, float)) and isinstance(houses, dict):
+            def rot(v: Optional[float]) -> Optional[float]:
+                if v is None:
+                    return None
+                x = (float(v) - float(ay)) % 360.0
+                return 0.0 if abs(x) < 1e-12 else x
+            for k in ("asc", "asc_deg", "mc", "mc_deg", "vertex", "eastpoint"):
+                if k in houses and isinstance(houses[k], (int, float)):
+                    houses[k] = rot(houses[k])
+            if isinstance(houses.get("cusps"), list):
+                houses["cusps"] = [rot(c) for c in houses["cusps"]]
+            if isinstance(houses.get("cusps_deg"), list):
+                houses["cusps_deg"] = [rot(c) for c in houses["cusps_deg"]]
+
+    houses = _recompute_houses_angles_if_needed(houses, ts, payload, chart)
+    chart_for_predict = _prepare_chart_for_predict(chart)
+
+    try:
+        from app.core.predict import predict  # local import to avoid cycles
+        preds_raw = predict(chart_for_predict, houses, horizon)
+    except Exception as e:
+        return jsonify({"ok": False, "error": "internal_error", "message": str(e), "type": type(e).__name__}), 500
+
+    th_path = os.environ.get("ASTRO_HC_THRESHOLDS", "config/hc_thresholds.json")
+    try:
+        with open(th_path, "r", encoding="utf-8") as f:
+            hc = json.load(f) or {}
     except Exception:
-        pass
+        hc = {}
+
+    defaults = hc.get("defaults", {}) or {}
+    tau = float(defaults.get("tau", 0.88))
+    floor = float(defaults.get("floor", 0.60))
+
+    overrides = body.get("hc_overrides") or {}
+    if isinstance(overrides, dict):
+        if "tau" in overrides:
+            tau = float(overrides["tau"])
+        if "floor" in overrides:
+            floor = float(overrides["floor"])
+
+    env_over = os.environ.get("ASTRO_HC_DEBUG_OVERRIDES")
+    if env_over:
+        try:
+            env_dict = json.loads(env_over)
+            if isinstance(env_dict, dict):
+                if "tau" in env_dict:
+                    tau = float(env_dict["tau"])
+                if "floor" in env_dict:
+                    floor = float(env_dict["floor"])
+        except Exception:
+            pass
+
+    preds = []
+    for i, pr in enumerate(preds_raw):
+        p = float(pr.get("probability", 0.0))
+        abstained = p < floor
+        hc_flag = (not abstained) and (p >= tau)
+        preds.append(
+            {
+                "prediction_id": f"pred_{i}",
+                "domain": pr.get("domain"),
+                "horizon": horizon,
+                "interval_start_utc": pr.get("interval", {}).get("start"),
+                "interval_end_utc": pr.get("interval", {}).get("end"),
+                "probability_calibrated": p,
+                "hc_flag": hc_flag,
+                "abstained": abstained,
+                "evidence": pr.get("evidence"),
+                "mode": chart.get("mode") if chart else None,
+                "ayanamsa_deg": (chart or {}).get("ayanamsa_deg") or (chart and _extract_ayanamsa_from_chart(chart)),
+                "notes": "QIA+calibrated placeholder; subject to M3 tuning "
+                         + ("abstained" if abstained else "accepted"),
+            }
+        )
+
+    if not overrides and not os.environ.get("ASTRO_HC_DEBUG_OVERRIDES"):
+        try:
+            preds = flag_predictions(preds, _freeze_horizon(horizon), th_path)
+        except Exception as e:
+            if DEBUG_VERBOSE:
+                log.warning("flag_predictions failed: %r", e)
+
+    meta = {
+        "timescales": ts,
+        "timescales_locked": True,
+        "chart_engine": _CHART_ENGINE_NAME,
+        "houses_engine": _HOUSES_KIND,
+    }
+    return jsonify({"ok": True, "predictions": preds, "meta": meta}), 200
+
+@api.post("/rectification/quick")
+def rect_quick():
     try:
-        _get_body.cache_clear()  # type: ignore[attr-defined]
+        body = request.get_json(force=True) or {}
+        payload, window_minutes = parse_rectification_payload(body)
+    except ValidationError as e:
+        return _json_error("validation_error", e.errors(), 400)
+    from app.core.rectify import rectification_candidates
+    result = rectification_candidates(payload, window_minutes)
+    return jsonify({"ok": True, **result}), 200
+
+# ───────────────────────────── misc: openapi / system / metrics ─────────────────────────────
+@api.get("/api/openapi")
+def openapi_spec():
+    import yaml
+    base = os.path.dirname(__file__)
+    candidates = [
+        os.path.join(base, "..", "openapi.yaml"),
+        os.path.join(base, "..", "..", "openapi.yaml"),
+    ]
+    for p in candidates:
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                spec = yaml.safe_load(f)
+                return jsonify(spec), 200
+        except Exception:
+            continue
+    return _json_error("openapi_not_found", None, 404)
+
+@api.get("/system-validation")
+def system_validation():
+    cfg = load_config(os.environ.get("ASTRO_CONFIG", "config/defaults.yaml"))
+    leap_status: Optional[Dict[str, Any]] = None
+    if _leaps:
+        for name in ("get_status", "status", "summary"):
+            fn = getattr(_leaps, name, None)
+            if callable(fn):
+                try:
+                    s = fn()
+                    if is_dataclass(s):
+                        leap_status = asdict(s)  # type: ignore
+                    elif hasattr(s, "__dict__"):
+                        leap_status = dict(s.__dict__)
+                    elif isinstance(s, dict):
+                        leap_status = s
+                    break
+                except Exception:
+                    pass
+    policy = {
+        "houses_engine": _HOUSES_KIND,
+        "polar": {
+            "soft_fallback_lat_gt": float(POLAR_SOFT_LIMIT_DEG),
+            "hard_reject_lat_ge": float(POLAR_HARD_LIMIT_DEG),
+            "numeric_fallback": os.getenv("ASTRO_HOUSES_NUMERIC_FALLBACK", "1").lower() in ("1", "true", "yes", "on"),
+        },
+    }
+    try:
+        now_utc = datetime.now(timezone.utc)
+        date_str = now_utc.strftime("%Y-%m-%d")
+        time_str = now_utc.strftime("%H:%M:%S")
+        ts_now = _compute_timescales_from_local(date_str, time_str, "UTC")
+        ts_sample = {
+            "jd_utc": float(ts_now.get("jd_utc")),
+            "jd_tt": float(ts_now.get("jd_tt")),
+            "jd_ut1": float(ts_now.get("jd_ut1")),
+            "delta_t": ts_now.get("delta_t"),
+            "delta_at": ts_now.get("delta_at"),
+            "dut1": float(ts_now.get("dut1")),
+        }
     except Exception:
-        pass
+        ts_sample = None
+
+    return jsonify(
+        {
+            "ok": True,
+            "astronomy_accuracy": "ERFA-first timescales (JD_TT/JD_UT1), strict where required",
+            "performance_slo": {"calculate_p95_ms": 800, "rect_quick_p95_s": 20},
+            "mode_consistency": {
+                "sidereal_default": cfg.mode == "sidereal",
+                "ayanamsa": getattr(cfg, "ayanamsa", None),
+            },
+            "policy": policy,
+            "leap_seconds": leap_status,
+            "version": VERSION,
+            "timescale_sample": ts_sample,
+        }
+    ), 200
+
+@api.get("/metrics")
+def metrics_export():
+    from flask import Response
+    return Response(metrics.export_prometheus(), mimetype="text/plain")
+
+@api.get("/api/config")
+@metrics.middleware("config")
+@rate_limit(1)
+def config_info():
+    cfg_path = os.environ.get("ASTRO_CONFIG", "config/defaults.yaml")
+    calib_path = os.environ.get("ASTRO_CALIBRATORS", "config/calibrators.json")
+    th_path = os.environ.get("ASTRO_HC_THRESHOLDS", "config/hc_thresholds.json")
+
+    cfg = load_config(cfg_path)
+    calib_ver = None
+    th_summary = None
+
     try:
-        _true_node_geocentric_cached.cache_clear()  # type: ignore[attr-defined]
+        now_utc = datetime.now(timezone.utc)
+        date_str = now_utc.strftime("%Y-%m-%d")
+        time_str = now_utc.strftime("%H:%M:%S")
+        ts_now = _compute_timescales_from_local(date_str, time_str, "UTC")
+        ts_sample = {
+            "jd_utc": float(ts_now.get("jd_utc")),
+            "jd_tt": float(ts_now.get("jd_tt")),
+            "jd_ut1": float(ts_now.get("jd_ut1")),
+            "delta_t": ts_now.get("delta_t"),
+            "delta_at": ts_now.get("delta_at"),
+            "dut1": float(ts_now.get("dut1")),
+        }
+    except Exception:
+        ts_sample = None
+
+    try:
+        with open(calib_path, "r", encoding="utf-8") as f:
+            calib_ver = (json.load(f) or {}).get("version")
     except Exception:
         pass
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Back-compat tiny wrappers (kept to avoid import breakages)
-# ─────────────────────────────────────────────────────────────────────────────
-def get_ecliptic_longitudes(*args, **kwargs):
-    return ecliptic_longitudes(*args, **kwargs)
+    try:
+        with open(th_path, "r", encoding="utf-8") as f:
+            th = json.load(f) or {}
+            th_summary = {"entropy_H": th.get("entropy_H"), "defaults": th.get("defaults")}
+    except Exception:
+        pass
 
-def get_node_longitude(name: str, jd_tt: float) -> float:
-    canon, kind = _canon_name(name)
-    if kind != "node":
-        raise ValueError("get_node_longitude expects a node name")
-    return _node_longitude(canon, jd_tt)
+    return jsonify(
+        {
+            "ok": True,
+            "mode": cfg.mode,
+            "ayanamsa": getattr(cfg, "ayanamsa", None),
+            "rate_limits_per_hour": getattr(cfg, "rate_limits_per_hour", None),
+            "pro_features_enabled": getattr(cfg, "pro_features_enabled", None),
+            "calibrators_version": calib_ver,
+            "hc_thresholds_summary": th_summary,
+            "timescale_sample": ts_sample,
+            "version": VERSION,
+        }
+    ), 200
 
-__all__ = [
-    "ecliptic_longitudes",
-    "ecliptic_longitudes_and_velocities",
-    "rows_to_maps",
-    "ephemeris_diagnostics",
-    "load_kernel",
-    "current_kernel_name",
-    "clear_adapter_caches",
-    "get_ecliptic_longitudes",
-    "get_node_longitude",
-]
+# ───────────────────────────── Dev endpoints ─────────────────────────────
+@api.get("/api/dev/ephem")
+def dev_ephem_status():
+    try:
+        from app.core import ephemeris_adapter as ea
+        eph, path = ea.load_kernel()
+        return jsonify({
+            "skyfield_available": ea._skyfield_available(),
+            "kernel_loaded": bool(eph),
+            "kernel_path": path,
+            "chart_engine": _CHART_ENGINE_NAME,
+        }), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": repr(e)}), 500
+
+@api.post("/api/dev/echo_timescales")
+def dev_echo_timescales():
+    body = request.get_json(force=True) or {}
+    try:
+        date = body.get("date") or "2000-01-01"
+        time_ = body.get("time") or "12:00"
+        tz = body.get("place_tz") or body.get("timezone") or "UTC"
+        ts = _compute_timescales_from_local(date, time_, tz)
+        return jsonify({"ok": True, "timescales": ts}), 200
+    except Exception as e:
+        return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
+
+@api.post("/api/dev/horizons_spk")
+def dev_horizons_spk():
+    return jsonify({
+        "ok": False,
+        "message": "Horizons telnet disabled on this host. Upload .bsp files into app/data/spk/ instead."
+    }), 501
+
+# ───────────────────────────── Ephemeris adapter endpoints ─────────────────────────────
+def _norm_rows_from_longitudes(raw: Any) -> List[Dict[str, Any]]:
+    """Adapter-normalizer → rows[{body,name,longitude}] supporting maps, arrays, single-key objects, or results."""
+    rows: List[Dict[str, Any]] = []
+    if raw is None:
+        return rows
+    if isinstance(raw, dict) and all(isinstance(v, (int, float)) for v in raw.values()):
+        for k, v in raw.items():
+            rows.append({"body": str(k).lower(), "name": str(k), "longitude": float(v)})
+        return rows
+    data = raw.get("results") if isinstance(raw, dict) and isinstance(raw.get("results"), list) else raw
+    if isinstance(data, list):
+        for r in data:
+            if isinstance(r, dict):
+                if len(r) == 1 and isinstance(next(iter(r.values())), (int, float)):
+                    k, v = next(iter(r.items()))
+                    rows.append({"body": str(k).lower(), "name": str(k), "longitude": float(v)})
+                    continue
+                body = (r.get("body") or r.get("name") or r.get("planet") or r.get("id") or r.get("label"))
+                L = r.get("longitude") or r.get("lon") or r.get("lambda") or r.get("ecliptic_longitude")
+                if body and isinstance(L, (int, float)):
+                    rows.append({"body": str(body).lower(), "name": str(r.get("name") or body), "longitude": float(L)})
+    return rows
+
+def _norm_rows_from_lv(raw: Any) -> List[Dict[str, Any]]:
+    """Adapter-normalizer → rows[{body,name,longitude,velocity}] supporting {longitudes,velocities} or results."""
+    rows: Dict[str, Dict[str, Any]] = {}
+    if isinstance(raw, dict) and "longitudes" in raw and "velocities" in raw:
+        for k, v in (raw.get("longitudes") or {}).items():
+            rows.setdefault(str(k).lower(), {"body": str(k).lower(), "name": str(k)})["longitude"] = float(v)
+        for k, v in (raw.get("velocities") or {}).items():
+            rows.setdefault(str(k).lower(), {"body": str(k).lower(), "name": str(k)})["velocity"] = float(v)
+        return list(rows.values())
+    data = raw.get("results") if isinstance(raw, dict) and isinstance(raw.get("results"), list) else raw
+    if isinstance(data, list):
+        for r in data:
+            if not isinstance(r, dict):
+                continue
+            body = (r.get("body") or r.get("name") or r.get("planet") or r.get("id") or r.get("label"))
+            if not body:
+                continue
+            key = str(body).lower()
+            rec = rows.setdefault(key, {"body": key, "name": str(r.get("name") or body)})
+            L = r.get("longitude") or r.get("lon") or r.get("lambda") or r.get("ecliptic_longitude")
+            V = r.get("velocity") or r.get("vel") or r.get("dlambda_dt") or r.get("deg_per_day")
+            if isinstance(L, (int, float)):
+                rec["longitude"] = float(L)
+            if isinstance(V, (int, float)):
+                rec["velocity"] = float(V)
+    return list(rows.values())
+
+@api.post("/api/ephemeris/diagnostics")
+def ephemeris_diagnostics_endpoint():
+    """POST-only diagnostics limited to majors + nodes (avoids SPICE)."""
+    try:
+        from app.core import ephemeris_adapter as ea
+        majors_plus_nodes = [
+            "Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn","Uranus","Neptune","Pluto",
+            "North Node","South Node"
+        ]
+        return jsonify(ea.ephemeris_diagnostics(requested=majors_plus_nodes)), 200
+    except Exception as e:
+        return _json_error("ephemeris_diag_error", str(e) if DEBUG_VERBOSE else None, 500)
+
+@api.post("/api/ephemeris/longitudes")
+def ephemeris_longitudes_endpoint():
+    """
+    Body can include either:
+      • jd_tt (number), OR civil inputs (date, time, place_tz|tz).
+      • bodies: [ 'sun','moon','mercury', ... ]   (names optional; derived if omitted)
+      • frame: 'ecliptic-of-date' | 'ecliptic-j2000' (default ecliptic-of-date)
+      • center: 'geocentric' | 'topocentric'       (default geocentric)
+      • latitude/longitude/elev_m required when center='topocentric'
+    """
+    try:
+        body = request.get_json(force=True) or {}
+        payload = parse_ephemeris_payload(body, require_bodies=True)
+    except ValidationError as e:
+        return _json_error("validation_error", e.errors(), 400)
+    except Exception as e:
+        return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
+
+    jd_tt   = payload["jd_tt"]
+    frame   = payload["frame"]
+    center  = payload["center"]
+    lat     = payload.get("latitude")
+    lon     = payload.get("longitude")
+    elev_m  = payload.get("elev_m", 0.0)
+    bodies  = payload["bodies"]
+    names   = payload["names"]
+    topocentric = (center == "topocentric")
+
+    try:
+        from app.core import ephemeris_adapter as ea
+        raw = ea.ecliptic_longitudes(
+            jd_tt,
+            names=names,
+            frame=frame,
+            topocentric=topocentric,
+            latitude=lat, longitude=lon, elevation_m=elev_m,
+        )
+    except Exception as e:
+        return _json_error("ephemeris_longitudes_error", str(e) if DEBUG_VERBOSE else None, 500)
+
+    rows = _norm_rows_from_longitudes(raw)
+
+    # STRICT filter + keep request order
+    requested = [b.lower() for b in bodies]
+    name_map  = {b.lower(): n for b, n in zip(bodies, names)}
+    by_body   = {r["body"]: r for r in rows if isinstance(r.get("longitude"), (int, float))}
+    ordered   = [
+        {"body": b, "name": name_map[b], "longitude": float(by_body[b]["longitude"])}
+        for b in requested if b in by_body
+    ]
+
+    return jsonify({
+        "ok": True,
+        "jd_tt": float(jd_tt),
+        "frame": frame,
+        "center": center,
+        "units": {"angles": "deg"},
+        "results": ordered,
+    }), 200
+
+@api.post("/api/ephemeris/longitudes_and_velocities")
+def ephemeris_lv_endpoint():
+    """
+    Same inputs as /ephemeris/longitudes (names optional).
+    Returns:
+      { ok, jd_tt, frame, center, units, results: [ { body, name, longitude, velocity } ... ] }
+    """
+    try:
+        body = request.get_json(force=True) or {}
+        payload = parse_ephemeris_payload(body, require_bodies=True)
+    except ValidationError as e:
+        return _json_error("validation_error", e.errors(), 400)
+    except Exception as e:
+        return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
+
+    jd_tt   = payload["jd_tt"]
+    frame   = payload["frame"]
+    center  = payload["center"]
+    lat     = payload.get("latitude")
+    lon     = payload.get("longitude")
+    elev_m  = payload.get("elev_m", 0.0)
+    bodies  = payload["bodies"]
+    names   = payload["names"]
+    topocentric = (center == "topocentric")
+
+    try:
+        from app.core import ephemeris_adapter as ea
+        raw = ea.ecliptic_longitudes_and_velocities(
+            jd_tt,
+            names=names,
+            frame=frame,
+            topocentric=topocentric,
+            latitude=lat, longitude=lon, elevation_m=elev_m,
+        )
+    except Exception as e:
+        return _json_error("ephemeris_lv_error", str(e) if DEBUG_VERBOSE else None, 500)
+
+    rows = _norm_rows_from_lv(raw)
+
+    requested = [b.lower() for b in bodies]
+    name_map  = {b.lower(): n for b, n in zip(bodies, names)}
+    by_body   = {
+        r["body"]: r for r in rows
+        if isinstance(r.get("longitude"), (int, float)) or isinstance(r.get("velocity"), (int, float))
+    }
+    ordered   = [
+        {
+            "body": b,
+            "name": name_map[b],
+            "longitude": float(by_body[b]["longitude"]) if "longitude" in by_body[b] else None,
+            "velocity": float(by_body[b]["velocity"]) if "velocity" in by_body[b] else None,
+        }
+        for b in requested if b in by_body
+    ]
+
+    return jsonify({
+        "ok": True,
+        "jd_tt": float(jd_tt),
+        "frame": frame,
+        "center": center,
+        "units": {"angles": "deg", "velocities": "deg/day"},
+        "results": ordered,
+    }), 200
