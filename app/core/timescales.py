@@ -172,18 +172,41 @@ def _utc_calendar_to_jd_utc(
     iy: int, im: int, iday: int, ih: int, imin: int, isec: int, ifrac: int
 ) -> float:
     """
-    Produce JD(UTC) via ERFA dtf2d.
-
-    This pyERFA build expects the 5-argument form with an ihmsf[4] array:
-        dtf2d("UTC", year, month, day, [hour, minute, second, 1e-4s])
+    Produce JD(UTC) via ERFA dtf2d, handling pyERFA builds that expose:
+      (A) positional 8-arg:  dtf2d("UTC", iy, im, id, ih, imn, sec, f)
+      (B) ihmsf[4] array:    dtf2d("UTC", iy, im, id, [ih, imn, sec, f])
+      (C) keyword 8-arg:     dtf2d("UTC", iy=..., im=..., id=..., ih=..., imn=..., sec=..., f=...)
     """
+
+    # A) Try positional 8-arg first (your latest error indicates this is needed)
+    try:
+        utc1, utc2 = erfa.dtf2d(
+            "UTC", int(iy), int(im), int(iday), int(ih), int(imin), int(isec), int(ifrac)
+        )
+        return math.fsum((utc1, utc2))
+    except Exception as e_pos:
+        last = f"pos-8: {e_pos!s}"
+
+    # B) Try ihmsf[4] array form
     try:
         ihmsf = [int(ih), int(imin), int(isec), int(ifrac)]
         utc1, utc2 = erfa.dtf2d("UTC", int(iy), int(im), int(iday), ihmsf)
         return math.fsum((utc1, utc2))
-    except Exception as e:
-        # Surface the precise failure up the stack (becomes HTTP 400 JSON)
-        raise ValueError(f"ERFA dtf2d failed: {e}")
+    except Exception as e_arr:
+        last += f"; ihmsf: {e_arr!s}"
+
+    # C) Try keyword 8-arg (some builds expose named params)
+    try:
+        utc1, utc2 = erfa.dtf2d(
+            "UTC",
+            iy=int(iy), im=int(im), id=int(iday),
+            ih=int(ih), imn=int(imin), sec=int(isec), f=int(ifrac),
+        )
+        return math.fsum((utc1, utc2))
+    except Exception as e_kw:
+        last += f"; kw-8: {e_kw!s}"
+        raise ValueError(f"ERFA dtf2d failed: {last}")
+
         
 def _delta_t_seconds_from_parts(tt1: float, tt2: float, ut11: float, ut12: float) -> float:
     """Two-part difference BEFORE collapsing — preserves precision."""
