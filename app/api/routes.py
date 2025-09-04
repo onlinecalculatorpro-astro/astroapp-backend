@@ -1043,15 +1043,47 @@ def ephemeris_longitudes_endpoint():
     except Exception as e:
         return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
 
-    jd_tt = payload["jd_tt"]
-    frame = payload["frame"]
+    # base fields from validated payload
+    jd_tt  = payload["jd_tt"]
+    frame  = payload["frame"]
     center = payload["center"]
-    lat = payload.get("latitude")
-    lon = payload.get("longitude")
-    elev_m = payload.get("elev_m", payload.get("elevation_m", 0.0))
     bodies = payload["bodies"]
-    names = payload["names"]
+    names  = payload["names"]
+
+    # accept both styles: center:"topocentric" OR topocentric:true
     topocentric = (center == "topocentric") or bool(payload.get("topocentric"))
+
+    # pull coords from payload OR observer sub-dict OR query overrides
+    lat  = payload.get("latitude")
+    lon  = payload.get("longitude")
+    elev = payload.get("elev_m", payload.get("elevation_m", 0.0))
+
+    obs_raw = {}
+    if isinstance(body, dict) and isinstance(body.get("observer"), dict):
+        obs_raw = dict(body["observer"])
+    elif isinstance(payload.get("observer"), dict):
+        obs_raw = dict(payload["observer"])  # in case validator passed it through
+
+    def _num(x):
+        try: return float(x)
+        except Exception: return None
+
+    lat  = lat  if isinstance(lat,  (int, float)) else _num(obs_raw.get("lat") or obs_raw.get("latitude"))
+    lon  = lon  if isinstance(lon,  (int, float)) else _num(obs_raw.get("lon") or obs_raw.get("lng") or obs_raw.get("longitude"))
+    elev = elev if isinstance(elev, (int, float)) else _num(
+        obs_raw.get("elevation_m") or obs_raw.get("elev_m") or obs_raw.get("alt_m") or obs_raw.get("altitude_m")
+    ) or 0.0
+
+    # query-string overrides for easy dev-console testing
+    q = request.args
+    if q.get("lat")    is not None: lat  = _num(q["lat"])
+    if q.get("lon")    is not None: lon  = _num(q["lon"])
+    if q.get("lng")    is not None: lon  = _num(q["lng"])
+    if q.get("elev_m") is not None: elev = _num(q["elev_m"]) or 0.0
+
+    observer = None
+    if lat is not None and lon is not None:
+        observer = {"lat": float(lat), "lon": float(lon), "elevation_m": float(elev)}
 
     try:
         from app.core import ephemeris_adapter as ea
@@ -1060,39 +1092,38 @@ def ephemeris_longitudes_endpoint():
             names=names,
             frame=frame,
             topocentric=topocentric,
-            latitude=lat,
-            longitude=lon,
-            elevation_m=elev_m,
+            # keep legacy fields for compatibility…
+            latitude=lat, longitude=lon, elevation_m=elev,
+            # …and pass the canonical observer block (preferred)
+            observer=observer,
         )
     except Exception as e:
         return _json_error("ephemeris_longitudes_error", str(e) if DEBUG_VERBOSE else None, 500)
 
     rows, meta = _norm_rows_from_longitudes(raw)
     requested = [b.lower() for b in bodies]
-    name_map = {b.lower(): n for b, n in zip(bodies, names)}
-    by_body = {r["body"]: r for r in rows if isinstance(r.get("longitude"), (int, float))}
-    ordered = [
+    name_map  = {b.lower(): n for b, n in zip(bodies, names)}
+    by_body   = {r["body"]: r for r in rows if isinstance(r.get("longitude"), (int, float))}
+    ordered   = [
         {"body": b, "name": name_map[b], "longitude": float(by_body[b]["longitude"])}
-        for b in requested
-        if b in by_body
+        for b in requested if b in by_body
     ]
 
-    # Pass through adapter meta + our echo of center/frame
-    meta_out = dict(meta)
+    meta_out = dict(meta)  # prefer adapter’s truth about topocentric resolution
     meta_out.setdefault("frame", frame)
-    meta_out.setdefault("topocentric", bool(topocentric))
+    # If adapter didn't include it, fall back to what was requested
+    if "topocentric" not in meta_out:
+        meta_out["topocentric"] = bool(topocentric)
 
-    return jsonify(
-        {
-            "ok": True,
-            "jd_tt": float(jd_tt),
-            "frame": frame,
-            "center": center,
-            "units": {"angles": "deg"},
-            "meta": meta_out,
-            "results": ordered,
-        }
-    ), 200
+    return jsonify({
+        "ok": True,
+        "jd_tt": float(jd_tt),
+        "frame": frame,
+        "center": "topocentric" if meta_out.get("topocentric") else "geocentric",
+        "units": {"angles": "deg"},
+        "meta": meta_out,
+        "results": ordered,
+    }), 200
 
 
 @api.post("/api/ephemeris/longitudes_and_velocities")
@@ -1105,15 +1136,42 @@ def ephemeris_lv_endpoint():
     except Exception as e:
         return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
 
-    jd_tt = payload["jd_tt"]
-    frame = payload["frame"]
+    jd_tt  = payload["jd_tt"]
+    frame  = payload["frame"]
     center = payload["center"]
-    lat = payload.get("latitude")
-    lon = payload.get("longitude")
-    elev_m = payload.get("elev_m", payload.get("elevation_m", 0.0))
     bodies = payload["bodies"]
-    names = payload["names"]
+    names  = payload["names"]
     topocentric = (center == "topocentric") or bool(payload.get("topocentric"))
+
+    lat  = payload.get("latitude")
+    lon  = payload.get("longitude")
+    elev = payload.get("elev_m", payload.get("elevation_m", 0.0))
+
+    obs_raw = {}
+    if isinstance(body, dict) and isinstance(body.get("observer"), dict):
+        obs_raw = dict(body["observer"])
+    elif isinstance(payload.get("observer"), dict):
+        obs_raw = dict(payload["observer"])
+
+    def _num(x):
+        try: return float(x)
+        except Exception: return None
+
+    lat  = lat  if isinstance(lat,  (int, float)) else _num(obs_raw.get("lat") or obs_raw.get("latitude"))
+    lon  = lon  if isinstance(lon,  (int, float)) else _num(obs_raw.get("lon") or obs_raw.get("lng") or obs_raw.get("longitude"))
+    elev = elev if isinstance(elev, (int, float)) else _num(
+        obs_raw.get("elevation_m") or obs_raw.get("elev_m") or obs_raw.get("alt_m") or obs_raw.get("altitude_m")
+    ) or 0.0
+
+    q = request.args
+    if q.get("lat")    is not None: lat  = _num(q["lat"])
+    if q.get("lon")    is not None: lon  = _num(q["lon"])
+    if q.get("lng")    is not None: lon  = _num(q["lng"])
+    if q.get("elev_m") is not None: elev = _num(q["elev_m"]) or 0.0
+
+    observer = None
+    if lat is not None and lon is not None:
+        observer = {"lat": float(lat), "lon": float(lon), "elevation_m": float(elev)}
 
     try:
         from app.core import ephemeris_adapter as ea
@@ -1122,19 +1180,17 @@ def ephemeris_lv_endpoint():
             names=names,
             frame=frame,
             topocentric=topocentric,
-            latitude=lat,
-            longitude=lon,
-            elevation_m=elev_m,
+            latitude=lat, longitude=lon, elevation_m=elev,
+            observer=observer,
         )
     except Exception as e:
         return _json_error("ephemeris_lv_error", str(e) if DEBUG_VERBOSE else None, 500)
 
     rows, meta = _norm_rows_from_lv(raw)
     requested = [b.lower() for b in bodies]
-    name_map = {b.lower(): n for b, n in zip(bodies, names)}
+    name_map  = {b.lower(): n for b, n in zip(bodies, names)}
     by_body = {
-        r["body"]: r
-        for r in rows
+        r["body"]: r for r in rows
         if isinstance(r.get("longitude"), (int, float)) or isinstance(r.get("velocity"), (int, float))
     }
     ordered = [
@@ -1144,25 +1200,23 @@ def ephemeris_lv_endpoint():
             "longitude": float(by_body[b]["longitude"]) if "longitude" in by_body[b] else None,
             "velocity": float(by_body[b]["velocity"]) if "velocity" in by_body[b] else None,
         }
-        for b in requested
-        if b in by_body
+        for b in requested if b in by_body
     ]
 
     meta_out = dict(meta)
     meta_out.setdefault("frame", frame)
-    meta_out.setdefault("topocentric", bool(topocentric))
+    if "topocentric" not in meta_out:
+        meta_out["topocentric"] = bool(topocentric)
 
-    return jsonify(
-        {
-            "ok": True,
-            "jd_tt": float(jd_tt),
-            "frame": frame,
-            "center": center,
-            "units": {"angles": "deg", "velocities": "deg/day"},
-            "meta": meta_out,
-            "results": ordered,
-        }
-    ), 200
+    return jsonify({
+        "ok": True,
+        "jd_tt": float(jd_tt),
+        "frame": frame,
+        "center": "topocentric" if meta_out.get("topocentric") else "geocentric",
+        "units": {"angles": "deg", "velocities": "deg/day"},
+        "meta": meta_out,
+        "results": ordered,
+    }), 200
 
 
 # ───────────────────────── rectification ─────────────────────────
