@@ -432,6 +432,11 @@ def create_app() -> Flask:
             "import_error": _ASTRONOMY_IMPORT_ERR,
         }), 200
 
+    @app.get("/favicon.ico")
+    def _noop_favicon():
+        return ("", 204)
+
+
     # /metrics (Basic Auth)
     @app.route("/metrics", methods=["GET"])
     def metrics_endpoint():
