@@ -537,6 +537,7 @@ def _extract_rows(kind: str, payload: Any) -> List[Dict[str, Any]]:
             if isinstance(data.get(sk), dict):
                 velmaps = data[sk]; break
 
+        # flat map {name:deg}
         if longmaps is None and kind == "flat" and all(isinstance(k, (str, int)) and isinstance(v, (int, float)) for k, v in data.items()):
             longmaps = data
 
@@ -551,22 +552,30 @@ def _extract_rows(kind: str, payload: Any) -> List[Dict[str, Any]]:
             return rows
 
     if kind in ("rows", "rowdicts"):
-        for row in payload:
-            if not isinstance(row, dict):
+        for r in payload:
+            if not isinstance(r, dict):
                 continue
-            nm = row.get("name") or row.get("body")
+
+            # NEW: accept single-key dicts like {"Sun": 123.45}
+            if len(r) == 1:
+                k, v = next(iter(r.items()))
+                if isinstance(k, (str, int)) and isinstance(v, (int, float)):
+                    rows.append({"name": str(k), "lon": float(v), "speed": None})
+                    continue
+
+            nm = r.get("name") or r.get("body")
             if not nm:
                 continue
-            lon = (row.get("lon", None) if row.get("lon", None) is not None else
-                   row.get("longitude", None) if row.get("longitude", None) is not None else
-                   row.get("longitude_deg", None) if row.get("longitude_deg", None) is not None else
-                   row.get("lambda", None))
+            lon = (r.get("lon", None) if r.get("lon", None) is not None else
+                   r.get("longitude", None) if r.get("longitude", None) is not None else
+                   r.get("longitude_deg", None) if r.get("longitude_deg", None) is not None else
+                   r.get("lambda", None))
             if lon is None or not isinstance(lon, (int, float)):
                 continue
-            sp = (row.get("speed", None) if isinstance(row.get("speed", None), (int, float)) else
-                  row.get("velocity", None) if isinstance(row.get("velocity", None), (int, float)) else
-                  row.get("speed_deg_per_day", None) if isinstance(row.get("speed_deg_per_day", None), (int, float)) else
-                  row.get("lambda_dot", None) if isinstance(row.get("lambda_dot", None), (int, float)) else None)
+            sp = (r.get("speed", None) if isinstance(r.get("speed", None), (int, float)) else
+                  r.get("velocity", None) if isinstance(r.get("velocity", None), (int, float)) else
+                  r.get("speed_deg_per_day", None) if isinstance(r.get("speed_deg_per_day", None), (int, float)) else
+                  r.get("lambda_dot", None) if isinstance(r.get("lambda_dot", None), (int, float)) else None)
             rows.append({"name": str(nm), "lon": float(lon), "speed": (float(sp) if sp is not None else None)})
         return rows
 
