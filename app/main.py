@@ -5,7 +5,6 @@ import logging
 import os
 import sys
 import traceback
-from datetime import datetime
 from time import perf_counter
 from typing import Any, Dict, Final
 
@@ -43,7 +42,7 @@ except Exception as e:  # pragma: no cover
     load_config = None  # type: ignore
 
 # ───────────────────────── Core engines & policy façade ─────────────────────────
-from app.core.astronomy import compute_chart
+# IMPORTANT: do NOT import astronomy here; we will lazy-import in the handler
 from app.core import timescales as _ts
 from app.core.house import (
     list_supported_house_systems,
@@ -99,6 +98,10 @@ ENGINE_LABEL: Final[str] = (
     os.getenv("HOUSES_ENGINE_NAME")
     or ("houses-advanced" if _ADV_OK else "proto-basic")
 )
+
+# Keep last astronomy import status for debugging
+_ASTRONOMY_IMPORT_OK: bool | None = None
+_ASTRONOMY_IMPORT_ERR: str | None = None
 
 # ───────────────────────── helpers: logging & errors ─────────────────────────
 def _configure_logging(app: Flask) -> None:
@@ -274,8 +277,23 @@ def _register_core_api(app: Flask) -> None:
     for alias in ("/api/time/timescales", "/time/timescales", "/timescales", "/api/time/convert"):
         app.add_url_rule(alias, f"timescales_alias_{alias}", _timescales_handler, methods=["POST"])
 
-    # chart only
+    # chart (lazy import astronomy)
     def _chart_handler():
+        global _ASTRONOMY_IMPORT_OK, _ASTRONOMY_IMPORT_ERR
+        try:
+            # Lazily import here so Gunicorn can boot even if astronomy has an issue
+            from app.core.astronomy import compute_chart  # type: ignore
+            _ASTRONOMY_IMPORT_OK, _ASTRONOMY_IMPORT_ERR = True, None
+        except Exception as e:
+            _ASTRONOMY_IMPORT_OK, _ASTRONOMY_IMPORT_ERR = False, repr(e)
+            app.logger.exception("Failed to import app.core.astronomy: %s", e)
+            return jsonify({
+                "ok": False,
+                "error": "astronomy_import_error",
+                "message": "Failed to import astronomy engine (see logs / __debug/astronomy_import).",
+                "detail": _ASTRONOMY_IMPORT_ERR,
+            }), 500
+
         payload = _body_json()
 
         # backfill timescales if civil provided
@@ -404,6 +422,14 @@ def create_app() -> Flask:
             "skyfield_importable": skyfield_ok,
             "jplephem_importable": jplephem_ok,
             "diagnostics": eph.ephemeris_diagnostics(),
+        }), 200
+
+    @app.get("/__debug/astronomy_import")
+    def __debug_astronomy_import():
+        return jsonify({
+            "import_attempted": _ASTRONOMY_IMPORT_OK is not None,
+            "import_ok": _ASTRONOMY_IMPORT_OK,
+            "import_error": _ASTRONOMY_IMPORT_ERR,
         }), 200
 
     # /metrics (Basic Auth)
