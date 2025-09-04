@@ -446,19 +446,15 @@ def _normalize_adapter_output_to_maps(
     res: Any, names_key: Tuple[str, ...]
 ) -> Tuple[Dict[str, float], Dict[str, Optional[float]]]:
     """
-    Normalize adapter output into:
-      ({name -> longitude_deg}, {name -> speed_deg_per_day | None})
-    Accepted shapes:
-      • dict with {longitudes:{}, velocities:{}}
-      • flat dict {name: deg}
-      • dict wrapping rows: {results|bodies|points|rows|data|payload|response: ...}
-      • list of row dicts [{"name":..,"lon"/"longitude":..,"speed"/"velocity":..}, ...]
-      • positional list [deg, deg, ...] aligned with names_key
+    Normalize various adapter return shapes to:
+      longitudes: {Name: deg}
+      speeds:     {Name: deg/day or None}
+    Accepts dict, list-of-dicts, list-of-tuples, or positional lists.
     """
-    longitudes: Dict[str, float] = {}
-    speeds: Dict[str, Optional[float]] = {}
     want = list(names_key)
     want_lc = [w.lower() for w in want]
+    longitudes: Dict[str, float] = {}
+    speeds: Dict[str, Optional[float]] = {}
 
     def _merge_numeric_map(src: Dict[Any, Any], *, into: str) -> None:
         src_lc = {str(k).lower(): v for k, v in src.items()}
@@ -469,86 +465,143 @@ def _normalize_adapter_output_to_maps(
                 else:
                     speeds[nm] = float(src_lc[nm_lc])
 
-    # ── 1) If dict, try known map keys first
+    # 1) Dict-like containers
     if isinstance(res, dict):
-        # direct maps
-        for lon_key in ("longitudes", "longitude", "lon"):
-            v = res.get(lon_key)
-            if isinstance(v, dict):
-                _merge_numeric_map(v, into="lon")
+        # peel common wrappers
+        for k in ("rows", "result", "data", "payload"):
+            if k in res and isinstance(res[k], (list, tuple)):
+                res = res[k]
                 break
-        for spd_key in ("velocities", "velocity", "speeds", "speed"):
-            v = res.get(spd_key)
-            if isinstance(v, dict):
-                _merge_numeric_map(v, into="spd")
-                break
-        if longitudes:
-            return longitudes, speeds
+        else:
+            # map {longitudes:{}, velocities:{}}
+            for lon_key in ("longitudes", "longitude", "lon"):
+                if lon_key in res and isinstance(res[lon_key], dict):
+                    _merge_numeric_map(res[lon_key], into="lon")
+                    break
+            for spd_key in ("velocities", "velocity", "speeds", "speed"):
+                if spd_key in res and isinstance(res[spd_key], dict):
+                    _merge_numeric_map(res[spd_key], into="spd")
+                    break
+            if longitudes:
+                return longitudes, speeds
+            # flat {name:deg}
+            if all(isinstance(k, (str, int)) and isinstance(v, (int, float)) for k, v in res.items()):
+                _merge_numeric_map(res, into="lon")
+                return longitudes, speeds
+            # if nothing matched but dict contains a single list, fall through
+            for v in res.values():
+                if isinstance(v, (list, tuple)):
+                    res = v
+                    break
 
-        # flat map {name: deg}
-        if res and all(isinstance(k, (str, int)) and isinstance(v, (int, float)) for k, v in res.items()):
-            _merge_numeric_map(res, into="lon")
-            return longitudes, speeds
-
-        # unwrap common wrappers then recurse
-        for wrap_key in ("results", "bodies", "points", "rows", "data", "payload", "response"):
-            inner = res.get(wrap_key)
-            if inner is not None:
-                return _normalize_adapter_output_to_maps(inner, names_key)
-
-    # ── 2) List cases
+    # 2) List/tuple forms
     if isinstance(res, (list, tuple)):
-        if res and isinstance(res[0], dict):
+        if not res:
+            return longitudes, speeds
+
+        # list of dict rows
+        if isinstance(res[0], dict):
             tmp_lon_lc: Dict[str, float] = {}
             tmp_spd_lc: Dict[str, Optional[float]] = {}
             for row in res:
                 try:
-                    nm = str(row.get("name", "")).strip()
+                    # name can be in 'name' or implied by 'body'
+                    nm = row.get("name") or row.get("body") or ""
                     if not nm:
                         continue
-                    nm_lc = nm.lower()
-                    # longitude
+                    nm_lc = str(nm).lower()
+
+                    # longitude variants
                     if row.get("lon") is not None:
                         lonv = float(row["lon"])
                     elif row.get("longitude") is not None:
                         lonv = float(row["longitude"])
                     elif row.get("longitude_deg") is not None:
                         lonv = float(row["longitude_deg"])
+                    elif row.get("lambda") is not None:
+                        lonv = float(row["lambda"])
                     else:
                         continue
+
                     tmp_lon_lc[nm_lc] = lonv
-                    # speed (optional)
-                    sp = row.get("speed")
-                    if sp is None:
-                        sp = row.get("velocity")
-                    if sp is None:
-                        sp = row.get("speed_deg_per_day")
-                    tmp_spd_lc[nm_lc] = (float(sp) if sp is not None else None)
+
+                    # speed variants
+                    sp = (
+                        row.get("speed")
+                        or row.get("velocity")
+                        or row.get("speed_deg_per_day")
+                        or row.get("lambda_dot")
+                    )
+                    tmp_spd_lc[nm_lc] = float(sp) if isinstance(sp, (int, float)) else None
                 except Exception:
                     continue
+
             for nm, nm_lc in zip(want, want_lc):
                 if nm_lc in tmp_lon_lc:
                     longitudes[nm] = float(tmp_lon_lc[nm_lc])
                     speeds[nm] = tmp_spd_lc.get(nm_lc, None)
             return longitudes, speeds
 
-        # positional list aligned with requested names
-        for i, nm in enumerate(want[:len(res)]):
-            if isinstance(res[i], (int, float)):
-                longitudes[nm] = float(res[i]); speeds[nm] = None
-        if longitudes:
+        # list of tuples: (name, lon[, speed])
+        if isinstance(res[0], (list, tuple)) and len(res[0]) >= 2:
+            tmp_lon: Dict[str, float] = {}
+            tmp_spd: Dict[str, Optional[float]] = {}
+            for item in res:
+                try:
+                    nm = str(item[0]); lonv = float(item[1])
+                    tmp_lon[nm] = lonv
+                    tmp_spd[nm] = float(item[2]) if len(item) >= 3 and isinstance(item[2], (int, float)) else None
+                except Exception:
+                    continue
+            for nm in want:
+                if nm in tmp_lon:
+                    longitudes[nm] = float(tmp_lon[nm])
+                    speeds[nm] = tmp_spd.get(nm, None)
             return longitudes, speeds
 
-    # ── 3) Object with attributes longitudes/velocities
+        # positional list of numbers → map by order
+        if all(isinstance(x, (int, float)) for x in res):
+            for i, nm in enumerate(want[:len(res)]):
+                longitudes[nm] = float(res[i]); speeds[nm] = None
+            return longitudes, speeds
+
+        # list of objects with attributes
+        first = res[0]
+        if hasattr(first, "name"):
+            tmp_lon: Dict[str, float] = {}
+            tmp_spd: Dict[str, Optional[float]] = {}
+            for obj in res:
+                try:
+                    nm = str(getattr(obj, "name"))
+                    lonv = getattr(obj, "lon", None)
+                    if lonv is None:
+                        lonv = getattr(obj, "longitude", None)
+                    if lonv is None:
+                        lonv = getattr(obj, "longitude_deg", None)
+                    if lonv is None:
+                        continue
+                    tmp_lon[nm] = float(lonv)
+                    sp = getattr(obj, "speed", None) or getattr(obj, "velocity", None)
+                    tmp_spd[nm] = float(sp) if isinstance(sp, (int, float)) else None
+                except Exception:
+                    continue
+            for nm in want:
+                if nm in tmp_lon:
+                    longitudes[nm] = float(tmp_lon[nm])
+                    speeds[nm] = tmp_spd.get(nm, None)
+            return longitudes, speeds
+
+    # 3) Fallback: attributes on object with .longitudes/.velocities
     longs = getattr(res, "longitudes", None)
     if isinstance(longs, dict):
-        _merge_numeric_map(longs, into="lon")
         vels = getattr(res, "velocities", {}) or {}
+        _merge_numeric_map(longs, into="lon")
         if isinstance(vels, dict):
             _merge_numeric_map(vels, into="spd")
         return longitudes, speeds
 
     raise AstronomyError("adapter_return_invalid", f"Unsupported adapter return type: {type(res)}")
+
 
 
 @lru_cache(maxsize=8192)
