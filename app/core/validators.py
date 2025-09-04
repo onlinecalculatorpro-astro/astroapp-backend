@@ -232,7 +232,7 @@ def resolve_timescales_from_civil_erfa(d: date, time_str: str, tzinfo: ZoneInfo)
 
     dut1_val = _env_dut1()
     if dut1_val is None:
-        # jd_tt doesn’t need DUT1 strictly, but builder requires it; use 0.0 if not provided
+        # jd_tt doesn't need DUT1 strictly, but builder requires it; use 0.0 if not provided
         dut1_val = 0.0
 
     # Convert the local civil inputs by passing strings + tz name back to the builder
@@ -261,21 +261,30 @@ class ChartPayload(TypedDict, total=False):
     house_system: Optional[str]
     dut1: float         # optional, validated if provided
 
-def parse_chart_payload(data: Dict[str, Any]) -> ChartPayload:
-    """Normalize input for chart/predictions/report/rectification endpoints."""
+def parse_chart_payload(data: Dict[str, Any], require_coordinates: bool = True) -> ChartPayload:
+    """
+    Normalize input for chart/predictions/report/rectification endpoints.
+    
+    Args:
+        data: Input payload
+        require_coordinates: If True, require lat/lon. If False, make them optional.
+    """
     place_tz_val = _coalesce(data, "place_tz", "tz", "timezone")
     lat_val = _coalesce(data, "latitude", "lat")
     lon_val = _coalesce(data, "longitude", "lon")
     elev_val = _coalesce(data, "elev_m", "elevation_m", "elevation")
 
-    _require({"place_tz": place_tz_val, "latitude": lat_val, "longitude": lon_val}, "place_tz", "latitude", "longitude")
+    # Always require timezone for civil time conversion
+    _require({"place_tz": place_tz_val}, "place_tz")
     _require(data, "date", "time")
+
+    # Conditionally require coordinates
+    if require_coordinates:
+        _require({"latitude": lat_val, "longitude": lon_val}, "latitude", "longitude")
 
     d = parse_date(str(data["date"]))
     t_str = parse_time_str(str(data["time"]))
     tzinfo = parse_tz(str(place_tz_val), loc_key="place_tz")
-    lat, lon = parse_latlon(lat_val, lon_val)
-    elev = parse_elev(elev_val)
     mode = parse_mode(data.get("mode"))
     house_system = parse_house_system(data.get("house_system") or data.get("system"))
 
@@ -284,11 +293,18 @@ def parse_chart_payload(data: Dict[str, Any]) -> ChartPayload:
         "time": t_str,
         "place_tz": str(place_tz_val),
         "timezone": str(place_tz_val),
-        "latitude": lat,
-        "longitude": lon,
-        "elev_m": elev,
         "mode": mode,
     }
+
+    # Handle optional coordinates
+    if lat_val is not None and lon_val is not None:
+        lat, lon = parse_latlon(lat_val, lon_val)
+        out["latitude"] = lat
+        out["longitude"] = lon
+        out["elev_m"] = parse_elev(elev_val)
+    elif require_coordinates:
+        # This should have been caught by _require above, but be explicit
+        raise ValidationError(_err(["latitude", "longitude"], "coordinates required", "missing"))
 
     # Optional DUT1 in request: enforce |DUT1| ≤ 0.9 if provided
     if "dut1" in data and data["dut1"] is not None:
@@ -304,13 +320,27 @@ def parse_chart_payload(data: Dict[str, Any]) -> ChartPayload:
         out["house_system"] = house_system
     return out
 
+def parse_calculation_payload(data: Dict[str, Any]) -> ChartPayload:
+    """
+    Parse payload for /api/calculate endpoint - makes coordinates conditional based on topocentric flag.
+    This matches the behavior expected by your computational modules.
+    """
+    # Check if topocentric mode is requested
+    topocentric = data.get("topocentric", False)
+    center = data.get("center", "geocentric")
+    
+    # Require coordinates only for topocentric calculations
+    require_coords = bool(topocentric) or (center == "topocentric")
+    
+    return parse_chart_payload(data, require_coordinates=require_coords)
+
 def parse_prediction_payload(data: Dict[str, Any]) -> Tuple[ChartPayload, Any]:
-    chart = parse_chart_payload(data)
+    chart = parse_chart_payload(data)  # Predictions always need coordinates for angles
     horizon = parse_horizon(data.get("horizon"))
     return chart, horizon
 
 def parse_rectification_payload(data: Dict[str, Any]) -> Tuple[ChartPayload, int]:
-    chart = parse_chart_payload(data)
+    chart = parse_chart_payload(data)  # Rectification always needs coordinates
     wm = data.get("window_minutes", 120)
     try:
         wm = int(wm)
@@ -412,6 +442,7 @@ def parse_ephemeris_payload(data: Dict[str, Any], *, require_bodies: bool = Fals
 __all__ = [
     "ValidationError",
     "parse_chart_payload",
+    "parse_calculation_payload",
     "parse_prediction_payload",
     "parse_rectification_payload",
     "parse_ephemeris_payload",
