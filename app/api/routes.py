@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -330,8 +331,14 @@ def timescales_endpoint():
     body = request.get_json(force=True) or {}
     try:
         date = body.get("date")
-        time_ = body.get("time")
-        tz = body.get("tz")
+        # accept tz aliases
+        tz = body.get("tz") or body.get("place_tz") or body.get("timezone")
+
+        # normalize time: allow "HH:MM" by appending ":00"
+        time_ = str(body.get("time") or "").strip()
+        if re.match(r"^\d{1,2}:\d{2}$", time_):
+            time_ = f"{time_}:00"
+
         if not isinstance(date, str) or not isinstance(time_, str) or not isinstance(tz, str):
             errs = []
             if not isinstance(date, str):
@@ -341,6 +348,7 @@ def timescales_endpoint():
             if not isinstance(tz, str):
                 errs.append({"loc": ["tz"], "msg": "required string (IANA zone)", "type": "value_error"})
             raise ValidationError(errs or "invalid payload")
+
         ts = _compute_timescales_from_local(date, time_, tz, payload=body if isinstance(body, dict) else None)
         return jsonify({"ok": True, "timescales": ts}), 200
     except ValidationError as e:
