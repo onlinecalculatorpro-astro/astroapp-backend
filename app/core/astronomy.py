@@ -249,27 +249,69 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
     jd_tt  = payload.get("jd_tt")
     jd_ut1 = payload.get("jd_ut1")
 
+    # fast path: already provided
     if all(isinstance(x, (int, float)) for x in (jd_ut, jd_tt, jd_ut1)):
         return float(jd_ut), float(jd_tt), float(jd_ut1)
 
-    # prefer time_kernel if available
+    # prefer time_kernel if available (NO lat/lon here)
     if _tk is not None:
-        for fname in ("timescales_from_civil", "compute_timescales", "build_timescales", "to_timescales", "from_civil"):
+        for fname in ("timescales_from_civil", "compute_timescales", "build_timescales",
+                      "to_timescales", "from_civil"):
             fn = getattr(_tk, fname, None)
-            if callable(fn):
-                d = payload.get("date")
-                t = payload.get("time")
-                tz = payload.get("place_tz") or payload.get("tz") or "UTC"
-                if _detect_leap_second(t):
-                    _warn_add(warnings, seen, _W.LEAP_SECOND)
-                    t = _normalize_time_for_leap_second(str(t))
-                out = fn(d, t, tz, payload.get("latitude"), payload.get("longitude"))
-                # accept jd_ut or jd_utc key variants
-                return float(out.get("jd_ut") or out.get("jd_utc")), float(out["jd_tt"]), float(out["jd_ut1"])
+            if not callable(fn):
+                continue
 
-    # fallback via timescales or stdlib
-    date_str = payload.get("date"); time_str = payload.get("time")
+            d  = payload.get("date")
+            t  = payload.get("time")
+            tz = payload.get("place_tz") or payload.get("tz") or "UTC"
+
+            # leap-second: mark + nudge text for parsers that dislike :60
+            if _detect_leap_second(t):
+                _warn_add(warnings, seen, _W.LEAP_SECOND)
+                t = _normalize_time_for_leap_second(str(t))
+
+            # figure out signature (some accept dut1, some use tz/place_tz)
+            try:
+                import inspect
+                params = inspect.signature(fn).parameters
+            except Exception:
+                params = {}
+
+            kwargs: Dict[str, Any] = {}
+            if "date" in params:     kwargs["date"] = d
+            if "time" in params:     kwargs["time"] = t
+            if "tz" in params:       kwargs["tz"] = tz
+            if "place_tz" in params: kwargs["place_tz"] = tz
+
+            dut1_val = payload.get("dut1")
+            if not isinstance(dut1_val, (int, float)):
+                dut1_val = CFG.dut1_seconds
+            if "dut1" in params:
+                kwargs["dut1"] = float(dut1_val)
+
+            # try keyword call first
+            try:
+                out = fn(**kwargs)
+                return float(out.get("jd_ut") or out.get("jd_utc")), float(out["jd_tt"]), float(out["jd_ut1"])
+            except TypeError:
+                # fallback to common positional forms: (date,time,tz[,dut1])
+                try:
+                    if "dut1" in params:
+                        out = fn(d, t, tz, float(dut1_val))
+                    else:
+                        out = fn(d, t, tz)
+                    return float(out.get("jd_ut") or out.get("jd_utc")), float(out["jd_tt"]), float(out["jd_ut1"])
+                except Exception:
+                    pass
+            except Exception:
+                # try next candidate
+                continue
+
+    # fallback: app.core.timescales or stdlib JD builder
+    date_str = payload.get("date")
+    time_str = payload.get("time")
     tz_str   = payload.get("place_tz") or payload.get("tz") or "UTC"
+
     if not isinstance(date_str, str) or not isinstance(time_str, str):
         missing = [k for k, v in (("jd_ut", jd_ut), ("jd_tt", jd_tt), ("jd_ut1", jd_ut1)) if not isinstance(v, (int, float))]
         raise AstronomyError("timescales_missing", f"Supply {', '.join(missing)} or provide date/time/tz")
