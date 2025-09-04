@@ -1047,7 +1047,7 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
         })
 
     # --- bodies built above ---
-if missing_bodies:
+    if missing_bodies:
     _warn_add(warnings, _seen, _W.ADAPTER_MISS_BODIES, ", ".join(missing_bodies))
 
 # Points (nodes): always geocentric; speed = None (with placeholders if missing)
