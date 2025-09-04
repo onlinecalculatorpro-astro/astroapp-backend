@@ -686,8 +686,15 @@ def _cached_positions(
             _geo_kwargs_for_sig(sig, topocentric=topocentric, lat_q=lat_q, lon_q=lon_q, elev_q=elev_q)
         )
 
+        # NEW: pick the right parameter name for the list of targets
+        name_param = None
+        for cand in ("names", "bodies", "planets", "ids"):
+            if cand in sig.parameters:
+                name_param = cand
+                break
+
         attempts: List[Optional[List[str]]] = [None]
-        if "names" in sig.parameters:
+        if name_param is not None:
             attempts = [list(names_key), [n.lower() for n in names_key]]
 
         last_err: Optional[Exception] = None
@@ -695,12 +702,16 @@ def _cached_positions(
         for name_list in attempts:
             kwargs = dict(base_kwargs)
             if name_list is not None:
-                kwargs["names"] = name_list
+                kwargs[name_param] = name_list  # <— always send the list via the accepted parameter
             try:
                 try:
                     res = fn(**kwargs)
                 except TypeError:
-                    res = fn(jd_tt_q)  # positional-only jd_tt
+                    # Some adapters require positional JD then names
+                    if name_param is None:
+                        res = fn(jd_tt_q)
+                    else:
+                        res = fn(jd_tt_q, name_list)
                 break
             except Exception as e:
                 last_err = e
