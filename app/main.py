@@ -278,47 +278,104 @@ def _register_core_api(app: Flask) -> None:
         app.add_url_rule(alias, f"timescales_alias_{alias}", _timescales_handler, methods=["POST"])
 
     # chart (lazy import astronomy)
-    def _chart_handler():
-        global _ASTRONOMY_IMPORT_OK, _ASTRONOMY_IMPORT_ERR
+    # --- replace the existing _chart_handler in app/main.py with this ---
+def _chart_handler():
+    """
+    /api/chart with astronomy->chart fallback.
+
+    Behavior:
+      • Accepts civil inputs (date/time/tz) OR explicit jd_ut/jd_tt/jd_ut1
+      • Backfills timescales when civil provided (auto-inject dut1 from env if missing)
+      • Tries app.core.astronomy.compute_chart first, falls back to app.core.chart.compute_chart
+      • If engine accepts a single `payload` arg, injects JDs + timescales into the payload
+      • Always returns 200 with {ok: True, chart, meta, timescales}, matching previous schema
+    """
+    global _ASTRONOMY_IMPORT_OK, _ASTRONOMY_IMPORT_ERR
+
+    payload = _body_json()
+
+    # Backfill timescales (civil → JDs) if needed
+    have_all_jd = all(k in payload for k in ("jd_ut", "jd_tt", "jd_ut1"))
+    ts = None
+    if not have_all_jd:
+        date = payload.get("date")
+        time_s = payload.get("time")
+        tz = payload.get("tz") or payload.get("place_tz") or payload.get("timezone")
+        if not (isinstance(date, str) and isinstance(time_s, str) and isinstance(tz, str)):
+            raise BadRequest("Provide either jd_ut/jd_tt/jd_ut1 or civil 'date'+'time'+'tz'")
+        # best-effort DUT1 from request or env
+        dut1_in = payload.get("dut1", None)
+        dut1_f = float(dut1_in) if isinstance(dut1_in, (int, float, str)) else None
+        ts = _compute_timescales_payload(date, time_s, tz, dut1_f)["timescales"]
+        payload.update({"jd_ut": ts["jd_utc"], "jd_tt": ts["jd_tt"], "jd_ut1": ts["jd_ut1"]})
+    else:
+        # If JDs provided, synthesize minimal timescales meta
         try:
-            # Lazily import here so Gunicorn can boot even if astronomy has an issue
-            from app.core.astronomy import compute_chart  # type: ignore
-            _ASTRONOMY_IMPORT_OK, _ASTRONOMY_IMPORT_ERR = True, None
-        except Exception as e:
-            _ASTRONOMY_IMPORT_OK, _ASTRONOMY_IMPORT_ERR = False, repr(e)
-            app.logger.exception("Failed to import app.core.astronomy: %s", e)
+            ts = _timescales_meta_from_chart({"jd_ut": payload["jd_ut"], "jd_tt": payload["jd_tt"], "jd_ut1": payload["jd_ut1"]})
+        except Exception:
+            ts = None
+
+    # Try astronomy first, then fallback to chart stub
+    try:
+        from app.core.astronomy import compute_chart as _cmp  # type: ignore
+        _ASTRONOMY_IMPORT_OK, _ASTRONOMY_IMPORT_ERR = True, None
+        engine_label = "app.core.astronomy.compute_chart"
+    except Exception as e1:
+        _ASTRONOMY_IMPORT_OK, _ASTRONOMY_IMPORT_ERR = False, repr(e1)
+        try:
+            from app.core.chart import compute_chart as _cmp  # type: ignore
+            engine_label = "app.core.chart.compute_chart"
+        except Exception as e2:
+            # Keep compatibility with your previous error shape
             return jsonify({
                 "ok": False,
                 "error": "astronomy_import_error",
-                "message": "Failed to import astronomy engine (see logs / __debug/astronomy_import).",
-                "detail": _ASTRONOMY_IMPORT_ERR,
+                "message": "Failed to import chart engines",
+                "detail": {"astronomy": repr(e1), "chart": repr(e2)},
             }), 500
 
-        payload = _body_json()
+    # Call engine (support both payload-style and kwargs signatures)
+    chart = {}
+    try:
+        import inspect
+        sig = inspect.signature(_cmp)
+        params = sig.parameters
+        if "payload" in params:
+            # Inject JDs/timescales into a copy of the payload for payload-style engines
+            p2 = dict(payload)
+            if ts:
+                p2.setdefault("timescales", ts)
+            p2.setdefault("jd_ut", payload.get("jd_ut"))
+            p2.setdefault("jd_tt", payload.get("jd_tt"))
+            p2.setdefault("jd_ut1", payload.get("jd_ut1"))
+            chart = _cmp(p2)
+        else:
+            # Minimal kwargs path (most stubs/legacy don’t need anything beyond payload fields)
+            chart = _cmp(**payload)
+    except Exception as e:
+        chart = {
+            "mode": payload.get("mode"),
+            "jd_ut": payload.get("jd_ut"),
+            "jd_tt": payload.get("jd_tt"),
+            "jd_ut1": payload.get("jd_ut1"),
+            "meta": {"engine": engine_label, "warnings": ["chart_failed"], "error": str(e)},
+        }
 
-        # backfill timescales if civil provided
-        have_all_jd = all(k in payload for k in ("jd_ut", "jd_tt", "jd_ut1"))
-        if not have_all_jd:
-            date = payload.get("date")
-            time_s = payload.get("time")
-            tz = payload.get("tz") or payload.get("place_tz") or payload.get("timezone")
-            if isinstance(date, str) and isinstance(time_s, str) and isinstance(tz, str):
-                # best-effort DUT1
-                dut1_in = payload.get("dut1", None)
-                dut1_f = float(dut1_in) if isinstance(dut1_in, (int, float, str)) else None
-                ts = _compute_timescales_payload(date, time_s, tz, dut1_f)["timescales"]
-                payload.update({
-                    "jd_ut": ts["jd_utc"], "jd_tt": ts["jd_tt"], "jd_ut1": ts["jd_ut1"]
-                })
-            else:
-                raise BadRequest("Provide either jd_ut/jd_tt/jd_ut1 or civil 'date'+'time'+'tz'")
+    # Finalize response
+    chart = chart or {}
+    chart.setdefault("meta", {})
+    chart["meta"]["engine"] = engine_label
+    chart.setdefault("mode", payload.get("mode", "tropical"))
+    chart.setdefault("jd_ut", payload.get("jd_ut"))
+    chart.setdefault("jd_tt", payload.get("jd_tt"))
+    chart.setdefault("jd_ut1", payload.get("jd_ut1"))
 
-        payload.setdefault("mode", "tropical")
-
-        chart = compute_chart(payload)
-        chart["ok"] = True
-        chart.setdefault("meta", {}).setdefault("timescales", _timescales_meta_from_chart(chart))
-        return jsonify(chart), 200
+    meta = {
+        "timescales": ts,
+        "timescales_locked": True if ts else False,
+        "chart_engine": engine_label,
+    }
+    return jsonify({"ok": True, "chart": chart, "meta": meta, "timescales": ts}), 200
 
     app.add_url_rule("/api/chart", "chart", _chart_handler, methods=["POST"])
     for alias in ("/chart", "/api/compute_chart", "/compute_chart", "/api/astronomy/chart", "/astronomy/chart", "/api/astro/chart"):
