@@ -275,11 +275,21 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
     jd_tt  = payload.get("jd_tt")
     jd_ut1 = payload.get("jd_ut1")
 
-    # Fast path: already provided
+    # 1) Fast path: all three are already supplied
     if all(isinstance(x, (int, float)) for x in (jd_ut, jd_tt, jd_ut1)):
         return float(jd_ut), float(jd_tt), float(jd_ut1)
 
-    # Prefer time_kernel if available (NO lat/lon here)
+    # Common civil inputs
+    d  = payload.get("date")
+    t  = payload.get("time")
+    tz = payload.get("place_tz") or payload.get("tz") or "UTC"
+
+    # Mark & normalize leap second if seen (':60')
+    if _detect_leap_second(t):
+        _warn_add(warnings, seen, _W.LEAP_SECOND)
+        t = _normalize_time_for_leap_second(str(t))
+
+    # 2) Prefer time_kernel if available (NO lat/lon)
     if _tk is not None:
         for fname in ("timescales_from_civil", "compute_timescales", "build_timescales",
                       "to_timescales", "from_civil"):
@@ -287,16 +297,7 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
             if not callable(fn):
                 continue
 
-            d  = payload.get("date")
-            t  = payload.get("time")
-            tz = payload.get("place_tz") or payload.get("tz") or "UTC"
-
-            # leap-second: mark + nudge text for parsers that dislike :60
-            if _detect_leap_second(t):
-                _warn_add(warnings, seen, _W.LEAP_SECOND)
-                t = _normalize_time_for_leap_second(str(t))
-
-            # introspect signature
+            # Figure out accepted parameters
             try:
                 params = inspect.signature(fn).parameters
             except Exception:
@@ -308,54 +309,72 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
             if "tz" in params:       kwargs["tz"] = tz
             if "place_tz" in params: kwargs["place_tz"] = tz
 
+            # DUT1: from payload or config broadcast
             dut1_val = payload.get("dut1")
             if not isinstance(dut1_val, (int, float)):
                 dut1_val = CFG.dut1_seconds
-            if "dut1" in params:
-                kwargs["dut1"] = float(dut1_val)
+            if "dut1" in params:          kwargs["dut1"] = float(dut1_val)
+            if "dut1_seconds" in params:  kwargs["dut1_seconds"] = float(dut1_val)
 
-            # try keyword call first
+            # Try keyword form first; then positional fallbacks
+            out = None
             try:
                 out = fn(**kwargs)
-                return float(out.get("jd_ut") or out.get("jd_utc")), float(out["jd_tt"]), float(out["jd_ut1"])
             except TypeError:
-                # fallback to common positional forms: (date,time,tz[,dut1])
                 try:
-                    if "dut1" in params:
+                    # (date, time, tz[, dut1])
+                    if "dut1" in params or "dut1_seconds" in params:
                         out = fn(d, t, tz, float(dut1_val))
                     else:
                         out = fn(d, t, tz)
-                    return float(out.get("jd_ut") or out.get("jd_utc")), float(out["jd_tt"]), float(out["jd_ut1"])
                 except Exception:
-                    pass
+                    out = None
             except Exception:
-                # try next candidate
+                out = None
+
+            if out is None:
                 continue
 
-    # Fallback: app.core.timescales or stdlib JD builder
-    date_str = payload.get("date")
-    time_str = payload.get("time")
-    tz_str   = payload.get("place_tz") or payload.get("tz") or "UTC"
+            # Bubble kernel warnings if any (e.g. "dst_ambiguous")
+            try:
+                ow = out.get("warnings") if isinstance(out, dict) else None
+                if isinstance(ow, (list, tuple)):
+                    for w in ow:
+                        if isinstance(w, str) and w:
+                            _warn_add(warnings, seen, w)
+            except Exception:
+                pass
 
-    if not isinstance(date_str, str) or not isinstance(time_str, str):
-        missing = [k for k, v in (("jd_ut", jd_ut), ("jd_tt", jd_tt), ("jd_ut1", jd_ut1)) if not isinstance(v, (int, float))]
+            # Support dict result or tuple `(jd_ut, jd_tt, jd_ut1)`
+            if isinstance(out, dict):
+                ju = float(out.get("jd_ut") or out.get("jd_utc"))
+                jt = float(out["jd_tt"])
+                j1 = float(out["jd_ut1"])
+                return ju, jt, j1
+            if isinstance(out, (list, tuple)) and len(out) >= 3:
+                ju, jt, j1 = map(float, out[:3])
+                return ju, jt, j1
+
+            # If we got here, try next kernel entrypoint
+        # end for kernel funcs
+
+    # 3) Fallback: app.core.timescales or stdlib JD builder
+    if not isinstance(d, str) or not isinstance(t, str):
+        missing = [k for k, v in (("jd_ut", jd_ut), ("jd_tt", jd_tt), ("jd_ut1", jd_ut1))
+                   if not isinstance(v, (int, float))]
         raise AstronomyError("timescales_missing", f"Supply {', '.join(missing)} or provide date/time/tz")
 
-    if _detect_leap_second(time_str):
-        _warn_add(warnings, seen, _W.LEAP_SECOND)
-        time_str = _normalize_time_for_leap_second(time_str)
-
-    def _jd_utc_via_ts(d: str, t: str, z: str) -> float:
+    def _jd_utc_via_ts(d_: str, t_: str, z_: str) -> float:
         if _ts is None:
             raise RuntimeError("timescales module not available")
-        return float(_ts.julian_day_utc(d, t, z))
+        return float(_ts.julian_day_utc(d_, t_, z_))
 
-    def _jd_utc_via_stdlib(d: str, t: str, z: str) -> float:
+    def _jd_utc_via_stdlib(d_: str, t_: str, z_: str) -> float:
         from datetime import datetime, timezone
         from zoneinfo import ZoneInfo
-        parts = t.split(":")
-        timestr = t if len(parts) >= 3 else (t + ":00")
-        dt_local = datetime.fromisoformat(f"{d}T{timestr}").replace(tzinfo=ZoneInfo(z))
+        parts = t_.split(":")
+        timestr = t_ if len(parts) >= 3 else (t_ + ":00")
+        dt_local = datetime.fromisoformat(f"{d_}T{timestr}").replace(tzinfo=ZoneInfo(z_))
         dt_utc = dt_local.astimezone(timezone.utc)
         Y, M, D = dt_utc.year, dt_utc.month, dt_utc.day
         h = dt_utc.hour + dt_utc.minute/60 + dt_utc.second/3600 + dt_utc.microsecond/3.6e9
@@ -368,14 +387,15 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
 
     used_stdlib = False
     try:
-        jd_utc = _jd_utc_via_ts(date_str, time_str, tz_str)
+        jd_utc = _jd_utc_via_ts(d, t, tz)
     except Exception:
-        jd_utc = _jd_utc_via_stdlib(date_str, time_str, tz_str)
+        jd_utc = _jd_utc_via_stdlib(d, t, tz)
         used_stdlib = True
         _warn_add(warnings, seen, _W.TIME_STD_FALLBACK)
 
+    # Compute TT from UTC JD (use monthly ΔT table if available)
     try:
-        y, m = map(int, str(date_str).split("-")[:2])
+        y, m = map(int, str(d).split("-")[:2])
     except Exception:
         y, m = 2000, 1
 
@@ -390,8 +410,13 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
         if not used_stdlib:
             _warn_add(warnings, seen, _W.DELTAT_CONST)
 
-    jd_ut_calc  = jd_utc
-    jd_ut1_calc = jd_utc + (CFG.dut1_seconds / 86400.0)
+    # UT and UT1 (apply DUT1 seconds if available; fallback to CFG)
+    dut1_s = payload.get("dut1")
+    if not isinstance(dut1_s, (int, float)):
+        dut1_s = CFG.dut1_seconds
+
+    jd_ut_calc  = float(jd_utc)
+    jd_ut1_calc = float(jd_utc) + (float(dut1_s) / 86400.0)
     return jd_ut_calc, jd_tt_calc, jd_ut1_calc
 
 
