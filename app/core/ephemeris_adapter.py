@@ -3,17 +3,23 @@
 # Research-grade Ephemeris Adapter (Skyfield + optional SPICE)
 #
 # - Majors (Sun..Pluto via barycenters): Skyfield, local DE421 kernel (no net)
-# - Lunar nodes: mean/true geocentric (configurable via OCP_NODE_MODEL)
+# - Lunar nodes: mean/true geocentric (configurable; per-row override supported)
 # - Small bodies (Ceres, Pallas, Juno, Vesta, Chiron): optional SPICE geocentric
 # - Frames:  "ecliptic-of-date" (default) or "ecliptic-j2000"
-# - Observer: geocentric or WGS84 topocentric (lat/lon/elev)
+# - Observer: geocentric or WGS84 topocentric (lat/lon/elev); accepts observer={}
 # - Velocities: central difference (deg/day) with step tuned per target
 #
-# Return shape (uniform, always):
+# Uniform return shape (always):
 #   {
 #     "results": [
-#        {"name": <as requested>, "longitude": <deg>, "velocity": <deg/day>?, "lat": <deg>?,
-#         "lon": <alias>, "speed": <alias>},
+#        {
+#          "name": <as requested>,
+#          "longitude": <deg>,               # canonical
+#          "velocity": <deg/day>?,           # canonical (if computed)
+#          "lat": <deg>?,                    # ecliptic latitude when available
+#          "lon": <alias of longitude>,      # alias for clients/harnesses
+#          "speed": <alias of velocity>      # alias for clients/harnesses
+#        },
 #        ...
 #     ],
 #     "meta": {
@@ -21,13 +27,12 @@
 #        "kernels": ["de421.bsp", "..."],
 #        "frame": "ecliptic-of-date" | "ecliptic-j2000",
 #        "topocentric": true|false,
-#        "node_model": "true"|"mean",
+#        "node_model": "true"|"mean",       # default model (env)
 #        "smalls_enabled": true|false
 #     }
 #   }
 #
-# Errors: raises EphemerisError with clear stage/context; callers may catch and
-# map to HTTP 4xx/5xx. Diagnostic /dev endpoints can read .args.
+# Errors: raises EphemerisError with stage/message; routes map to HTTP codes.
 # -----------------------------------------------------------------------------
 from __future__ import annotations
 
@@ -71,7 +76,7 @@ class EphemerisError(RuntimeError):
 # ─────────────────────────────────────────────────────────────────────────────
 # Optional backends
 # ─────────────────────────────────────────────────────────────────────────────
-def _skyfield_available() -> bool:  # used by routes diagnostics
+def _skyfield_available() -> bool:
     try:
         import skyfield  # noqa: F401
         return True
@@ -116,8 +121,21 @@ _PLANET_KEYS: Dict[str, str] = {
 }
 _MAJOR_CANON = {k.lower(): k for k in _PLANET_KEYS.keys()}
 
-_NODE_CANON  = {"north node": "North Node", "south node": "South Node"}
-_NODE_NAMES = set(_NODE_CANON.values())
+# Node aliases with optional model overrides
+# e.g., "True Node" -> ("North Node", "true"); "Mean Node" -> ("North Node","mean")
+_NODE_ALIAS: Dict[str, Tuple[str, Optional[str]]] = {
+    "north node": ("North Node", None),
+    "south node": ("South Node", None),
+    "true node":  ("North Node", "true"),
+    "mean node":  ("North Node", "mean"),
+    "true north node": ("North Node", "true"),
+    "true south node": ("South Node", "true"),
+    "mean north node": ("North Node", "mean"),
+    "mean south node": ("South Node", "mean"),
+    "rahu": ("North Node", None),
+    "ketu": ("South Node", None),
+}
+_NODE_NAMES = {"North Node", "South Node"}
 
 _SMALL_CANON = {"ceres": "Ceres", "pallas": "Pallas", "juno": "Juno", "vesta": "Vesta", "chiron": "Chiron"}
 _SMALLBODY_HINTS: Dict[str, List[str]] = {
@@ -128,17 +146,26 @@ _SMALLBODY_HINTS: Dict[str, List[str]] = {
     "Chiron": ["2060 Chiron", "Chiron", "2002060", "2060", "95P/Chiron"],
 }
 
-def _canon_name(nm: str) -> Tuple[str, str]:
-    """Return (canonical_name, kind) with kind in {'major','node','small','unknown'}."""
+def _canon_node(nm: str) -> Tuple[str, Optional[str]]:
+    """Return (canonical_node_name, model_override)"""
+    low = (nm or "").strip().lower()
+    return _NODE_ALIAS.get(low, (nm, None))
+
+def _canon_name(nm: str) -> Tuple[str, str, Optional[str]]:
+    """Return (canonical_name, kind, node_model_override) with kind in {'major','node','small','unknown'}."""
     s = (nm or "").strip()
     low = s.lower()
     if low in _MAJOR_CANON:
-        return _MAJOR_CANON[low], "major"
-    if low in _NODE_CANON:
-        return _NODE_CANON[low], "node"
+        return _MAJOR_CANON[low], "major", None
     if low in _SMALL_CANON:
-        return _SMALL_CANON[low], "small"
-    return s, "unknown"
+        return _SMALL_CANON[low], "small", None
+    if low in _NODE_ALIAS or low in {"north node", "south node"}:
+        cn, override = _canon_node(low)
+        # Normalize to strictly "North Node"/"South Node"
+        if cn.lower() in {"north node", "south node"}:
+            cn = cn.title()
+        return cn, "node", override
+    return s, "unknown", None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Math helpers
@@ -416,17 +443,31 @@ def _cross(a, b):
     ax, ay, az = a; bx, by, bz = b
     return (ay*bz - az*by, az*bx - ax*bz, ax*by - ay*bz)
 
-def _observer(main, *, topocentric: bool, latitude: Optional[float], longitude: Optional[float], elevation_m: Optional[float]):
+def _observer(main, *, topocentric: bool,
+              latitude: Optional[float],
+              longitude: Optional[float],
+              elevation_m: Optional[float],
+              observer: Optional[Dict[str, float]] = None):
+    """Return a Skyfield observer object (Earth or WGS84 lat/lon)."""
     if main is None:
         return None
+
+    # Allow an 'observer' dict to override top-level latitude/longitude
+    if observer and isinstance(observer, dict):
+        latitude  = float(observer.get("lat", latitude) if observer.get("lat") is not None else latitude)
+        longitude = float(observer.get("lon", longitude) if observer.get("lon") is not None else longitude)
+        elevation_m = float(observer.get("elevation_m", elevation_m) if observer.get("elevation_m") is not None else (elevation_m or 0.0))
+
     if topocentric and (latitude is None or longitude is None):
         log.debug("topocentric requested but latitude/longitude missing — using geocentric observer")
+
     if topocentric and latitude is not None and longitude is not None:
         try:
             from skyfield.api import wgs84
             return wgs84.latlon(float(latitude), float(longitude), elevation_m=float(elevation_m or 0.0))
         except Exception as e:
             log.debug("Topocentric build failed: %s", e)
+
     try:
         return main["earth"]
     except Exception:
@@ -538,8 +579,9 @@ def _true_node_geocentric_cached(jd_q: float) -> float:
         log.debug("True node calc failed at JD %.6f: %s", jd_q, e)
         return _mean_node(jd_q)
 
-def _node_longitude(name: str, jd_tt: float) -> float:
-    if _NODE_MODEL == "mean":
+def _node_longitude(name: str, jd_tt: float, *, model_override: Optional[str] = None) -> float:
+    model = (model_override or _NODE_MODEL).lower()
+    if model == "mean":
         asc = _mean_node(jd_tt)
     else:
         jd_q = round(float(jd_tt), 5)  # cache-friendly quantization
@@ -566,6 +608,15 @@ def _meta(frame: str, topocentric: bool) -> Dict[str, Any]:
 def _uniform(rows: List[Dict[str, float]], frame: str, topocentric: bool) -> Dict[str, Any]:
     return {"results": rows, "meta": _meta(frame, topocentric)}
 
+def _mk_row(name: str, lon: float, *, lat: Optional[float] = None, vel: Optional[float] = None) -> Dict[str, float]:
+    row: Dict[str, float] = {"name": name, "longitude": float(lon), "lon": float(lon)}
+    if lat is not None:
+        row["lat"] = float(lat)
+    if vel is not None:
+        row["velocity"] = float(vel)
+        row["speed"] = float(vel)
+    return row
+
 def ecliptic_longitudes(
     jd_tt: float,
     names: Optional[List[str]] = None,
@@ -575,12 +626,14 @@ def ecliptic_longitudes(
     latitude: Optional[float] = None,
     longitude: Optional[float] = None,
     elevation_m: Optional[float] = None,
+    observer: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """
-    Compute apparent ecliptic longitudes (deg) for requested bodies at TT Julian Date.
+    Compute apparent ecliptic longitudes (deg) for requested bodies/points at TT Julian Date.
     - Frame: 'ecliptic-of-date' or 'ecliptic-j2000'
     - Observer: geocentric (default) or topocentric with WGS84(lat, lon, elev_m)
-    - Velocities: included for nodes (finite diff) and majors (central diff) when possible
+                Accepts 'observer' dict overriding top-level lat/lon/elevation_m.
+    - Velocities: included for nodes (finite diff) and majors (central diff) when possible.
     Invariants: 0 <= longitude < 360; velocity in deg/day when present.
     """
     _check_jd_guard(jd_tt)
@@ -592,30 +645,34 @@ def ecliptic_longitudes(
     main, _ = _get_kernels()
     t = _to_tts(jd_tt) if main is not None else None
     ef = _get_ecliptic_frame(frame) if main is not None else None
-    obs = _observer(main, topocentric=topocentric, latitude=latitude, longitude=longitude, elevation_m=elevation_m) if main is not None else None
+    obs = _observer(
+        main,
+        topocentric=topocentric,
+        latitude=latitude,
+        longitude=longitude,
+        elevation_m=elevation_m,
+        observer=observer,
+    ) if main is not None else None
     ts = _get_timescale()
 
-    wanted = names[:] if names else list(_PLANET_KEYS.keys())
+    wanted = (names[:] if names else list(_PLANET_KEYS.keys()))
     rows: List[Dict[str, float]] = []
 
     for raw in wanted:
-        canon, kind = _canon_name(raw)
+        canon, kind, node_override = _canon_name(raw)
 
-        # Lunar nodes (geocentric)
+        # Lunar nodes (geocentric, allowing per-row model override)
         if kind == "node":
             try:
-                lon_val = _node_longitude(canon, jd_tt)
-                # velocity via finite difference with Moon step
+                lon_val = _node_longitude(canon, jd_tt, model_override=node_override)
                 step = _speed_step_for("Moon")
-                lon_m = _node_longitude(canon, jd_tt - step)
-                lon_p = _node_longitude(canon, jd_tt + step)
+                lon_m = _node_longitude(canon, jd_tt - step, model_override=node_override)
+                lon_p = _node_longitude(canon, jd_tt + step, model_override=node_override)
                 vel_val = _wrap_diff_deg(lon_p, lon_m) / (2.0 * step)
-                row = {"name": raw, "longitude": float(lon_val), "lon": float(lon_val),
-                       "velocity": float(vel_val), "speed": float(vel_val), "lat": 0.0}
+                rows.append(_mk_row(raw, lon_val, lat=0.0, vel=vel_val))
             except Exception as e:
                 log.debug("Node computation failed for %s: %s", canon, e)
-                row = {"name": raw, "longitude": 0.0, "lon": 0.0, "lat": 0.0}
-            rows.append(row)
+                rows.append(_mk_row(raw, 0.0, lat=0.0))
             continue
 
         # Majors via Skyfield
@@ -625,15 +682,14 @@ def ecliptic_longitudes(
                 try:
                     geo = obs.at(t).observe(body).apparent()
                     lon, lat = _frame_latlon(geo, ef)
-                    row: Dict[str, float] = {"name": raw, "longitude": float(lon), "lon": float(lon), "lat": float(lat)}
+                    vel: Optional[float] = None
                     if ts is not None:
                         step = _speed_step_for(canon)
                         t0 = ts.tt_jd(jd_tt - step); t1 = ts.tt_jd(jd_tt + step)
                         lon0, _ = _frame_latlon(obs.at(t0).observe(body).apparent(), ef)
                         lon1, _ = _frame_latlon(obs.at(t1).observe(body).apparent(), ef)
                         vel = _wrap_diff_deg(lon1, lon0) / (2.0 * step)
-                        row["velocity"] = float(vel); row["speed"] = float(vel)
-                    rows.append(row)
+                    rows.append(_mk_row(raw, lon, lat=lat, vel=vel))
                     continue
                 except Exception as e:
                     log.debug("Skyfield failed for %s: %s", canon, e)
@@ -642,13 +698,10 @@ def ecliptic_longitudes(
         if kind == "small" and _SPICE_READY and _ENABLE_SMALLS:
             lon, lat, spd = _spice_lon_lat_speed(jd_tt, canon, frame=frame)
             if lon is not None and lat is not None:
-                row = {"name": raw, "longitude": float(lon), "lon": float(lon), "lat": float(lat)}
-                if spd is not None:
-                    row["velocity"] = float(spd); row["speed"] = float(spd)
-                rows.append(row)
+                rows.append(_mk_row(raw, lon, lat=lat, vel=spd))
                 continue
 
-        # If nothing worked, note and move on (keep deterministic order)
+        # If nothing worked, keep deterministic order and log
         log.debug("Ephemeris: unresolved body %s (kind=%s)", raw, kind)
 
     return _uniform(rows, frame, topocentric)
@@ -662,11 +715,11 @@ def ecliptic_longitudes_and_velocities(
     latitude: Optional[float] = None,
     longitude: Optional[float] = None,
     elevation_m: Optional[float] = None,
+    observer: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """
-    Same as ecliptic_longitudes(), but emphasizes that velocities may be present
-    when numerically stable. Nodes here return longitude only (lat=0; velocity may
-    be omitted by some consumers, but we include it when computed).
+    Same as ecliptic_longitudes(), but emphasizes that velocities should be present
+    when numerically stable. Nodes include velocity (deg/day) via finite differences.
     """
     _check_jd_guard(jd_tt)
 
@@ -681,7 +734,14 @@ def ecliptic_longitudes_and_velocities(
 
     t  = _to_tts(jd_tt)
     ef = _get_ecliptic_frame(frame)
-    obs = _observer(main, topocentric=topocentric, latitude=latitude, longitude=longitude, elevation_m=elevation_m)
+    obs = _observer(
+        main,
+        topocentric=topocentric,
+        latitude=latitude,
+        longitude=longitude,
+        elevation_m=elevation_m,
+        observer=observer,
+    )
 
     if t is None or ef is None or obs is None:
         return _uniform(rows, frame, topocentric)
@@ -689,19 +749,17 @@ def ecliptic_longitudes_and_velocities(
     ts = _get_timescale()
 
     for raw in names:
-        canon, kind = _canon_name(raw)
+        canon, kind, node_override = _canon_name(raw)
 
-        # Nodes (geocentric)
+        # Nodes (geocentric, per-row model override honored)
         if kind == "node":
             try:
-                lon_val = _node_longitude(canon, jd_tt)
-                # Keep velocity for symmetry with ecliptic_longitudes
+                lon_val = _node_longitude(canon, jd_tt, model_override=node_override)
                 step = _speed_step_for("Moon")
-                lon_m = _node_longitude(canon, jd_tt - step)
-                lon_p = _node_longitude(canon, jd_tt + step)
+                lon_m = _node_longitude(canon, jd_tt - step, model_override=node_override)
+                lon_p = _node_longitude(canon, jd_tt + step, model_override=node_override)
                 vel_val = _wrap_diff_deg(lon_p, lon_m) / (2.0 * step)
-                rows.append({"name": raw, "longitude": float(lon_val), "lon": float(lon_val),
-                             "velocity": float(vel_val), "speed": float(vel_val)})
+                rows.append(_mk_row(raw, lon_val, vel=vel_val))
             except Exception as e:
                 log.debug("Node computation failed for %s: %s", canon, e)
             continue
@@ -713,7 +771,7 @@ def ecliptic_longitudes_and_velocities(
                 try:
                     geo = obs.at(t).observe(body).apparent()
                     lon, lat = _frame_latlon(geo, ef)
-                    row: Dict[str, float] = {"name": raw, "longitude": float(lon), "lon": float(lon), "lat": float(lat)}
+                    vel: Optional[float] = None
                     if ts is not None:
                         step = _speed_step_for(canon)
                         t0 = ts.tt_jd(jd_tt - step)
@@ -721,8 +779,7 @@ def ecliptic_longitudes_and_velocities(
                         lon0, _ = _frame_latlon(obs.at(t0).observe(body).apparent(), ef)
                         lon1, _ = _frame_latlon(obs.at(t1).observe(body).apparent(), ef)
                         vel = _wrap_diff_deg(lon1, lon0) / (2.0 * step)
-                        row["velocity"] = float(vel); row["speed"] = float(vel)
-                    rows.append(row)
+                    rows.append(_mk_row(raw, lon, lat=lat, vel=vel))
                     skyfield_success = True
                 except Exception as e:
                     log.debug("Skyfield failed for %s: %s", canon, e)
@@ -731,10 +788,7 @@ def ecliptic_longitudes_and_velocities(
         if (not skyfield_success) and _SPICE_READY and _ENABLE_SMALLS and kind == "small":
             lon, vel = _spice_ecliptic_longitude_speed(jd_tt, canon, frame=frame)
             if lon is not None:
-                row: Dict[str, float] = {"name": raw, "longitude": float(lon), "lon": float(lon)}
-                if vel is not None:
-                    row["velocity"] = float(vel); row["speed"] = float(vel)
-                rows.append(row)
+                rows.append(_mk_row(raw, lon, vel=vel))
 
     return _uniform(rows, frame, topocentric)
 
@@ -776,7 +830,7 @@ def ephemeris_diagnostics(requested: Optional[List[str]] = None) -> Dict[str, An
     missing: List[str] = []
 
     for raw in wanted:
-        nm, kind = _canon_name(raw)
+        nm, kind, _override = _canon_name(raw)
         if kind == "node":
             resolved[raw] = {"type": "node", "kernel": "computed", "label": nm}
             continue
@@ -841,10 +895,10 @@ def get_ecliptic_longitudes(*args, **kwargs):
 
 def get_node_longitude(name: str, jd_tt: float) -> float:
     """Explicit node longitude helper used by legacy code paths."""
-    canon, kind = _canon_name(name)
+    canon, kind, override = _canon_name(name)
     if kind != "node":
         raise ValueError("get_node_longitude expects a node name")
-    return _node_longitude(canon, jd_tt)
+    return _node_longitude(canon, jd_tt, model_override=override)
 
 __all__ = [
     "_skyfield_available",
