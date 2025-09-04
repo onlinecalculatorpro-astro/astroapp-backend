@@ -924,33 +924,54 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
     if mode == "sidereal":
         ay_deg, _ = _resolve_ayanamsa(jd_tt, payload.get("ayanamsa"), warnings, _seen)
 
-    # Build bodies list (with safety net placeholders if adapter missed)
-    out_bodies: List[Dict[str, Any]] = []
-    missing_bodies: List[str] = []
-    for nm in majors_req:
-        tup = results.get(nm)
-        if not tup or tup[0] is None:
-            missing_bodies.append(nm)
-            # placeholder to satisfy length-based tests; lon None, speed None
-            out_bodies.append({
-                "name": nm, "lon": None, "longitude_deg": None,
-                "speed": None, "speed_deg_per_day": None, "lat": None,
-            })
-            continue
-        lon_deg, speed = tup
-        if mode == "sidereal" and ay_deg is not None:
-            lon_deg = _norm360(lon_deg - float(ay_deg))
-        out_bodies.append({
-            "name": nm,
-            "lon": float(_norm360(lon_deg)),
-            "longitude_deg": float(_norm360(lon_deg)),
-            "speed": (float(speed) if speed is not None else None),
-            "speed_deg_per_day": (float(speed) if speed is not None else None),
-            "lat": None,
-        })
+    # Build bodies list (with geocentric fallback if topo returns missing/NaN)
+out_bodies: List[Dict[str, Any]] = []
+missing_bodies: List[str] = []
 
-    if missing_bodies:
-        _warn_add(warnings, _seen, _W.ADAPTER_MISS_BODIES, ", ".join(missing_bodies))
+def _is_num(x):  # local helper
+    try:
+        return isinstance(x, (int, float)) and math.isfinite(float(x))
+    except Exception:
+        return False
+
+for nm in majors_req:
+    tup = results.get(nm)  # (lon_deg, speed) or None
+    lon_deg: Optional[float] = None
+    speed: Optional[float] = None
+
+    if tup:
+        lon_deg, speed = tup
+        if not _is_num(lon_deg):
+            lon_deg = None  # force fallback below
+
+    # Fallback: if topocentric position missing, try geocentric position-only
+    if lon_deg is None:
+        geo_map, _src = _longitudes_only_geocentric(jd_tt, [nm])
+        if nm in geo_map and _is_num(geo_map[nm]):
+            lon_deg = float(geo_map[nm])
+            speed = speed if _is_num(speed) else None
+            _warn_add(warnings, _seen, "topo_position_fallback_geocentric", nm)
+
+    if lon_deg is None:
+        # still missing → record and continue
+        missing_bodies.append(nm)
+        continue
+
+    # Sidereal rotation
+    if mode == "sidereal" and ay_deg is not None:
+        lon_deg = _norm360(lon_deg - float(ay_deg))
+
+    out_bodies.append({
+        "name": nm,
+        "lon": float(_norm360(lon_deg)),
+        "longitude_deg": float(_norm360(lon_deg)),
+        "speed": (float(speed) if _is_num(speed) else None),
+        "speed_deg_per_day": (float(speed) if _is_num(speed) else None),
+        "lat": None,
+    })
+
+if missing_bodies:
+    _warn_add(warnings, _seen, _W.ADAPTER_MISS_BODIES, ", ".join(missing_bodies))
 
     # Points (nodes): always geocentric; speed = None (with placeholders if missing)
     out_points: List[Dict[str, Any]] = []
