@@ -193,38 +193,69 @@ def _compute_timescales_from_local(
     """
     Calls app.core.timescales.build_timescales(date_str, time_str, tz_name, dut1_seconds)
     and adapts the dataclass to the API dict shape.
-    Strict research mode: DUT1 required (request or env ASTRO_DUT1[_BROADCAST]).
+
+    DUT1 resolution (in order of precedence):
+      1) payload["dut1_seconds"]  (preferred)
+      2) payload["dut1"]          (legacy)
+      3) env ASTRO_DUT1_BROADCAST or ASTRO_DUT1 (default "0.0")
     """
-    # quick tz validation for clearer errors
+
+    # Quick tz validation for clearer errors
     try:
         _ = ZoneInfo(tz_name)
     except Exception:
-        raise ValidationError([{"loc": ["tz"], "msg": "must be a valid IANA zone like 'Asia/Kolkata'", "type": "value_error"}])
+        raise ValidationError([{
+            "loc": ["tz"],
+            "msg": "must be a valid IANA zone like 'Asia/Kolkata'",
+            "type": "value_error",
+        }])
 
-    # DUT1 required (request or env)
-    if payload and "dut1" in payload:
+    # Resolve DUT1 seconds from payload/env
+    def _env_dut1() -> float:
+        env_val = os.getenv("ASTRO_DUT1_BROADCAST", os.getenv("ASTRO_DUT1", "0.0"))
         try:
-            dut1_seconds = float(payload["dut1"])
+            return float(env_val)
         except Exception:
-            raise ValidationError([{"loc": ["dut1"], "msg": "must be a number (seconds)", "type": "value_error"}])
+            raise ValidationError([{
+                "loc": ["dut1"],
+                "msg": "environment DUT1 must be a valid number",
+                "type": "value_error",
+            }])
+
+    dut1_seconds: float
+    if isinstance(payload, dict):
+        if "dut1_seconds" in payload:
+            try:
+                dut1_seconds = float(payload["dut1_seconds"])
+            except Exception:
+                raise ValidationError([{
+                    "loc": ["dut1_seconds"],
+                    "msg": "must be a number (seconds)",
+                    "type": "value_error",
+                }])
+        elif "dut1" in payload:
+            try:
+                dut1_seconds = float(payload["dut1"])
+            except Exception:
+                raise ValidationError([{
+                    "loc": ["dut1"],
+                    "msg": "must be a number (seconds)",
+                    "type": "value_error",
+                }])
+        else:
+            dut1_seconds = _env_dut1()
     else:
-        env_dut1 = os.getenv("ASTRO_DUT1_BROADCAST", os.getenv("ASTRO_DUT1"))
-        if env_dut1 is None:
-            raise ValidationError([{"loc": ["dut1"], "msg": "DUT1 required (provide in request or set ASTRO_DUT1[_BROADCAST])", "type": "value_error"}])
-        try:
-            dut1_seconds = float(env_dut1)
-        except Exception:
-            raise ValidationError([{"loc": ["dut1"], "msg": "environment DUT1 must be a valid number", "type": "value_error"}])
+        dut1_seconds = _env_dut1()
 
-    # build + adapt
+    # Build + adapt
     try:
         ts: TimeScales = build_timescales(date_str, time_str, tz_name, dut1_seconds)
     except ValueError as e:
         msg = str(e)
-        # map to field hints when possible
-        if "DUT1" in msg:
+        # Map to field-specific hints when possible
+        if "DUT1" in msg.upper():
             raise ValidationError([{"loc": ["dut1"], "msg": msg, "type": "value_error"}])
-        if "1960" in msg or "pre-1960" in msg:
+        if "1960" in msg or "pre-1960" in msg.lower():
             raise ValidationError([{"loc": ["date"], "msg": msg, "type": "value_error"}])
         raise ValidationError([{"loc": ["timescales"], "msg": msg, "type": "value_error"}])
 
@@ -233,7 +264,7 @@ def _compute_timescales_from_local(
         "jd_tt": float(ts.jd_tt),
         "jd_ut1": float(ts.jd_ut1),
         "delta_t": float(ts.delta_t),
-        "delta_at": float(ts.dat),  # rename for external clarity
+        "delta_at": float(ts.dat),  # alias for external clarity
         "dut1": float(ts.dut1),
         "timezone": tz_name,
         "tz_offset_seconds": int(ts.tz_offset_seconds),
