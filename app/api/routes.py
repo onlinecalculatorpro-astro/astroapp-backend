@@ -1,19 +1,13 @@
 # app/api/routes.py
 """
-API ROUTES — Research-Grade, ERFA-Aligned Timescales & Astronomy Adapters
-
-Scope
-- Public HTTP API (timescales, chart, houses, ephemeris, predictions).
-- Single source of truth for civil→(UTC, TT, UT1): app.core.timescales.build_timescales().
-
-Precision & Policy
-- ERFA chain (dtf2d → utctai → taitt; utcut1) with two-part JDs.
-- DUT1 guard (|DUT1| ≤ 0.9 s), UTC < 1960 rejected by timescales core.
-- Leap-second 23:59:60 accepted; warnings preserved end-to-end.
-
-Warning tokens (must pass through unchanged)
-- "dst_ambiguous"
-- "microsecond_precision_clamped"
+AstroApp — Canonical API Routes
+- Timescales (ERFA-aligned)
+- Chart + Houses
+- Predictions
+- Ephemeris
+- Rectification
+- Ops: /api/health, /api/config, /api/openapi
+No aliases, no dev echo endpoints.
 """
 
 from __future__ import annotations
@@ -25,15 +19,14 @@ from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from flask import Blueprint, Response, jsonify, request
+from flask import Blueprint, jsonify, request
 from zoneinfo import ZoneInfo
 
 from app.version import VERSION
 from app.utils.config import load_config
 from app.utils.hc import flag_predictions
-from app.utils.metrics import metrics
 from app.utils.ratelimit import rate_limit
-from app.core.validators import (  # parsing is centralized here
+from app.core.validators import (
     ValidationError,
     parse_chart_payload,
     parse_prediction_payload,
@@ -41,10 +34,10 @@ from app.core.validators import (  # parsing is centralized here
     parse_ephemeris_payload,
 )
 
-# Timescales: FINAL, locked API
+# Timescales core
 from app.core.timescales import build_timescales, TimeScales
 
-# Predictions engine (kept as-is; optional)
+# Optional predictions engine
 try:
     from app.core.predict import predict as predict_engine
 except Exception:
@@ -57,7 +50,7 @@ DEBUG_VERBOSE = os.getenv("ASTRO_DEBUG_VERBOSE", "0").lower() in ("1", "true", "
 ARCSEC_TOL = float(os.getenv("ASTRO_ASC_TOL_ARCSEC", "3.6"))  # 0.001°
 
 
-# ───────────────────────────── helpers: small math on degrees ─────────────────────────────
+# ───────────────────────── helpers ─────────────────────────
 def _wrap360(x: float) -> float:
     try:
         v = float(x) % 360.0
@@ -75,7 +68,6 @@ def _delta_arcsec(a: float, b: float) -> float:
     return abs(_shortest_delta_deg(a, b)) * 3600.0
 
 
-# ───────────────────────────── error helper ─────────────────────────────
 def _json_error(code: str, details: Any = None, http: int = 400):
     out: Dict[str, Any] = {"ok": False, "error": code}
     if details is not None:
@@ -83,7 +75,6 @@ def _json_error(code: str, details: Any = None, http: int = 400):
     return jsonify(out), http
 
 
-# ───────────────────────────── ERFA-first angle helpers (ASC/MC parity) ─────────────────────────────
 def _split_jd(jd: float) -> tuple[float, float]:
     d = int(jd // 1)
     return float(d), float(jd - d)
@@ -115,7 +106,6 @@ def _gast_deg(jd_ut1: float, jd_tt: float) -> float:
         import math
         return _wrap360(math.degrees(gst_rad))
     except Exception:
-        # polynomial fallback
         import math
         T = (float(jd_ut1) - 2451545.0) / 36525.0
         theta = (
@@ -183,7 +173,7 @@ def _recompute_angles_exact(
     return {"asc_deg": asc, "mc_deg": mc}
 
 
-# ───────────────────────────── Timescales adapter ─────────────────────────────
+# ───────────────────────── timescales adapter ─────────────────────────
 def _compute_timescales_from_local(
     date_str: str,
     time_str: str,
@@ -191,16 +181,14 @@ def _compute_timescales_from_local(
     payload: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Calls app.core.timescales.build_timescales(date_str, time_str, tz_name, dut1_seconds)
-    and adapts the dataclass to the API dict shape.
+    Calls build_timescales(date, time, tz, dut1_seconds) and adapts result.
 
-    DUT1 resolution (in order of precedence):
-      1) payload["dut1_seconds"]  (preferred)
-      2) payload["dut1"]          (legacy)
-      3) env ASTRO_DUT1_BROADCAST or ASTRO_DUT1 (default "0.0")
+    DUT1 precedence:
+      1) payload["dut1_seconds"] (preferred)
+      2) payload["dut1"]         (legacy)
+      3) env ASTRO_DUT1_BROADCAST / ASTRO_DUT1 (default "0.0")
     """
-
-    # Quick tz validation for clearer errors
+    # tz validation
     try:
         _ = ZoneInfo(tz_name)
     except Exception:
@@ -210,7 +198,6 @@ def _compute_timescales_from_local(
             "type": "value_error",
         }])
 
-    # Resolve DUT1 seconds from payload/env
     def _env_dut1() -> float:
         env_val = os.getenv("ASTRO_DUT1_BROADCAST", os.getenv("ASTRO_DUT1", "0.0"))
         try:
@@ -222,37 +209,26 @@ def _compute_timescales_from_local(
                 "type": "value_error",
             }])
 
-    dut1_seconds: float
     if isinstance(payload, dict):
         if "dut1_seconds" in payload:
             try:
                 dut1_seconds = float(payload["dut1_seconds"])
             except Exception:
-                raise ValidationError([{
-                    "loc": ["dut1_seconds"],
-                    "msg": "must be a number (seconds)",
-                    "type": "value_error",
-                }])
+                raise ValidationError([{"loc": ["dut1_seconds"], "msg": "must be a number (seconds)", "type": "value_error"}])
         elif "dut1" in payload:
             try:
                 dut1_seconds = float(payload["dut1"])
             except Exception:
-                raise ValidationError([{
-                    "loc": ["dut1"],
-                    "msg": "must be a number (seconds)",
-                    "type": "value_error",
-                }])
+                raise ValidationError([{"loc": ["dut1"], "msg": "must be a number (seconds)", "type": "value_error"}])
         else:
             dut1_seconds = _env_dut1()
     else:
         dut1_seconds = _env_dut1()
 
-    # Build + adapt
     try:
         ts: TimeScales = build_timescales(date_str, time_str, tz_name, dut1_seconds)
     except ValueError as e:
         msg = str(e)
-        # Map to field-specific hints when possible
         if "DUT1" in msg.upper():
             raise ValidationError([{"loc": ["dut1"], "msg": msg, "type": "value_error"}])
         if "1960" in msg or "pre-1960" in msg.lower():
@@ -264,7 +240,7 @@ def _compute_timescales_from_local(
         "jd_tt": float(ts.jd_tt),
         "jd_ut1": float(ts.jd_ut1),
         "delta_t": float(ts.delta_t),
-        "delta_at": float(ts.dat),  # alias for external clarity
+        "delta_at": float(ts.dat),
         "dut1": float(ts.dut1),
         "timezone": tz_name,
         "tz_offset_seconds": int(ts.tz_offset_seconds),
@@ -272,19 +248,13 @@ def _compute_timescales_from_local(
     }
 
 
-# ───────────────────────────── health / metrics / config / openapi ─────────────────────────────
+# ───────────────────────── health / ops ─────────────────────────
 @api.get("/api/health")
 def health():
     return jsonify({"ok": True, "status": "up", "version": VERSION}), 200
 
 
-@api.get("/metrics")
-def metrics_export():
-    return Response(metrics.export_prometheus(), mimetype="text/plain")
-
-
 @api.get("/api/config")
-@metrics.middleware("config")
 @rate_limit(1)
 def config_info():
     cfg_path = os.environ.get("ASTRO_CONFIG", "config/defaults.yaml")
@@ -295,7 +265,6 @@ def config_info():
     calib_ver = None
     th_summary = None
 
-    # timescale sample (UTC now) — helpful for clients
     try:
         now_utc = datetime.now(timezone.utc)
         ts_now = _compute_timescales_from_local(
@@ -346,28 +315,18 @@ def config_info():
 def openapi_spec():
     import yaml
     base = os.path.dirname(__file__)
-    candidates = [
-        os.path.join(base, "..", "openapi.yaml"),
-        os.path.join(base, "..", "..", "openapi.yaml"),
-    ]
-    for p in candidates:
+    for p in (os.path.join(base, "..", "openapi.yaml"), os.path.join(base, "..", "..", "openapi.yaml")):
         try:
             with open(p, "r", encoding="utf-8") as f:
-                spec = yaml.safe_load(f)
-                return jsonify(spec), 200
+                return jsonify(yaml.safe_load(f)), 200
         except Exception:
             continue
     return _json_error("openapi_not_found", None, 404)
 
 
-# ───────────────────────────── production TIMESCALES endpoint ─────────────────────────────
+# ───────────────────────── timescales ─────────────────────────
 @api.post("/api/timescales")
 def timescales_endpoint():
-    """
-    POST body:
-      { "date": "YYYY-MM-DD", "time": "HH:MM[:SS[.us]]", "tz": "IANA/Zone", "dut1": <float seconds> }
-    Returns ERFA-derived JD_UTC / JD_TT / JD_UT1 with warnings preserved.
-    """
     body = request.get_json(force=True) or {}
     try:
         date = body.get("date")
@@ -390,26 +349,7 @@ def timescales_endpoint():
         return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
 
 
-# ───────────────────────────── dev echo (compatible alias) ─────────────────────────────
-@api.post("/api/dev/echo_timescales")
-def dev_echo_timescales():
-    """
-    Dev-only alias; also accepts `place_tz` as tz.
-    """
-    body = request.get_json(force=True) or {}
-    try:
-        date = body.get("date") or "2000-01-01"
-        time_ = body.get("time") or "12:00"
-        tz = body.get("place_tz") or body.get("tz") or body.get("timezone") or "UTC"
-        ts = _compute_timescales_from_local(date, time_, tz, payload=body if isinstance(body, dict) else None)
-        return jsonify({"ok": True, "timescales": ts}), 200
-    except ValidationError as e:
-        return _json_error("validation_error", e.errors(), 400)
-    except Exception as e:
-        return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
-
-
-# ───────────────────────────── Chart / Houses glue (kept; uses timescales) ─────────────────────────────
+# ───────────────────────── chart / houses ─────────────────────────
 # compute_chart engine discovery (primary + fallback)
 _compute_chart = None  # type: ignore
 _CHART_ENGINE_NAME: Optional[str] = None
@@ -426,7 +366,7 @@ except Exception as e1:  # pragma: no cover
         _CHART_ENGINE_NAME = None
         log.error("No compute_chart available: astronomy failed=%r, chart failed=%r", e1, e2)
 
-# house engines: prefer policy façade
+# house engine (policy façade preferred)
 _HOUSES_KIND = "policy"
 _can_sys = None
 try:
@@ -454,90 +394,65 @@ def _sig_accepts(fn, *names: str) -> Dict[str, bool]:
     try:
         params = fn.__signature__.parameters  # type: ignore[attr-defined]
     except Exception:
-        try:
-            import inspect
-            params = inspect.signature(fn).parameters
-        except Exception:
-            return {n: False for n in names}
+        import inspect
+        params = inspect.signature(fn).parameters
     return {n: (n in params) for n in names}
 
 
 def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str, Any]:
     """
     Calls the chart engine with maximum compatibility:
-      • Path A: engine accepts a single `payload` argument -> inject normalized fields
-        and timescales/JDs INTO a copy of payload; no extra kwargs.
-      • Path B: legacy engines -> pass only kwargs they explicitly accept.
-
-    Always attaches engine label + JDs to the returned chart.
+      • Path A: engine(payload) — inject normalized fields & timescales into payload copy
+      • Path B: legacy signatures — only pass kwargs the engine advertises
+    Always attaches engine label + JDs to returned chart.
     """
     if _compute_chart is None:
         raise RuntimeError("chart_engine_unavailable")
 
     import inspect
-    sig = inspect.signature(_compute_chart)
-    params = sig.parameters
-    param_names = set(params.keys())
+    param_names = set(inspect.signature(_compute_chart).parameters.keys())
 
-    # Helper: choose first accepted name from candidates
     def pick(*cands: str) -> Optional[str]:
         for c in cands:
             if c in param_names:
                 return c
         return None
 
-    # ---------- small normalizer for engines that consume a single payload ----------
     def _normalize_payload_for_engine(p: Dict[str, Any]) -> Dict[str, Any]:
-        q = dict(p)  # shallow copy
-        # center: derive from topocentric flag
-        if "center" not in q:
-            if bool(q.get("topocentric")):
-                q["center"] = "topocentric"
-            else:
-                q["center"] = "geocentric"
-        # frame default for ecliptic longitude engines
+        q = dict(p)
+        q.setdefault("center", "topocentric" if bool(q.get("topocentric")) else "geocentric")
         q.setdefault("frame", "ecliptic-of-date")
-
-        # bodies -> names (some engines read 'names')
         bodies = q.get("bodies")
         if isinstance(bodies, list):
             if all(isinstance(b, str) for b in bodies):
                 q.setdefault("names", bodies)
             elif all(isinstance(b, dict) for b in bodies):
                 q.setdefault("names", [str(b.get("name") or b.get("body") or "").strip() for b in bodies])
-
-        # ensure ayanamsa string is passed if present (sidereal engines)
         if "ayanamsa" in q and isinstance(q["ayanamsa"], str):
             q["ayanamsa"] = q["ayanamsa"].strip().lower()
-
-        # inject timescales/JDs so engines relying on them can read from payload
         q.setdefault("jd_ut", ts["jd_utc"])
         q.setdefault("jd_tt", ts["jd_tt"])
         q.setdefault("jd_ut1", ts["jd_ut1"])
         q.setdefault("timescales", ts)
         return q
 
-    # -------- Path A: modern engine expects a single `payload` argument --------
+    # Path A
     if "payload" in param_names:
         payload2 = _normalize_payload_for_engine(payload)
         try:
-            chart = _compute_chart(payload2)  # no extra kwargs
+            chart = _compute_chart(payload2)  # type: ignore[arg-type]
         except Exception as e:
-            # Surface the error to help debugging (remove if undesired)
             chart = {
                 "mode": payload.get("mode"),
                 "jd_ut": ts["jd_utc"],
                 "jd_tt": ts["jd_tt"],
                 "jd_ut1": ts["jd_ut1"],
                 "meta": {"engine": _CHART_ENGINE_NAME, "warnings": ["chart_failed"]},
-                "error": str(e),
+                "error": str(e) if DEBUG_VERBOSE else "chart_failed",
             }
-
     else:
-        # -------- Path B: legacy engines with expanded kwargs --------
+        # Path B (legacy)
         kwargs: Dict[str, Any] = {}
-
-        # civil fields (if engine wants them)
         if pick("date", "date_str", "date_s"):
             kwargs[pick("date", "date_str", "date_s")] = payload.get("date")
         if pick("time", "time_str", "time_s"):
@@ -567,7 +482,6 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
         if "frame" in payload and pick("frame"):
             kwargs["frame"] = payload["frame"]
 
-        # timescales/JDs injection to kwargs when engine advertises those params
         if "timescales" in param_names:
             kwargs["timescales"] = ts
         if "jd_tt" in param_names:
@@ -588,10 +502,9 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
                 "jd_tt": ts["jd_tt"],
                 "jd_ut1": ts["jd_ut1"],
                 "meta": {"engine": _CHART_ENGINE_NAME, "warnings": ["chart_failed"]},
-                "error": str(e),
+                "error": str(e) if DEBUG_VERBOSE else "chart_failed",
             }
 
-    # Post-process: attach engine + JDs; backfill mode if engine didn’t return it
     chart = chart or {}
     chart.setdefault("meta", {})
     chart["meta"]["engine"] = _CHART_ENGINE_NAME or "unknown"
@@ -603,10 +516,21 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
     return chart
 
 
+def _sig_accepts_houses() -> Dict[str, bool]:
+    if _houses_fn is None:
+        return {}
+    return _sig_accepts(
+        _houses_fn, "lat", "lon", "latitude", "longitude",
+        "system", "requested_house_system", "house_system",
+        "mode", "jd_ut", "jd_tt", "jd_ut1", "diagnostics", "validation",
+    )
+
+
 def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
     if _houses_fn is None:
         raise RuntimeError("houses_engine_unavailable")
 
+    acc = _sig_accepts_houses()
     lat = float(payload["latitude"])
     lon = float(payload["longitude"])
 
@@ -616,45 +540,39 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
         else (requested_system_raw.lower() or None)
     )
 
-    accepts = _sig_accepts(
-        _houses_fn, "lat", "lon", "latitude", "longitude",
-        "system", "requested_house_system", "house_system",
-        "mode", "jd_ut", "jd_tt", "jd_ut1", "diagnostics", "validation",
-    )
-
     kwargs: Dict[str, Any] = {}
-    if accepts.get("lat"):
+    if acc.get("lat"):
         kwargs["lat"] = lat
-    elif accepts.get("latitude"):
+    elif acc.get("latitude"):
         kwargs["latitude"] = lat
     else:
         kwargs["lat"] = lat
 
-    if accepts.get("lon"):
+    if acc.get("lon"):
         kwargs["lon"] = lon
-    elif accepts.get("longitude"):
+    elif acc.get("longitude"):
         kwargs["longitude"] = lon
     else:
         kwargs["lon"] = lon
 
     if requested_system:
-        if accepts.get("system"):
+        if acc.get("system"):
             kwargs["system"] = requested_system
-        elif accepts.get("requested_house_system"):
+        elif acc.get("requested_house_system"):
             kwargs["requested_house_system"] = requested_system
-        elif accepts.get("house_system"):
+        elif acc.get("house_system"):
             kwargs["house_system"] = requested_system
 
-    if accepts.get("jd_tt"):
+    if acc.get("jd_tt"):
         kwargs["jd_tt"] = ts["jd_tt"]
-    if accepts.get("jd_ut1"):
+    if acc.get("jd_ut1"):
         kwargs["jd_ut1"] = ts["jd_ut1"]
-    if accepts.get("jd_ut") and "jd_tt" not in kwargs and "jd_ut1" not in kwargs:
+    if acc.get("jd_ut") and "jd_tt" not in kwargs and "jd_ut1" not in kwargs:
         kwargs["jd_ut"] = ts["jd_utc"]
 
-    if accepts.get("diagnostics") and "diagnostics" in payload:
+    if acc.get("diagnostics") and "diagnostics" in payload:
         kwargs["diagnostics"] = bool(payload["diagnostics"])
-    if accepts.get("validation") and "validation" in payload:
+    if acc.get("validation") and "validation" in payload:
         kwargs["validation"] = bool(payload["validation"])
 
     return _houses_fn(**kwargs)
@@ -722,25 +640,17 @@ def _recompute_houses_angles_if_needed(
     if isinstance(asc_old, (int, float)):
         d_asc = _delta_arcsec(asc_new, float(asc_old))
         if d_asc > ARCSEC_TOL:
-            h["asc_deg"] = _wrap360(asc_new)
-            h["asc"] = h["asc_deg"]
-            changed = True
+            h["asc_deg"] = _wrap360(asc_new); h["asc"] = h["asc_deg"]; changed = True
             warn_list.append(f"asc_corrected_for_parity({d_asc:.2f}arcsec)")
     else:
-        h["asc_deg"] = _wrap360(asc_new)
-        h["asc"] = h["asc_deg"]
-        changed = True
+        h["asc_deg"] = _wrap360(asc_new); h["asc"] = h["asc_deg"]; changed = True
     if isinstance(mc_old, (int, float)):
         d_mc = _delta_arcsec(mc_new, float(mc_old))
         if d_mc > ARCSEC_TOL:
-            h["mc_deg"] = _wrap360(mc_new)
-            h["mc"] = h["mc_deg"]
-            changed = True
+            h["mc_deg"] = _wrap360(mc_new); h["mc"] = h["mc_deg"]; changed = True
             warn_list.append(f"mc_corrected_for_parity({d_mc:.2f}arcsec)")
     else:
-        h["mc_deg"] = _wrap360(mc_new)
-        h["mc"] = h["mc_deg"]
-        changed = True
+        h["mc_deg"] = _wrap360(mc_new); h["mc"] = h["mc_deg"]; changed = True
     if changed:
         h["warnings"] = warn_list
     return _normalize_houses_payload(h)
@@ -763,7 +673,7 @@ def _prepare_chart_for_predict(chart: Dict[str, Any]) -> Dict[str, Any]:
     return ch
 
 
-# calculate/report endpoints (left intact; depend on validators + engines)
+# ───────────────────────── endpoints ─────────────────────────
 @api.post("/api/calculate")
 def calculate():
     try:
@@ -772,9 +682,9 @@ def calculate():
         hs = str(body.get("house_system", "")).strip()
         if hs:
             payload["house_system"] = hs
-    for k in ("bodies", "points", "ayanamsa", "topocentric", "elevation_m", "dut1"):
-    if k in body:
-        payload[k] = body[k]    
+        for k in ("bodies", "points", "ayanamsa", "topocentric", "elevation_m", "dut1"):
+            if k in body:
+                payload[k] = body[k]
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
     except Exception as e:
@@ -783,7 +693,6 @@ def calculate():
     tz_name = payload.get("place_tz") or payload.get("timezone") or "UTC"
     ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name, payload=payload)
 
-    # chart
     try:
         chart = _call_compute_chart(payload, ts)
     except Exception as e:
@@ -797,7 +706,6 @@ def calculate():
         if DEBUG_VERBOSE:
             chart["error"] = str(e)
 
-    # houses
     try:
         houses = _call_compute_houses(payload, ts)
         houses = _normalize_houses_payload(houses)
@@ -808,7 +716,6 @@ def calculate():
     except Exception as e:
         return _json_error("houses_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
-    # sidereal rotation of angles/cusps to chart ayanamsa (if provided)
     mode = (payload.get("mode") or "tropical").lower()
     if mode == "sidereal":
         ay = _extract_ayanamsa_from_chart(chart)
@@ -846,8 +753,8 @@ def report():
         if hs:
             payload["house_system"] = hs
         for k in ("bodies", "points", "ayanamsa", "topocentric", "elevation_m", "dut1"):
-    if k in body:
-        payload[k] = body[k]
+            if k in body:
+                payload[k] = body[k]
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
 
@@ -910,7 +817,7 @@ def report():
     return jsonify({"ok": True, "chart": chart, "houses": houses, "narrative": narrative, "meta": meta}), 200
 
 
-# ───────────────────────────── Predictions (optional engine) ─────────────────────────────
+# ───────────────────────── predictions ─────────────────────────
 @api.post("/predictions")
 def predictions_route():
     if predict_engine is None:
@@ -923,8 +830,8 @@ def predictions_route():
         if hs:
             payload["house_system"] = hs
         for k in ("bodies", "points", "ayanamsa", "topocentric", "elevation_m", "dut1"):
-    if k in body:
-        payload[k] = body[k]
+            if k in body:
+                payload[k] = body[k]
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
 
@@ -966,7 +873,6 @@ def predictions_route():
     houses = _recompute_houses_angles_if_needed(houses, ts, payload, chart)
     chart_for_predict = _prepare_chart_for_predict(chart)
 
-    # thresholds
     th_path = os.environ.get("ASTRO_HC_THRESHOLDS", "config/hc_thresholds.json")
     try:
         with open(th_path, "r", encoding="utf-8") as f:
@@ -997,7 +903,6 @@ def predictions_route():
         except Exception:
             pass
 
-    # predictions
     try:
         result = predict_engine(chart_for_predict, houses, horizon)
         raw_preds = result.get("predictions") if isinstance(result, dict) else result
@@ -1024,7 +929,7 @@ def predictions_route():
                 "abstained": abstained,
                 "evidence": pr.get("evidence"),
                 "mode": chart.get("mode"),
-                "ayanamsa_deg": (_extract_ayanamsa_from_chart(chart)),
+                "ayanamsa_deg": _extract_ayanamsa_from_chart(chart),
                 "notes": "QIA+calibrated placeholder; subject to M3 tuning "
                          + ("abstained" if abstained else "accepted"),
             }
@@ -1046,7 +951,7 @@ def predictions_route():
     return jsonify({"ok": True, "predictions": preds, "meta": meta}), 200
 
 
-# ───────────────────────────── Ephemeris adapter endpoints ─────────────────────────────
+# ───────────────────────── ephemeris ─────────────────────────
 def _norm_rows_from_longitudes(raw: Any) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     if raw is None:
@@ -1097,31 +1002,8 @@ def _norm_rows_from_lv(raw: Any) -> List[Dict[str, Any]]:
     return list(rows.values())
 
 
-@api.post("/api/ephemeris/diagnostics")
-def ephemeris_diagnostics_endpoint():
-    """POST-only diagnostics limited to majors + nodes (avoids SPICE)."""
-    try:
-        from app.core import ephemeris_adapter as ea
-        majors_plus_nodes = [
-            "Sun", "Moon", "Mercury", "Venus", "Mars",
-            "Jupiter", "Saturn", "Uranus", "Neptune", "Pluto",
-            "North Node", "South Node",
-        ]
-        return jsonify(ea.ephemeris_diagnostics(requested=majors_plus_nodes)), 200
-    except Exception as e:
-        return _json_error("ephemeris_diag_error", str(e) if DEBUG_VERBOSE else None, 500)
-
-
 @api.post("/api/ephemeris/longitudes")
 def ephemeris_longitudes_endpoint():
-    """
-    Body can include either:
-      • jd_tt (number), OR civil inputs (date, time, place_tz|tz).
-      • bodies: [ 'sun','moon','mercury', ... ]
-      • frame: 'ecliptic-of-date' | 'ecliptic-j2000' (default ecliptic-of-date)
-      • center: 'geocentric' | 'topocentric' (default geocentric)
-      • latitude/longitude/elev_m required when center='topocentric'
-    """
     try:
         body = request.get_json(force=True) or {}
         payload = parse_ephemeris_payload(body, require_bodies=True)
@@ -1155,7 +1037,6 @@ def ephemeris_longitudes_endpoint():
         return _json_error("ephemeris_longitudes_error", str(e) if DEBUG_VERBOSE else None, 500)
 
     rows = _norm_rows_from_longitudes(raw)
-
     requested = [b.lower() for b in bodies]
     name_map = {b.lower(): n for b, n in zip(bodies, names)}
     by_body = {r["body"]: r for r in rows if isinstance(r.get("longitude"), (int, float))}
@@ -1166,24 +1047,12 @@ def ephemeris_longitudes_endpoint():
     ]
 
     return jsonify(
-        {
-            "ok": True,
-            "jd_tt": float(jd_tt),
-            "frame": frame,
-            "center": center,
-            "units": {"angles": "deg"},
-            "results": ordered,
-        }
+        {"ok": True, "jd_tt": float(jd_tt), "frame": frame, "center": center, "units": {"angles": "deg"}, "results": ordered}
     ), 200
 
 
 @api.post("/api/ephemeris/longitudes_and_velocities")
 def ephemeris_lv_endpoint():
-    """
-    Same inputs as /ephemeris/longitudes (names optional).
-    Returns:
-      { ok, jd_tt, frame, center, units, results: [ { body, name, longitude, velocity } ... ] }
-    """
     try:
         body = request.get_json(force=True) or {}
         payload = parse_ephemeris_payload(body, require_bodies=True)
@@ -1217,7 +1086,6 @@ def ephemeris_lv_endpoint():
         return _json_error("ephemeris_lv_error", str(e) if DEBUG_VERBOSE else None, 500)
 
     rows = _norm_rows_from_lv(raw)
-
     requested = [b.lower() for b in bodies]
     name_map = {b.lower(): n for b, n in zip(bodies, names)}
     by_body = {
@@ -1248,7 +1116,7 @@ def ephemeris_lv_endpoint():
     ), 200
 
 
-# ───────────────────────────── Rectification (quick) ─────────────────────────────
+# ───────────────────────── rectification ─────────────────────────
 @api.post("/rectification/quick")
 def rect_quick():
     try:
@@ -1261,23 +1129,7 @@ def rect_quick():
     return jsonify({"ok": True, **result}), 200
 
 
-# ───────────────────────────── Dev ephemeris / system validation ─────────────────────────────
-@api.get("/api/dev/ephem")
-def dev_ephem_status():
-    try:
-        from app.core import ephemeris_adapter as ea
-        eph, path = ea.load_kernel()
-        return jsonify(
-            {
-                "skyfield_available": ea._skyfield_available(),
-                "kernel_loaded": bool(eph),
-                "kernel_path": path,
-            }
-        ), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": repr(e)}), 500
-
-
+# ───────────────────────── system-validation (optional) ─────────────────────────
 @api.get("/system-validation")
 def system_validation():
     cfg = load_config(os.environ.get("ASTRO_CONFIG", "config/defaults.yaml"))
@@ -1298,16 +1150,6 @@ def system_validation():
     except Exception:
         pass
 
-    policy = {
-        "houses_engine": _HOUSES_KIND,
-        "polar": {
-            "soft_fallback_lat_gt": float(POLAR_SOFT_LIMIT_DEG),
-            "hard_reject_lat_ge": float(POLAR_HARD_LIMIT_DEG),
-            "numeric_fallback": os.getenv("ASTRO_HOUSES_NUMERIC_FALLBACK", "1").lower()
-            in ("1", "true", "yes", "on"),
-        },
-    }
-
     try:
         now_utc = datetime.now(timezone.utc)
         ts_now = _compute_timescales_from_local(
@@ -1325,6 +1167,16 @@ def system_validation():
         }
     except Exception:
         ts_sample = None
+
+    policy = {
+        "houses_engine": _HOUSES_KIND,
+        "polar": {
+            "soft_fallback_lat_gt": float(POLAR_SOFT_LIMIT_DEG),
+            "hard_reject_lat_ge": float(POLAR_HARD_LIMIT_DEG),
+            "numeric_fallback": os.getenv("ASTRO_HOUSES_NUMERIC_FALLBACK", "1").lower()
+            in ("1", "true", "yes", "on"),
+        },
+    }
 
     return jsonify(
         {
