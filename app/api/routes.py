@@ -6,8 +6,11 @@ AstroApp — Canonical API Routes
 - Predictions
 - Ephemeris
 - Rectification
-- Ops: /api/health, /api/config, /api/openapi
-No aliases, no dev echo endpoints.
+- Ops: /api/health, /api/config, /api/openapi, /__debug/routes
+
+Notes:
+- Topocentric ephemeris honored via either center:"topocentric" or topocentric:true
+- Ephemeris responses include adapter meta (with meta.topocentric)
 """
 
 from __future__ import annotations
@@ -18,9 +21,9 @@ import os
 import re
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, current_app
 from zoneinfo import ZoneInfo
 
 from app.version import VERSION
@@ -323,6 +326,20 @@ def openapi_spec():
         except Exception:
             continue
     return _json_error("openapi_not_found", None, 404)
+
+
+@api.get("/__debug/routes")
+def debug_routes():
+    """Simple route index used by the frontend 'Routes' page."""
+    rules = []
+    for r in current_app.url_map.iter_rules():
+        # Skip static handler
+        if r.endpoint == "static":
+            continue
+        methods = sorted(m for m in r.methods if m not in {"HEAD", "OPTIONS"})
+        rules.append({"rule": str(r), "methods": methods, "endpoint": r.endpoint})
+    rules.sort(key=lambda x: x["rule"])
+    return jsonify({"ok": True, "routes": rules}), 200
 
 
 # ───────────────────────── timescales ─────────────────────────
@@ -960,14 +977,17 @@ def predictions_route():
 
 
 # ───────────────────────── ephemeris ─────────────────────────
-def _norm_rows_from_longitudes(raw: Any) -> List[Dict[str, Any]]:
+def _norm_rows_from_longitudes(raw: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
+    meta: Dict[str, Any] = {}
+    if isinstance(raw, dict):
+        meta = dict(raw.get("meta") or {})
     if raw is None:
-        return rows
+        return rows, meta
     if isinstance(raw, dict) and all(isinstance(v, (int, float)) for v in raw.values()):
         for k, v in raw.items():
             rows.append({"body": str(k).lower(), "name": str(k), "longitude": float(v)})
-        return rows
+        return rows, meta
     data = raw.get("results") if isinstance(raw, dict) and isinstance(raw.get("results"), list) else raw
     if isinstance(data, list):
         for r in data:
@@ -980,17 +1000,20 @@ def _norm_rows_from_longitudes(raw: Any) -> List[Dict[str, Any]]:
                 L = r.get("longitude") or r.get("lon") or r.get("lambda") or r.get("ecliptic_longitude")
                 if body and isinstance(L, (int, float)):
                     rows.append({"body": str(body).lower(), "name": str(r.get("name") or body), "longitude": float(L)})
-    return rows
+    return rows, meta
 
 
-def _norm_rows_from_lv(raw: Any) -> List[Dict[str, Any]]:
-    rows: Dict[str, Dict[str, Any]] = {}
+def _norm_rows_from_lv(raw: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    rows_map: Dict[str, Dict[str, Any]] = {}
+    meta: Dict[str, Any] = {}
+    if isinstance(raw, dict):
+        meta = dict(raw.get("meta") or {})
     if isinstance(raw, dict) and "longitudes" in raw and "velocities" in raw:
         for k, v in (raw.get("longitudes") or {}).items():
-            rows.setdefault(str(k).lower(), {"body": str(k).lower(), "name": str(k)})["longitude"] = float(v)
+            rows_map.setdefault(str(k).lower(), {"body": str(k).lower(), "name": str(k)})["longitude"] = float(v)
         for k, v in (raw.get("velocities") or {}).items():
-            rows.setdefault(str(k).lower(), {"body": str(k).lower(), "name": str(k)})["velocity"] = float(v)
-        return list(rows.values())
+            rows_map.setdefault(str(k).lower(), {"body": str(k).lower(), "name": str(k)})["velocity"] = float(v)
+        return list(rows_map.values()), meta
     data = raw.get("results") if isinstance(raw, dict) and isinstance(raw.get("results"), list) else raw
     if isinstance(data, list):
         for r in data:
@@ -1000,14 +1023,14 @@ def _norm_rows_from_lv(raw: Any) -> List[Dict[str, Any]]:
             if not body:
                 continue
             key = str(body).lower()
-            rec = rows.setdefault(key, {"body": key, "name": str(r.get("name") or body)})
+            rec = rows_map.setdefault(key, {"body": key, "name": str(r.get("name") or body)})
             L = r.get("longitude") or r.get("lon") or r.get("lambda") or r.get("ecliptic_longitude")
-            V = r.get("velocity") or r.get("vel") or r.get("dlambda_dt") or r.get("deg_per_day")
+            V = r.get("velocity") or r.get("vel") or r.get("dlambda_dt") or r.get("deg_per_day") or r.get("speed")
             if isinstance(L, (int, float)):
                 rec["longitude"] = float(L)
             if isinstance(V, (int, float)):
                 rec["velocity"] = float(V)
-    return list(rows.values())
+    return list(rows_map.values()), meta
 
 
 @api.post("/api/ephemeris/longitudes")
@@ -1025,10 +1048,10 @@ def ephemeris_longitudes_endpoint():
     center = payload["center"]
     lat = payload.get("latitude")
     lon = payload.get("longitude")
-    elev_m = payload.get("elev_m", 0.0)
+    elev_m = payload.get("elev_m", payload.get("elevation_m", 0.0))
     bodies = payload["bodies"]
     names = payload["names"]
-    topocentric = (center == "topocentric")
+    topocentric = (center == "topocentric") or bool(payload.get("topocentric"))
 
     try:
         from app.core import ephemeris_adapter as ea
@@ -1044,7 +1067,7 @@ def ephemeris_longitudes_endpoint():
     except Exception as e:
         return _json_error("ephemeris_longitudes_error", str(e) if DEBUG_VERBOSE else None, 500)
 
-    rows = _norm_rows_from_longitudes(raw)
+    rows, meta = _norm_rows_from_longitudes(raw)
     requested = [b.lower() for b in bodies]
     name_map = {b.lower(): n for b, n in zip(bodies, names)}
     by_body = {r["body"]: r for r in rows if isinstance(r.get("longitude"), (int, float))}
@@ -1054,8 +1077,21 @@ def ephemeris_longitudes_endpoint():
         if b in by_body
     ]
 
+    # Pass through adapter meta + our echo of center/frame
+    meta_out = dict(meta)
+    meta_out.setdefault("frame", frame)
+    meta_out.setdefault("topocentric", bool(topocentric))
+
     return jsonify(
-        {"ok": True, "jd_tt": float(jd_tt), "frame": frame, "center": center, "units": {"angles": "deg"}, "results": ordered}
+        {
+            "ok": True,
+            "jd_tt": float(jd_tt),
+            "frame": frame,
+            "center": center,
+            "units": {"angles": "deg"},
+            "meta": meta_out,
+            "results": ordered,
+        }
     ), 200
 
 
@@ -1074,10 +1110,10 @@ def ephemeris_lv_endpoint():
     center = payload["center"]
     lat = payload.get("latitude")
     lon = payload.get("longitude")
-    elev_m = payload.get("elev_m", 0.0)
+    elev_m = payload.get("elev_m", payload.get("elevation_m", 0.0))
     bodies = payload["bodies"]
     names = payload["names"]
-    topocentric = (center == "topocentric")
+    topocentric = (center == "topocentric") or bool(payload.get("topocentric"))
 
     try:
         from app.core import ephemeris_adapter as ea
@@ -1093,7 +1129,7 @@ def ephemeris_lv_endpoint():
     except Exception as e:
         return _json_error("ephemeris_lv_error", str(e) if DEBUG_VERBOSE else None, 500)
 
-    rows = _norm_rows_from_lv(raw)
+    rows, meta = _norm_rows_from_lv(raw)
     requested = [b.lower() for b in bodies]
     name_map = {b.lower(): n for b, n in zip(bodies, names)}
     by_body = {
@@ -1112,6 +1148,10 @@ def ephemeris_lv_endpoint():
         if b in by_body
     ]
 
+    meta_out = dict(meta)
+    meta_out.setdefault("frame", frame)
+    meta_out.setdefault("topocentric", bool(topocentric))
+
     return jsonify(
         {
             "ok": True,
@@ -1119,6 +1159,7 @@ def ephemeris_lv_endpoint():
             "frame": frame,
             "center": center,
             "units": {"angles": "deg", "velocities": "deg/day"},
+            "meta": meta_out,
             "results": ordered,
         }
     ), 200
