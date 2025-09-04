@@ -1050,50 +1050,50 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
     if missing_bodies:
         _warn_add(warnings, _seen, _W.ADAPTER_MISS_BODIES, ", ".join(missing_bodies))
 
-# Points (nodes): always geocentric; speed = None (with placeholders if missing)
-out_points: List[Dict[str, Any]] = []
+    # Points (nodes): always geocentric; speed = None (with placeholders if missing)
+    out_points: List[Dict[str, Any]] = []
     if points_req:
         lon_map_nodes, source_nodes = _longitudes_only_geocentric(jd_tt, points_req)
 
-    # Fill counterpart by 180° if only one present
-    need_n = ("North Node" in points_req) and ("North Node" not in lon_map_nodes)
-    need_s = ("South Node" in points_req) and ("South Node" not in lon_map_nodes)
-    if need_n or need_s:
-        if "North Node" in lon_map_nodes and need_s:
-            lon_map_nodes["South Node"] = _norm360(lon_map_nodes["North Node"] + 180.0)
-        elif "South Node" in lon_map_nodes and need_n:
-            lon_map_nodes["North Node"] = _norm360(lon_map_nodes["South Node"] + 180.0)
-        else:
-            missing = []
-            if need_n: missing.append("North Node")
-            if need_s: missing.append("South Node")
-            extra_map, _ = _longitudes_only_geocentric(jd_tt, missing)
-            lon_map_nodes.update(extra_map)
+        # Fill counterpart by 180° if only one present
+        need_n = ("North Node" in points_req) and ("North Node" not in lon_map_nodes)
+        need_s = ("South Node" in points_req) and ("South Node" not in lon_map_nodes)
+        if need_n or need_s:
+            if "North Node" in lon_map_nodes and need_s:
+                lon_map_nodes["South Node"] = _norm360(lon_map_nodes["North Node"] + 180.0)
+            elif "South Node" in lon_map_nodes and need_n:
+                lon_map_nodes["North Node"] = _norm360(lon_map_nodes["South Node"] + 180.0)
+            else:
+                missing = []
+                if need_n: missing.append("North Node")
+                if need_s: missing.append("South Node")
+                extra_map, _ = _longitudes_only_geocentric(jd_tt, missing)
+                lon_map_nodes.update(extra_map)
 
-    for nm in points_req:
-        if nm not in lon_map_nodes:
-            _warn_add(warnings, _seen, _W.ADAPTER_MISS_POINTS, nm)
+        for nm in points_req:
+            if nm not in lon_map_nodes:
+                _warn_add(warnings, _seen, _W.ADAPTER_MISS_POINTS, nm)
+                out_points.append({
+                    "name": nm, "is_point": True,
+                    "lon": None, "longitude_deg": None,
+                    "speed": None, "speed_deg_per_day": None, "lat": None,
+                })
+                continue
+            lon_deg = float(lon_map_nodes[nm])
+            if mode == "sidereal" and ay_deg is not None:
+                lon_deg = _norm360(lon_deg - float(ay_deg))
             out_points.append({
-                "name": nm, "is_point": True,
-                "lon": None, "longitude_deg": None,
-                "speed": None, "speed_deg_per_day": None, "lat": None,
+                "name": nm,
+                "is_point": True,
+                "lon": float(_norm360(lon_deg)),
+                "longitude_deg": float(_norm360(lon_deg)),
+                "speed": None,
+                "speed_deg_per_day": None,
+                "lat": None,
             })
-            continue
-        lon_deg = float(lon_map_nodes[nm])
-        if mode == "sidereal" and ay_deg is not None:
-            lon_deg = _norm360(lon_deg - float(ay_deg))
-        out_points.append({
-            "name": nm,
-            "is_point": True,
-            "lon": float(_norm360(lon_deg)),
-            "longitude_deg": float(_norm360(lon_deg)),
-            "speed": None,
-            "speed_deg_per_day": None,
-            "lat": None,
-        })
 
-    if source_nodes and source_nodes != source_tag:
-        _warn_add(warnings, _seen, _W.PTS_SOURCE_MISMATCH, source_nodes)
+        if source_nodes and source_nodes != source_tag:
+            _warn_add(warnings, _seen, _W.PTS_SOURCE_MISMATCH, source_nodes)
 
     # Angles
     asc_deg, mc_deg, dbg = _compute_angles(
@@ -1132,4 +1132,5 @@ out_points: List[Dict[str, Any]] = []
         "meta": meta,
         "warnings": warnings,  # top-level mirror (deduped)
     }
-    return out
+    return out ---
+    
