@@ -24,13 +24,6 @@ except Exception as e:  # pragma: no cover
     print("WARNING: routes blueprint failed to import:", _routes_import_err, file=sys.stderr)
     traceback.print_exc()
 
-# Optional config loader (used by debug/system endpoints only)
-try:
-    from app.utils.config import load_config  # type: ignore
-except Exception as e:  # pragma: no cover
-    print("INFO: app.utils.config.load_config not available:", repr(e), file=sys.stderr)
-    load_config = None  # type: ignore
-
 # ───────────────────────── Prometheus (safe shim) ─────────────────────────
 try:
     from prometheus_client import (  # type: ignore
@@ -42,11 +35,11 @@ except Exception:  # pragma: no cover
         def inc(self, *_a, **_k): return None
         def observe(self, *_a, **_k): return None
         def set(self, *_a, **_k): return None
-    def Counter(_n: str, _h: str, _lbls: list[str] | tuple[str, ...]): return _NoOpMetric()  # type: ignore
+    def Counter(_n: str, _h: str, _lbls: list[str] | tuple[str, ...] = ()): return _NoOpMetric()  # type: ignore
     def Gauge(_n: str, _h: str): return _NoOpMetric()  # type: ignore
-    def Histogram(_n: str, _h: str, _lbls: list[str] | tuple[str, ...]): return _NoOpMetric()  # type: ignore
+    def Histogram(_n: str, _h: str, _lbls: list[str] | tuple[str, ...] = ()): return _NoOpMetric()  # type: ignore
     CONTENT_TYPE_LATEST = "text/plain; version=0.0.4; charset=utf-8"  # type: ignore
-    class _NoRegistry: pass
+    class _NoRegistry: ...
     REGISTRY = _NoRegistry()  # type: ignore
     def generate_latest(_reg=None): return b""  # type: ignore
 
@@ -96,6 +89,8 @@ def create_app() -> Flask:
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)  # type: ignore
 
     _configure_logging(app)
+    _register_errors(app)
+
     GAUGE_APP_UP.set(1.0)
 
     # Seed a few paths so histograms have labels
@@ -168,7 +163,13 @@ def create_app() -> Flask:
 
     # ───── Register the core API blueprint (all canonical routes live there) ─────
     if _routes_bp is not None:
-        app.register_blueprint(_routes_bp)  # routes are defined with absolute /api/... paths inside the blueprint
+        # routes.py uses absolute '/api/...' paths; no url_prefix needed
+        app.register_blueprint(_routes_bp)
+    else:
+        # Minimal fallback so health dashboards don’t look totally red
+        @app.get("/api/health")
+        def _health_fallback():
+            return jsonify(ok=False, error="routes_blueprint_not_loaded", detail=_routes_import_err), 500
 
     app.logger.info("App initialized; routes_loaded=%s", bool(_routes_bp))
     return app
