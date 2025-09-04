@@ -465,10 +465,9 @@ def _sig_accepts(fn, *names: str) -> Dict[str, bool]:
 def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str, Any]:
     """
     Calls the chart engine with maximum compatibility:
-      • If engine signature includes `payload`, pass a single payload object with
-        timescales/JDs injected INTO that payload (no extra kwargs).
-      • Else, keep legacy kwargs mapping (date/time/lat/lon/etc.), injecting JDs
-        only if the engine signature advertises those params.
+      • Path A: engine accepts a single `payload` argument -> inject normalized fields
+        and timescales/JDs INTO a copy of payload; no extra kwargs.
+      • Path B: legacy engines -> pass only kwargs they explicitly accept.
 
     Always attaches engine label + JDs to the returned chart.
     """
@@ -487,17 +486,52 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
                 return c
         return None
 
+    # ---------- small normalizer for engines that consume a single payload ----------
+    def _normalize_payload_for_engine(p: Dict[str, Any]) -> Dict[str, Any]:
+        q = dict(p)  # shallow copy
+        # center: derive from topocentric flag
+        if "center" not in q:
+            if bool(q.get("topocentric")):
+                q["center"] = "topocentric"
+            else:
+                q["center"] = "geocentric"
+        # frame default for ecliptic longitude engines
+        q.setdefault("frame", "ecliptic-of-date")
+
+        # bodies -> names (some engines read 'names')
+        bodies = q.get("bodies")
+        if isinstance(bodies, list):
+            if all(isinstance(b, str) for b in bodies):
+                q.setdefault("names", bodies)
+            elif all(isinstance(b, dict) for b in bodies):
+                q.setdefault("names", [str(b.get("name") or b.get("body") or "").strip() for b in bodies])
+
+        # ensure ayanamsa string is passed if present (sidereal engines)
+        if "ayanamsa" in q and isinstance(q["ayanamsa"], str):
+            q["ayanamsa"] = q["ayanamsa"].strip().lower()
+
+        # inject timescales/JDs so engines relying on them can read from payload
+        q.setdefault("jd_ut", ts["jd_utc"])
+        q.setdefault("jd_tt", ts["jd_tt"])
+        q.setdefault("jd_ut1", ts["jd_ut1"])
+        q.setdefault("timescales", ts)
+        return q
+
     # -------- Path A: modern engine expects a single `payload` argument --------
     if "payload" in param_names:
-        # Inject timescales/JDs directly into the payload copy to avoid unexpected kwargs
-        payload2: Dict[str, Any] = dict(payload)  # shallow copy
-        # Standardize expected fields for engines that read from payload
-        payload2.setdefault("jd_ut", ts["jd_utc"])
-        payload2.setdefault("jd_tt", ts["jd_tt"])
-        payload2.setdefault("jd_ut1", ts["jd_ut1"])
-        payload2.setdefault("timescales", ts)
-
-        chart = _compute_chart(payload2)  # <- no extra kwargs passed
+        payload2 = _normalize_payload_for_engine(payload)
+        try:
+            chart = _compute_chart(payload2)  # no extra kwargs
+        except Exception as e:
+            # Surface the error to help debugging (remove if undesired)
+            chart = {
+                "mode": payload.get("mode"),
+                "jd_ut": ts["jd_utc"],
+                "jd_tt": ts["jd_tt"],
+                "jd_ut1": ts["jd_ut1"],
+                "meta": {"engine": _CHART_ENGINE_NAME, "warnings": ["chart_failed"]},
+                "error": str(e),
+            }
 
     else:
         # -------- Path B: legacy engines with expanded kwargs --------
@@ -540,13 +574,22 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
             kwargs["jd_tt"] = ts["jd_tt"]
         if "jd_ut1" in param_names:
             kwargs["jd_ut1"] = ts["jd_ut1"]
-        # Support both jd_utc and jd_ut parameter names
         if "jd_utc" in param_names:
             kwargs["jd_utc"] = ts["jd_utc"]
         elif "jd_ut" in param_names:
             kwargs["jd_ut"] = ts["jd_utc"]
 
-        chart = _compute_chart(**kwargs)
+        try:
+            chart = _compute_chart(**kwargs)
+        except Exception as e:
+            chart = {
+                "mode": payload.get("mode"),
+                "jd_ut": ts["jd_utc"],
+                "jd_tt": ts["jd_tt"],
+                "jd_ut1": ts["jd_ut1"],
+                "meta": {"engine": _CHART_ENGINE_NAME, "warnings": ["chart_failed"]},
+                "error": str(e),
+            }
 
     # Post-process: attach engine + JDs; backfill mode if engine didn’t return it
     chart = chart or {}
