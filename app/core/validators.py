@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 import re
-from datetime import datetime, date, time, timezone
+from datetime import datetime, date, timezone
 from typing import Any, Dict, Tuple, List, Optional, Union, TypedDict, Literal
 from zoneinfo import ZoneInfo
 
@@ -47,14 +47,38 @@ def _coalesce(data: Dict[str, Any], *candidates: str) -> Optional[Any]:
             return data[k]
     return None
 
-def _fmt_hms(t: time) -> str:
-    return f"{t.hour:02d}:{t.minute:02d}:{t.second:02d}"
-
 def _is_number(x: Any) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool)
 
 
 # ───────────────────────────── atomic parsers ─────────────────────────────
+
+_TIME_RE = re.compile(r"^\s*(?P<h>\d{1,2}):(?P<m>\d{2})(?::(?P<s>\d{2})(?:\.(?P<f>\d+))?)?\s*$")
+
+def _normalize_time_hms(s: str) -> str:
+    """
+    Accepts 'HH:MM', 'HH:MM:SS', or 'HH:MM:SS.frac'.
+    Allows leap second SS == 60.
+    Disallows 24:00 except exactly '24:00:00'.
+    Returns canonical 'HH:MM:SS[.frac]' string (keeps fractional part if provided).
+    """
+    m = _TIME_RE.match(s or "")
+    if not m:
+        raise ValidationError(_err("time", "time must be 'HH:MM' or 'HH:MM:SS[.frac]'", "value_error.time"))
+    hh = int(m.group("h")); mm = int(m.group("m"))
+    ss = int(m.group("s") or 0)
+    frac = (m.group("f") or "")
+    if not (0 <= hh <= 24 and 0 <= mm <= 59 and 0 <= ss <= 60):
+        raise ValidationError(_err("time", "time fields out of range", "value_error.time"))
+    if hh == 24:
+        if not (mm == 0 and ss == 0 and frac == ""):
+            raise ValidationError(_err("time", "24:00:00 is only allowed exactly", "value_error.time"))
+        return "24:00:00"
+    frac = "".join(ch for ch in frac if ch.isdigit())
+    # keep seconds field if present in input; otherwise default to :00
+    if m.group("s") is None:
+        return f"{hh:02d}:{mm:02d}:00"
+    return f"{hh:02d}:{mm:02d}:{ss:02d}" + (f".{frac}" if frac else "")
 
 def parse_date(s: str) -> date:
     try:
@@ -62,19 +86,9 @@ def parse_date(s: str) -> date:
     except Exception:
         raise ValidationError(_err("date", "date must be 'YYYY-MM-DD'", "value_error.date"))
 
-def parse_time(s: str) -> time:
-    """Accept 'HH:MM' or 'HH:MM:SS' (24h)."""
-    try:
-        parts = s.split(":")
-        if len(parts) not in (2, 3):
-            raise ValueError
-        hh, mm = int(parts[0]), int(parts[1])
-        ss = int(parts[2]) if len(parts) == 3 else 0
-        if not (0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss <= 59):
-            raise ValueError
-        return time(hh, mm, ss)
-    except Exception:
-        raise ValidationError(_err("time", "time must be 'HH:MM' or 'HH:MM:SS' (24-hour)", "value_error.time"))
+def parse_time_str(s: str) -> str:
+    """Normalize to 'HH:MM:SS[.frac]' and allow leap second."""
+    return _normalize_time_hms(s)
 
 def parse_tz(tz: str, loc_key: str = "place_tz") -> ZoneInfo:
     """Only IANA zones or 'UTC' are accepted."""
@@ -109,7 +123,7 @@ def parse_elev(elev: Any | None, key: str = "elev_m") -> float:
     return e
 
 def parse_mode(mode: Any | None) -> Literal["sidereal", "tropical"]:
-    m = (mode or os.environ.get("ASTRO_MODE") or "sidereal")
+    m = (mode or os.environ.get("ASTRO_MODE") or "tropical")
     m = str(m).strip().lower()
     if m not in ("sidereal", "tropical"):
         raise ValidationError(_err("mode", "mode must be 'sidereal' or 'tropical'", "value_error.mode"))
@@ -197,70 +211,39 @@ def parse_horizon(value: Any | None) -> Dict[str, int] | str:
 
 # ───────────────────────────── timescale helpers ─────────────────────────────
 
-def resolve_timescales_from_civil(d: date, t: time, tzinfo: ZoneInfo) -> Dict[str, float]:
+def _env_dut1() -> Optional[float]:
+    s = os.getenv("ASTRO_DUT1_BROADCAST", os.getenv("ASTRO_DUT1"))
+    if s is None:
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+def resolve_timescales_from_civil_erfa(d: date, time_str: str, tzinfo: ZoneInfo) -> Dict[str, float]:
     """
-    Convert aware local datetime -> UTC -> JD scales using app.core.time_kernel.
-    Tries multiple method names for compatibility:
-      - to_jd_tt(dt_utc) OR to_jd_tt_from_utc(dt_utc)
-      - to_jd_utc(dt_utc) + utc_to_tt(jd_utc)
-      - to_jd(dt_utc, scale="utc"/"tt")
+    Use ERFA-aligned build_timescales() with strict DUT1 policy (env or 0.0 if absent),
+    and return {'jd_tt', 'jd_utc', 'jd_ut'} best-effort (jd_ut mirrors jd_utc if unknown).
     """
     try:
-        from app.core import time_kernel as tk  # lazy import
+        from app.core.timescales import build_timescales  # lazy import
     except Exception as e:
-        raise ValidationError(_err([], f"time kernel unavailable: {e}", "runtime_error"))
+        raise ValidationError(_err([], f"timescales core unavailable: {e}", "runtime_error"))
 
-    dt_local = datetime.combine(d, t).replace(tzinfo=tzinfo)
-    dt_utc = dt_local.astimezone(timezone.utc).replace(tzinfo=None)
+    dut1_val = _env_dut1()
+    if dut1_val is None:
+        # jd_tt doesn’t need DUT1 strictly, but builder requires it; use 0.0 if not provided
+        dut1_val = 0.0
 
-    jd_utc: Optional[float] = None
-    jd_tt: Optional[float] = None
-    jd_ut: Optional[float] = None
-
-    # Try direct JD(TT)
-    for name in ("to_jd_tt", "to_jd_tt_from_utc"):
-        fn = getattr(tk, name, None)
-        if callable(fn):
-            try:
-                jd_tt = float(fn(dt_utc))
-                break
-            except Exception:
-                pass
-
-    # Try JD(UTC) then convert
-    if jd_tt is None:
-        for name in ("to_jd_utc", "to_jd_from_utc", "to_jd"):
-            fn = getattr(tk, name, None)
-            if callable(fn):
-                try:
-                    # Some to_jd need a scale
-                    try:
-                        jd_utc = float(fn(dt_utc, scale="utc"))  # type: ignore
-                    except TypeError:
-                        jd_utc = float(fn(dt_utc))  # type: ignore
-                    break
-                except Exception:
-                    pass
-        if jd_utc is not None:
-            conv = getattr(tk, "utc_to_tt", None)
-            if callable(conv):
-                try:
-                    jd_tt = float(conv(jd_utc))
-                except Exception:
-                    pass
-
-    # Optional UT (not always needed)
-    if jd_utc is not None:
-        jd_ut = jd_utc  # if tk distinguishes, caller can override
-
-    if jd_tt is None:
-        raise ValidationError(_err([], "could not resolve jd_tt from civil time with time_kernel", "value_error.timescale"))
-
-    out = {"jd_tt": jd_tt}
-    if jd_utc is not None:
-        out["jd_utc"] = jd_utc
-    if jd_ut is not None:
-        out["jd_ut"] = jd_ut
+    # Convert the local civil inputs by passing strings + tz name back to the builder
+    tz_name = str(tzinfo.key) if hasattr(tzinfo, "key") else "UTC"
+    ts = build_timescales(d.strftime("%Y-%m-%d"), time_str, tz_name, float(dut1_val))
+    # Map to the expected keys
+    out = {"jd_tt": float(ts.jd_tt)}
+    if getattr(ts, "jd_utc", None) is not None:
+        out["jd_utc"] = float(ts.jd_utc)
+        # best-effort UT = UTC when UT1 not explicitly returned here
+        out["jd_ut"] = float(ts.jd_utc)
     return out
 
 
@@ -268,7 +251,7 @@ def resolve_timescales_from_civil(d: date, t: time, tzinfo: ZoneInfo) -> Dict[st
 
 class ChartPayload(TypedDict, total=False):
     date: str
-    time: str
+    time: str           # canonicalized 'HH:MM:SS[.frac]' (may be leap-second)
     place_tz: str
     timezone: str
     latitude: float
@@ -276,7 +259,7 @@ class ChartPayload(TypedDict, total=False):
     elev_m: float
     mode: Literal["sidereal", "tropical"]
     house_system: Optional[str]
-    dt: datetime
+    dut1: float         # optional, validated if provided
 
 def parse_chart_payload(data: Dict[str, Any]) -> ChartPayload:
     """Normalize input for chart/predictions/report/rectification endpoints."""
@@ -289,7 +272,7 @@ def parse_chart_payload(data: Dict[str, Any]) -> ChartPayload:
     _require(data, "date", "time")
 
     d = parse_date(str(data["date"]))
-    t = parse_time(str(data["time"]))
+    t_str = parse_time_str(str(data["time"]))
     tzinfo = parse_tz(str(place_tz_val), loc_key="place_tz")
     lat, lon = parse_latlon(lat_val, lon_val)
     elev = parse_elev(elev_val)
@@ -298,15 +281,25 @@ def parse_chart_payload(data: Dict[str, Any]) -> ChartPayload:
 
     out: ChartPayload = {
         "date": d.strftime("%Y-%m-%d"),
-        "time": _fmt_hms(t),
+        "time": t_str,
         "place_tz": str(place_tz_val),
         "timezone": str(place_tz_val),
         "latitude": lat,
         "longitude": lon,
         "elev_m": elev,
         "mode": mode,
-        "dt": datetime.combine(d, t).replace(tzinfo=tzinfo),
     }
+
+    # Optional DUT1 in request: enforce |DUT1| ≤ 0.9 if provided
+    if "dut1" in data and data["dut1"] is not None:
+        try:
+            dut1 = float(data["dut1"])
+        except Exception:
+            raise ValidationError(_err("dut1", "must be a number (seconds)", "type_error.float"))
+        if abs(dut1) > 0.9:
+            raise ValidationError(_err("dut1", "DUT1 magnitude must be ≤ 0.9 s", "value_error"))
+        out["dut1"] = dut1
+
     if house_system:
         out["house_system"] = house_system
     return out
@@ -363,11 +356,16 @@ def parse_ephemeris_payload(data: Dict[str, Any], *, require_bodies: bool = Fals
     Parse common ephemeris inputs. Behavior:
       - If jd_tt is present (number) → use it.
       - Else, if civil fields present (date, time, place_tz|tz and lat/lon when center=topocentric)
-        → resolve jd_tt via time_kernel.
+        → resolve jd_tt via ERFA-aligned timescales builder (env DUT1 or 0.0).
       - Validates/normalizes frame, center, node_model, elev_m.
       - If require_bodies, validates and (optionally) derives names.
     """
     out: EphemerisPayload = {}
+
+    # Frame / Center / Node model first (so we know whether topo coords are required)
+    out["frame"] = parse_frame(data.get("frame"))
+    out["center"] = parse_center(data.get("center"))
+    out["node_model"] = parse_node_model(data.get("node_model"))
 
     # Scales
     jd_tt = data.get("jd_tt")
@@ -376,21 +374,16 @@ def parse_ephemeris_payload(data: Dict[str, Any], *, require_bodies: bool = Fals
             raise ValidationError(_err("jd_tt", "must be a number (Julian Day TT)", "type_error.float"))
         out["jd_tt"] = float(jd_tt)
     else:
-        # Try resolve from civil
+        # Try resolve from civil via ERFA-aligned builder
         place_tz_val = _coalesce(data, "place_tz", "tz", "timezone")
         if all(k in data for k in ("date", "time")) and place_tz_val:
             d = parse_date(str(data["date"]))
-            t = parse_time(str(data["time"]))
+            t_str = parse_time_str(str(data["time"]))
             tzinfo = parse_tz(str(place_tz_val), loc_key="place_tz")
-            ts = resolve_timescales_from_civil(d, t, tzinfo)
-            out.update(ts)  # includes jd_tt (+ jd_utc/jd_ut if available)
+            ts = resolve_timescales_from_civil_erfa(d, t_str, tzinfo)
+            out.update(ts)  # includes jd_tt (+ jd_utc/jd_ut best-effort)
         else:
             raise ValidationError(_err("jd_tt", "missing field: jd_tt (or provide civil fields: date/time/(place_tz|tz))", "missing"))
-
-    # Frame / Center / Node model
-    out["frame"] = parse_frame(data.get("frame"))
-    out["center"] = parse_center(data.get("center"))
-    out["node_model"] = parse_node_model(data.get("node_model"))
 
     # Geo/topo coordinates
     lat_val = _coalesce(data, "latitude", "lat")
