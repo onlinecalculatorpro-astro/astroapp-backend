@@ -1043,17 +1043,18 @@ def ephemeris_longitudes_endpoint():
     except Exception as e:
         return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
 
-    # base fields from validated payload
     jd_tt  = payload["jd_tt"]
     frame  = payload["frame"]
     center = payload["center"]
     bodies = payload["bodies"]
     names  = payload["names"]
-
-    # accept both styles: center:"topocentric" OR topocentric:true
     topocentric = (center == "topocentric") or bool(payload.get("topocentric"))
 
-    # pull coords from payload OR observer sub-dict OR query overrides
+    # ---- resolve observer coordinates (payload → body.observer → query overrides)
+    def _num(x):
+        try: return float(x)
+        except Exception: return None
+
     lat  = payload.get("latitude")
     lon  = payload.get("longitude")
     elev = payload.get("elev_m", payload.get("elevation_m", 0.0))
@@ -1062,19 +1063,15 @@ def ephemeris_longitudes_endpoint():
     if isinstance(body, dict) and isinstance(body.get("observer"), dict):
         obs_raw = dict(body["observer"])
     elif isinstance(payload.get("observer"), dict):
-        obs_raw = dict(payload["observer"])  # in case validator passed it through
+        obs_raw = dict(payload["observer"])
 
-    def _num(x):
-        try: return float(x)
-        except Exception: return None
+    if not isinstance(lat, (int, float)):
+        lat = _num(obs_raw.get("lat") or obs_raw.get("latitude"))
+    if not isinstance(lon, (int, float)):
+        lon = _num(obs_raw.get("lon") or obs_raw.get("lng") or obs_raw.get("longitude"))
+    if not isinstance(elev, (int, float)):
+        elev = _num(obs_raw.get("elevation_m") or obs_raw.get("elev_m") or obs_raw.get("alt_m") or obs_raw.get("altitude_m")) or 0.0
 
-    lat  = lat  if isinstance(lat,  (int, float)) else _num(obs_raw.get("lat") or obs_raw.get("latitude"))
-    lon  = lon  if isinstance(lon,  (int, float)) else _num(obs_raw.get("lon") or obs_raw.get("lng") or obs_raw.get("longitude"))
-    elev = elev if isinstance(elev, (int, float)) else _num(
-        obs_raw.get("elevation_m") or obs_raw.get("elev_m") or obs_raw.get("alt_m") or obs_raw.get("altitude_m")
-    ) or 0.0
-
-    # query-string overrides for easy dev-console testing
     q = request.args
     if q.get("lat")    is not None: lat  = _num(q["lat"])
     if q.get("lon")    is not None: lon  = _num(q["lon"])
@@ -1092,9 +1089,9 @@ def ephemeris_longitudes_endpoint():
             names=names,
             frame=frame,
             topocentric=topocentric,
-            # keep legacy fields for compatibility…
+            # legacy fields (kept for compatibility)
             latitude=lat, longitude=lon, elevation_m=elev,
-            # …and pass the canonical observer block (preferred)
+            # canonical observer block (preferred)
             observer=observer,
         )
     except Exception as e:
@@ -1109,9 +1106,8 @@ def ephemeris_longitudes_endpoint():
         for b in requested if b in by_body
     ]
 
-    meta_out = dict(meta)  # prefer adapter’s truth about topocentric resolution
+    meta_out = dict(meta)
     meta_out.setdefault("frame", frame)
-    # If adapter didn't include it, fall back to what was requested
     if "topocentric" not in meta_out:
         meta_out["topocentric"] = bool(topocentric)
 
@@ -1143,6 +1139,10 @@ def ephemeris_lv_endpoint():
     names  = payload["names"]
     topocentric = (center == "topocentric") or bool(payload.get("topocentric"))
 
+    def _num(x):
+        try: return float(x)
+        except Exception: return None
+
     lat  = payload.get("latitude")
     lon  = payload.get("longitude")
     elev = payload.get("elev_m", payload.get("elevation_m", 0.0))
@@ -1153,15 +1153,12 @@ def ephemeris_lv_endpoint():
     elif isinstance(payload.get("observer"), dict):
         obs_raw = dict(payload["observer"])
 
-    def _num(x):
-        try: return float(x)
-        except Exception: return None
-
-    lat  = lat  if isinstance(lat,  (int, float)) else _num(obs_raw.get("lat") or obs_raw.get("latitude"))
-    lon  = lon  if isinstance(lon,  (int, float)) else _num(obs_raw.get("lon") or obs_raw.get("lng") or obs_raw.get("longitude"))
-    elev = elev if isinstance(elev, (int, float)) else _num(
-        obs_raw.get("elevation_m") or obs_raw.get("elev_m") or obs_raw.get("alt_m") or obs_raw.get("altitude_m")
-    ) or 0.0
+    if not isinstance(lat, (int, float)):
+        lat = _num(obs_raw.get("lat") or obs_raw.get("latitude"))
+    if not isinstance(lon, (int, float)):
+        lon = _num(obs_raw.get("lon") or obs_raw.get("lng") or obs_raw.get("longitude"))
+    if not isinstance(elev, (int, float)):
+        elev = _num(obs_raw.get("elevation_m") or obs_raw.get("elev_m") or obs_raw.get("alt_m") or obs_raw.get("altitude_m")) or 0.0
 
     q = request.args
     if q.get("lat")    is not None: lat  = _num(q["lat"])
