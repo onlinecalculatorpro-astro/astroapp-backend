@@ -818,7 +818,7 @@ def report():
 
 
 # ───────────────────────── predictions ─────────────────────────
-@api.post("/predictions")
+@api.post("/api/predictions")
 def predictions_route():
     if predict_engine is None:
         return _json_error("predictions_unavailable", "predict engine not wired", 501)
@@ -1117,7 +1117,7 @@ def ephemeris_lv_endpoint():
 
 
 # ───────────────────────── rectification ─────────────────────────
-@api.post("/rectification/quick")
+@api.post("/api/rectification/quick")
 def rect_quick():
     try:
         body = request.get_json(force=True) or {}
