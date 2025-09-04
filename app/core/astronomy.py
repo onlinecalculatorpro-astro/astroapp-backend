@@ -1048,12 +1048,12 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     # --- bodies built above ---
     if missing_bodies:
-    _warn_add(warnings, _seen, _W.ADAPTER_MISS_BODIES, ", ".join(missing_bodies))
+        _warn_add(warnings, _seen, _W.ADAPTER_MISS_BODIES, ", ".join(missing_bodies))
 
 # Points (nodes): always geocentric; speed = None (with placeholders if missing)
 out_points: List[Dict[str, Any]] = []
-if points_req:
-    lon_map_nodes, source_nodes = _longitudes_only_geocentric(jd_tt, points_req)
+    if points_req:
+        lon_map_nodes, source_nodes = _longitudes_only_geocentric(jd_tt, points_req)
 
     # Fill counterpart by 180° if only one present
     need_n = ("North Node" in points_req) and ("North Node" not in lon_map_nodes)
