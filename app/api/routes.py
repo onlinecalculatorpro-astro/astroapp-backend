@@ -772,9 +772,9 @@ def calculate():
         hs = str(body.get("house_system", "")).strip()
         if hs:
             payload["house_system"] = hs
-        for k in ("bodies", "ayanamsa", "topocentric", "elevation_m", "dut1"):
-            if k in body:
-                payload[k] = body[k]
+    for k in ("bodies", "points", "ayanamsa", "topocentric", "elevation_m", "dut1"):
+    if k in body:
+        payload[k] = body[k]    
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
     except Exception as e:
@@ -845,9 +845,9 @@ def report():
         hs = str(body.get("house_system", "")).strip()
         if hs:
             payload["house_system"] = hs
-        for k in ("bodies", "ayanamsa", "topocentric", "elevation_m", "dut1"):
-            if k in body:
-                payload[k] = body[k]
+        for k in ("bodies", "points", "ayanamsa", "topocentric", "elevation_m", "dut1"):
+    if k in body:
+        payload[k] = body[k]
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
 
@@ -922,9 +922,9 @@ def predictions_route():
         hs = str(body.get("house_system", "")).strip()
         if hs:
             payload["house_system"] = hs
-        for k in ("bodies", "ayanamsa", "topocentric", "elevation_m", "dut1"):
-            if k in body:
-                payload[k] = body[k]
+        for k in ("bodies", "points", "ayanamsa", "topocentric", "elevation_m", "dut1"):
+    if k in body:
+        payload[k] = body[k]
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
 
