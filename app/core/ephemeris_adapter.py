@@ -591,6 +591,11 @@ def _observer(
         return main["earth"], False
     except Exception:
         return None, False
+    # ---- Geocentric default
+    try:
+        return main["earth"], False
+    except Exception:
+        return None, False
     # Geocentric default
     try:
         return main["earth"]
