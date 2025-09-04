@@ -41,12 +41,12 @@ except Exception as e:  # pragma: no cover
     _EPH_IMPORT_ERROR = e
 
 try:
-    from app.core import time_kernel as _tk  # preferred timescales
+    from app.core import time_kernel as _tk  # preferred timescales (optional)
 except Exception:  # pragma: no cover
     _tk = None
 
 try:
-    from app.core import timescales as _ts  # civil→JD helpers
+    from app.core import timescales as _ts  # civil→JD helpers (optional)
 except Exception:  # pragma: no cover
     _ts = None
 
@@ -106,7 +106,6 @@ _CLASSIC_10 = (
     "Sun", "Moon", "Mercury", "Venus", "Mars",
     "Jupiter", "Saturn", "Uranus", "Neptune", "Pluto",
 )
-# Present but not used (kept for forward-compat)
 _EXTRA_ALLOWED = ("Ceres", "Pallas", "Juno", "Vesta", "Chiron", "North Node", "South Node")
 ALLOWED_BODIES = set(_CLASSIC_10) | set(_EXTRA_ALLOWED)
 _DEF_BODIES: Tuple[str, ...] = _CLASSIC_10
@@ -134,6 +133,7 @@ class _W:
     ADAPTER_MISS_BODIES = "adapter_missing_bodies"
     ADAPTER_MISS_POINTS = "adapter_missing_points"
     PTS_SOURCE_MISMATCH = "points_source"
+    LEAP_SECOND = "leap_second"  # explicit token
 
 
 def _warn_add(store: List[str], seen: set[str], code: str, detail: Optional[str] = None) -> None:
@@ -246,8 +246,38 @@ def _split_bodies_points(payload: Dict[str, Any], warnings: List[str], seen: set
 
 
 # ───────────────────────────── Timescales ─────────────────────────────
+def _detect_leap_second(time_str: Optional[str]) -> bool:
+    """Return True if 'hh:mm:60' style is detected."""
+    if not isinstance(time_str, str):
+        return False
+    try:
+        hh, mm, ss = time_str.split(":")
+        return int(ss.split(".")[0]) == 60
+    except Exception:
+        return False
+
+
+def _normalize_time_for_leap_second(time_str: str) -> str:
+    """
+    Convert 'hh:mm:60[.fff]' → 'hh:mm:59.999999' for parsers that reject :60.
+    We only nudge the seconds; ERFA will still handle the leap via warnings if in the chain.
+    """
+    try:
+        hh, mm, ss = time_str.split(":")
+        frac = ""
+        if "." in ss:
+            s, frac = ss.split(".", 1)
+        else:
+            s = ss
+        if int(s) != 60:
+            return time_str
+        return f"{hh}:{mm}:59.999999"
+    except Exception:
+        return time_str
+
+
 def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[str]) -> Tuple[float, float, float]:
-    jd_ut  = payload.get("jd_ut")
+    jd_ut  = payload.get("jd_ut") or payload.get("jd_utc")
     jd_tt  = payload.get("jd_tt")
     jd_ut1 = payload.get("jd_ut1")
 
@@ -260,21 +290,29 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
                       "to_timescales", "from_civil"):
             fn = getattr(_tk, fname, None)
             if callable(fn):
-                out = fn(
-                    payload.get("date"),
-                    payload.get("time"),
-                    payload.get("place_tz") or payload.get("tz") or "UTC",
-                    payload.get("latitude"),
-                    payload.get("longitude"),
-                )
-                return float(out["jd_ut"]), float(out["jd_tt"]), float(out["jd_ut1"])
+                # Leap second: nudge input string + add warning token
+                d = payload.get("date")
+                t = payload.get("time")
+                tz = payload.get("place_tz") or payload.get("tz") or "UTC"
+                if _detect_leap_second(t):
+                    _warn_add(warnings, seen, _W.LEAP_SECOND)
+                    t = _normalize_time_for_leap_second(str(t))
+                out = fn(d, t, tz, payload.get("latitude"), payload.get("longitude"))
+                # Expect keys jd_ut, jd_tt, jd_ut1 (or similar)
+                return float(out.get("jd_ut") or out.get("jd_utc")), float(out["jd_tt"]), float(out["jd_ut1"])
 
     # 2) app.core.timescales or stdlib fallback
-    date_str = payload.get("date"); time_str = payload.get("time")
+    date_str = payload.get("date")
+    time_str = payload.get("time")
     tz_str   = payload.get("place_tz") or payload.get("tz") or "UTC"
     if not isinstance(date_str, str) or not isinstance(time_str, str):
         missing = [k for k, v in (("jd_ut", jd_ut), ("jd_tt", jd_tt), ("jd_ut1", jd_ut1)) if not isinstance(v, (int, float))]
         raise AstronomyError("timescales_missing", f"Supply {', '.join(missing)} or provide date/time/tz")
+
+    # Leap-second nudging + explicit token
+    if _detect_leap_second(time_str):
+        _warn_add(warnings, seen, _W.LEAP_SECOND)
+        time_str = _normalize_time_for_leap_second(time_str)
 
     def _jd_utc_via_ts(d: str, t: str, z: str) -> float:
         if _ts is None:
@@ -449,27 +487,21 @@ def _geo_kwargs_for_sig(sig: inspect.Signature, *, topocentric: bool, lat_q, lon
     return kw
 
 
-# --- Normalizer (decomposed) ---
 def _unwrap_adapter_result(res: Any) -> Tuple[str, Any]:
     """Return (kind, payload) where kind in: maps|rows|rowdicts|tuples|positional|objects|empty|flat."""
     if res is None:
         return "empty", []
     if isinstance(res, dict):
-        # Prioritized wrappers
         for k in ("rows", "result", "data", "payload"):
             v = res.get(k)
             if isinstance(v, (list, tuple)):
                 return "rows", v
-        # Lon/vel maps or flat map
         if any(k in res for k in ("longitudes", "longitude", "lon", "velocities", "velocity", "speed", "speeds")):
             return "maps", res
-        # Sometimes a dict where one value is the list we want
         for v in res.values():
             if isinstance(v, (list, tuple)):
                 return "rows", v
-        # Otherwise treat as flat map {name:deg}
         return "flat", res
-
     if isinstance(res, (list, tuple)):
         if not res:
             return "empty", []
@@ -482,8 +514,7 @@ def _unwrap_adapter_result(res: Any) -> Tuple[str, Any]:
             return "positional", res
         if hasattr(first, "name"):
             return "objects", res
-        return "rows", res  # last-resort
-    # Object with .longitudes/.velocities
+        return "rows", res
     if hasattr(res, "longitudes"):
         return "maps", {"longitudes": getattr(res, "longitudes", None), "velocities": getattr(res, "velocities", None)}
     return "unknown", res
@@ -506,12 +537,10 @@ def _extract_rows(kind: str, payload: Any) -> List[Dict[str, Any]]:
             if isinstance(data.get(sk), dict):
                 velmaps = data[sk]; break
 
-        # flat map {name:deg}
         if longmaps is None and kind == "flat" and all(isinstance(k, (str, int)) and isinstance(v, (int, float)) for k, v in data.items()):
             longmaps = data
 
         if isinstance(longmaps, dict):
-            # merge with velmaps if present
             for name, lon in longmaps.items():
                 if isinstance(lon, (int, float)):
                     sp = None
@@ -528,7 +557,6 @@ def _extract_rows(kind: str, payload: Any) -> List[Dict[str, Any]]:
             nm = row.get("name") or row.get("body")
             if not nm:
                 continue
-            # longitude variants
             lon = (row.get("lon", None) if row.get("lon", None) is not None else
                    row.get("longitude", None) if row.get("longitude", None) is not None else
                    row.get("longitude_deg", None) if row.get("longitude_deg", None) is not None else
@@ -553,7 +581,6 @@ def _extract_rows(kind: str, payload: Any) -> List[Dict[str, Any]]:
         return rows
 
     if kind == "positional":
-        # Names must be supplied separately; handled in the mapper below.
         return [{"_pos": i, "lon": float(v)} for i, v in enumerate(payload)]
 
     if kind == "objects":
@@ -577,7 +604,6 @@ def _map_rows_to_requested(rows: List[Dict[str, Any]], requested: Tuple[str, ...
     lon_map: Dict[str, float] = {}
     spd_map: Dict[str, Optional[float]] = {}
 
-    # By name (case-insensitive)
     by_name = {str(r.get("name", "")).lower(): r for r in rows if "name" in r}
     for nm, key in zip(want, want_lc):
         r = by_name.get(key)
@@ -585,7 +611,6 @@ def _map_rows_to_requested(rows: List[Dict[str, Any]], requested: Tuple[str, ...
             lon_map[nm] = float(r["lon"])
             spd_map[nm] = float(r["speed"]) if isinstance(r.get("speed"), (int, float)) else None
 
-    # Positional fallback (if still missing and rows carry _pos)
     pos_rows = [r for r in rows if "_pos" in r and isinstance(r.get("lon"), (int, float))]
     if pos_rows:
         for pr in pos_rows:
@@ -598,7 +623,6 @@ def _map_rows_to_requested(rows: List[Dict[str, Any]], requested: Tuple[str, ...
 
 
 # ───────────────────────────── TTL cache around adapter ───────────────
-# Keyed by (kernel_tag, jd_tt_q, names tuple, topo flag, lat_q, lon_q, elev_q)
 _PosCache: Dict[Tuple[Any, ...], Tuple[float, Dict[str, float], Dict[str, Optional[float]], str]] = {}
 
 def _ttl_get_or_compute(
@@ -859,7 +883,7 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
     # Names
     majors_req, points_req = _split_bodies_points(payload, warnings, _seen)
 
-    # Timescales
+    # Timescales (handles jd_* direct OR civil; adds "leap_second" token if hh:mm:60 seen)
     jd_ut, jd_tt, jd_ut1 = _ensure_timescales(payload, warnings, _seen)
 
     # Observer
@@ -927,7 +951,6 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
             elif "South Node" in lon_map_nodes and need_n:
                 lon_map_nodes["North Node"] = _norm360(lon_map_nodes["South Node"] + 180.0)
             else:
-                # final attempt: fetch the missing one explicitly
                 missing = []
                 if need_n: missing.append("North Node")
                 if need_s: missing.append("South Node")
@@ -972,9 +995,6 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
     if warnings:
         meta["warnings"] = warnings
-    if ay_note and "fallback" in (ay_note or ""):
-        # already logged as structured warning; keep mirrored in top-level list only once
-        pass
 
     out: Dict[str, Any] = {
         "mode": mode,
