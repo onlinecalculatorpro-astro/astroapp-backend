@@ -465,9 +465,12 @@ def _sig_accepts(fn, *names: str) -> Dict[str, bool]:
 def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str, Any]:
     """
     Calls the chart engine with maximum compatibility:
-      • If engine signature includes `payload`, call `compute_chart(payload, **extras)`
-      • Else, keep legacy kwargs mapping (date/time/lat/lon/etc.)
-    Always injects timescales/JDs when accepted by the engine.
+      • If engine signature includes `payload`, pass a single payload object with
+        timescales/JDs injected INTO that payload (no extra kwargs).
+      • Else, keep legacy kwargs mapping (date/time/lat/lon/etc.), injecting JDs
+        only if the engine signature advertises those params.
+
+    Always attaches engine label + JDs to the returned chart.
     """
     if _compute_chart is None:
         raise RuntimeError("chart_engine_unavailable")
@@ -486,50 +489,51 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
 
     # -------- Path A: modern engine expects a single `payload` argument --------
     if "payload" in param_names:
-        extras: Dict[str, Any] = {}
-        # Inject timescales and JDs if the engine exposes those params
-        if "timescales" in param_names:
-            extras["timescales"] = ts
-        if "jd_tt" in param_names:
-            extras["jd_tt"] = ts["jd_tt"]
-        if "jd_ut1" in param_names:
-            extras["jd_ut1"] = ts["jd_ut1"]
-        # Prefer explicit jd_utc if supported; otherwise fall back to jd_ut
-        if "jd_utc" in param_names:
-            extras["jd_utc"] = ts["jd_utc"]
-        elif "jd_ut" in param_names:
-            extras["jd_ut"] = ts["jd_utc"]
+        # Inject timescales/JDs directly into the payload copy to avoid unexpected kwargs
+        payload2: Dict[str, Any] = dict(payload)  # shallow copy
+        # Standardize expected fields for engines that read from payload
+        payload2.setdefault("jd_ut", ts["jd_utc"])
+        payload2.setdefault("jd_tt", ts["jd_tt"])
+        payload2.setdefault("jd_ut1", ts["jd_ut1"])
+        payload2.setdefault("timescales", ts)
 
-        chart = _compute_chart(payload, **extras)  # <-- positional payload (fixes your error)
+        chart = _compute_chart(payload2)  # <- no extra kwargs passed
+
     else:
         # -------- Path B: legacy engines with expanded kwargs --------
         kwargs: Dict[str, Any] = {}
+
         # civil fields (if engine wants them)
         if pick("date", "date_str", "date_s"):
-            kwargs[pick("date", "date_str", "date_s")] = payload["date"]  # type: ignore[index]
+            kwargs[pick("date", "date_str", "date_s")] = payload.get("date")
         if pick("time", "time_str", "time_s"):
-            kwargs[pick("time", "time_str", "time_s")] = payload["time"]  # type: ignore[index]
+            kwargs[pick("time", "time_str", "time_s")] = payload.get("time")
+
         if "latitude" in payload and pick("latitude", "lat"):
-            kwargs[pick("latitude", "lat")] = payload["latitude"]  # type: ignore[index]
+            kwargs[pick("latitude", "lat")] = payload["latitude"]
         if "longitude" in payload and pick("longitude", "lon"):
-            kwargs[pick("longitude", "lon")] = payload["longitude"]  # type: ignore[index]
+            kwargs[pick("longitude", "lon")] = payload["longitude"]
+
         tz_name = payload.get("place_tz") or payload.get("timezone")
         if tz_name and pick("place_tz", "timezone", "tz_name"):
-            kwargs[pick("place_tz", "timezone", "tz_name")] = tz_name  # type: ignore[index]
+            kwargs[pick("place_tz", "timezone", "tz_name")] = tz_name
+
         if pick("mode", "system") and "mode" in payload:
-            kwargs[pick("mode", "system")] = payload["mode"]  # type: ignore[index]
+            kwargs[pick("mode", "system")] = payload["mode"]
         if "ayanamsa" in payload and pick("ayanamsa", "ayanamsha", "aya"):
-            kwargs[pick("ayanamsa", "ayanamsha", "aya")] = payload["ayanamsa"]  # type: ignore[index]
+            kwargs[pick("ayanamsa", "ayanamsha", "aya")] = payload["ayanamsa"]
+
         if "topocentric" in payload and pick("topocentric", "observer_topocentric"):
-            kwargs[pick("topocentric", "observer_topocentric")] = bool(payload["topocentric"])  # type: ignore[index]
+            kwargs[pick("topocentric", "observer_topocentric")] = bool(payload["topocentric"])
         if "elevation_m" in payload and pick("elevation_m", "elevation"):
-            kwargs[pick("elevation_m", "elevation")] = payload["elevation_m"]  # type: ignore[index]
+            kwargs[pick("elevation_m", "elevation")] = payload["elevation_m"]
+
         if "bodies" in payload and pick("bodies", "names", "planets"):
-            kwargs[pick("bodies", "names", "planets")] = payload["bodies"]  # type: ignore[index]
+            kwargs[pick("bodies", "names", "planets")] = payload["bodies"]
         if "frame" in payload and pick("frame"):
             kwargs["frame"] = payload["frame"]
 
-        # timescales/JDs injection
+        # timescales/JDs injection to kwargs when engine advertises those params
         if "timescales" in param_names:
             kwargs["timescales"] = ts
         if "jd_tt" in param_names:
