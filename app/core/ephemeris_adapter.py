@@ -453,24 +453,23 @@ def _get_ecliptic_frame(frame: str):
 # ─────────────────────────────────────────────────────────────────────────────
 # Ecliptic lon/lat extraction (robust) + vector math + observer resolver
 # ─────────────────────────────────────────────────────────────────────────────
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Any, Dict, List
+import math
 
 def _frame_latlon(geo, ecliptic_frame) -> Tuple[float, float]:
     """
     Return (lon_deg_mod360, lat_deg) in the requested ecliptic frame.
+
     Some Skyfield versions hiccup on topocentric .frame_latlon(); we fall back to:
       1) geo.frame_latlon(ecliptic_frame)               (preferred)
       2) geo.frame_xyz(ecliptic_frame)  -> manual lon/lat
       3) geo.ecliptic_latlon()          -> of-date (last resort)
     """
-    import math
-
     # 1) Preferred, fast path
     try:
         lat, lon, _ = geo.frame_latlon(ecliptic_frame)
         lon_deg = float(lon.degrees) % 360.0
         lat_deg = float(lat.degrees)
-        # Validate the results are finite
         if math.isfinite(lon_deg) and math.isfinite(lat_deg):
             return lon_deg, lat_deg
     except Exception:
@@ -480,7 +479,6 @@ def _frame_latlon(geo, ecliptic_frame) -> Tuple[float, float]:
     try:
         xyz = geo.frame_xyz(ecliptic_frame)
         x, y, z = (float(xyz.au[0]), float(xyz.au[1]), float(xyz.au[2]))
-        # Guard against a degenerate 0-vector (shouldn't happen, but be safe)
         rho = math.hypot(x, y)
         if math.isfinite(x) and math.isfinite(y) and math.isfinite(z) and (rho > 0.0 or z != 0.0):
             lon = _atan2deg(y, x)
@@ -491,7 +489,7 @@ def _frame_latlon(geo, ecliptic_frame) -> Tuple[float, float]:
 
     # 3) Last resort: Skyfield helper (ecliptic-of-date)
     try:
-        elat, elon, _ = geo.ecliptic_latlon()  # may differ slightly from requested frame
+        elat, elon, _ = geo.ecliptic_latlon()
         lon_deg = float(elon.degrees) % 360.0
         lat_deg = float(elat.degrees)
         if math.isfinite(lon_deg) and math.isfinite(lat_deg):
@@ -530,6 +528,12 @@ def _observer(
     if main is None:
         return None, False
 
+    # Pull Earth once; needed for both geocentric and topocentric
+    try:
+        earth = main["earth"]
+    except Exception:
+        return None, False
+
     # ---- Pull overrides from `observer` dict (tolerate common aliases)
     if isinstance(observer, dict):
         def _num(x):
@@ -538,16 +542,13 @@ def _observer(
             except Exception:
                 return None
 
-        lat_o = observer.get("lat", observer.get("latitude"))
-        lon_o = observer.get("lon", observer.get("lng", observer.get("longitude")))
+        lat_o  = observer.get("lat", observer.get("latitude"))
+        lon_o  = observer.get("lon", observer.get("lng", observer.get("longitude")))
         elev_o = observer.get("elevation_m", observer.get("elev_m", observer.get("alt_m", observer.get("altitude_m"))))
 
-        if lat_o is not None:
-            latitude = _num(lat_o)
-        if lon_o is not None:
-            longitude = _num(lon_o)
-        if elev_o is not None:
-            elevation_m = _num(elev_o)
+        if lat_o  is not None: latitude    = _num(lat_o)
+        if lon_o  is not None: longitude   = _num(lon_o)
+        if elev_o is not None: elevation_m = _num(elev_o)
 
     # ---- Normalize and validate ranges if present
     def _valid_lat(lat: Optional[float]) -> bool:
@@ -556,13 +557,8 @@ def _observer(
     def _normalize_lon(lon: Optional[float]) -> Optional[float]:
         if not isinstance(lon, (int, float)):
             return None
-        # normalize to [-180, 180)
-        x = float(lon)
-        x = ((x + 180.0) % 360.0) - 180.0
-        # special case for -180 -> +180 wrap consistency
-        if x == -180.0:
-            x = 180.0
-        return x
+        x = ((float(lon) + 180.0) % 360.0) - 180.0  # normalize to [-180, 180)
+        return 180.0 if x == -180.0 else x
 
     if isinstance(longitude, (int, float)):
         longitude = _normalize_lon(float(longitude))
@@ -571,36 +567,17 @@ def _observer(
     if topocentric:
         if not (_valid_lat(latitude) and isinstance(longitude, (int, float))):
             meta_warnings.append("topocentric_missing_coords: falling back to geocentric")
-            try:
-                return main["earth"], False
-            except Exception:
-                return None, False
+            return earth, False
         try:
             from skyfield.api import wgs84
-            obs = wgs84.latlon(float(latitude), float(longitude), elevation_m=float(elevation_m or 0.0))
-            return obs, True
+            topo = wgs84.latlon(float(latitude), float(longitude), elevation_m=float(elevation_m or 0.0))
+            return earth + topo, True  # ← IMPORTANT: return Earth + Topos
         except Exception as e:
             meta_warnings.append(f"topocentric_build_failed:{e}")
-            try:
-                return main["earth"], False
-            except Exception:
-                return None, False
+            return earth, False
 
     # ---- Geocentric default
-    try:
-        return main["earth"], False
-    except Exception:
-        return None, False
-    # ---- Geocentric default
-    try:
-        return main["earth"], False
-    except Exception:
-        return None, False
-    # Geocentric default
-    try:
-        return main["earth"]
-    except Exception:
-        return None
+    return earth, False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Lunar nodes (geocentric)
