@@ -27,6 +27,7 @@ Deployment note:
 from typing import List, Tuple, Optional
 import difflib
 import logging
+import math
 import os
 
 logger = logging.getLogger(__name__)
@@ -49,7 +50,6 @@ try:
 except Exception:
     _HAS_POLICY = False
 
-# Emit a one-time import-time log (info/warn) so ops can spot config issues
 if not _HAS_POLICY:
     logger.warning(
         "house policy façade unavailable; strict calls may fall back to direct engine path. "
@@ -152,6 +152,12 @@ def _calc_core(
       fall back to "equal" on engine failure (historic behavior).
     """
     global _warned_no_policy_strict_once
+
+    # basic lat/lon sanity (let the engine/policy do deeper validation)
+    if not (isinstance(lat, (int, float)) and math.isfinite(lat)):
+        raise ValueError("latitude must be a finite number")
+    if not (isinstance(lon, (int, float)) and math.isfinite(lon)):
+        raise ValueError("longitude must be a finite number")
 
     strict = (jd_tt is not None and jd_ut1 is not None)
 
