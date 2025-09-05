@@ -864,7 +864,7 @@ class EphemerisAdapter:
         frame: Optional[str] = None,
         topocentric: bool = False,
         latitude: Optional[float] = None,
-        longitude: Optional[float] = None,
+        longitude: Optional[float]] = None,
         elevation_m: Optional[float] = None,
         observer: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
