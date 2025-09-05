@@ -213,21 +213,28 @@ def _compute_timescales_from_local(
                 "type": "value_error",
             }])
 
-    if isinstance(payload, dict):
-        if "dut1_seconds" in payload:
-            try:
-                dut1_seconds = float(payload["dut1_seconds"])
-            except Exception:
-                raise ValidationError([{"loc": ["dut1_seconds"], "msg": "must be a number (seconds)", "type": "value_error"}])
-        elif "dut1" in payload:
-            try:
-                dut1_seconds = float(payload["dut1"])
-            except Exception:
-                raise ValidationError([{"loc": ["dut1"], "msg": "must be a number (seconds)", "type": "value_error"}])
-        else:
-            dut1_seconds = _env_dut1()
-    else:
-        dut1_seconds = _env_dut1()
+    # tolerant DUT1 parsing (treat "", None, "null", "undefined" as “not provided”)
+    def _parse_payload_dut1(p: Optional[Dict[str, Any]]) -> float:
+        if not isinstance(p, dict):
+            return _env_dut1()
+        has_primary = "dut1_seconds" in p
+        has_legacy = "dut1" in p
+        if not (has_primary or has_legacy):
+            return _env_dut1()
+        key = "dut1_seconds" if has_primary else "dut1"
+        raw = p.get(key)
+        if raw in (None, "", "null", "undefined"):
+            return _env_dut1()
+        try:
+            return float(raw)
+        except Exception:
+            raise ValidationError([{
+                "loc": [key],
+                "msg": "must be a number (seconds)",
+                "type": "value_error",
+            }])
+
+    dut1_seconds = _parse_payload_dut1(payload)
 
     try:
         ts: TimeScales = build_timescales(date_str, time_str, tz_name, dut1_seconds)
@@ -730,7 +737,10 @@ def calculate():
     payload["houses"] = bool(want_houses)  # harmless for engines that ignore it
 
     tz_name = payload.get("place_tz") or payload.get("timezone") or "UTC"
-    ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name, payload=payload)
+    try:
+        ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name, payload=payload)
+    except ValidationError as e:
+        return _json_error("validation_error", e.errors(), 400)
 
     try:
         chart = _call_compute_chart(payload, ts)
@@ -808,7 +818,10 @@ def report():
     payload["houses"] = bool(want_houses)
 
     tz_name = payload.get("place_tz") or payload.get("timezone") or "UTC"
-    ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name, payload=payload)
+    try:
+        ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name, payload=payload)
+    except ValidationError as e:
+        return _json_error("validation_error", e.errors(), 400)
 
     try:
         chart = _call_compute_chart(payload, ts)
@@ -895,7 +908,10 @@ def predictions_route():
     payload["houses"] = bool(want_houses)
 
     tz_name = payload.get("place_tz") or payload.get("timezone") or "UTC"
-    ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name, payload=payload)
+    try:
+        ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name, payload=payload)
+    except ValidationError as e:
+        return _json_error("validation_error", e.errors(), 400)
 
     try:
         chart = _call_compute_chart(payload, ts)
