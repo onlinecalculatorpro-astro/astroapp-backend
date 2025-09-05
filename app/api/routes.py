@@ -978,63 +978,129 @@ def predictions_route():
 
 # ───────────────────────── ephemeris ─────────────────────────
 def _norm_rows_from_longitudes(raw: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Normalize longitude results to consistent format."""
     rows: List[Dict[str, Any]] = []
     meta: Dict[str, Any] = {}
+    
     if isinstance(raw, dict):
         meta = dict(raw.get("meta") or {})
+    
     if raw is None:
         return rows, meta
+    
+    # Handle simple dict of name->longitude mappings
     if isinstance(raw, dict) and all(isinstance(v, (int, float)) for v in raw.values()):
         for k, v in raw.items():
             rows.append({"body": str(k).lower(), "name": str(k), "longitude": float(v)})
         return rows, meta
+    
+    # Handle structured results with "results" array
     data = raw.get("results") if isinstance(raw, dict) and isinstance(raw.get("results"), list) else raw
     if isinstance(data, list):
         for r in data:
             if isinstance(r, dict):
+                # Handle single key-value longitude mappings
                 if len(r) == 1 and isinstance(next(iter(r.values())), (int, float)):
                     k, v = next(iter(r.items()))
                     rows.append({"body": str(k).lower(), "name": str(k), "longitude": float(v)})
                     continue
+                
+                # Extract body name from various possible fields
                 body = (r.get("body") or r.get("name") or r.get("planet") or r.get("id") or r.get("label"))
+                # Extract longitude from various possible fields
                 L = r.get("longitude") or r.get("lon") or r.get("lambda") or r.get("ecliptic_longitude")
+                
                 if body and isinstance(L, (int, float)):
-                    rows.append({"body": str(body).lower(), "name": str(r.get("name") or body), "longitude": float(L)})
+                    rows.append({
+                        "body": str(body).lower(), 
+                        "name": str(r.get("name") or body), 
+                        "longitude": float(L)
+                    })
+    
     return rows, meta
 
 
 def _norm_rows_from_lv(raw: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Normalize longitude+velocity results to consistent format."""
     rows_map: Dict[str, Dict[str, Any]] = {}
     meta: Dict[str, Any] = {}
+    
     if isinstance(raw, dict):
         meta = dict(raw.get("meta") or {})
+    
+    # Handle separate longitudes/velocities dictionaries
     if isinstance(raw, dict) and "longitudes" in raw and "velocities" in raw:
         for k, v in (raw.get("longitudes") or {}).items():
             rows_map.setdefault(str(k).lower(), {"body": str(k).lower(), "name": str(k)})["longitude"] = float(v)
         for k, v in (raw.get("velocities") or {}).items():
             rows_map.setdefault(str(k).lower(), {"body": str(k).lower(), "name": str(k)})["velocity"] = float(v)
         return list(rows_map.values()), meta
+    
+    # Handle structured results with "results" array
     data = raw.get("results") if isinstance(raw, dict) and isinstance(raw.get("results"), list) else raw
     if isinstance(data, list):
         for r in data:
             if not isinstance(r, dict):
                 continue
+            
             body = (r.get("body") or r.get("name") or r.get("planet") or r.get("id") or r.get("label"))
             if not body:
                 continue
+            
             key = str(body).lower()
             rec = rows_map.setdefault(key, {"body": key, "name": str(r.get("name") or body)})
+            
+            # Extract longitude and velocity from various possible fields
             L = r.get("longitude") or r.get("lon") or r.get("lambda") or r.get("ecliptic_longitude")
             V = r.get("velocity") or r.get("vel") or r.get("dlambda_dt") or r.get("deg_per_day") or r.get("speed")
+            
             if isinstance(L, (int, float)):
                 rec["longitude"] = float(L)
             if isinstance(V, (int, float)):
                 rec["velocity"] = float(V)
+    
     return list(rows_map.values()), meta
+
+
+def _extract_observer_coords(body: dict, payload: dict, request_args) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """Extract observer coordinates from multiple possible sources with explicit precedence."""
+    def _safe_float(x):
+        try:
+            return float(x) if x is not None else None
+        except (ValueError, TypeError):
+            return None
+    
+    # Initialize from payload top-level
+    lat = _safe_float(payload.get("latitude"))
+    lon = _safe_float(payload.get("longitude")) 
+    elev = _safe_float(payload.get("elev_m") or payload.get("elevation_m"))
+    
+    # Override with observer object if present
+    obs_raw = body.get("observer") if isinstance(body, dict) else None
+    if isinstance(obs_raw, dict):
+        lat = _safe_float(obs_raw.get("lat") or obs_raw.get("latitude")) or lat
+        lon = _safe_float(obs_raw.get("lon") or obs_raw.get("lng") or obs_raw.get("longitude")) or lon
+        elev = _safe_float(obs_raw.get("elevation_m") or obs_raw.get("elev_m") or obs_raw.get("alt_m") or obs_raw.get("altitude_m")) or elev
+    
+    # Final override with query parameters (highest precedence)
+    if request_args.get("lat") is not None:
+        lat = _safe_float(request_args["lat"])
+    if request_args.get("lon") is not None or request_args.get("lng") is not None:
+        lon = _safe_float(request_args.get("lon") or request_args.get("lng"))
+    if request_args.get("elev_m") is not None:
+        elev = _safe_float(request_args["elev_m"])
+    
+    return lat, lon, elev or 0.0
 
 
 @api.post("/api/ephemeris/longitudes")
 def ephemeris_longitudes_endpoint():
+    """
+    Compute ecliptic longitudes for celestial bodies at a given time.
+    
+    Supports both geocentric and topocentric calculations with flexible
+    coordinate specification (payload, observer object, or query params).
+    """
     try:
         body = request.get_json(force=True) or {}
         payload = parse_ephemeris_payload(body, require_bodies=True)
@@ -1043,78 +1109,93 @@ def ephemeris_longitudes_endpoint():
     except Exception as e:
         return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
 
-    jd_tt  = payload["jd_tt"]
-    frame  = payload["frame"]
+    # Extract core parameters
+    jd_tt = payload["jd_tt"]
+    frame = payload["frame"]
     center = payload["center"]
     bodies = payload["bodies"]
-    names  = payload["names"]
+    names = payload["names"]
 
+    # Determine if topocentric calculation is requested
     topocentric = (center == "topocentric") or bool(payload.get("topocentric"))
 
-    # ---- gather coords from payload, observer{}, and query (?lat&lon&elev_m)
-    def _num(x):
-        try: return float(x)
-        except Exception: return None
+    # Extract observer coordinates from all possible sources
+    lat, lon, elev = _extract_observer_coords(body, payload, request.args)
+    
+    # Validate topocentric requirements
+    if topocentric and (lat is None or lon is None):
+        return _json_error(
+            "topocentric_coords_required",
+            {
+                "message": "Topocentric calculation requires observer latitude and longitude",
+                "hint": "Provide coordinates via 'observer' object, top-level 'latitude'/'longitude', or ?lat&lon query params",
+                "received": {"latitude": lat, "longitude": lon, "elevation_m": elev}
+            },
+            422
+        )
 
-    lat  = payload.get("latitude")
-    lon  = payload.get("longitude")
-    elev = payload.get("elev_m", payload.get("elevation_m", 0.0))
+    # Build observer object for adapter (only if coordinates are complete)
+    observer_dict = None
+    if lat is not None and lon is not None:
+        observer_dict = {"lat": lat, "lon": lon, "elevation_m": elev}
 
-    obs_raw = (body.get("observer") if isinstance(body, dict) else None) or {}
-    if isinstance(obs_raw, dict):
-        if lat  is None: lat  = _num(obs_raw.get("lat") or obs_raw.get("latitude"))
-        if lon  is None: lon  = _num(obs_raw.get("lon") or obs_raw.get("lng") or obs_raw.get("longitude"))
-        if not isinstance(elev, (int, float)):
-            elev = _num(obs_raw.get("elevation_m") or obs_raw.get("elev_m") or obs_raw.get("alt_m") or obs_raw.get("altitude_m")) or 0.0
-
-    q = request.args
-    if q.get("lat")    is not None: lat  = _num(q["lat"])
-    if q.get("lon")    is not None: lon  = _num(q["lon"])
-    if q.get("lng")    is not None: lon  = _num(q["lng"])
-    if q.get("elev_m") is not None: elev = _num(q["elev_m"]) or 0.0
-
-    observer = {"lat": float(lat), "lon": float(lon), "elevation_m": float(elev)} if (lat is not None and lon is not None) else None
-
-    # If topo requested but coords missing, tell the client instead of silently degrading
-    if topocentric and observer is None:
-        return _json_error("topocentric_coords_required",
-                           {"hint": "Provide observer.lat & observer.lon (or ?lat&lon query)."},
-                           422)
-
+    # Call the ephemeris adapter
     try:
         from app.core import ephemeris_adapter as ea
-        raw = ea.ecliptic_longitudes(
+        raw_result = ea.ecliptic_longitudes(
             jd_tt,
             names=names,
             frame=frame,
             topocentric=topocentric,
-            latitude=lat, longitude=lon, elevation_m=elev,  # legacy scalars
-            observer=observer,                               # canonical input (takes precedence)
+            latitude=lat,
+            longitude=lon, 
+            elevation_m=elev,
+            observer=observer_dict,  # This takes precedence in the adapter
         )
     except Exception as e:
-        return _json_error("ephemeris_longitudes_error", str(e) if DEBUG_VERBOSE else None, 500)
+        return _json_error(
+            "ephemeris_computation_error", 
+            {"error": str(e)} if DEBUG_VERBOSE else {"error": "Ephemeris computation failed"}, 
+            500
+        )
 
-    rows, meta = _norm_rows_from_longitudes(raw)
+    # Normalize the adapter results
+    rows, adapter_meta = _norm_rows_from_longitudes(raw_result)
 
+    # Build ordered results matching the requested body order
     requested = [b.lower() for b in bodies]
-    name_map  = {b.lower(): n for b, n in zip(bodies, names)}
-    by_body   = {r["body"]: r for r in rows if isinstance(r.get("longitude"), (int, float))}
-    ordered   = [{"body": b, "name": name_map[b], "longitude": float(by_body[b]["longitude"])} for b in requested if b in by_body]
+    name_map = {b.lower(): n for b, n in zip(bodies, names)}
+    by_body = {r["body"]: r for r in rows if isinstance(r.get("longitude"), (int, float))}
+    
+    ordered_results = []
+    for body_key in requested:
+        if body_key in by_body:
+            result = by_body[body_key]
+            ordered_results.append({
+                "body": body_key,
+                "name": name_map[body_key],
+                "longitude": float(result["longitude"])
+            })
 
-    meta_out = dict(meta)
-    meta_out.setdefault("frame", frame)
-    meta_out.setdefault("topocentric", bool(topocentric))  # echo our intent if adapter didn’t set it
+    # Build response metadata
+    response_meta = dict(adapter_meta)
+    response_meta.setdefault("frame", frame)
+    # Trust the adapter's topocentric flag if set, otherwise use our determination
+    if "topocentric" not in response_meta:
+        response_meta["topocentric"] = bool(topocentric)
+
+    # Determine effective center based on what actually happened
+    effective_center = "topocentric" if response_meta.get("topocentric") else "geocentric"
 
     return jsonify({
         "ok": True,
         "jd_tt": float(jd_tt),
         "frame": frame,
-        "center": "topocentric" if meta_out.get("topocentric") else "geocentric",
+        "center": effective_center,
         "units": {"angles": "deg"},
-        "meta": meta_out,
-        "results": ordered,
+        "meta": response_meta,
+        "results": ordered_results,
     }), 200
-
 
 # ───────────────────────── rectification ─────────────────────────
 @api.post("/api/rectification/quick")
