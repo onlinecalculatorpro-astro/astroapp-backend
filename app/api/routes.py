@@ -1062,12 +1062,87 @@ def _norm_rows_from_lv(raw: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     return list(rows_map.values()), meta
 
 
+def _extract_observer_coordinates(body_dict: dict, payload: dict, query_args) -> dict:
+    """Extract observer coordinates with explicit diagnostic logging."""
+    def safe_float(val):
+        if val is None:
+            return None
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return None
+    
+    # Initialize result
+    coords = {"lat": None, "lon": None, "elev": 0.0}
+    sources = []
+    
+    # 1. Check payload top-level
+    if payload.get("latitude") is not None:
+        coords["lat"] = safe_float(payload["latitude"])
+        sources.append("payload.latitude")
+    if payload.get("longitude") is not None:
+        coords["lon"] = safe_float(payload["longitude"])
+        sources.append("payload.longitude")
+    if payload.get("elevation_m") is not None:
+        coords["elev"] = safe_float(payload["elevation_m"]) or 0.0
+        sources.append("payload.elevation_m")
+    elif payload.get("elev_m") is not None:
+        coords["elev"] = safe_float(payload["elev_m"]) or 0.0
+        sources.append("payload.elev_m")
+    
+    # 2. Check observer object in body
+    observer_obj = body_dict.get("observer")
+    if isinstance(observer_obj, dict):
+        if coords["lat"] is None:
+            coords["lat"] = safe_float(observer_obj.get("lat") or observer_obj.get("latitude"))
+            if coords["lat"] is not None:
+                sources.append("observer.lat")
+        
+        if coords["lon"] is None:
+            coords["lon"] = safe_float(
+                observer_obj.get("lon") or 
+                observer_obj.get("lng") or 
+                observer_obj.get("longitude")
+            )
+            if coords["lon"] is not None:
+                sources.append("observer.lon")
+        
+        elev_from_obs = safe_float(
+            observer_obj.get("elevation_m") or 
+            observer_obj.get("elev_m") or 
+            observer_obj.get("alt_m") or 
+            observer_obj.get("altitude_m")
+        )
+        if elev_from_obs is not None:
+            coords["elev"] = elev_from_obs
+            sources.append("observer.elevation_m")
+    
+    # 3. Check query parameters (highest precedence)
+    if query_args.get("lat"):
+        coords["lat"] = safe_float(query_args["lat"])
+        sources.append("query.lat")
+    if query_args.get("lon"):
+        coords["lon"] = safe_float(query_args["lon"])
+        sources.append("query.lon")
+    elif query_args.get("lng"):
+        coords["lon"] = safe_float(query_args["lng"])
+        sources.append("query.lng")
+    if query_args.get("elev_m"):
+        coords["elev"] = safe_float(query_args["elev_m"]) or 0.0
+        sources.append("query.elev_m")
+    
+    return {
+        "coordinates": coords,
+        "sources": sources,
+        "observer_obj_present": isinstance(observer_obj, dict),
+        "observer_obj_contents": observer_obj if isinstance(observer_obj, dict) else None
+    }
+
+
 @api.post("/api/ephemeris/longitudes")
 def ephemeris_longitudes_endpoint():
     """
-    Compute ecliptic longitudes for celestial bodies at a given time.
-    
-    Critical fix: Direct observer coordinate handling without complex precedence logic.
+    Compute ecliptic longitudes with aggressive debugging for topocentric mode.
     """
     try:
         body = request.get_json(force=True) or {}
@@ -1087,111 +1162,101 @@ def ephemeris_longitudes_endpoint():
     # Determine if topocentric calculation is requested
     topocentric = (center == "topocentric") or bool(payload.get("topocentric"))
 
-    # Simple, direct coordinate extraction
-    lat = None
-    lon = None
-    elev = 0.0
-    
-    # Try payload top-level first
-    try:
-        if payload.get("latitude") is not None:
-            lat = float(payload["latitude"])
-        if payload.get("longitude") is not None:
-            lon = float(payload["longitude"])
-        if payload.get("elevation_m") is not None:
-            elev = float(payload["elevation_m"])
-        elif payload.get("elev_m") is not None:
-            elev = float(payload["elev_m"])
-    except (ValueError, TypeError):
-        pass
-    
-    # Try observer object (this should work for your test case)
-    observer_obj = body.get("observer")
-    if isinstance(observer_obj, dict):
-        try:
-            if lat is None and observer_obj.get("lat") is not None:
-                lat = float(observer_obj["lat"])
-            elif lat is None and observer_obj.get("latitude") is not None:
-                lat = float(observer_obj["latitude"])
-                
-            if lon is None and observer_obj.get("lon") is not None:
-                lon = float(observer_obj["lon"])
-            elif lon is None and observer_obj.get("lng") is not None:
-                lon = float(observer_obj["lng"])
-            elif lon is None and observer_obj.get("longitude") is not None:
-                lon = float(observer_obj["longitude"])
-                
-            if observer_obj.get("elevation_m") is not None:
-                elev = float(observer_obj["elevation_m"])
-            elif observer_obj.get("elev_m") is not None:
-                elev = float(observer_obj["elev_m"])
-        except (ValueError, TypeError):
-            pass
-    
-    # Try query parameters last
-    try:
-        if request.args.get("lat"):
-            lat = float(request.args["lat"])
-        if request.args.get("lon"):
-            lon = float(request.args["lon"])
-        elif request.args.get("lng"):
-            lon = float(request.args["lng"])
-        if request.args.get("elev_m"):
-            elev = float(request.args["elev_m"])
-    except (ValueError, TypeError):
-        pass
+    # Extract coordinates with full diagnostics
+    coord_info = _extract_observer_coordinates(body, payload, request.args)
+    coords = coord_info["coordinates"]
+    lat, lon, elev = coords["lat"], coords["lon"], coords["elev"]
 
-    # Debug logging
-    print(f"ENDPOINT DEBUG:")
-    print(f"  topocentric={topocentric}")
-    print(f"  extracted: lat={lat}, lon={lon}, elev={elev}")
-    print(f"  observer_obj from body: {observer_obj}")
-    print(f"  payload keys: {list(payload.keys())}")
+    # Comprehensive debug logging
+    print(f"\n=== ENDPOINT COORDINATE EXTRACTION DEBUG ===")
+    print(f"topocentric_requested: {topocentric}")
+    print(f"coordinate_sources: {coord_info['sources']}")
+    print(f"extracted_lat: {lat}")
+    print(f"extracted_lon: {lon}")
+    print(f"extracted_elev: {elev}")
+    print(f"observer_obj_present: {coord_info['observer_obj_present']}")
+    print(f"observer_obj_contents: {coord_info['observer_obj_contents']}")
+    print(f"payload_keys: {list(payload.keys())}")
+    print(f"body_keys: {list(body.keys())}")
+    print(f"query_args: {dict(request.args)}")
 
-    # Validate topocentric requirements
-    if topocentric and (lat is None or lon is None):
+    # Validate coordinates for topocentric
+    coords_valid = (lat is not None and lon is not None and 
+                   isinstance(lat, (int, float)) and isinstance(lon, (int, float)) and
+                   -90 <= lat <= 90)
+    
+    print(f"coords_valid: {coords_valid}")
+    print(f"lat_valid: {lat is not None and isinstance(lat, (int, float)) and -90 <= lat <= 90}")
+    print(f"lon_valid: {lon is not None and isinstance(lon, (int, float))}")
+
+    if topocentric and not coords_valid:
         return _json_error(
             "topocentric_coords_required",
             {
-                "message": "Topocentric calculation requires observer latitude and longitude",
-                "extracted": {"latitude": lat, "longitude": lon, "elevation_m": elev},
-                "observer_obj": observer_obj,
-                "payload_keys": list(payload.keys())
+                "message": "Invalid or missing coordinates for topocentric calculation",
+                "extracted": {"lat": lat, "lon": lon, "elev": elev},
+                "coord_info": coord_info
             },
             422
         )
 
-    # Call the ephemeris adapter - SIMPLIFIED
+    # Call adapter with MAXIMUM information
     try:
         from app.core import ephemeris_adapter as ea
         
-        # Create clean observer dict if we have coordinates
-        observer_dict = {"lat": lat, "lon": lon, "elevation_m": elev} if (lat is not None and lon is not None) else None
+        print(f"\n=== CALLING ADAPTER ===")
+        print(f"adapter_call_params:")
+        print(f"  jd_tt: {jd_tt}")
+        print(f"  names: {names}")
+        print(f"  frame: {frame}")
+        print(f"  topocentric: {topocentric}")
+        print(f"  latitude: {lat}")
+        print(f"  longitude: {lon}")
+        print(f"  elevation_m: {elev}")
+        print(f"  observer: {{'lat': {lat}, 'lon': {lon}, 'elevation_m': {elev}} if coords_valid else None}")
         
-        print(f"  calling adapter with observer_dict: {observer_dict}")
+        # Try adapter call with all possible parameter combinations
+        if coords_valid:
+            observer_dict = {"lat": lat, "lon": lon, "elevation_m": elev}
+            raw_result = ea.ecliptic_longitudes(
+                jd_tt,
+                names=names,
+                frame=frame,
+                topocentric=topocentric,
+                latitude=lat,              # Individual coordinates
+                longitude=lon,
+                elevation_m=elev,
+                observer=observer_dict,    # Observer dict
+            )
+        else:
+            raw_result = ea.ecliptic_longitudes(
+                jd_tt,
+                names=names,
+                frame=frame,
+                topocentric=False,  # Force geocentric if coords invalid
+            )
         
-        raw_result = ea.ecliptic_longitudes(
-            jd_tt,
-            names=names,
-            frame=frame,
-            topocentric=topocentric,
-            observer=observer_dict,  # ONLY pass observer dict, not individual coords
-        )
-        
-        print(f"  adapter returned meta.topocentric: {raw_result.get('meta', {}).get('topocentric')}")
+        adapter_meta = raw_result.get("meta", {})
+        print(f"\n=== ADAPTER RESULT ===")
+        print(f"adapter_meta_topocentric: {adapter_meta.get('topocentric')}")
+        print(f"adapter_warnings: {adapter_meta.get('warnings', [])}")
+        print(f"adapter_ok: {adapter_meta.get('ok')}")
+        print(f"adapter_meta_keys: {list(adapter_meta.keys())}")
         
     except Exception as e:
-        print(f"  adapter error: {e}")
+        print(f"adapter_error: {e}")
+        import traceback
+        traceback.print_exc()
         return _json_error(
             "ephemeris_computation_error", 
             {"error": str(e)} if DEBUG_VERBOSE else {"error": "Ephemeris computation failed"}, 
             500
         )
 
-    # Normalize the adapter results
+    # Normalize results
     rows, adapter_meta = _norm_rows_from_longitudes(raw_result)
 
-    # Build ordered results matching the requested body order
+    # Build ordered results
     requested = [b.lower() for b in bodies]
     name_map = {b.lower(): n for b, n in zip(bodies, names)}
     by_body = {r["body"]: r for r in rows if isinstance(r.get("longitude"), (int, float))}
@@ -1210,9 +1275,15 @@ def ephemeris_longitudes_endpoint():
     response_meta = dict(adapter_meta)
     response_meta.setdefault("frame", frame)
     
-    # CRITICAL: Trust only the adapter's topocentric determination
-    effective_topocentric = response_meta.get("topocentric", False)
-    effective_center = "topocentric" if effective_topocentric else "geocentric"
+    # Final debug output
+    final_topocentric = response_meta.get("topocentric", False)
+    effective_center = "topocentric" if final_topocentric else "geocentric"
+    
+    print(f"\n=== FINAL RESULT ===")
+    print(f"final_topocentric_flag: {final_topocentric}")
+    print(f"effective_center: {effective_center}")
+    print(f"response_longitude: {ordered_results[0]['longitude'] if ordered_results else 'N/A'}")
+    print(f"================================================\n")
 
     return jsonify({
         "ok": True,
