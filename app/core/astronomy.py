@@ -1,16 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-High-precision planetary chart computation (ecliptic-of-date).
+High-precision planetary chart computation.
 
 What this module provides:
 - Thin `compute_chart`, sturdy helpers.
-- Adapter normalization for many shapes (maps/rows/single-key dicts/tuples/objects).
+- Adapter normalization for many shapes:
+  * dict maps, flat maps, list-form (names + longitudes [+ velocities]),
+    row dicts, tuples, positional, and objects.
 - Leap-second detection (':60') with normalization + warning token.
 - Structured, deduped warnings.
 - Typed-ish config via env; sane defaults.
-- Tiny TTL cache for adapter calls (kernel tag, JD, topo, names).
+- Tiny TTL cache for adapter calls (kernel tag, JD, topo, names, frame).
 - Nodes normalization: move nodes from bodies[] → points[].
-- Safety net: explicit topo→geo fallback with warnings (no silent geocentric).
+- Robust adapter interface with comprehensive error propagation and fallbacks.
 
 Public API:
     compute_chart(payload: dict) -> dict
@@ -23,7 +25,11 @@ from __future__ import annotations
 from typing import Any, Dict, List, Tuple, Optional, Callable
 from dataclasses import dataclass
 from functools import lru_cache
-import math, os, inspect, time
+import math
+import os
+import inspect
+import time
+import traceback
 
 __all__ = ["compute_chart", "clear_ephemeris_cache"]
 
@@ -93,6 +99,7 @@ class _AstroCfg:
     dut1_seconds: float
     always_include_majors_with_points: bool
     cache_ttl_sec: float
+    debug_adapter: bool
 
 
 CFG = _AstroCfg(
@@ -113,6 +120,7 @@ CFG = _AstroCfg(
     dut1_seconds=_float_env("ASTRO_DUT1_BROADCAST", "ASTRO_DUT1", "OCP_DUT1_SECONDS", default=0.0),
     always_include_majors_with_points=_bool_env("OCP_ALWAYS_INCLUDE_MAJORS_WITH_POINTS", True),
     cache_ttl_sec=float(os.getenv("OCP_ASTRO_CACHE_TTL_SEC", "600")),  # 10 min
+    debug_adapter=_bool_env("ASTRO_DEBUG_ADAPTER", False),
 )
 
 
@@ -125,7 +133,6 @@ _EXTRA_ALLOWED = ("Ceres", "Pallas", "Juno", "Vesta", "Chiron", "North Node", "S
 ALLOWED_BODIES = set(_CLASSIC_10) | set(_EXTRA_ALLOWED)
 _DEF_BODIES: Tuple[str, ...] = _CLASSIC_10
 
-# Broad node synonyms → canonical points
 _NODE_CANON = {
     "north node": "North Node",
     "south node": "South Node",
@@ -138,8 +145,43 @@ _NODE_CANON = {
     "descending node": "South Node",
     "northnode": "North Node",
     "southnode": "South Node",
+    "rahu": "North Node",
+    "ketu": "South Node",
+    "lunar node": "North Node",
+    "moon node": "North Node",
+    "☊": "North Node",
+    "☋": "South Node",
 }
 _NODE_SET_LC = set(_NODE_CANON.keys())
+
+_BODY_SYNONYMS = {
+    "sun": "Sun",
+    "moon": "Moon",
+    "mercury": "Mercury",
+    "venus": "Venus",
+    "mars": "Mars",
+    "jupiter": "Jupiter",
+    "saturn": "Saturn",
+    "uranus": "Uranus",
+    "neptune": "Neptune",
+    "pluto": "Pluto",
+    "ceres": "Ceres",
+    "pallas": "Pallas",
+    "juno": "Juno",
+    "vesta": "Vesta",
+    "chiron": "Chiron",
+    # Common variants / glyphs
+    "sol": "Sun",
+    "luna": "Moon",
+    "earth": "Earth",
+    "♀": "Venus",
+    "♂": "Mars",
+    "♃": "Jupiter",
+    "♄": "Saturn",
+    "♅": "Uranus",
+    "♆": "Neptune",
+    "♇": "Pluto",
+}
 
 _PROJECT_SOURCE_TAG = "astronomy(core)"
 
@@ -166,6 +208,9 @@ class _W:
     LEAP_SECOND = "leap_second"
     TOPO_FALLBACK_GEO = "topo_position_fallback_geocentric"
     ADAPTER_NO_TOPO = "adapter_no_topocentric_support"
+    ADAPTER_ERROR = "adapter_error"
+    ADAPTER_PARSE_ERROR = "adapter_response_parse_error"
+    BODY_NAME_FUZZY_MATCH = "body_name_fuzzy_matched"
 
 
 def _warn_add(store: List[str], seen: set[str], code: str, detail: Optional[str] = None) -> None:
@@ -173,6 +218,11 @@ def _warn_add(store: List[str], seen: set[str], code: str, detail: Optional[str]
     if s not in seen:
         seen.add(s)
         store.append(s)
+
+
+def _debug_log(message: str) -> None:
+    if CFG.debug_adapter:
+        print(f"DEBUG ASTRO: {message}")
 
 
 # ───────────────────────────── Tiny math helpers ──────────────────────
@@ -193,16 +243,20 @@ def _shortest_signed_delta_deg(a2: float, a1: float) -> float:
 
 
 def _coerce_bool(val: Any, default: bool = False) -> bool:
-    if isinstance(val, bool): return val
+    if isinstance(val, bool):
+        return val
     if isinstance(val, str):
         s = val.strip().lower()
-        if s in ("1", "true", "t", "yes", "y", "on"): return True
-        if s in ("0", "false", "f", "no", "n", "off"): return False
+        if s in ("1", "true", "t", "yes", "y", "on"):
+            return True
+        if s in ("0", "false", "f", "no", "n", "off"):
+            return False
     return default
 
 
 def _q(x: Optional[float], q: float) -> Optional[float]:
-    if x is None: return None
+    if x is None:
+        return None
     return round(float(x) / q) * q
 
 
@@ -227,11 +281,26 @@ def _canon_node_name(s: str) -> Optional[str]:
     return _NODE_CANON.get(key)
 
 
+def _normalize_body_name(name: str) -> str:
+    normalized = str(name).strip()
+    if normalized in ALLOWED_BODIES:
+        return normalized
+    lower_name = normalized.lower()
+    if lower_name in _BODY_SYNONYMS:
+        return _BODY_SYNONYMS[lower_name]
+    for allowed in ALLOWED_BODIES:
+        if allowed.lower() == lower_name:
+            return allowed
+    return normalized
+
+
 def _split_bodies_points(payload: Dict[str, Any], warnings: List[str], seen: set[str]) -> Tuple[List[str], List[str]]:
     bodies_raw = payload.get("bodies", None)
     if bodies_raw is None:
         majors: List[str] = list(_DEF_BODIES)
+        bodies_were_omitted = True
     else:
+        bodies_were_omitted = False
         try:
             majors = [str(b) for b in bodies_raw]
         except Exception:
@@ -251,26 +320,30 @@ def _split_bodies_points(payload: Dict[str, Any], warnings: List[str], seen: set
 
     majors_out: List[str] = []
     for b in majors:
-        if b not in ALLOWED_BODIES and str(b).strip().lower() not in _NODE_SET_LC:
+        normalized_body = _normalize_body_name(b)
+        if normalized_body not in ALLOWED_BODIES and str(b).strip().lower() not in _NODE_SET_LC:
             allowed = ", ".join(sorted(ALLOWED_BODIES))
             raise AstronomyError("unsupported_body", f"'{b}' not supported (allowed: {allowed})")
         # move any node-ish body into points
-        if str(b).strip().lower() in _NODE_SET_LC or b in ("North Node", "South Node"):
-            canon = _canon_node_name(b) or (b if b in ("North Node", "South Node") else None)
+        if str(b).strip().lower() in _NODE_SET_LC or normalized_body in ("North Node", "South Node"):
+            canon = _canon_node_name(b) or (normalized_body if normalized_body in ("North Node", "South Node") else None)
             if canon and canon not in points:
                 points.append(canon)
         else:
-            majors_out.append(b)
+            majors_out.append(normalized_body)
 
-    # If majors collapsed, always restore the classic 10 (prevents empty chart.bodies).
+    # If majors collapsed to nothing, optionally re-add the classic 10
     if len(majors_out) == 0:
-        majors_out = list(_DEF_BODIES)
+        if bodies_were_omitted or CFG.always_include_majors_with_points:
+            majors_out = list(_DEF_BODIES)
 
     # Dedup points, keep order
-    pts_seen = set(); pts_final: List[str] = []
+    pts_seen: set[str] = set()
+    pts_final: List[str] = []
     for p in points:
         if p not in pts_seen:
-            pts_seen.add(p); pts_final.append(p)
+            pts_seen.add(p)
+            pts_final.append(p)
 
     return majors_out, pts_final
 
@@ -297,24 +370,26 @@ def _normalize_time_for_leap_second(time_str: str) -> str:
 
 
 def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[str]) -> Tuple[float, float, float]:
-    jd_ut  = payload.get("jd_ut") or payload.get("jd_utc")
-    jd_tt  = payload.get("jd_tt")
+    jd_ut = payload.get("jd_ut") or payload.get("jd_utc")
+    jd_tt = payload.get("jd_tt")
     jd_ut1 = payload.get("jd_ut1")
 
+    # 1) All three supplied
     if all(isinstance(x, (int, float)) for x in (jd_ut, jd_tt, jd_ut1)):
         return float(jd_ut), float(jd_tt), float(jd_ut1)
 
-    d  = payload.get("date")
-    t  = payload.get("time")
+    # Civil inputs
+    d = payload.get("date")
+    t = payload.get("time")
     tz = payload.get("place_tz") or payload.get("tz") or "UTC"
 
     if _detect_leap_second(t):
         _warn_add(warnings, seen, _W.LEAP_SECOND)
         t = _normalize_time_for_leap_second(str(t))
 
+    # 2) time_kernel (preferred)
     if _tk is not None:
-        for fname in ("timescales_from_civil", "compute_timescales", "build_timescales",
-                      "to_timescales", "from_civil"):
+        for fname in ("timescales_from_civil", "compute_timescales", "build_timescales", "to_timescales", "from_civil"):
             fn = getattr(_tk, fname, None)
             if not callable(fn):
                 continue
@@ -324,18 +399,24 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
                 params = {}
 
             kwargs: Dict[str, Any] = {}
-            if "date" in params:     kwargs["date"] = d
-            if "time" in params:     kwargs["time"] = t
-            if "tz" in params:       kwargs["tz"] = tz
-            if "place_tz" in params: kwargs["place_tz"] = tz
+            if "date" in params:
+                kwargs["date"] = d
+            if "time" in params:
+                kwargs["time"] = t
+            if "tz" in params:
+                kwargs["tz"] = tz
+            if "place_tz" in params:
+                kwargs["place_tz"] = tz
 
             dut1_val = payload.get("dut1")
             if not isinstance(dut1_val, (int, float)):
                 dut1_val = payload.get("dut1_seconds")
             if not isinstance(dut1_val, (int, float)):
                 dut1_val = CFG.dut1_seconds
-            if "dut1" in params:          kwargs["dut1"] = float(dut1_val)
-            if "dut1_seconds" in params:  kwargs["dut1_seconds"] = float(dut1_val)
+            if "dut1" in params:
+                kwargs["dut1"] = float(dut1_val)
+            if "dut1_seconds" in params:
+                kwargs["dut1_seconds"] = float(dut1_val)
 
             out = None
             try:
@@ -372,9 +453,9 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
                 ju, jt, j1 = map(float, out[:3])
                 return ju, jt, j1
 
+    # 3) Fallback: timescales module or stdlib
     if not isinstance(d, str) or not isinstance(t, str):
-        missing = [k for k, v in (("jd_ut", jd_ut), ("jd_tt", jd_tt), ("jd_ut1", jd_ut1))
-                   if not isinstance(v, (int, float))]
+        missing = [k for k, v in (("jd_ut", jd_ut), ("jd_tt", jd_tt), ("jd_ut1", jd_ut1)) if not isinstance(v, (int, float))]
         raise AstronomyError("timescales_missing", f"Supply {', '.join(missing)} or provide date/time/tz")
 
     def _jd_utc_via_ts(d_: str, t_: str, z_: str) -> float:
@@ -390,13 +471,14 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
         dt_local = datetime.fromisoformat(f"{d_}T{timestr}").replace(tzinfo=ZoneInfo(z_))
         dt_utc = dt_local.astimezone(timezone.utc)
         Y, M, D = dt_utc.year, dt_utc.month, dt_utc.day
-        h = dt_utc.hour + dt_utc.minute/60 + dt_utc.second/3600 + dt_utc.microsecond/3.6e9
+        h = dt_utc.hour + dt_utc.minute / 60 + dt_utc.second / 3600 + dt_utc.microsecond / 3.6e9
         if M <= 2:
-            Y -= 1; M += 12
+            Y -= 1
+            M += 12
         A = Y // 100
         B = 2 - A + A // 4
-        JD0 = int(365.25*(Y + 4716)) + int(30.6001*(M + 1)) + D + B - 1524.5
-        return JD0 + h/24.0
+        JD0 = int(365.25 * (Y + 4716)) + int(30.6001 * (M + 1)) + D + B - 1524.5
+        return JD0 + h / 24.0
 
     used_stdlib = False
     try:
@@ -415,10 +497,10 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
         try:
             jd_tt_calc = float(_ts.jd_tt_from_utc_jd(jd_utc, y, m))
         except Exception:
-            jd_tt_calc = jd_utc + 69.0/86400.0
+            jd_tt_calc = jd_utc + 69.0 / 86400.0
             _warn_add(warnings, seen, _W.DELTAT_CONST)
     else:
-        jd_tt_calc = jd_utc + 69.0/86400.0
+        jd_tt_calc = jd_utc + 69.0 / 86400.0
         if not used_stdlib:
             _warn_add(warnings, seen, _W.DELTAT_CONST)
 
@@ -428,13 +510,14 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
     if not isinstance(dut1_s, (int, float)):
         dut1_s = CFG.dut1_seconds
 
-    jd_ut_calc  = float(jd_utc)
+    jd_ut_calc = float(jd_utc)
     jd_ut1_calc = float(jd_utc) + (float(dut1_s) / 86400.0)
     return jd_ut_calc, jd_tt_calc, jd_ut1_calc
 
 
 # ───────────────────────────── Geo / Topocentric ──────────────────────
-def _normalize_lon180(lon: float) -> float: return _wrap180(lon)
+def _normalize_lon180(lon: float) -> float:
+    return _wrap180(lon)
 
 
 def _validate_and_normalize_geo_for_topo(
@@ -469,9 +552,11 @@ def _validate_and_normalize_geo_for_topo(
             raise AstronomyError("invalid_input", "elevation_m must be a finite number in meters")
         elev_m = float(elev)
         if elev_m < CFG.elev_min:
-            _warn_add(warnings, seen, _W.ELEV_CLAMP_MIN); elev_m = CFG.elev_min
+            _warn_add(warnings, seen, _W.ELEV_CLAMP_MIN)
+            elev_m = CFG.elev_min
         elif elev_m > CFG.elev_max:
-            _warn_add(warnings, seen, _W.ELEV_CLAMP_MAX); elev_m = CFG.elev_max
+            _warn_add(warnings, seen, _W.ELEV_CLAMP_MAX)
+            elev_m = CFG.elev_max
         elif abs(elev_m) >= CFG.elev_warn:
             _warn_add(warnings, seen, _W.ELEV_HIGH)
 
@@ -481,8 +566,7 @@ def _validate_and_normalize_geo_for_topo(
 # ───────────────────────────── Ayanāṁśa ───────────────────────────────
 @lru_cache(maxsize=4096)
 def _ayanamsa_deg_cached(jd_tt_q: float, ay_key: str) -> Tuple[float, str]:
-    for modpath, fn in (("app.core.ayanamsa", "get_ayanamsa_deg"),
-                        ("app.core.astro_extras", "get_ayanamsa_deg")):
+    for modpath, fn in (("app.core.ayanamsa", "get_ayanamsa_deg"), ("app.core.astro_extras", "get_ayanamsa_deg")):
         try:
             mod = __import__(modpath, fromlist=[fn])
             fnobj = getattr(mod, fn, None)
@@ -496,22 +580,24 @@ def _ayanamsa_deg_cached(jd_tt_q: float, ay_key: str) -> Tuple[float, str]:
         except Exception:
             pass
 
-    AY_J2000_DEG     = (23 + 51/60 + 26.26/3600)
-    RATE_AS_PER_YR   = 50.290966
-    Tcent            = (jd_tt_q - 2451545.0) / 36525.0
-    years            = Tcent * 100.0
-    base             = AY_J2000_DEG + (RATE_AS_PER_YR * years) / 3600.0
+    AY_J2000_DEG = (23 + 51 / 60 + 26.26 / 3600)
+    RATE_AS_PER_YR = 50.290966
+    Tcent = (jd_tt_q - 2451545.0) / 36525.0
+    years = Tcent * 100.0
+    base = AY_J2000_DEG + (RATE_AS_PER_YR * years) / 3600.0
     name = (ay_key or CFG.ayanamsa_default or "lahiri").lower()
     if name in ("lahiri", "chitrapaksha", "default", "sidereal"):
         return base, "lahiri(fallback)"
-    if name in ("fagan", "fagan_bradley", "fagan/bradley"):
+    if name in ("fagan", "fagan_bradley", "fagan/bradley", "fagan/allen"):
         return base + (0.83 / 60.0), "fagan_bradley(fallback)"
     if name in ("krishnamurti", "kp"):
         return base - (20.0 / 3600.0), "krishnamurti(fallback)"
     return base, f"ayanamsa_fallback_to_lahiri({name})"
 
 
-def _resolve_ayanamsa(jd_tt: float, ayanamsa: Any, warnings: List[str], seen: set[str]) -> Tuple[Optional[float], Optional[str]]:
+def _resolve_ayanamsa(
+    jd_tt: float, ayanamsa: Any, warnings: List[str], seen: set[str]
+) -> Tuple[Optional[float], Optional[str]]:
     if ayanamsa is None or (isinstance(ayanamsa, str) and not str(ayanamsa).strip()):
         key = CFG.ayanamsa_default
     elif isinstance(ayanamsa, (int, float)):
@@ -527,8 +613,7 @@ def _resolve_ayanamsa(jd_tt: float, ayanamsa: Any, warnings: List[str], seen: se
 
 # ───────────────────────────── Adapter I/O & normalization ────────────
 def _adapter_source_tag() -> str:
-    tag = getattr(eph, "current_kernel_name", None) \
-          or getattr(eph, "EPHEMERIS_NAME", None) or "adapter"
+    tag = getattr(eph, "current_kernel_name", None) or getattr(eph, "EPHEMERIS_NAME", None) or "adapter"
     try:
         return str(tag())
     except Exception:
@@ -544,9 +629,7 @@ def _adapter_callable(*names: str) -> Optional[Callable[..., Any]]:
 
 
 def _geo_kwargs_for_sig(
-    sig: inspect.Signature, *,
-    topocentric: bool,
-    lat_q, lon_q, elev_q
+    sig: inspect.Signature, *, topocentric: bool, lat_q, lon_q, elev_q
 ) -> Dict[str, Any]:
     kw: Dict[str, Any] = {}
     params = sig.parameters
@@ -558,18 +641,25 @@ def _geo_kwargs_for_sig(
 
     if topocentric:
         if lat_q is not None:
-            if "latitude" in params: kw["latitude"] = float(lat_q)
-            elif "lat" in params:    kw["lat"] = float(lat_q)
+            if "latitude" in params:
+                kw["latitude"] = float(lat_q)
+            elif "lat" in params:
+                kw["lat"] = float(lat_q)
         if lon_q is not None:
-            if "longitude" in params: kw["longitude"] = float(lon_q)
-            elif "lon" in params:     kw["lon"] = float(lon_q)
+            if "longitude" in params:
+                kw["longitude"] = float(lon_q)
+            elif "lon" in params:
+                kw["lon"] = float(lon_q)
         if elev_q is not None:
-            if "elevation_m" in params:   kw["elevation_m"] = float(elev_q)
-            elif "elev_m" in params:      kw["elev_m"] = float(elev_q)
-            elif "elevation" in params:   kw["elevation"] = float(elev_q)
+            if "elevation_m" in params:
+                kw["elevation_m"] = float(elev_q)
+            elif "elev_m" in params:
+                kw["elev_m"] = float(elev_q)
+            elif "elevation" in params:
+                kw["elevation"] = float(elev_q)
 
         if "observer" in params and (lat_q is not None and lon_q is not None):
-            obs = {"latitude":  float(lat_q), "longitude": float(lon_q)}
+            obs = {"latitude": float(lat_q), "longitude": float(lon_q)}
             if elev_q is not None:
                 obs["elevation_m"] = float(elev_q)
             kw["observer"] = obs
@@ -582,15 +672,15 @@ def _unwrap_adapter_result(res: Any) -> Tuple[str, Any]:
     if res is None:
         return "empty", []
     if isinstance(res, dict):
-        # If dict contains any of these keys, treat as "maps" but allow list payloads too.
-        if any(k in res for k in ("longitudes", "longitude", "lon", "velocities", "velocity", "speed", "speeds", "names", "bodies", "planets", "ids")):
-            return "maps", res
-        # wrappers
         for k in ("rows", "result", "data", "payload"):
             v = res.get(k)
             if isinstance(v, (list, tuple)):
                 return "rows", v
-        # flat dict of name->deg
+        if any(k in res for k in ("longitudes", "longitude", "lon", "velocities", "velocity", "speed", "speeds", "names", "bodies", "planets", "ids")):
+            return "maps", res
+        for v in res.values():
+            if isinstance(v, (list, tuple)):
+                return "rows", v
         return "flat", res
 
     if isinstance(res, (list, tuple)):
@@ -621,29 +711,29 @@ def _extract_rows(kind: str, payload: Any) -> List[Dict[str, Any]]:
 
     if kind in ("maps", "flat"):
         data = payload or {}
-
-        # Prefer dict map: {name:deg}
+        # dict maps
         longmaps = None
         for lk in ("longitudes", "longitude", "lon"):
             if isinstance(data.get(lk), dict):
-                longmaps = data[lk]; break
-
-        # Handle list-form longitudes (with optional names[] & velocities[])
-        list_longs = None
-        for lk in ("longitudes", "longitude", "lon"):
-            if isinstance(data.get(lk), (list, tuple)):
-                list_longs = list(data[lk]); break
-
+                longmaps = data[lk]
+                break
         velmaps = None
         for sk in ("velocities", "velocity", "speed", "speeds"):
             if isinstance(data.get(sk), dict):
-                velmaps = data[sk]; break
+                velmaps = data[sk]
+                break
 
+        # list-form with parallel names/longitudes[/velocities]
+        list_longs = None
+        for lk in ("longitudes", "longitude", "lon"):
+            if isinstance(data.get(lk), (list, tuple)):
+                list_longs = list(data[lk])
+                break
         list_vels = None
         for sk in ("velocities", "velocity", "speed", "speeds"):
             if isinstance(data.get(sk), (list, tuple)):
-                list_vels = list(data[sk]); break
-
+                list_vels = list(data[sk])
+                break
         names_list = None
         for nk in ("names", "bodies", "planets", "ids", "labels"):
             if isinstance(data.get(nk), (list, tuple)) and all(isinstance(x, (str, int)) for x in data[nk]):
@@ -675,7 +765,7 @@ def _extract_rows(kind: str, payload: Any) -> List[Dict[str, Any]]:
             return rows
 
         # flat map {name:deg}
-        if kind == "flat" and all(isinstance(k, (str, int)) and isinstance(v, (int, float)) for k, v in data.items()):
+        if kind == "flat" and isinstance(data, dict) and all(isinstance(k, (str, int)) and isinstance(v, (int, float)) for k, v in data.items()):
             for name, lon in data.items():
                 rows.append({"name": str(name), "lon": float(lon), "speed": None})
             return rows
@@ -684,8 +774,6 @@ def _extract_rows(kind: str, payload: Any) -> List[Dict[str, Any]]:
         for r in payload:
             if not isinstance(r, dict):
                 continue
-
-            # accept single-key dicts like {"Sun": 123.45}
             if len(r) == 1:
                 k, v = next(iter(r.items()))
                 if isinstance(k, (str, int)) and isinstance(v, (int, float)):
@@ -695,25 +783,31 @@ def _extract_rows(kind: str, payload: Any) -> List[Dict[str, Any]]:
             nm = r.get("name") or r.get("body") or r.get("planet") or r.get("id") or r.get("label")
             if not nm:
                 continue
-            lon = (r.get("lon", None) if r.get("lon", None) is not None else
-                   r.get("longitude", None) if r.get("longitude", None) is not None else
-                   r.get("longitude_deg", None) if r.get("longitude_deg", None) is not None else
-                   r.get("lambda", None) if r.get("lambda", None) is not None else
-                   r.get("ecliptic_longitude", None))
+            lon = (
+                r.get("lon", None) if r.get("lon", None) is not None else
+                r.get("longitude", None) if r.get("longitude", None) is not None else
+                r.get("longitude_deg", None) if r.get("longitude_deg", None) is not None else
+                r.get("lambda", None) if r.get("lambda", None) is not None else
+                r.get("ecliptic_longitude", None)
+            )
             if lon is None or not isinstance(lon, (int, float)):
                 continue
-            sp = (r.get("speed", None) if isinstance(r.get("speed", None), (int, float)) else
-                  r.get("velocity", None) if isinstance(r.get("velocity", None), (int, float)) else
-                  r.get("speed_deg_per_day", None) if isinstance(r.get("speed_deg_per_day", None), (int, float)) else
-                  r.get("lambda_dot", None) if isinstance(r.get("lambda_dot", None), (int, float)) else
-                  r.get("deg_per_day", None) if isinstance(r.get("deg_per_day", None), (int, float)) else None)
+            sp = (
+                r.get("speed", None) if isinstance(r.get("speed", None), (int, float)) else
+                r.get("velocity", None) if isinstance(r.get("velocity", None), (int, float)) else
+                r.get("speed_deg_per_day", None) if isinstance(r.get("speed_deg_per_day", None), (int, float)) else
+                r.get("lambda_dot", None) if isinstance(r.get("lambda_dot", None), (int, float)) else
+                r.get("deg_per_day", None) if isinstance(r.get("deg_per_day", None), (int, float)) else
+                None
+            )
             rows.append({"name": str(nm), "lon": float(lon), "speed": (float(sp) if sp is not None else None)})
         return rows
 
     if kind == "tuples":
         for item in payload:
             try:
-                nm = str(item[0]); lon = float(item[1])
+                nm = str(item[0])
+                lon = float(item[1])
                 sp = float(item[2]) if len(item) >= 3 and isinstance(item[2], (int, float)) else None
                 rows.append({"name": nm, "lon": lon, "speed": sp})
             except Exception:
@@ -727,8 +821,9 @@ def _extract_rows(kind: str, payload: Any) -> List[Dict[str, Any]]:
         for obj in payload:
             try:
                 nm = str(getattr(obj, "name"))
-                lon = (getattr(obj, "lon", None) or getattr(obj, "longitude", None) or getattr(obj, "longitude_deg", None))
-                if lon is None: continue
+                lon = getattr(obj, "lon", None) or getattr(obj, "longitude", None) or getattr(obj, "longitude_deg", None)
+                if lon is None:
+                    continue
                 sp = getattr(obj, "speed", None) or getattr(obj, "velocity", None)
                 rows.append({"name": nm, "lon": float(lon), "speed": (float(sp) if isinstance(sp, (int, float)) else None)})
             except Exception:
@@ -738,26 +833,76 @@ def _extract_rows(kind: str, payload: Any) -> List[Dict[str, Any]]:
     return rows
 
 
-def _map_rows_to_requested(rows: List[Dict[str, Any]], requested: Tuple[str, ...]) -> Tuple[Dict[str, float], Dict[str, Optional[float]]]:
+def _map_rows_to_requested(
+    rows: List[Dict[str, Any]], requested: Tuple[str, ...], warnings: List[str], seen: set[str]
+) -> Tuple[Dict[str, float], Dict[str, Optional[float]]]:
     want = list(requested)
     want_lc = [w.lower() for w in want]
     lon_map: Dict[str, float] = {}
     spd_map: Dict[str, Optional[float]] = {}
 
-    by_name = {str(r.get("name", "")).lower(): r for r in rows if "name" in r}
+    _debug_log(f"Mapping {len(rows)} adapter rows to {len(requested)} requested bodies")
+    _debug_log(f"Requested bodies: {list(requested)}")
+    _debug_log(f"Adapter row names: {[r.get('name', 'NO_NAME') for r in rows]}")
+
+    by_name: Dict[str, Dict[str, Any]] = {}
+    by_name_lower: Dict[str, Dict[str, Any]] = {}
+
+    for r in rows:
+        if "name" not in r:
+            continue
+        name = str(r["name"])
+        by_name[name] = r
+        by_name_lower[name.lower()] = r
+
+    _debug_log(f"Adapter provides: {list(by_name.keys())}")
+
+    # Phase 1: exact/case-insensitive
     for nm, key in zip(want, want_lc):
-        r = by_name.get(key)
+        r = by_name.get(nm)
         if r and isinstance(r.get("lon"), (int, float)):
             lon_map[nm] = float(r["lon"])
             spd_map[nm] = float(r["speed"]) if isinstance(r.get("speed"), (int, float)) else None
+            _debug_log(f"Exact match: {nm} -> {lon_map[nm]}")
+            continue
+        r = by_name_lower.get(key)
+        if r and isinstance(r.get("lon"), (int, float)):
+            lon_map[nm] = float(r["lon"])
+            spd_map[nm] = float(r["speed"]) if isinstance(r.get("speed"), (int, float)) else None
+            _debug_log(f"Case-insensitive match: {nm} -> {lon_map[nm]}")
+            continue
 
+    # Phase 2: synonym/normalized
+    for nm in want:
+        if nm in lon_map:
+            continue
+        normalized = _normalize_body_name(nm)
+        if normalized != nm:
+            for adapter_name in by_name:
+                if _normalize_body_name(adapter_name) == normalized:
+                    r = by_name[adapter_name]
+                    if isinstance(r.get("lon"), (int, float)):
+                        lon_map[nm] = float(r["lon"])
+                        spd_map[nm] = float(r["speed"]) if isinstance(r.get("speed"), (int, float)) else None
+                        _warn_add(warnings, seen, _W.BODY_NAME_FUZZY_MATCH, f"{nm}->{adapter_name}")
+                        _debug_log(f"Synonym match: {nm} -> {adapter_name} -> {lon_map[nm]}")
+                        break
+
+    # Phase 3: positional fallback
     pos_rows = [r for r in rows if "_pos" in r and isinstance(r.get("lon"), (int, float))]
     if pos_rows:
+        _debug_log(f"Using positional fallback for {len(pos_rows)} positions")
         for pr in pos_rows:
             i = int(pr["_pos"])
             if 0 <= i < len(want) and want[i] not in lon_map:
                 lon_map[want[i]] = float(pr["lon"])
                 spd_map[want[i]] = None
+                _debug_log(f"Positional match[{i}]: {want[i]} -> {lon_map[want[i]]}")
+
+    _debug_log(f"Final mapping successful for {len(lon_map)}/{len(want)} bodies: {list(lon_map.keys())}")
+    missing = [nm for nm in want if nm not in lon_map]
+    if missing:
+        _debug_log(f"Missing bodies: {missing}")
 
     return lon_map, spd_map
 
@@ -769,7 +914,7 @@ _PosCache: Dict[Tuple[Any, ...], Tuple[float, Dict[str, float], Dict[str, Option
 def _ttl_get_or_compute(
     key: Tuple[Any, ...],
     ttl: float,
-    compute: Callable[[], Tuple[Dict[str, float], Dict[str, Optional[float]], str]]
+    compute: Callable[[], Tuple[Dict[str, float], Dict[str, Optional[float]], str]],
 ) -> Tuple[Dict[str, float], Dict[str, Optional[float]], str]:
     now = time.time()
     item = _PosCache.get(key)
@@ -799,19 +944,26 @@ def _cached_positions(
     elev_q: Optional[float],
     warnings: Optional[List[str]] = None,
     seen: Optional[set[str]] = None,
+    frame: str = "ecliptic-of-date",
 ) -> Tuple[Dict[str, float], Dict[str, Optional[float]], str]:
     """
-    Robust ephemeris adapter call:
-      1) Try kwargs (with topo/geo) + names-as-kw.
-      2) Try positional names + kwargs (so observer info still passes).
-      3) If topo=True still failing, warn + force geocentric then retry (kw + pos+kw).
-      4) As last resort (non-topo), plain positional (jd,names)/(jd).
+    Robust adapter interface with comprehensive error handling.
     """
     if eph is None:
         raise AstronomyError("ephemeris_unavailable", f"ephemeris_adapter import failed: {_EPH_IMPORT_ERROR!r}")
 
+    if warnings is None:
+        warnings = []
+    if seen is None:
+        seen = set()
+
     kernel_tag = _adapter_source_tag()
-    cache_key = (kernel_tag, jd_tt_q, names_key, bool(topocentric), lat_q, lon_q, elev_q)
+    cache_key = (kernel_tag, jd_tt_q, names_key, bool(topocentric), lat_q, lon_q, elev_q, frame)
+
+    _debug_log(f"Requesting positions for {len(names_key)} bodies: {list(names_key)}")
+    _debug_log(f"Topocentric: {topocentric}, JD_TT: {jd_tt_q}, frame={frame}")
+    if topocentric:
+        _debug_log(f"Observer: lat={lat_q}, lon={lon_q}, elev={elev_q}")
 
     def _compute() -> Tuple[Dict[str, float], Dict[str, Optional[float]], str]:
         fn = _adapter_callable(
@@ -830,110 +982,146 @@ def _cached_positions(
             sig = None
             params = {}
 
-        def _make_kwargs(force_center: Optional[str], topo_flag: bool) -> Dict[str, Any]:
+        _debug_log(f"Using adapter function: {getattr(fn, '__name__', '<callable>')}")
+        _debug_log(f"Function parameters: {list(params.keys())}")
+
+        def _call_adapter_safely(names_list: List[str], force_geocentric: bool = False) -> Any:
             base_kwargs: Dict[str, Any] = {}
+
+            # Time parameter
             if "jd_tt" in params:
                 base_kwargs["jd_tt"] = jd_tt_q
             elif "jd" in params:
                 base_kwargs["jd"] = jd_tt_q
+
+            # Frame parameter
             if "frame" in params:
-                base_kwargs["frame"] = "ecliptic-of-date"
-            geo_kwargs = _geo_kwargs_for_sig(sig or inspect.Signature(), topocentric=topo_flag, lat_q=lat_q, lon_q=lon_q, elev_q=elev_q)
+                base_kwargs["frame"] = frame
+
+            # Geographic parameters
+            actual_topo = topocentric and not force_geocentric
+            geo_kwargs = _geo_kwargs_for_sig(
+                sig or inspect.Signature(),
+                topocentric=actual_topo,
+                lat_q=lat_q,
+                lon_q=lon_q,
+                elev_q=elev_q,
+            )
             base_kwargs.update(geo_kwargs)
-            if force_center is not None and "center" in params:
-                base_kwargs["center"] = force_center
-            return base_kwargs
 
-        def _call_kw(names_list: List[str], force_center: Optional[str], topo_flag: bool) -> Any:
-            base_kwargs = _make_kwargs(force_center, topo_flag)
+            if force_geocentric and "center" in params:
+                base_kwargs["center"] = "geocentric"
+                for topo_key in ["latitude", "lat", "longitude", "lon", "elevation_m", "elev_m", "elevation", "observer"]:
+                    base_kwargs.pop(topo_key, None)
+
+            _debug_log(f"Adapter call kwargs: {base_kwargs}")
+
             detected_name_keys = [k for k in ("names", "bodies", "planets", "ids") if k in params]
-            last_err_local: Optional[Exception] = None
 
-            # keyword with detected names keys
-            for nk in (detected_name_keys or []):
+            # Method 1: Keyword with detected names key
+            for name_key in (detected_name_keys or ["names", "bodies", "planets"]):
                 try:
-                    kw = dict(base_kwargs); kw[nk] = names_list
-                    return fn(**kw)
+                    kw = dict(base_kwargs)
+                    kw[name_key] = names_list
+                    _debug_log(f"Trying {name_key}={names_list}")
+                    result = fn(**kw)
+                    _debug_log(f"Adapter call successful with {name_key}")
+                    return result
                 except Exception as e:
-                    last_err_local = e
+                    _debug_log(f"Failed with {name_key}: {type(e).__name__}: {e}")
+                    continue
 
-            # force explicit common key names
-            for forced_key in ("names", "bodies", "planets", "ids"):
-                try:
-                    kw = dict(base_kwargs); kw[forced_key] = names_list
-                    return fn(**kw)
-                except Exception as e:
-                    last_err_local = e
-
-            raise AstronomyError("adapter_failed", f"kw-call failed; last error: {last_err_local!r}")
-
-        def _call_pos_with_kwargs(names_list: List[str], force_center: Optional[str], topo_flag: bool) -> Any:
-            # pass jd and names positionally; attach observer kwargs as keywords
-            base_kwargs = _make_kwargs(force_center, topo_flag)
-            base_kwargs.pop("jd_tt", None)
-            base_kwargs.pop("jd", None)
+            # Method 2: Positional names + kwargs (works for many adapters)
             try:
-                return fn(jd_tt_q, names_list, **base_kwargs)
-            except TypeError:
-                # maybe only jd positionally, no names kw/pos supported
-                return None
-
-        name_lists: List[List[str]] = [list(names_key), [n.lower() for n in names_key]]
-
-        # 1) topo/geo as requested: kwargs first, then positional+kwargs
-        res: Any = None
-        last_err: Optional[Exception] = None
-        for nl in name_lists:
-            try:
-                res = _call_kw(nl, None, topocentric)
-                break
+                base_kwargs2 = dict(base_kwargs)
+                base_kwargs2.pop("jd_tt", None)
+                base_kwargs2.pop("jd", None)
+                result = fn(jd_tt_q, names_list, **base_kwargs2)
+                _debug_log("Adapter call successful with positional names + kwargs")
+                return result
             except Exception as e:
-                last_err = e
-                res = None
-            if res is None:
-                res = _call_pos_with_kwargs(nl, None, topocentric)
+                _debug_log(f"Positional+kwargs call failed: {type(e).__name__}: {e}")
+
+            # Method 3: Pure positional (geocentric-only usually)
+            try:
+                _debug_log(f"Trying positional call: fn({jd_tt_q}, {names_list})")
+                result = fn(jd_tt_q, names_list)
+                _debug_log("Adapter call successful with positional args")
+                return result
+            except Exception as e:
+                _debug_log(f"Positional call failed: {type(e).__name__}: {e}")
+
+            # Method 4: JD only (returns all)
+            try:
+                _debug_log(f"Trying JD-only call: fn({jd_tt_q})")
+                result = fn(jd_tt_q)
+                _debug_log("Adapter call successful with JD-only")
+                return result
+            except Exception as e:
+                _debug_log(f"JD-only call failed: {type(e).__name__}: {e}")
+
+            return None
+
+        # Try name variants
+        names_to_try = [
+            list(names_key),                               # Original
+            [n.lower() for n in names_key],               # Lowercase
+            [_normalize_body_name(n) for n in names_key], # Normalized
+        ]
+
+        res = None
+        adapter_error = None
+
+        for name_variant in names_to_try:
+            try:
+                res = _call_adapter_safely(name_variant)
                 if res is not None:
                     break
+            except Exception as e:
+                adapter_error = e
+                _debug_log(f"Adapter call failed for {name_variant}: {e}")
+                continue
 
-        # 2) If still nothing and topo requested → warn & force geocentric; retry
+        # Topocentric fallback: try explicit geocentric if topo path failed
         if res is None and topocentric:
-            if warnings is not None and seen is not None:
-                _warn_add(warnings, seen, _W.ADAPTER_NO_TOPO, str(kernel_tag))
-            for nl in name_lists:
-                try:
-                    res = _call_kw(nl, "geocentric", False)
-                    break
-                except Exception as e:
-                    last_err = e
-                    res = None
-                if res is None:
-                    res = _call_pos_with_kwargs(nl, "geocentric", False)
-                    if res is not None:
-                        break
+            _warn_add(warnings, seen, _W.ADAPTER_NO_TOPO, str(kernel_tag))
+            _debug_log("Topocentric failed, attempting geocentric fallback")
 
-        # 3) If still nothing and NOT topo → plain positional fallbacks
-        if res is None and not topocentric:
-            for nl in name_lists:
+            for name_variant in names_to_try:
                 try:
-                    res = fn(jd_tt_q, nl)
-                    break
+                    res = _call_adapter_safely(name_variant, force_geocentric=True)
+                    if res is not None:
+                        _debug_log("Geocentric fallback successful")
+                        break
                 except Exception as e:
-                    last_err = e
-                    res = None
-            if res is None:
-                try:
-                    res = fn(jd_tt_q)
-                except Exception as e:
-                    last_err = e
-                    res = None
+                    adapter_error = e
+                    continue
 
         if res is None:
-            raise AstronomyError("adapter_failed", f"ephemeris adapter failed; last error: {last_err!r}")
+            error_details = f"kernel={kernel_tag}, last_error={adapter_error}"
+            _warn_add(warnings, seen, _W.ADAPTER_ERROR, error_details)
+            _debug_log(f"All adapter calls failed: {error_details}")
+            return {}, {}, kernel_tag
 
-        kind, payload = _unwrap_adapter_result(res)
-        rows = _extract_rows(kind, payload)
-        lon_map, spd_map = _map_rows_to_requested(rows, names_key)
-        return lon_map, spd_map, kernel_tag
+        # Parse adapter response
+        try:
+            _debug_log(f"Parsing adapter response: {type(res)}")
+            kind, payload = _unwrap_adapter_result(res)
+            _debug_log(f"Unwrapped as: {kind}")
+
+            rows = _extract_rows(kind, payload)
+            _debug_log(f"Extracted {len(rows)} data rows")
+
+            lon_map, spd_map = _map_rows_to_requested(rows, names_key, warnings, seen)
+            _debug_log(f"Successfully mapped {len(lon_map)} positions")
+
+            return lon_map, spd_map, kernel_tag
+
+        except Exception as e:
+            _warn_add(warnings, seen, _W.ADAPTER_PARSE_ERROR, f"{type(e).__name__}: {e}")
+            _debug_log(f"Failed to parse adapter response: {e}")
+            traceback.print_exc()
+            return {}, {}, kernel_tag
 
     return _ttl_get_or_compute(cache_key, CFG.cache_ttl_sec, _compute)
 
@@ -953,6 +1141,7 @@ def _longitudes_and_speeds(
     speed_step_days: float,
     warnings: List[str],
     seen: set[str],
+    frame: str,
 ) -> Tuple[Dict[str, Tuple[float, Optional[float]]], str]:
     names_key = tuple(names)
     jd_tt_q = _q(jd_tt, CFG.jd_quant) or jd_tt
@@ -961,7 +1150,7 @@ def _longitudes_and_speeds(
     elev_q = _q(elevation_m, CFG.elev_quant) if topocentric else None
 
     now_lon, now_spd, source = _cached_positions(
-        jd_tt_q, names_key, topocentric, lat_q, lon_q, elev_q, warnings=warnings, seen=seen
+        jd_tt_q, names_key, topocentric, lat_q, lon_q, elev_q, warnings=warnings, seen=seen, frame=frame
     )
 
     out: Dict[str, Tuple[float, Optional[float]]] = {}
@@ -974,7 +1163,7 @@ def _longitudes_and_speeds(
 
     # compute missing speeds via central difference (reusing cache)
     minus_lon_cache: Dict[float, Dict[str, float]] = {}
-    plus_lon_cache:  Dict[float, Dict[str, float]] = {}
+    plus_lon_cache: Dict[float, Dict[str, float]] = {}
 
     def _get_cached(jd_q: float) -> Dict[str, float]:
         if jd_q in minus_lon_cache:
@@ -982,16 +1171,17 @@ def _longitudes_and_speeds(
         if jd_q in plus_lon_cache:
             return plus_lon_cache[jd_q]
         lon_m, _spd_m, _ = _cached_positions(
-            jd_q, names_key, topocentric, lat_q, lon_q, elev_q, warnings=warnings, seen=seen
+            jd_q, names_key, topocentric, lat_q, lon_q, elev_q, warnings=warnings, seen=seen, frame=frame
         )
-        minus_lon_cache[jd_q] = lon_m; plus_lon_cache[jd_q] = lon_m
+        minus_lon_cache[jd_q] = lon_m
+        plus_lon_cache[jd_q] = lon_m
         return lon_m
 
     for nm in names_key:
         l0 = _norm360(float(now_lon[nm])) if nm in now_lon else None
         spd: Optional[float] = float(now_spd[nm]) if nm in now_spd and now_spd[nm] is not None else None
         if l0 is None:
-            out[nm] = (None, None)  # sentinel -> treated as missing
+            out[nm] = (None, None)  # sentinel for "missing"
             continue
         if spd is None:
             step = _adaptive_speed_step(nm, speed_step_days)
@@ -1009,28 +1199,40 @@ def _longitudes_and_speeds(
     return out, source
 
 
-def _longitudes_only_geocentric(jd_tt: float, names: List[str]) -> Tuple[Dict[str, float], str]:
+def _longitudes_only_geocentric(jd_tt: float, names: List[str], frame: str) -> Tuple[Dict[str, float], str]:
     """Nodes/points: force geocentric regardless of topo request."""
     names_key = tuple(names)
     jd_tt_q = _q(jd_tt, CFG.jd_quant) or jd_tt
-    lon_map, _spd_map, source = _cached_positions(jd_tt_q, names_key, False, None, None, None)
+    lon_map, _spd_map, source = _cached_positions(jd_tt_q, names_key, False, None, None, None, frame=frame)
     return {k: _norm360(float(v)) for k, v in lon_map.items()}, source
 
 
 # ───────────────────────────── Angles (Asc/MC) ────────────────────────
 def _split_jd(jd: float) -> Tuple[float, float]:
-    d = math.floor(jd); return d, jd - d
+    d = math.floor(jd)
+    return d, jd - d
 
 
 def _atan2d(y: float, x: float) -> float:
-    if x == 0.0 and y == 0.0: return 0.0
+    if x == 0.0 and y == 0.0:
+        return 0.0
     return _norm360(math.degrees(math.atan2(y, x)))
 
 
-def _sind(a: float) -> float: return math.sin(math.radians(a))
-def _cosd(a: float) -> float: return math.cos(math.radians(a))
-def _tand(a: float) -> float: return math.tan(math.radians(a))
-def _acotd(x: float) -> float: return _norm360(math.degrees(math.atan2(1.0, x)))
+def _sind(a: float) -> float:
+    return math.sin(math.radians(a))
+
+
+def _cosd(a: float) -> float:
+    return math.cos(math.radians(a))
+
+
+def _tand(a: float) -> float:
+    return math.tan(math.radians(a))
+
+
+def _acotd(x: float) -> float:
+    return _norm360(math.degrees(math.atan2(1.0, x)))
 
 
 def _gast_deg(jd_ut1: float, jd_tt: float, warnings: List[str], seen: set[str]) -> float:
@@ -1043,7 +1245,7 @@ def _gast_deg(jd_ut1: float, jd_tt: float, warnings: List[str], seen: set[str]) 
         except Exception:
             pass
     T = (float(jd_ut1) - 2451545.0) / 36525.0
-    theta = 280.46061837 + 360.98564736629 * (float(jd_ut1) - 2451545.0) + 0.000387933*(T**2) - (T**3)/38710000.0
+    theta = 280.46061837 + 360.98564736629 * (float(jd_ut1) - 2451545.0) + 0.000387933 * (T**2) - (T**3) / 38710000.0
     _warn_add(warnings, seen, _W.ANGLES_MEEUS)
     return _norm360(theta)
 
@@ -1058,7 +1260,7 @@ def _true_obliquity_deg(jd_tt: float, warnings: List[str], seen: set[str]) -> fl
         except Exception:
             pass
     T = (float(jd_tt) - 2451545.0) / 36525.0
-    eps_arcsec = 84381.448 - 46.8150*T - 0.00059*(T**2) + 0.001813*(T**3)
+    eps_arcsec = 84381.448 - 46.8150 * T - 0.00059 * (T**2) + 0.001813 * (T**3)
     _warn_add(warnings, seen, _W.ANGLES_MEEUS)
     return eps_arcsec / 3600.0
 
@@ -1094,7 +1296,7 @@ def _compute_angles(
 
     if mode == "sidereal" and ayanamsa_deg is not None:
         asc = _norm360(asc - float(ayanamsa_deg))
-        mc  = _norm360(mc  - float(ayanamsa_deg))
+        mc = _norm360(mc - float(ayanamsa_deg))
 
     dbg = {"eps_true_deg": float(eps), "gast_deg": float(gast), "ramc_deg": float(ramc)}
     return float(asc), float(mc), dbg
@@ -1109,9 +1311,11 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
     _seen: set[str] = set()
 
     mode = _validate_mode(payload)
+    frame = str(payload.get("frame", "ecliptic-of-date")).strip().lower() or "ecliptic-of-date"
 
     # Names
     majors_req, points_req = _split_bodies_points(payload, warnings, _seen)
+    _debug_log(f"Chart computation started: mode={mode}, frame={frame}, majors={len(majors_req)}, points={len(points_req)}")
 
     # Timescales
     jd_ut, jd_tt, jd_ut1 = _ensure_timescales(payload, warnings, _seen)
@@ -1136,21 +1340,30 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
         lon = float(payload.get("longitude")) if _is_finite(payload.get("longitude")) else None
         elev = None
 
+    _debug_log(f"Observer setup: topocentric={topocentric}, lat={lat}, lon={lon}, elev={elev}")
+
     # Majors (longitudes + speeds)
     results, source_tag = _longitudes_and_speeds(
-        jd_tt, majors_req,
+        jd_tt,
+        majors_req,
         topocentric=topocentric,
-        latitude=lat, longitude=lon, elevation_m=elev,
+        latitude=lat,
+        longitude=lon,
+        elevation_m=elev,
         speed_step_days=CFG.speed_fd_step_days,
-        warnings=warnings, seen=_seen,
+        warnings=warnings,
+        seen=_seen,
+        frame=frame,
     )
+
+    _debug_log(f"Retrieved {len(results)} major body positions from {source_tag}")
 
     # Sidereal ayanāṁśa
     ay_deg: Optional[float] = None
     if mode == "sidereal":
         ay_deg, _ = _resolve_ayanamsa(jd_tt, payload.get("ayanamsa"), warnings, _seen)
 
-    # Build bodies list (with geocentric fallback if topo returns missing)
+    # Build bodies (with explicit topo→geo fallback per body if still missing)
     out_bodies: List[Dict[str, Any]] = []
     missing_bodies: List[str] = []
 
@@ -1172,36 +1385,43 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
 
         # Fallback: if position missing, try geocentric position-only
         if lon_deg is None:
-            geo_map, _src = _longitudes_only_geocentric(jd_tt, [nm])
+            _debug_log(f"Attempting geocentric fallback for missing body: {nm}")
+            geo_map, _src = _longitudes_only_geocentric(jd_tt, [nm], frame=frame)
             if nm in geo_map and _is_num(geo_map[nm]):
                 lon_deg = float(geo_map[nm])
                 _warn_add(warnings, _seen, _W.TOPO_FALLBACK_GEO, nm)
+                _debug_log(f"Geocentric fallback successful for {nm}: {lon_deg}")
 
         if lon_deg is None:
             missing_bodies.append(nm)
+            _debug_log(f"Body {nm} remains missing after all fallbacks")
             continue
 
         if mode == "sidereal" and ay_deg is not None:
             lon_deg = _norm360(lon_deg - float(ay_deg))
 
-        out_bodies.append({
-            "name": nm,
-            "lon": float(_norm360(lon_deg)),
-            "longitude_deg": float(_norm360(lon_deg)),
-            "speed": (float(speed) if _is_num(speed) else None),
-            "speed_deg_per_day": (float(speed) if _is_num(speed) else None),
-            "lat": None,
-        })
+        out_bodies.append(
+            {
+                "name": nm,
+                "lon": float(_norm360(lon_deg)),
+                "longitude_deg": float(_norm360(lon_deg)),
+                "speed": (float(speed) if _is_num(speed) else None),
+                "speed_deg_per_day": (float(speed) if _is_num(speed) else None),
+                "lat": None,
+            }
+        )
 
     if missing_bodies:
         _warn_add(warnings, _seen, _W.ADAPTER_MISS_BODIES, ", ".join(missing_bodies))
+        _debug_log(f"WARNING: Missing bodies after all attempts: {missing_bodies}")
 
-    # Points (nodes): always geocentric; speed = None (with placeholders if missing)
+    _debug_log(f"Successfully computed {len(out_bodies)}/{len(majors_req)} major bodies")
+
+    # Points (nodes): always geocentric; speed=None
     out_points: List[Dict[str, Any]] = []
     if points_req:
-        lon_map_nodes, source_nodes = _longitudes_only_geocentric(jd_tt, points_req)
+        lon_map_nodes, source_nodes = _longitudes_only_geocentric(jd_tt, points_req, frame=frame)
 
-        # Fill counterpart by 180° if only one present
         need_n = ("North Node" in points_req) and ("North Node" not in lon_map_nodes)
         need_s = ("South Node" in points_req) and ("South Node" not in lon_map_nodes)
         if need_n or need_s:
@@ -1210,51 +1430,65 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
             elif "South Node" in lon_map_nodes and need_n:
                 lon_map_nodes["North Node"] = _norm360(lon_map_nodes["South Node"] + 180.0)
             else:
-                missing = []
-                if need_n: missing.append("North Node")
-                if need_s: missing.append("South Node")
-                extra_map, _ = _longitudes_only_geocentric(jd_tt, missing)
+                missing_pts: List[str] = []
+                if need_n:
+                    missing_pts.append("North Node")
+                if need_s:
+                    missing_pts.append("South Node")
+                extra_map, _ = _longitudes_only_geocentric(jd_tt, missing_pts, frame=frame)
                 lon_map_nodes.update(extra_map)
 
         for nm in points_req:
             if nm not in lon_map_nodes:
                 _warn_add(warnings, _seen, _W.ADAPTER_MISS_POINTS, nm)
-                out_points.append({
-                    "name": nm, "is_point": True,
-                    "lon": None, "longitude_deg": None,
-                    "speed": None, "speed_deg_per_day": None, "lat": None,
-                })
+                out_points.append(
+                    {
+                        "name": nm,
+                        "is_point": True,
+                        "lon": None,
+                        "longitude_deg": None,
+                        "speed": None,
+                        "speed_deg_per_day": None,
+                        "lat": None,
+                    }
+                )
                 continue
             lon_deg = float(lon_map_nodes[nm])
             if mode == "sidereal" and ay_deg is not None:
                 lon_deg = _norm360(lon_deg - float(ay_deg))
-            out_points.append({
-                "name": nm,
-                "is_point": True,
-                "lon": float(_norm360(lon_deg)),
-                "longitude_deg": float(_norm360(lon_deg)),
-                "speed": None,
-                "speed_deg_per_day": None,
-                "lat": None,
-            })
+            out_points.append(
+                {
+                    "name": nm,
+                    "is_point": True,
+                    "lon": float(_norm360(lon_deg)),
+                    "longitude_deg": float(_norm360(lon_deg)),
+                    "speed": None,
+                    "speed_deg_per_day": None,
+                    "lat": None,
+                }
+            )
 
         if source_nodes and source_nodes != source_tag:
             _warn_add(warnings, _seen, _W.PTS_SOURCE_MISMATCH, source_nodes)
 
     # Angles
     asc_deg, mc_deg, dbg = _compute_angles(
-        jd_ut1=jd_ut1, jd_tt=jd_tt, latitude=lat, longitude=lon,
-        mode=mode, ayanamsa_deg=ay_deg, warnings=warnings, seen=_seen,
+        jd_ut1=jd_ut1,
+        jd_tt=jd_tt,
+        latitude=lat,
+        longitude=lon,
+        mode=mode,
+        ayanamsa_deg=ay_deg,
+        warnings=warnings,
+        seen=_seen,
     )
 
-    # --- meta & output ---
+    # Meta
     center = "topocentric" if topocentric else "geocentric"
-
     meta: Dict[str, Any] = {
         "mode": mode,
         "ayanamsa_deg": float(ay_deg) if ay_deg is not None else None,
-        "frame": "ecliptic-of-date",
-        # New canonical fields (keep 'observer' for back-compat)
+        "frame": frame,
         "center": center,
         "topocentric": bool(topocentric),
         "observer": center,  # legacy alias
@@ -1268,6 +1502,8 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
     if warnings:
         meta["warnings"] = list(warnings)
 
+    _debug_log(f"Chart computation completed: {len(out_bodies)} bodies, {len(out_points)} points, {len(warnings)} warnings")
+
     out: Dict[str, Any] = {
         "mode": mode,
         "ayanamsa_deg": float(ay_deg) if ay_deg is not None else None,
@@ -1280,8 +1516,7 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
             "asc_deg": (float(asc_deg) if asc_deg is not None else None),
             "mc_deg": (float(mc_deg) if mc_deg is not None else None),
         },
-        # legacy mirrors
-        "asc_deg": (float(asc_deg) if asc_deg is not None else None),
+        "asc_deg": (float(asc_deg) if asc_deg is not None else None),  # legacy mirrors
         "mc_deg": (float(mc_deg) if mc_deg is not None else None),
         "meta": meta,
         "warnings": list(warnings),
