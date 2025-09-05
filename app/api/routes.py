@@ -689,6 +689,24 @@ def _require_coords_for_houses(payload: Dict[str, Any]):
         raise ValueError("latitude and longitude are required (finite numbers) to compute houses")
 
 
+def _want_houses(body: Dict[str, Any]) -> bool:
+    """
+    Decide whether to compute houses.
+
+    Accepts:
+      - houses: true/false
+      - houses: { compute: false }  (legacy-safe)
+    Defaults to True for back-compat.
+    """
+    h = body.get("houses")
+    if isinstance(h, bool):
+        return h
+    if isinstance(h, dict):
+        if "compute" in h and h.get("compute") is False:
+            return False
+    return True
+
+
 # ───────────────────────── endpoints ─────────────────────────
 @api.post("/api/calculate")
 def calculate():
@@ -699,13 +717,17 @@ def calculate():
         if hs:
             payload["house_system"] = hs
         # allow both elevation_m and elev_m to flow through
-        for k in ("bodies", "points", "ayanamsa", "topocentric", "elevation_m", "elev_m", "dut1"):
+        for k in ("bodies", "points", "ayanamsa", "topocentric", "elevation_m", "elev_m", "dut1", "houses"):
             if k in body:
                 payload[k] = body[k]
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
     except Exception as e:
         return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
+
+    # NEW: decide houses policy up-front
+    want_houses = _want_houses(body)
+    payload["houses"] = bool(want_houses)  # harmless for engines that ignore it
 
     tz_name = payload.get("place_tz") or payload.get("timezone") or "UTC"
     ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name, payload=payload)
@@ -723,43 +745,49 @@ def calculate():
         if DEBUG_VERBOSE:
             chart["error"] = str(e)
 
-    try:
-        _require_coords_for_houses(payload)
-        houses = _call_compute_houses(payload, ts)
-        houses = _normalize_houses_payload(houses)
-    except ValueError as e:
-        return _json_error("houses_coords_required", str(e), 422)
-    except NotImplementedError as e:
-        return _json_error("houses_not_implemented", str(e) if DEBUG_VERBOSE else None, 501)
-    except Exception as e:
-        return _json_error("houses_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+    houses: Optional[Dict[str, Any]] = None
+    if want_houses:
+        try:
+            _require_coords_for_houses(payload)
+            houses = _call_compute_houses(payload, ts)
+            houses = _normalize_houses_payload(houses)
+        except ValueError as e:
+            return _json_error("houses_coords_required", str(e), 422)
+        except NotImplementedError as e:
+            return _json_error("houses_not_implemented", str(e) if DEBUG_VERBOSE else None, 501)
+        except Exception as e:
+            return _json_error("houses_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
-    mode = (payload.get("mode") or "tropical").lower()
-    if mode == "sidereal":
-        ay = _extract_ayanamsa_from_chart(chart)
-        if isinstance(ay, (int, float)) and isinstance(houses, dict):
-            def rot(v: Optional[float]) -> Optional[float]:
-                if v is None:
-                    return None
-                x = (float(v) - float(ay)) % 360.0
-                return 0.0 if abs(x) < 1e-12 else x
-            for k in ("asc", "asc_deg", "mc", "mc_deg", "vertex", "eastpoint"):
-                if k in houses and isinstance(houses[k], (int, float)):
-                    houses[k] = rot(houses[k])
-            if isinstance(houses.get("cusps"), list):
-                houses["cusps"] = [rot(c) for c in houses["cusps"]]
-            if isinstance(houses.get("cusps_deg"), list):
-                houses["cusps_deg"] = [rot(c) for c in houses["cusps_deg"]]
+        mode = (payload.get("mode") or "tropical").lower()
+        if mode == "sidereal":
+            ay = _extract_ayanamsa_from_chart(chart)
+            if isinstance(ay, (int, float)) and isinstance(houses, dict):
+                def rot(v: Optional[float]) -> Optional[float]:
+                    if v is None:
+                        return None
+                    x = (float(v) - float(ay)) % 360.0
+                    return 0.0 if abs(x) < 1e-12 else x
+                for k in ("asc", "asc_deg", "mc", "mc_deg", "vertex", "eastpoint"):
+                    if k in houses and isinstance(houses[k], (int, float)):
+                        houses[k] = rot(houses[k])
+                if isinstance(houses.get("cusps"), list):
+                    houses["cusps"] = [rot(c) for c in houses["cusps"]]
+                if isinstance(houses.get("cusps_deg"), list):
+                    houses["cusps_deg"] = [rot(c) for c in houses["cusps_deg"]]
 
-    houses = _recompute_houses_angles_if_needed(houses, ts, payload, chart)
+        houses = _recompute_houses_angles_if_needed(houses, ts, payload, chart)
 
     meta = {
         "timescales": ts,
         "timescales_locked": True,
         "chart_engine": _CHART_ENGINE_NAME,
-        "houses_engine": _HOUSES_KIND,
+        "houses_engine": _HOUSES_KIND if want_houses else "skipped",
+        "houses_requested": bool(want_houses),
     }
-    return jsonify({"ok": True, "timescales": ts, "chart": chart, "houses": houses, "meta": meta}), 200
+    resp = {"ok": True, "timescales": ts, "chart": chart, "meta": meta}
+    if want_houses:
+        resp["houses"] = houses
+    return jsonify(resp), 200
 
 
 @api.post("/api/report")
@@ -770,11 +798,14 @@ def report():
         hs = str(body.get("house_system", "")).strip()
         if hs:
             payload["house_system"] = hs
-        for k in ("bodies", "points", "ayanamsa", "topocentric", "elevation_m", "elev_m", "dut1"):
+        for k in ("bodies", "points", "ayanamsa", "topocentric", "elevation_m", "elev_m", "dut1", "houses"):
             if k in body:
                 payload[k] = body[k]
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
+
+    want_houses = _want_houses(body)
+    payload["houses"] = bool(want_houses)
 
     tz_name = payload.get("place_tz") or payload.get("timezone") or "UTC"
     ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name, payload=payload)
@@ -792,35 +823,37 @@ def report():
         if DEBUG_VERBOSE:
             chart["error"] = str(e)
 
-    try:
-        _require_coords_for_houses(payload)
-        houses = _call_compute_houses(payload, ts)
-        houses = _normalize_houses_payload(houses)
-    except ValueError as e:
-        return _json_error("houses_coords_required", str(e), 422)
-    except NotImplementedError as e:
-        return _json_error("houses_not_implemented", str(e) if DEBUG_VERBOSE else None, 501)
-    except Exception as e:
-        return _json_error("houses_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+    houses: Optional[Dict[str, Any]] = None
+    if want_houses:
+        try:
+            _require_coords_for_houses(payload)
+            houses = _call_compute_houses(payload, ts)
+            houses = _normalize_houses_payload(houses)
+        except ValueError as e:
+            return _json_error("houses_coords_required", str(e), 422)
+        except NotImplementedError as e:
+            return _json_error("houses_not_implemented", str(e) if DEBUG_VERBOSE else None, 501)
+        except Exception as e:
+            return _json_error("houses_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
-    mode = (payload.get("mode") or "tropical").lower()
-    if mode == "sidereal":
-        ay = _extract_ayanamsa_from_chart(chart)
-        if isinstance(ay, (int, float)) and isinstance(houses, dict):
-            def rot(v: Optional[float]) -> Optional[float]:
-                if v is None:
-                    return None
-                x = (float(v) - float(ay)) % 360.0
-                return 0.0 if abs(x) < 1e-12 else x
-            for k in ("asc", "asc_deg", "mc", "mc_deg", "vertex", "eastpoint"):
-                if k in houses and isinstance(houses[k], (int, float)):
-                    houses[k] = rot(houses[k])
-            if isinstance(houses.get("cusps"), list):
-                houses["cusps"] = [rot(c) for c in houses["cusps"]]
-            if isinstance(houses.get("cusps_deg"), list):
-                houses["cusps_deg"] = [rot(c) for c in houses["cusps_deg"]]
+        mode = (payload.get("mode") or "tropical").lower()
+        if mode == "sidereal":
+            ay = _extract_ayanamsa_from_chart(chart)
+            if isinstance(ay, (int, float)) and isinstance(houses, dict):
+                def rot(v: Optional[float]) -> Optional[float]:
+                    if v is None:
+                        return None
+                    x = (float(v) - float(ay)) % 360.0
+                    return 0.0 if abs(x) < 1e-12 else x
+                for k in ("asc", "asc_deg", "mc", "mc_deg", "vertex", "eastpoint"):
+                    if k in houses and isinstance(houses[k], (int, float)):
+                        houses[k] = rot(houses[k])
+                if isinstance(houses.get("cusps"), list):
+                    houses["cusps"] = [rot(c) for c in houses["cusps"]]
+                if isinstance(houses.get("cusps_deg"), list):
+                    houses["cusps_deg"] = [rot(c) for c in houses["cusps_deg"]]
 
-    houses = _recompute_houses_angles_if_needed(houses, ts, payload, chart)
+        houses = _recompute_houses_angles_if_needed(houses, ts, payload, chart)
 
     narrative = (
         "This is a placeholder narrative aligned to your mode and computed houses. "
@@ -831,9 +864,13 @@ def report():
         "timescales": ts,
         "timescales_locked": True,
         "chart_engine": _CHART_ENGINE_NAME,
-        "houses_engine": _HOUSES_KIND,
+        "houses_engine": _HOUSES_KIND if want_houses else "skipped",
+        "houses_requested": bool(want_houses),
     }
-    return jsonify({"ok": True, "chart": chart, "houses": houses, "narrative": narrative, "meta": meta}), 200
+    resp = {"ok": True, "chart": chart, "narrative": narrative, "meta": meta}
+    if want_houses:
+        resp["houses"] = houses
+    return jsonify(resp), 200
 
 
 # ───────────────────────── predictions ─────────────────────────
@@ -848,11 +885,14 @@ def predictions_route():
         hs = str(body.get("house_system", "")).strip()
         if hs:
             payload["house_system"] = hs
-        for k in ("bodies", "points", "ayanamsa", "topocentric", "elevation_m", "elev_m", "dut1"):
+        for k in ("bodies", "points", "ayanamsa", "topocentric", "elevation_m", "elev_m", "dut1", "houses"):
             if k in body:
                 payload[k] = body[k]
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
+
+    want_houses = _want_houses(body)
+    payload["houses"] = bool(want_houses)
 
     tz_name = payload.get("place_tz") or payload.get("timezone") or "UTC"
     ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name, payload=payload)
@@ -862,35 +902,38 @@ def predictions_route():
     except Exception as e:
         return _json_error("chart_internal", str(e) if DEBUG_VERBOSE else "chart_failed", 500)
 
-    try:
-        _require_coords_for_houses(payload)
-        houses = _call_compute_houses(payload, ts)
-        houses = _normalize_houses_payload(houses)
-    except ValueError as e:
-        return _json_error("houses_coords_required", str(e), 422)
-    except NotImplementedError as e:
-        return _json_error("houses_not_implemented", str(e) if DEBUG_VERBOSE else None, 501)
-    except Exception as e:
-        return _json_error("houses_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+    houses: Optional[Dict[str, Any]] = None
+    if want_houses:
+        try:
+            _require_coords_for_houses(payload)
+            houses = _call_compute_houses(payload, ts)
+            houses = _normalize_houses_payload(houses)
+        except ValueError as e:
+            return _json_error("houses_coords_required", str(e), 422)
+        except NotImplementedError as e:
+            return _json_error("houses_not_implemented", str(e) if DEBUG_VERBOSE else None, 501)
+        except Exception as e:
+            return _json_error("houses_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
-    mode = (payload.get("mode") or "tropical").lower()
-    if mode == "sidereal":
-        ay = _extract_ayanamsa_from_chart(chart)
-        if isinstance(ay, (int, float)) and isinstance(houses, dict):
-            def rot(v: Optional[float]) -> Optional[float]:
-                if v is None:
-                    return None
-                x = (float(v) - float(ay)) % 360.0
-                return 0.0 if abs(x) < 1e-12 else x
-            for k in ("asc", "asc_deg", "mc", "mc_deg", "vertex", "eastpoint"):
-                if k in houses and isinstance(houses[k], (int, float)):
-                    houses[k] = rot(houses[k])
-            if isinstance(houses.get("cusps"), list):
-                houses["cusps"] = [rot(c) for c in houses["cusps"]]
-            if isinstance(houses.get("cusps_deg"), list):
-                houses["cusps_deg"] = [rot(c) for c in houses["cusps_deg"]]
+        mode = (payload.get("mode") or "tropical").lower()
+        if mode == "sidereal":
+            ay = _extract_ayanamsa_from_chart(chart)
+            if isinstance(ay, (int, float)) and isinstance(houses, dict):
+                def rot(v: Optional[float]) -> Optional[float]:
+                    if v is None:
+                        return None
+                    x = (float(v) - float(ay)) % 360.0
+                    return 0.0 if abs(x) < 1e-12 else x
+                for k in ("asc", "asc_deg", "mc", "mc_deg", "vertex", "eastpoint"):
+                    if k in houses and isinstance(houses[k], (int, float)):
+                        houses[k] = rot(houses[k])
+                if isinstance(houses.get("cusps"), list):
+                    houses["cusps"] = [rot(c) for c in houses["cusps"]]
+                if isinstance(houses.get("cusps_deg"), list):
+                    houses["cusps_deg"] = [rot(c) for c in houses["cusps_deg"]]
 
-    houses = _recompute_houses_angles_if_needed(houses, ts, payload, chart)
+        houses = _recompute_houses_angles_if_needed(houses, ts, payload, chart)
+
     chart_for_predict = _prepare_chart_for_predict(chart)
 
     th_path = os.environ.get("ASTRO_HC_THRESHOLDS", "config/hc_thresholds.json")
@@ -966,9 +1009,11 @@ def predictions_route():
         "timescales": ts,
         "timescales_locked": True,
         "chart_engine": _CHART_ENGINE_NAME,
-        "houses_engine": _HOUSES_KIND,
+        "houses_engine": _HOUSES_KIND if want_houses else "skipped",
+        "houses_requested": bool(want_houses),
     }
-    return jsonify({"ok": True, "predictions": preds, "meta": meta}), 200
+    resp = {"ok": True, "predictions": preds, "meta": meta}
+    return jsonify(resp), 200
 
 
 # ───────────────────────── ephemeris ─────────────────────────
