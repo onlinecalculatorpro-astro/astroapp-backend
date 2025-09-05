@@ -745,49 +745,82 @@ def _cached_positions(
         if fn is None:
             raise AstronomyError("adapter_api_mismatch", "ephemeris_adapter missing longitudes API")
 
-        sig = inspect.signature(fn)
+        try:
+            sig = inspect.signature(fn)
+            params = sig.parameters
+        except Exception:
+            sig = None
+            params = {}
+
         base_kwargs: Dict[str, Any] = {}
-        if "jd_tt" in sig.parameters:
+        if "jd_tt" in params:
             base_kwargs["jd_tt"] = jd_tt_q
-        elif "jd" in sig.parameters:
+        elif "jd" in params:
             base_kwargs["jd"] = jd_tt_q
-        if "frame" in sig.parameters:
+        if "frame" in params:
             base_kwargs["frame"] = "ecliptic-of-date"
 
         base_kwargs.update(
-            _geo_kwargs_for_sig(sig, topocentric=topocentric, lat_q=lat_q, lon_q=lon_q, elev_q=elev_q)
+            _geo_kwargs_for_sig(sig or inspect.Signature(), topocentric=topocentric, lat_q=lat_q, lon_q=lon_q, elev_q=elev_q)
         )
 
-        # pick parameter for target names
-        name_param = None
-        for cand in ("names", "bodies", "planets", "ids"):
-            if cand in sig.parameters:
-                name_param = cand
-                break
+        # detect any plausible names parameter
+        detected_name_keys = [k for k in ("names", "bodies", "planets", "ids") if k in params]
+        name_lists: List[List[str]] = [list(names_key), [n.lower() for n in names_key]]
 
-        attempts: List[Optional[List[str]]] = [None]
-        if name_param is not None:
-            attempts = [list(names_key), [n.lower() for n in names_key]]
-
-        last_err: Optional[Exception] = None
         res: Any = None
-        for name_list in attempts:
-            kwargs = dict(base_kwargs)
-            if name_list is not None:
-                kwargs[name_param] = name_list  # type: ignore[index]
-            try:
+        last_err: Optional[Exception] = None
+
+        # 1) Try keyword with any detected name key (both original & lowercase lists)
+        for nk in (detected_name_keys or []):
+            for nl in name_lists:
                 try:
-                    res = fn(**kwargs)
-                except TypeError:
-                    # positional variants: (jd, names?) or (jd)
-                    if name_param is None:
-                        res = fn(jd_tt_q)
-                    else:
-                        res = fn(jd_tt_q, name_list)
+                    kw = dict(base_kwargs); kw[nk] = nl
+                    res = fn(**kw)
+                    raise StopIteration  # success → break all
+                except StopIteration:
+                    pass
+                except Exception as e:
+                    last_err = e
+                    res = None
+        if res is not None:
+            kind, payload = _unwrap_adapter_result(res)
+            rows = _extract_rows(kind, payload)
+            lon_map, spd_map = _map_rows_to_requested(rows, names_key)
+            return lon_map, spd_map, kernel_tag
+
+        # 2) Try common keyword spellings explicitly even if not detected
+        for forced_key in ("names", "bodies", "planets", "ids"):
+            for nl in name_lists:
+                try:
+                    kw = dict(base_kwargs); kw[forced_key] = nl
+                    res = fn(**kw)
+                    raise StopIteration
+                except StopIteration:
+                    pass
+                except Exception as e:
+                    last_err = e
+                    res = None
+        if res is not None:
+            kind, payload = _unwrap_adapter_result(res)
+            rows = _extract_rows(kind, payload)
+            lon_map, spd_map = _map_rows_to_requested(rows, names_key)
+            return lon_map, spd_map, kernel_tag
+
+        # 3) Positional fallbacks: (jd_tt, names) then (jd_tt)
+        for nl in name_lists:
+            try:
+                res = fn(jd_tt_q, nl)
                 break
             except Exception as e:
                 last_err = e
-                continue
+                res = None
+        if res is None:
+            try:
+                res = fn(jd_tt_q)
+            except Exception as e:
+                last_err = e
+                res = None
 
         if res is None:
             raise AstronomyError("adapter_failed", f"ephemeris adapter failed; last error: {last_err!r}")
