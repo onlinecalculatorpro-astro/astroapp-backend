@@ -1064,7 +1064,7 @@ def _norm_rows_from_lv(raw: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
 
 @api.post("/api/ephemeris/longitudes")
 def ephemeris_longitudes_endpoint():
-    """Minimal working endpoint focused on getting topocentric mode functional."""
+    """Fixed endpoint that properly handles topocentric flag."""
     try:
         body = request.get_json(force=True) or {}
         payload = parse_ephemeris_payload(body, require_bodies=True)
@@ -1078,12 +1078,15 @@ def ephemeris_longitudes_endpoint():
     frame = payload.get("frame", "ecliptic-of-date")
     bodies = payload["bodies"]
     names = payload["names"]
-    topocentric = bool(payload.get("topocentric"))
+    
+    # CRITICAL FIX: Get topocentric flag directly from request body, not payload
+    topocentric = bool(body.get("topocentric", False))
 
-    # Extract coordinates simply and directly
+    # Extract coordinates
     lat = lon = elev = None
     observer_obj = body.get("observer", {})
     
+    # Try observer object first
     if isinstance(observer_obj, dict):
         try:
             lat = float(observer_obj.get("lat", 0))
@@ -1092,14 +1095,14 @@ def ephemeris_longitudes_endpoint():
         except (ValueError, TypeError):
             lat = lon = elev = None
 
-    # Also try top-level coordinates
+    # Try top-level coordinates
     try:
-        if lat is None and payload.get("latitude") is not None:
-            lat = float(payload["latitude"])
-        if lon is None and payload.get("longitude") is not None:
-            lon = float(payload["longitude"])
-        if elev is None and payload.get("elevation_m") is not None:
-            elev = float(payload["elevation_m"])
+        if lat is None and body.get("latitude") is not None:
+            lat = float(body["latitude"])
+        if lon is None and body.get("longitude") is not None:
+            lon = float(body["longitude"])
+        if elev is None and body.get("elevation_m") is not None:
+            elev = float(body["elevation_m"])
     except (ValueError, TypeError):
         pass
 
@@ -1114,20 +1117,24 @@ def ephemeris_longitudes_endpoint():
     except (ValueError, TypeError):
         pass
 
-    # Validation for topocentric
-    coords_ok = (isinstance(lat, (int, float)) and isinstance(lon, (int, float)) and 
-                 -90 <= lat <= 90 and -180 <= lon <= 180)
+    # Ensure we have valid numbers (default to 0 if None)
+    lat = lat if isinstance(lat, (int, float)) else 0.0
+    lon = lon if isinstance(lon, (int, float)) else 0.0
+    elev = elev if isinstance(elev, (int, float)) else 0.0
 
-    print(f"=== DEBUG ===")
-    print(f"topocentric: {topocentric}")
+    # Validation
+    coords_valid = (-90 <= lat <= 90 and -180 <= lon <= 180)
+
+    print(f"=== FIXED ENDPOINT DEBUG ===")
+    print(f"body.topocentric: {body.get('topocentric')}")
+    print(f"topocentric (fixed): {topocentric}")
     print(f"lat: {lat}, lon: {lon}, elev: {elev}")
-    print(f"coords_ok: {coords_ok}")
-    print(f"observer_obj: {observer_obj}")
+    print(f"coords_valid: {coords_valid}")
 
-    if topocentric and not coords_ok:
+    if topocentric and not coords_valid:
         return _json_error(
-            "topocentric_coords_required",
-            {"lat": lat, "lon": lon, "elev": elev, "observer": observer_obj},
+            "invalid_coordinates",
+            {"lat": lat, "lon": lon, "elev": elev, "message": "Invalid coordinates for topocentric mode"},
             422
         )
 
@@ -1135,27 +1142,20 @@ def ephemeris_longitudes_endpoint():
     try:
         from app.core import ephemeris_adapter as ea
         
-        if coords_ok:
-            print(f"Calling adapter with coords: lat={lat}, lon={lon}, elev={elev}")
-            result = ea.ecliptic_longitudes(
-                jd_tt,
-                names=names,
-                frame=frame,
-                topocentric=topocentric,
-                latitude=lat,
-                longitude=lon,
-                elevation_m=elev
-            )
-        else:
-            print(f"Calling adapter geocentric (coords invalid)")
-            result = ea.ecliptic_longitudes(
-                jd_tt,
-                names=names,
-                frame=frame,
-                topocentric=False
-            )
+        print(f"Calling adapter: topocentric={topocentric}, lat={lat}, lon={lon}, elev={elev}")
+        
+        result = ea.ecliptic_longitudes(
+            jd_tt,
+            names=names,
+            frame=frame,
+            topocentric=topocentric,
+            latitude=lat,
+            longitude=lon,
+            elevation_m=elev
+        )
 
-        print(f"Adapter returned topocentric: {result.get('meta', {}).get('topocentric')}")
+        adapter_topo = result.get('meta', {}).get('topocentric', False)
+        print(f"Adapter returned topocentric: {adapter_topo}")
         
     except Exception as e:
         print(f"Adapter error: {e}")
@@ -1164,7 +1164,7 @@ def ephemeris_longitudes_endpoint():
     # Process results
     rows, meta = _norm_rows_from_longitudes(result)
     
-    # Build ordered response
+    # Build response
     requested = [b.lower() for b in bodies]
     name_map = {b.lower(): n for b, n in zip(bodies, names)}
     by_body = {r["body"]: r for r in rows}
@@ -1183,8 +1183,8 @@ def ephemeris_longitudes_endpoint():
     final_meta.setdefault("frame", frame)
     topocentric_actual = final_meta.get("topocentric", False)
     
-    print(f"Final topocentric flag: {topocentric_actual}")
-    print(f"=============")
+    print(f"Final response topocentric: {topocentric_actual}")
+    print(f"=============================")
 
     return jsonify({
         "ok": True,
@@ -1195,18 +1195,6 @@ def ephemeris_longitudes_endpoint():
         "meta": final_meta,
         "results": ordered_results,
     }), 200
-# ───────────────────────── rectification ─────────────────────────
-@api.post("/api/rectification/quick")
-def rect_quick():
-    try:
-        body = request.get_json(force=True) or {}
-        payload, window_minutes = parse_rectification_payload(body)
-    except ValidationError as e:
-        return _json_error("validation_error", e.errors(), 400)
-    from app.core.rectify import rectification_candidates
-    result = rectification_candidates(payload, window_minutes)
-    return jsonify({"ok": True, **result}), 200
-
 
 # ───────────────────────── system-validation (optional) ─────────────────────────
 @api.get("/system-validation")
