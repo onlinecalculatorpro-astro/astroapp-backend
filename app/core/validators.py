@@ -228,12 +228,13 @@ def resolve_timescales_from_civil_erfa(d: date, time_str: str, tzinfo: ZoneInfo)
     tz_name = getattr(tzinfo, "key", None) or "UTC"
     ts = build_timescales(d.strftime("%Y-%m-%d"), time_str, str(tz_name), float(dut1_val))
 
-    out = {"jd_tt": float(getattr(ts, "jd_tt"))}
-    if getattr(ts, "jd_utc", None) is not None:
-        out["jd_utc"] = float(ts.jd_utc)
-        out["jd_ut"] = float(ts.jd_utc)
+    out = {
+        "jd_tt":  float(ts.jd_tt),
+        "jd_utc": float(ts.jd_utc),
+        "jd_ut1": float(ts.jd_ut1),  # expose UT1 explicitly
+        "jd_ut":  float(ts.jd_ut1),  # legacy alias: UT ≡ UT1 for our purposes
+    }
     return out
-
 
 # ───────────────────────────── payload parsers ─────────────────────────────
 
