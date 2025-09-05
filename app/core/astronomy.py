@@ -1189,10 +1189,7 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
     if warnings:
         meta["warnings"] = list(warnings)
-        out = { ..., "meta": meta, "warnings": warnings, ... }
-
-
-
+        
     out: Dict[str, Any] = {
         "mode": mode,
         "ayanamsa_deg": float(ay_deg) if ay_deg is not None else None,
