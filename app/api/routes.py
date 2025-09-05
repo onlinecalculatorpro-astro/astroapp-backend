@@ -377,7 +377,7 @@ try:  # pragma: no cover
     _CHART_ENGINE_NAME = "app.core.astronomy.compute_chart"
 except Exception as e1:  # pragma: no cover
     try:
-        from app.core.chart import compute_chart as _compute_chart  # type: ignore
+        from app.core.astronomy import compute_chart as _compute_chart  # type: ignore
         _CHART_ENGINE_NAME = "app.core.chart.compute_chart"
         log.warning("Primary astronomy.compute_chart missing; fallback chart.compute_chart in use. err=%r", e1)
     except Exception as e2:
