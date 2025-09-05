@@ -5,7 +5,6 @@ AstroApp — Canonical API Routes
 - Chart + Houses
 - Predictions
 - Ephemeris
-- Rectification
 - Ops: /api/health, /api/config, /api/openapi, /__debug/routes
 
 Notes:
@@ -35,7 +34,7 @@ from app.core.validators import (
     ValidationError,
     parse_chart_payload,
     parse_prediction_payload,
-    parse_rectification_payload,
+    parse_rectification_payload,  # noqa: F401 (kept for completeness)
     parse_ephemeris_payload,
 )
 
@@ -377,7 +376,7 @@ try:  # pragma: no cover
     _CHART_ENGINE_NAME = "app.core.astronomy.compute_chart"
 except Exception as e1:  # pragma: no cover
     try:
-        from app.core.astronomy import compute_chart as _compute_chart  # type: ignore
+        from app.core.chart import compute_chart as _compute_chart  # <-- proper fallback
         _CHART_ENGINE_NAME = "app.core.chart.compute_chart"
         log.warning("Primary astronomy.compute_chart missing; fallback chart.compute_chart in use. err=%r", e1)
     except Exception as e2:
@@ -476,8 +475,9 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
             kwargs[pick("ayanamsa", "ayanamsha", "aya")] = payload["ayanamsa"]
         if "topocentric" in payload and pick("topocentric", "observer_topocentric"):
             kwargs[pick("topocentric", "observer_topocentric")] = bool(payload["topocentric"])
-        if "elevation_m" in payload and pick("elevation_m", "elevation"):
-            kwargs[pick("elevation_m", "elevation")] = payload["elevation_m"]
+        # allow both elevation_m and elev_m
+        if ("elevation_m" in payload or "elev_m" in payload) and pick("elevation_m", "elevation"):
+            kwargs[pick("elevation_m", "elevation")] = payload.get("elevation_m", payload.get("elev_m"))
         if "bodies" in payload and pick("bodies", "names", "planets"):
             kwargs[pick("bodies", "names", "planets")] = payload["bodies"]
         if "frame" in payload and pick("frame"):
@@ -529,8 +529,14 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
         raise RuntimeError("houses_engine_unavailable")
 
     acc = _sig_accepts_houses()
-    lat = float(payload["latitude"])
-    lon = float(payload["longitude"])
+
+    lat_raw = payload.get("latitude")
+    lon_raw = payload.get("longitude")
+    if not isinstance(lat_raw, (int, float)) or not isinstance(lon_raw, (int, float)):
+        raise ValueError("latitude and longitude are required (finite numbers) to compute houses")
+
+    lat = float(lat_raw)
+    lon = float(lon_raw)
 
     requested_system_raw = (payload.get("house_system") or "").strip()
     requested_system = (
@@ -671,6 +677,18 @@ def _prepare_chart_for_predict(chart: Dict[str, Any]) -> Dict[str, Any]:
     return ch
 
 
+def _require_coords_for_houses(payload: Dict[str, Any]):
+    lat = payload.get("latitude")
+    lon = payload.get("longitude")
+    try:
+        lat_ok = isinstance(lat, (int, float)) and float(lat) == float(lat)
+        lon_ok = isinstance(lon, (int, float)) and float(lon) == float(lon)
+    except Exception:
+        lat_ok = lon_ok = False
+    if not (lat_ok and lon_ok):
+        raise ValueError("latitude and longitude are required (finite numbers) to compute houses")
+
+
 # ───────────────────────── endpoints ─────────────────────────
 @api.post("/api/calculate")
 def calculate():
@@ -680,7 +698,8 @@ def calculate():
         hs = str(body.get("house_system", "")).strip()
         if hs:
             payload["house_system"] = hs
-        for k in ("bodies", "points", "ayanamsa", "topocentric", "elevation_m", "dut1"):
+        # allow both elevation_m and elev_m to flow through
+        for k in ("bodies", "points", "ayanamsa", "topocentric", "elevation_m", "elev_m", "dut1"):
             if k in body:
                 payload[k] = body[k]
     except ValidationError as e:
@@ -705,12 +724,13 @@ def calculate():
             chart["error"] = str(e)
 
     try:
+        _require_coords_for_houses(payload)
         houses = _call_compute_houses(payload, ts)
         houses = _normalize_houses_payload(houses)
+    except ValueError as e:
+        return _json_error("houses_coords_required", str(e), 422)
     except NotImplementedError as e:
         return _json_error("houses_not_implemented", str(e) if DEBUG_VERBOSE else None, 501)
-    except ValueError as e:
-        return _json_error("houses_error", str(e), 422)
     except Exception as e:
         return _json_error("houses_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
@@ -750,7 +770,7 @@ def report():
         hs = str(body.get("house_system", "")).strip()
         if hs:
             payload["house_system"] = hs
-        for k in ("bodies", "points", "ayanamsa", "topocentric", "elevation_m", "dut1"):
+        for k in ("bodies", "points", "ayanamsa", "topocentric", "elevation_m", "elev_m", "dut1"):
             if k in body:
                 payload[k] = body[k]
     except ValidationError as e:
@@ -773,12 +793,13 @@ def report():
             chart["error"] = str(e)
 
     try:
+        _require_coords_for_houses(payload)
         houses = _call_compute_houses(payload, ts)
         houses = _normalize_houses_payload(houses)
+    except ValueError as e:
+        return _json_error("houses_coords_required", str(e), 422)
     except NotImplementedError as e:
         return _json_error("houses_not_implemented", str(e) if DEBUG_VERBOSE else None, 501)
-    except ValueError as e:
-        return _json_error("houses_error", str(e), 422)
     except Exception as e:
         return _json_error("houses_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
@@ -827,7 +848,7 @@ def predictions_route():
         hs = str(body.get("house_system", "")).strip()
         if hs:
             payload["house_system"] = hs
-        for k in ("bodies", "points", "ayanamsa", "topocentric", "elevation_m", "dut1"):
+        for k in ("bodies", "points", "ayanamsa", "topocentric", "elevation_m", "elev_m", "dut1"):
             if k in body:
                 payload[k] = body[k]
     except ValidationError as e:
@@ -842,12 +863,13 @@ def predictions_route():
         return _json_error("chart_internal", str(e) if DEBUG_VERBOSE else "chart_failed", 500)
 
     try:
+        _require_coords_for_houses(payload)
         houses = _call_compute_houses(payload, ts)
         houses = _normalize_houses_payload(houses)
+    except ValueError as e:
+        return _json_error("houses_coords_required", str(e), 422)
     except NotImplementedError as e:
         return _json_error("houses_not_implemented", str(e) if DEBUG_VERBOSE else None, 501)
-    except ValueError as e:
-        return _json_error("houses_error", str(e), 422)
     except Exception as e:
         return _json_error("houses_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
@@ -1009,7 +1031,6 @@ def _norm_rows_from_longitudes(raw: Any) -> Tuple[List[Dict[str, Any]], Dict[str
                         "name": str(r.get("name") or body),
                         "longitude": float(L),
                     }
-                    # pass-through extras if present
                     if _coerce_float(r.get("speed")) is not None:
                         row["speed"] = float(r.get("speed"))
                     if _coerce_float(r.get("velocity")) is not None:
