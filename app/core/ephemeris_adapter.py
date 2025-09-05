@@ -2,14 +2,15 @@
 # -----------------------------------------------------------------------------
 # Research-grade Ephemeris Adapter (Skyfield + optional SPICE)
 #
-# Highlights
-# • Deterministic, testable Config + Adapter class (legacy API delegates to it)
-# • Precise ecliptic frame conversion (ERFA preferred; guarded degraded fallback)
-# • Adaptive, Richardson-extrapolated velocities + independent XY cross-check
-# • Robust true-node computation (no precision-losing rounding); explicit policy
-# • Clean error taxonomy + structured meta diagnostics (for fuzzers/CI)
-# • Optional SPICE for selected small bodies (Ceres, Pallas, Juno, Vesta, Chiron)
-# • Thread-safe kernel bootstrap; no silent exception swallowing
+# Guarantees
+# • ALWAYS returns {"results": [ {name, longitude, ...} ], "meta": {...}, "center": "..."}.
+# • Accepts both argument names: names=[] or bodies=[].
+# • Frame: "ecliptic-of-date" (default) or "ecliptic-j2000", via ERFA when available.
+# • Topocentric honored via (topocentric=True + observer or lat/lon/elevation); safe fallback to geocentric with warning.
+# • Velocities via adaptive Richardson + independent XY estimator cross-check.
+# • Robust lunar nodes (true via angular-momentum; mean as policy/fallback), with speed via central diff.
+# • Clean error taxonomy in warnings; JD guard aligned to DE421 span (configurable).
+# • Optional SPICE for selected small bodies (Ceres, Pallas, Juno, Vesta, Chiron) when enabled.
 # -----------------------------------------------------------------------------
 from __future__ import annotations
 
@@ -24,7 +25,7 @@ import threading
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Constants / environment (bounded; converted into Config defaults)
+# Constants / environment (mapped into Config defaults)
 # ─────────────────────────────────────────────────────────────────────────────
 EPHEMERIS_NAME_DEFAULT = "de421"
 
@@ -34,8 +35,8 @@ ENFORCE_JD_RANGE = os.getenv("OCP_ENFORCE_JD_RANGE", "1").lower() in ("1", "true
 
 _ENABLE_SMALLS_ENV = os.getenv("OCP_ENABLE_SMALL_BODIES", "0").lower() in ("1", "true", "yes", "on")
 _ALLOW_DEGRADED_ENV = os.getenv("OCP_ALLOW_DEGRADED", "1").lower() in ("1", "true", "yes", "on")
-_NODE_MODEL_ENV = os.getenv("OCP_NODE_MODEL", "true").strip().lower()  # {"true","mean"}
-_NODE_ON_FAIL_ENV = os.getenv("OCP_NODE_ON_FAIL", "error").strip().lower()  # {"error","mean"}
+_NODE_MODEL_ENV = os.getenv("OCP_NODE_MODEL", "true").strip().lower()        # {"true","mean"}
+_NODE_ON_FAIL_ENV = os.getenv("OCP_NODE_ON_FAIL", "error").strip().lower()   # {"error","mean"}
 
 # Velocity steps (days) — initial guesses; adaptive refines
 _SPEED_STEP_MAP = {
@@ -46,7 +47,7 @@ _SPEED_STEP_MAP = {
 _SPEED_STEP_DEFAULT = float(os.getenv("OCP_SPEED_STEP_DEFAULT", "0.5"))  # ±12 h
 
 # Diagnostics tolerances
-_SPEED_TOL_ARCSEC_ENV = float(os.getenv("OCP_SPEED_TOL_ARCSEC", "0.05"))  # Richardson vs XY check (abs tol)
+_SPEED_TOL_ARCSEC_ENV = float(os.getenv("OCP_SPEED_TOL_ARCSEC", "0.05"))  # Richardson vs XY abs tol (arcsec/day)
 _SPEED_MIN_STEP_D_ENV = float(os.getenv("OCP_SPEED_MIN_STEP_D", "0.01"))  # minimum h (days) for differencing
 
 # Node cache tick resolution in seconds (0→nanosecond ticks)
@@ -111,7 +112,7 @@ class Config:
     jd_max: float = DE421_JD_MAX
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Global singletons (kept for legacy API; the class can be used independently)
+# Global singletons (legacy facade; the class can be used independently)
 # ─────────────────────────────────────────────────────────────────────────────
 _TS = None                 # Skyfield timescale
 _MAIN = None               # Main DE421 kernel
@@ -185,7 +186,6 @@ def _canon_name(nm: str) -> Tuple[str, str, Optional[str]]:
 # ─────────────────────────────────────────────────────────────────────────────
 def _wrap360(x: float, *, abs_zero_tol_deg: float) -> float:
     v = float(x) % 360.0
-    # treat near-zero as zero; avoid exact equality comparisons
     return 0.0 if math.isclose(v, 0.0, abs_tol=abs_zero_tol_deg) else v
 
 def _atan2deg(y: float, x: float, *, abs_zero_tol_deg: float) -> float:
@@ -290,18 +290,12 @@ def _get_kernels():
     return _MAIN, _EXTRA
 
 def current_kernel_name() -> str:
-    """Human-friendly list of loaded kernel filenames (or default label)."""
     if _KERNEL_PATHS:
         return ", ".join(os.path.basename(p) for p in _KERNEL_PATHS)
     return EPHEMERIS_NAME_DEFAULT
 
 def load_kernel(kernel_name: str = "de421"):
-    """
-    Load the configured Skyfield kernels (main + any extras).
-
-    Returns:
-        (kernel_object, kernel_name_string)
-    """
+    """Load configured Skyfield kernels (main + extras)."""
     k, _ = _get_kernels()
     return k, current_kernel_name()
 
@@ -524,9 +518,7 @@ def _observer(
     observer: Optional[Dict[str, float]],
     meta_warnings: List[str],
 ) -> Tuple[Optional[Any], bool]:
-    """
-    Build the observer. Returns (observer_object, resolved_topocentric_flag).
-    """
+    """Build the observer. Returns (observer_object, resolved_topocentric_flag)."""
     if main is None:
         return None, False
 
@@ -594,7 +586,7 @@ def _node_tick(jd_tt: float, res_s: float) -> int:
 @lru_cache(maxsize=8192)
 def _true_node_geocentric_tick(cache_key: Tuple[int, float, float]) -> float:
     """Compute true node (North) longitude in ecliptic-of-date using lunar angular-momentum vector."""
-    tick, jd_tt, step = cache_key  # tick is used only to make the key hashable & robust
+    tick, jd_tt, step = cache_key  # tick only ensures robust hashing
     try:
         from skyfield.framelib import ecliptic_frame  # type: ignore
     except Exception:
@@ -622,7 +614,7 @@ def _true_node_geocentric_tick(cache_key: Tuple[int, float, float]) -> float:
             return (ay*bz - az*by, az*bx - ax*bz, ax*by - ay*bz)
 
         h = _cross(r0, v)
-        n = _cross((0.0, 0.0, 1.0), h)  # Ecliptic north is Ẑ in ecliptic frame by construction
+        n = _cross((0.0, 0.0, 1.0), h)  # ecliptic Ẑ
         nx, ny = n[0], n[1]
         norm_xy = math.hypot(nx, ny)
         if not math.isfinite(norm_xy) or norm_xy < 1e-18:
@@ -801,8 +793,9 @@ class EphemerisAdapter:
                 vel: Optional[float] = None, node_model: Optional[str] = None,
                 node_fallback: Optional[str] = None) -> Dict[str, Any]:
         row: Dict[str, Any] = {"name": name, "longitude": float(lon), "lon": float(lon)}
-        if lat is not None:
+        if lat is not None and math.isfinite(lat):
             row["lat"] = float(lat)
+            row["latitude"] = float(lat)
         if vel is not None and math.isfinite(vel):
             row["velocity"] = float(vel)
             row["speed"] = float(vel)
@@ -866,6 +859,7 @@ class EphemerisAdapter:
         self,
         jd_tt: float,
         names: Optional[List[str]] = None,
+        bodies: Optional[List[str]] = None,   # alias accepted
         *,
         frame: Optional[str] = None,
         topocentric: bool = False,
@@ -900,7 +894,8 @@ class EphemerisAdapter:
             if main is None or obs is None or ef is None or ts is None:
                 raise EphemerisError("setup", "Ephemeris setup failed", main=bool(main), obs=bool(obs), ef=bool(ef), ts=bool(ts))
 
-            wanted = (names[:] if names else list(_PLANET_KEYS.keys()))
+            wanted_src = names if names is not None else bodies
+            wanted = (list(wanted_src) if wanted_src else list(_PLANET_KEYS.keys()))
             rows: List[Dict[str, Any]] = []
 
             for raw in wanted:
@@ -941,16 +936,26 @@ class EphemerisAdapter:
 
                 warnings.append(f"unresolved:{raw}:{kind}")
 
-            return {"results": rows, "meta": self._meta(used_frame, topo_resolved, warnings, diags)}
+            payload = {
+                "results": rows,
+                "meta": self._meta(used_frame, topo_resolved, warnings, diags),
+                "center": "topocentric" if topo_resolved else "geocentric",
+            }
+            return payload
 
         except EphemerisError as e:
             warnings.append(f"error:{e.stage}:{e.message}")
-            return {"results": [], "meta": self._meta(used_frame or self.cfg.frame, False, warnings, diags)}
+            return {
+                "results": [],
+                "meta": self._meta(used_frame or self.cfg.frame, False, warnings, diags),
+                "center": "geocentric",
+            }
 
     def ecliptic_longitudes_and_velocities(
         self,
         jd_tt: float,
-        names: List[str],
+        names: Optional[List[str]] = None,
+        bodies: Optional[List[str]] = None,   # alias accepted
         *,
         frame: Optional[str] = None,
         topocentric: bool = False,
@@ -959,10 +964,11 @@ class EphemerisAdapter:
         elevation_m: Optional[float] = None,
         observer: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
-        # identical to ecliptic_longitudes, but emphasizes velocity presence
+        # Same as ecliptic_longitudes; emphasizes velocity in rows (present as "velocity" and "speed").
         return self.ecliptic_longitudes(
             jd_tt,
-            names,
+            names=names,
+            bodies=bodies,
             frame=frame,
             topocentric=topocentric,
             latitude=latitude,
