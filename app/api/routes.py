@@ -1062,44 +1062,12 @@ def _norm_rows_from_lv(raw: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     return list(rows_map.values()), meta
 
 
-def _extract_observer_coords(body: dict, payload: dict, request_args) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    """Extract observer coordinates from multiple possible sources with explicit precedence."""
-    def _safe_float(x):
-        try:
-            return float(x) if x is not None else None
-        except (ValueError, TypeError):
-            return None
-    
-    # Initialize from payload top-level
-    lat = _safe_float(payload.get("latitude"))
-    lon = _safe_float(payload.get("longitude")) 
-    elev = _safe_float(payload.get("elev_m") or payload.get("elevation_m"))
-    
-    # Override with observer object if present
-    obs_raw = body.get("observer") if isinstance(body, dict) else None
-    if isinstance(obs_raw, dict):
-        lat = _safe_float(obs_raw.get("lat") or obs_raw.get("latitude")) or lat
-        lon = _safe_float(obs_raw.get("lon") or obs_raw.get("lng") or obs_raw.get("longitude")) or lon
-        elev = _safe_float(obs_raw.get("elevation_m") or obs_raw.get("elev_m") or obs_raw.get("alt_m") or obs_raw.get("altitude_m")) or elev
-    
-    # Final override with query parameters (highest precedence)
-    if request_args.get("lat") is not None:
-        lat = _safe_float(request_args["lat"])
-    if request_args.get("lon") is not None or request_args.get("lng") is not None:
-        lon = _safe_float(request_args.get("lon") or request_args.get("lng"))
-    if request_args.get("elev_m") is not None:
-        elev = _safe_float(request_args["elev_m"])
-    
-    return lat, lon, elev or 0.0
-
-
 @api.post("/api/ephemeris/longitudes")
 def ephemeris_longitudes_endpoint():
     """
     Compute ecliptic longitudes for celestial bodies at a given time.
     
-    Supports both geocentric and topocentric calculations with flexible
-    coordinate specification (payload, observer object, or query params).
+    Critical fix: Direct observer coordinate handling without complex precedence logic.
     """
     try:
         body = request.get_json(force=True) or {}
@@ -1119,40 +1087,101 @@ def ephemeris_longitudes_endpoint():
     # Determine if topocentric calculation is requested
     topocentric = (center == "topocentric") or bool(payload.get("topocentric"))
 
-    # Extract observer coordinates from all possible sources
-    lat, lon, elev = _extract_observer_coords(body, payload, request.args)
+    # Simple, direct coordinate extraction
+    lat = None
+    lon = None
+    elev = 0.0
     
+    # Try payload top-level first
+    try:
+        if payload.get("latitude") is not None:
+            lat = float(payload["latitude"])
+        if payload.get("longitude") is not None:
+            lon = float(payload["longitude"])
+        if payload.get("elevation_m") is not None:
+            elev = float(payload["elevation_m"])
+        elif payload.get("elev_m") is not None:
+            elev = float(payload["elev_m"])
+    except (ValueError, TypeError):
+        pass
+    
+    # Try observer object (this should work for your test case)
+    observer_obj = body.get("observer")
+    if isinstance(observer_obj, dict):
+        try:
+            if lat is None and observer_obj.get("lat") is not None:
+                lat = float(observer_obj["lat"])
+            elif lat is None and observer_obj.get("latitude") is not None:
+                lat = float(observer_obj["latitude"])
+                
+            if lon is None and observer_obj.get("lon") is not None:
+                lon = float(observer_obj["lon"])
+            elif lon is None and observer_obj.get("lng") is not None:
+                lon = float(observer_obj["lng"])
+            elif lon is None and observer_obj.get("longitude") is not None:
+                lon = float(observer_obj["longitude"])
+                
+            if observer_obj.get("elevation_m") is not None:
+                elev = float(observer_obj["elevation_m"])
+            elif observer_obj.get("elev_m") is not None:
+                elev = float(observer_obj["elev_m"])
+        except (ValueError, TypeError):
+            pass
+    
+    # Try query parameters last
+    try:
+        if request.args.get("lat"):
+            lat = float(request.args["lat"])
+        if request.args.get("lon"):
+            lon = float(request.args["lon"])
+        elif request.args.get("lng"):
+            lon = float(request.args["lng"])
+        if request.args.get("elev_m"):
+            elev = float(request.args["elev_m"])
+    except (ValueError, TypeError):
+        pass
+
+    # Debug logging
+    print(f"ENDPOINT DEBUG:")
+    print(f"  topocentric={topocentric}")
+    print(f"  extracted: lat={lat}, lon={lon}, elev={elev}")
+    print(f"  observer_obj from body: {observer_obj}")
+    print(f"  payload keys: {list(payload.keys())}")
+
     # Validate topocentric requirements
     if topocentric and (lat is None or lon is None):
         return _json_error(
             "topocentric_coords_required",
             {
                 "message": "Topocentric calculation requires observer latitude and longitude",
-                "hint": "Provide coordinates via 'observer' object, top-level 'latitude'/'longitude', or ?lat&lon query params",
-                "received": {"latitude": lat, "longitude": lon, "elevation_m": elev}
+                "extracted": {"latitude": lat, "longitude": lon, "elevation_m": elev},
+                "observer_obj": observer_obj,
+                "payload_keys": list(payload.keys())
             },
             422
         )
 
-    # Build observer object for adapter (only if coordinates are complete)
-    observer_dict = None
-    if lat is not None and lon is not None:
-        observer_dict = {"lat": lat, "lon": lon, "elevation_m": elev}
-
-    # Call the ephemeris adapter
+    # Call the ephemeris adapter - SIMPLIFIED
     try:
         from app.core import ephemeris_adapter as ea
+        
+        # Create clean observer dict if we have coordinates
+        observer_dict = {"lat": lat, "lon": lon, "elevation_m": elev} if (lat is not None and lon is not None) else None
+        
+        print(f"  calling adapter with observer_dict: {observer_dict}")
+        
         raw_result = ea.ecliptic_longitudes(
             jd_tt,
             names=names,
             frame=frame,
             topocentric=topocentric,
-            latitude=lat,
-            longitude=lon, 
-            elevation_m=elev,
-            observer=observer_dict,  # This takes precedence in the adapter
+            observer=observer_dict,  # ONLY pass observer dict, not individual coords
         )
+        
+        print(f"  adapter returned meta.topocentric: {raw_result.get('meta', {}).get('topocentric')}")
+        
     except Exception as e:
+        print(f"  adapter error: {e}")
         return _json_error(
             "ephemeris_computation_error", 
             {"error": str(e)} if DEBUG_VERBOSE else {"error": "Ephemeris computation failed"}, 
@@ -1180,12 +1209,10 @@ def ephemeris_longitudes_endpoint():
     # Build response metadata
     response_meta = dict(adapter_meta)
     response_meta.setdefault("frame", frame)
-    # Trust the adapter's topocentric flag if set, otherwise use our determination
-    if "topocentric" not in response_meta:
-        response_meta["topocentric"] = bool(topocentric)
-
-    # Determine effective center based on what actually happened
-    effective_center = "topocentric" if response_meta.get("topocentric") else "geocentric"
+    
+    # CRITICAL: Trust only the adapter's topocentric determination
+    effective_topocentric = response_meta.get("topocentric", False)
+    effective_center = "topocentric" if effective_topocentric else "geocentric"
 
     return jsonify({
         "ok": True,
@@ -1196,7 +1223,6 @@ def ephemeris_longitudes_endpoint():
         "meta": response_meta,
         "results": ordered_results,
     }), 200
-
 # ───────────────────────── rectification ─────────────────────────
 @api.post("/api/rectification/quick")
 def rect_quick():
