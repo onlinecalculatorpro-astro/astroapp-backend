@@ -255,7 +255,7 @@ def _load_kernel(path: str):
 
 def _get_kernels():
     """Thread-safe lazy load of main and extra kernels."""
-    global _MAIN, _EXTRA, _KERNEL_PATHS, EPHEMERIS_NAME_DEFAULT
+    global _MAIN, _EXTRA, _KERNEL_PATHS
     if _MAIN is not None:
         return _MAIN, _EXTRA
 
@@ -290,11 +290,18 @@ def _get_kernels():
     return _MAIN, _EXTRA
 
 def current_kernel_name() -> str:
+    """Human-friendly list of loaded kernel filenames (or default label)."""
     if _KERNEL_PATHS:
         return ", ".join(os.path.basename(p) for p in _KERNEL_PATHS)
     return EPHEMERIS_NAME_DEFAULT
 
 def load_kernel(kernel_name: str = "de421"):
+    """
+    Load the configured Skyfield kernels (main + any extras).
+
+    Returns:
+        (kernel_object, kernel_name_string)
+    """
     k, _ = _get_kernels()
     return k, current_kernel_name()
 
@@ -811,7 +818,7 @@ class EphemerisAdapter:
             raise EphemerisError("validation", "Julian date outside DE421 nominal span", jd_tt=float(jd_tt))
 
     # ---- public computations ------------------------------------------------
-    def _compute_major_row(self, *, body, obs, ef, ef_tag: str, jd_tt: float, name: str, ts, warnings: List[str], diags: Dict[str, Any]) -> Dict[str, Any]:
+    def _compute_major_row(self, *, body, obs, ef, jd_tt: float, name: str, ts, warnings: List[str], diags: Dict[str, Any]) -> Dict[str, Any]:
         # lon/lat now
         geo_now = obs.at(ts.tt_jd(jd_tt)).observe(body).apparent()
         lon_now, lat_now = _frame_latlon(geo_now, ef, abs_zero_tol_deg=self.cfg.abs_zero_tol_deg)
@@ -880,7 +887,6 @@ class EphemerisAdapter:
             main, _ = _get_kernels()
             ts = _get_timescale()
             ef = _get_ecliptic_frame(used_frame)
-            ef_tag = "ecliptic-j2000" if used_frame.lower() in ("ecliptic-j2000","j2000","ecl-j2000") else "ecliptic-of-date"
 
             obs, topo_resolved = _observer(
                 main,
@@ -916,7 +922,7 @@ class EphemerisAdapter:
                         warnings.append(f"missing_body:{canon}")
                         continue
                     try:
-                        rows.append(self._compute_major_row(body=body, obs=obs, ef=ef, ef_tag=ef_tag, jd_tt=jd_tt, name=raw, ts=ts, warnings=warnings, diags=diags))
+                        rows.append(self._compute_major_row(body=body, obs=obs, ef=ef, jd_tt=jd_tt, name=raw, ts=ts, warnings=warnings, diags=diags))
                         continue
                     except EphemerisError as e:
                         warnings.append(f"error:compute_major:{canon}:{e.stage}")
@@ -1101,14 +1107,6 @@ def rows_to_maps(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
 
 def ephemeris_diagnostics(*args, **kwargs) -> Dict[str, Any]:
     return _get_default_adapter().ephemeris_diagnostics(*args, **kwargs)
-
-def load_kernel(kernel_name: str = "de421"):
-    return _get_default_adapter(), current_kernel_name()
-
-def current_kernel_name() -> str:
-    if _KERNEL_PATHS:
-        return ", ".join(os.path.basename(p) for p in _KERNEL_PATHS)
-    return EPHEMERIS_NAME_DEFAULT
 
 def clear_adapter_caches() -> None:
     _get_default_adapter().clear_caches()
