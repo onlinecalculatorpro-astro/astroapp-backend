@@ -1189,6 +1189,8 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
     if warnings:
         meta["warnings"] = list(warnings)
+        out = { ..., "meta": meta, "warnings": warnings, ... }
+
 
 
     out: Dict[str, Any] = {
