@@ -1051,6 +1051,9 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
         # accept either 'elev_m' (route/validator output) or 'elevation_m'/'elevation'
         elev_in = payload.get("elev_m")
         if elev_in is None:
+        # accept either 'elev_m' (route/validator output) or legacy 'elevation_m'/'elevation'
+        elev_in = payload.get("elev_m")
+        if elev_in is None:
         elev_in = payload.get("elevation_m")
         if elev_in is None:
         elev_in = payload.get("elevation")
@@ -1058,6 +1061,7 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
         lat, lon, elev, downgraded = _validate_and_normalize_geo_for_topo(
         payload.get("latitude"), payload.get("longitude"), elev_in, warnings, _seen
         )
+
 
         if downgraded:
             topocentric = False
@@ -1191,7 +1195,8 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
         **dbg,
     }
     if warnings:
-        meta["warnings"] = warnings
+        meta["warnings"] = list(warnings)
+
 
     out: Dict[str, Any] = {
         "mode": mode,
