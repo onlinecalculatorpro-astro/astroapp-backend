@@ -54,7 +54,7 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import erfa  # PyERFA (BSD) — IAU SOFA routines
 
-# --------------------------- constants & numeric policy ---------------------------
+# ───────────────────────── constants & numeric policy ─────────────────────────
 
 TAU_R = 2.0 * math.pi
 DEG_R = math.pi / 180.0
@@ -69,7 +69,7 @@ PLACIDUS_TOL_STEP = float(os.getenv("PLACIDUS_TOL_STEP", "1e-9"))   # last step 
 # Certification threshold (arcseconds); keep aligned with doc target 0.003° ≈ 10.8″
 GOLD_CERT_ARCSEC = float(os.getenv("GOLD_CERT_ARCSEC", "10.8"))
 
-# --------------------------- angle helpers ---------------------------
+# ───────────────────────── angle helpers ─────────────────────────
 
 def _norm_deg(x: float) -> float:
     r = math.fmod(x, 360.0)
@@ -127,7 +127,7 @@ def _kahan_sum(values: List[float]) -> float:
 def _stable_angle_sum(angles: List[float]) -> float:
     return _norm_deg(_kahan_sum(angles))
 
-# --------------------------- ERFA / fundamental angles ---------------------------
+# ───────────────────────── ERFA / fundamental angles ─────────────────────────
 
 def _gast_deg(jd_ut1: float, jd_tt: float) -> float:
     d1u, d2u = _split_jd(jd_ut1)
@@ -165,7 +165,7 @@ def _vertex_longitude_deg(phi: float, ramc: float, eps: float) -> float:
     den = _cosd(ramc)
     return _acotd(num / max(1e-15, den))
 
-# --------------------------- common cusp helpers ---------------------------
+# ───────────────────────── common cusp helpers ─────────────────────────
 
 def _blank() -> List[Optional[float]]:
     return [None] * 12
@@ -173,20 +173,21 @@ def _blank() -> List[Optional[float]]:
 def _fill_opposites(cusps: List[Optional[float]]) -> List[float]:
     """Fill opposing cusps by exact 180° where only one side was computed."""
     pairs = [(9, 3), (10, 4), (11, 5), (0, 6), (1, 7), (2, 8)]
+    out = cusps[:]
     for a, b in pairs:
-        if cusps[a] is not None and cusps[b] is None:
-            cusps[b] = _norm_deg(cusps[a] + 180.0)
-        elif cusps[b] is not None and cusps[a] is None:
-            cusps[a] = _norm_deg(cusps[b] + 180.0)
-    out = [float(_norm_deg(c)) for c in cusps]  # type: ignore
+        if out[a] is not None and out[b] is None:
+            out[b] = _norm_deg(out[a] + 180.0)  # type: ignore
+        elif out[b] is not None and out[a] is None:
+            out[a] = _norm_deg(out[b] + 180.0)  # type: ignore
+    outf = [float(_norm_deg(c)) for c in out]  # type: ignore
     # enforce exact opposition (avoid micro-drift)
     for i in range(6):
-        opp = _norm_deg(out[i] + 180.0)
-        if _wrap_diff_deg(out[i + 6], opp) > 1e-12:
-            out[i + 6] = opp
-    return out
+        opp = _norm_deg(outf[i] + 180.0)
+        if _wrap_diff_deg(outf[i + 6], opp) > 1e-12:
+            outf[i + 6] = opp
+    return outf
 
-# --------------------------- exact house engines (closed/solved) ---------------------------
+# ───────────────────────── exact house engines (closed/solved) ─────────────────────────
 
 def _equal(asc: float) -> List[float]:
     return [_norm_deg(asc + 30.0 * i) for i in range(12)]
@@ -271,7 +272,7 @@ def _koch(phi: float, eps: float, ramc: float, mc: float) -> List[float]:
     cusps[2]  = cusp_from_H(H3)
     return _fill_opposites(cusps)
 
-# --------- Shared trigonometric blocks for Placidus & Topocentric (PP) ----------
+# ───── Shared trigonometric blocks for Placidus & Topocentric (PP) ─────
 
 def _decl_of_lambda_deg(lam: float, eps: float) -> float:
     return _asin_strict_deg(_sind(eps) * _sind(lam), "decl(lambda)")
@@ -297,7 +298,7 @@ def _sda_topocentric_deg(dec: float, phi: float) -> float:
     t = -tan_phi_eff * _tand(dec)
     return _acos_strict_deg(t, "sda_pp")
 
-# --------------------------- Placidus & PP numeric solver ---------------------------
+# ───────────────────────── Placidus & PP numeric solver ─────────────────────────
 
 def _placidus_secant_solver(
     eq_func: Callable[[float], float],
@@ -424,7 +425,7 @@ def _topocentric_pp(phi: float, eps: float, ramc: float, asc: float, mc: float, 
         sda_fn=_sda_topocentric_deg, diag_store=_diag, label_prefix="PP:"
     )
 
-# --------------------------- Corrected Alcabitius (semi-arc division) ---------------------------
+# ───────────────────────── Corrected Alcabitius (semi-arc division) ─────────────────────────
 
 def _alcabitius(phi: float, eps: float, asc: float, mc: float) -> List[float]:
     """Solve by semi-arc division referenced to culmination (like Placidus but fixed fractions)."""
@@ -461,7 +462,7 @@ def _alcabitius(phi: float, eps: float, asc: float, mc: float) -> List[float]:
     cusps[1],  cusps[2]  = C2,  C3
     return _fill_opposites(cusps)
 
-# --------------------------- other exact engines / styles ---------------------------
+# ───────────────────────── other exact engines / styles ─────────────────────────
 
 def _vehlow_equal(asc: float) -> List[float]:
     start = _norm_deg(asc - 15.0)
@@ -489,7 +490,7 @@ def _natural_houses() -> List[float]:
     base = 0.0
     return [_norm_deg(base + 30.0 * i) for i in range(12)]
 
-# --------------------------- declared but intentionally gated ---------------------------
+# ───────────────────────── declared but intentionally gated ─────────────────────────
 
 _GATED_VENDOR_VARIANTS = {"horizon", "carter_pe", "sunshine", "pullen_sd"}
 _GATED_RESEARCH = {"meridian", "krusinski"}
@@ -500,7 +501,7 @@ def _raise_gated(name: str) -> None:
         f"(awaiting unambiguous public spec and gold vectors)."
     )
 
-# --------------------------- GOLD STANDARD: Test Vector Framework ---------------------------
+# ───────────────────────── GOLD STANDARD: Test Vector Framework ─────────────────────────
 
 class GoldTestVector(NamedTuple):
     name: str
@@ -558,7 +559,7 @@ def _expected_from_rule(system: str, asc: float, mc: float) -> Optional[List[flo
     if s == "equal_from_mc": return _equal_from_mc(mc)
     return None
 
-# --------------------------- error budget & validation types ---------------------------
+# ───────────────────────── error budget & validation types ─────────────────────────
 
 @dataclass
 class ErrorBudget:
@@ -589,7 +590,7 @@ class ValidationResult(NamedTuple):
     passed: bool
     error_budget: ErrorBudget
 
-# --------------------------- data model ---------------------------
+# ───────────────────────── data model ─────────────────────────
 
 @dataclass
 class HouseData:
@@ -607,7 +608,7 @@ class HouseData:
         if self.warnings is None:
             self.warnings = []
 
-# --------------------------- supported systems ---------------------------
+# ───────────────────────── supported systems ─────────────────────────
 
 # 24 declared (incl. equal_from_mc, natural_houses, bhava_* aliases; plus gated)
 SUPPORTED_HOUSE_SYSTEMS = [
@@ -627,7 +628,7 @@ IMPLEMENTED_HOUSE_SYSTEMS = {
     "equal_from_mc","natural_houses","bhava_chalit_sripati","bhava_chalit_equal_from_mc",
 }
 
-# --------------------------- main calculator ---------------------------
+# ───────────────────────── main calculator ─────────────────────────
 
 class PreciseHouseCalculator:
     """
@@ -822,7 +823,7 @@ class PreciseHouseCalculator:
             error_budget=error_budget
         )
 
-# --------------------------- integration helper ---------------------------
+# ───────────────────────── integration helper ─────────────────────────
 
 def compute_house_system(
     latitude: float,
@@ -866,7 +867,7 @@ def compute_house_system(
         }
     return payload
 
-# --------------------------- Planet→House assignment & diagnostics ---------------------------
+# ───────────────────────── Planet→House assignment & diagnostics ─────────────────────────
 
 def assign_houses(longitudes_deg: List[float], cusps_deg: List[float]) -> List[int]:
     """
@@ -991,7 +992,7 @@ def analyze_house_sizes(cusps_deg: List[float]) -> Dict[str, Any]:
         "total_abs_deviation_deg": sum(dev),
     }
 
-# --------------------------- KP helpers (nakshatra, sub-lord) ---------------------------
+# ───────────────────────── KP helpers (nakshatra, sub-lord) ─────────────────────────
 
 # Vimshottari order (KP convention starts from Ketu)
 _VIM_ORDER = ["ketu","venus","sun","moon","mars","rahu","jupiter","saturn","mercury"]
@@ -1048,7 +1049,7 @@ def kp_assign_for_points(points_deg: Dict[str, float], *, zodiac_mode: str = "si
         out[name] = kp_details(lon, zodiac_mode=zodiac_mode, ayanamsa_deg=ayanamsa_deg)
     return out
 
-# --------------------------- Gauquelin sectors (provisional) ---------------------------
+# ───────────────────────── Gauquelin sectors (provisional) ─────────────────────────
 
 def gauquelin_sector(ra_deg: float, dec_deg: float, *, ramc_deg: float, phi_deg: float) -> int:
     """
@@ -1065,7 +1066,7 @@ def gauquelin_sector(ra_deg: float, dec_deg: float, *, ramc_deg: float, phi_deg:
     if sector > 36: sector = 36
     return sector
 
-# --------------------------- validation runner ---------------------------
+# ───────────────────────── validation runner ─────────────────────────
 
 def run_comprehensive_validation(external_vectors_file: Optional[str] = None) -> Dict[str, Any]:
     """
@@ -1131,7 +1132,7 @@ def run_comprehensive_validation(external_vectors_file: Optional[str] = None) ->
         'detailed_results': [r._asdict() for r in all_results]
     }
 
-# --------------------------- CLI ---------------------------
+# ───────────────────────── CLI ─────────────────────────
 
 if __name__ == "__main__":
     report = run_comprehensive_validation()
