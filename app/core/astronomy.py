@@ -531,16 +531,54 @@ def _adapter_callable(*names: str) -> Optional[Callable[..., Any]]:
     return None
 
 
-def _geo_kwargs_for_sig(sig: inspect.Signature, *, topocentric: bool, lat_q, lon_q, elev_q) -> Dict[str, Any]:
+def _geo_kwargs_for_sig(
+    sig: inspect.Signature, *,
+    topocentric: bool,
+    lat_q, lon_q, elev_q
+) -> Dict[str, Any]:
+    """
+    Build kwargs for the ephemeris adapter, covering different API styles:
+      - boolean flag:         topocentric=<bool>
+      - string selector:      center="topocentric"|"geocentric"
+      - synonyms:             lat/latitude, lon/longitude, elev_m/elevation_m/elevation
+      - structured observer:  observer={latitude, longitude, elevation_m}
+    Only supplies values the target function actually accepts.
+    """
     kw: Dict[str, Any] = {}
-    if "topocentric" in sig.parameters:
-        kw["topocentric"] = topocentric
+    params = sig.parameters
+
+    # 1) Common center/flag
+    if "topocentric" in params:
+        kw["topocentric"] = bool(topocentric)
+    if "center" in params:
+        kw["center"] = "topocentric" if topocentric else "geocentric"
+
+    # 2) Coordinates (only if topocentric requested)
     if topocentric:
-        if "latitude" in sig.parameters and lat_q is not None: kw["latitude"] = float(lat_q)
-        if "longitude" in sig.parameters and lon_q is not None: kw["longitude"] = float(lon_q)
-        if "elevation_m" in sig.parameters and elev_q is not None: kw["elevation_m"] = float(elev_q)
-        if "lat" in sig.parameters and lat_q is not None: kw["lat"] = float(lat_q)
-        if "lon" in sig.parameters and lon_q is not None: kw["lon"] = float(lon_q)
+        # latitude
+        if lat_q is not None:
+            if "latitude" in params: kw["latitude"] = float(lat_q)
+            elif "lat" in params:    kw["lat"] = float(lat_q)
+        # longitude
+        if lon_q is not None:
+            if "longitude" in params: kw["longitude"] = float(lon_q)
+            elif "lon" in params:     kw["lon"] = float(lon_q)
+        # elevation
+        if elev_q is not None:
+            if "elevation_m" in params:   kw["elevation_m"] = float(elev_q)
+            elif "elev_m" in params:      kw["elev_m"] = float(elev_q)
+            elif "elevation" in params:   kw["elevation"] = float(elev_q)
+
+        # 3) Structured observer object (some adapters prefer this)
+        if "observer" in params and (lat_q is not None and lon_q is not None):
+            obs = {
+                "latitude":  float(lat_q),
+                "longitude": float(lon_q),
+            }
+            if elev_q is not None:
+                obs["elevation_m"] = float(elev_q)
+            kw["observer"] = obs
+
     return kw
 
 
