@@ -1,17 +1,15 @@
 # app/core/validators.py
 from __future__ import annotations
 
-import os
 import re
 from datetime import datetime, date
 from typing import Any, Dict, Tuple, List, Optional, Union, TypedDict, Literal
 from zoneinfo import ZoneInfo
 
-# ───────────────────────────── errors ─────────────────────────────
+# ───────────────────────── errors ─────────────────────────
 
 class ValidationError(ValueError):
     """Structured validator error compatible with routes.py (has .errors())."""
-
     def __init__(self, details: Union[str, Dict[str, Any], List[Dict[str, Any]]]):
         if isinstance(details, str):
             self._details = [{"loc": [], "msg": details, "type": "value_error"}]
@@ -27,52 +25,58 @@ class ValidationError(ValueError):
             super().__init__("validation_error")
 
     def errors(self) -> List[Dict[str, Any]]:
-        return self._details
+        return list(self._details)
 
 
-# ───────────────────────────── helpers ─────────────────────────────
+# ───────────────────────── helpers ─────────────────────────
 
 def _err(loc: List[str] | str, msg: str, typ: str = "value_error") -> Dict[str, Any]:
     return {"loc": [loc] if isinstance(loc, str) else loc, "msg": msg, "type": typ}
 
-def _require(data: Dict[str, Any], *keys: str) -> None:
-    missing = [k for k in keys if k not in data or data[k] is None]
-    if missing:
-        raise ValidationError([_err(k, "field required", "missing") for k in missing])
+def _as_float(v: Any) -> Optional[float]:
+    try:
+        if v is None:
+            return None
+        x = float(v)
+        if x != x:  # NaN
+            return None
+        return x
+    except Exception:
+        return None
 
-def _coalesce(data: Dict[str, Any], *candidates: str) -> Optional[Any]:
-    for k in candidates:
-        if k in data and data[k] is not None:
-            return data[k]
+def _truthy(val: Any) -> Optional[bool]:
+    if isinstance(val, bool):
+        return val
+    if val is None:
+        return None
+    s = str(val).strip().lower()
+    if s in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "f", "no", "n", "off"}:
+        return False
     return None
 
-def _is_number(x: Any) -> bool:
-    return isinstance(x, (int, float)) and not isinstance(x, bool)
-
-def _to_bool(x: Any, default: bool = False) -> bool:
-    if isinstance(x, bool):
-        return x
-    if isinstance(x, (int, float)) and x in (0, 1):
-        return bool(x)
-    if isinstance(x, str):
-        s = x.strip().lower()
-        if s in ("1", "true", "t", "yes", "y", "on"):
-            return True
-        if s in ("0", "false", "f", "no", "n", "off"):
-            return False
-    return default
+def _validate_iana_tz(tz: str, loc: Optional[List[str]] = None) -> str:
+    # Only validate if provided; routes will default to UTC otherwise.
+    try:
+        _ = ZoneInfo(tz)
+    except Exception:
+        raise ValidationError([{
+            "loc": loc or ["tz"],
+            "msg": "must be a valid IANA zone like 'Asia/Kolkata'",
+            "type": "value_error",
+        }])
+    return tz
 
 
-# ───────────────────────────── atomic parsers ─────────────────────────────
+# ───────────────────────── atomic parsers ─────────────────────────
 
 _TIME_RE = re.compile(r"^\s*(?P<h>\d{1,2}):(?P<m>\d{2})(?::(?P<s>\d{2})(?:\.(?P<f>\d+))?)?\s*$")
 
 def _normalize_time_hms(s: str) -> str:
     """
-    Accept 'HH:MM', 'HH:MM:SS', or 'HH:MM:SS.frac'.
-    Allow leap second (SS == 60).
-    Disallow 24:00 except exactly '24:00:00'.
-    Return canonical 'HH:MM:SS[.frac]'.
+    Accept 'HH:MM', 'HH:MM:SS', or 'HH:MM:SS.frac'. Allow leap-second (SS==60).
+    Disallow 24:00 except exactly '24:00:00'. Return canonical 'HH:MM:SS[.frac]'.
     """
     m = _TIME_RE.match(s or "")
     if not m:
@@ -99,41 +103,20 @@ def parse_date(s: str) -> date:
 def parse_time_str(s: str) -> str:
     return _normalize_time_hms(s)
 
-def parse_tz(tz: str, loc_key: str = "place_tz") -> ZoneInfo:
-    if tz.upper() != "UTC" and "/" not in tz:
-        raise ValidationError(_err(loc_key, "must be a valid IANA timezone (e.g., 'Asia/Kolkata')", "value_error.timezone"))
-    try:
-        return ZoneInfo(tz)
-    except Exception:
-        raise ValidationError(_err(loc_key, "must be a valid IANA timezone (e.g., 'Asia/Kolkata')", "value_error.timezone"))
-
 def parse_latlon(lat: Any, lon: Any, lat_key="latitude", lon_key="longitude") -> Tuple[float, float]:
-    try:
-        lat_f, lon_f = float(lat), float(lon)
-    except Exception:
-        raise ValidationError(_err([lat_key, lon_key], "latitude/longitude must be numbers", "type_error.float"))
+    lat_f = _as_float(lat); lon_f = _as_float(lon)
+    if lat_f is None or lon_f is None:
+        raise ValidationError(_err([lat_key, lon_key], "latitude/longitude must be finite numbers", "type_error.float"))
     if not (-90.0 <= lat_f <= 90.0):
         raise ValidationError(_err(lat_key, "latitude must be between -90 and 90"))
     if not (-180.0 <= lon_f <= 180.0):
         raise ValidationError(_err(lon_key, "longitude must be between -180 and 180"))
-    return lat_f, lon_f
-
-def parse_elev(elev: Any | None, key: str = "elev_m") -> float:
-    if elev is None or (isinstance(elev, str) and elev.strip() == ""):
-        return 0.0
-    try:
-        e = float(elev)
-    except Exception:
-        raise ValidationError(_err(key, "elev_m must be a number (meters)", "type_error.float"))
-    if not (-12000.0 <= e <= 10000.0):
-        raise ValidationError(_err(key, "elev_m out of plausible range (-12000 .. 10000 m)"))
-    return e
+    return float(lat_f), float(lon_f)
 
 def parse_mode(mode: Any | None) -> Literal["sidereal", "tropical"]:
-    m = (mode or os.environ.get("ASTRO_MODE") or "tropical")
-    m = str(m).strip().lower()
+    m = str(mode or "tropical").strip().lower()
     if m not in ("sidereal", "tropical"):
-        raise ValidationError(_err("mode", "mode must be 'sidereal' or 'tropical'", "value_error.mode"))
+        raise ValidationError(_err("mode", "mode must be 'tropical' or 'sidereal'", "value_error.mode"))
     return m  # type: ignore
 
 def parse_house_system(val: Any | None) -> Optional[str]:
@@ -155,285 +138,188 @@ def parse_frame(val: Any | None) -> Literal["ecliptic-of-date", "ecliptic-j2000"
         "ecliptic-j2000": "ecliptic-j2000",
         "j2000": "ecliptic-j2000",
         "ecliptic_j2000": "ecliptic-j2000",
+        "ecl-j2000": "eclipctic-j2000",  # typo-safe; corrected below
     }
-    out = aliases.get(s)
-    if not out:
+    out = aliases.get(s) or s
+    if out == "eclipctic-j2000":  # fix typo alias
+        out = "ecliptic-j2000"
+    if out not in ("ecliptic-of-date", "ecliptic-j2000"):
         raise ValidationError(_err("frame", "frame must be 'ecliptic-of-date' or 'ecliptic-j2000'"))
     return out  # type: ignore
 
-def parse_center(val: Any | None) -> Literal["geocentric", "topocentric"]:
-    s = str(val or "geocentric").strip().lower()
-    aliases = {"geo": "geocentric", "geocentric": "geocentric", "topo": "topocentric", "topocentric": "topocentric"}
-    out = aliases.get(s)
-    if not out:
-        raise ValidationError(_err("center", "center must be 'geocentric' or 'topocentric'"))
-    return out  # type: ignore
 
-def parse_node_model(val: Any | None) -> Literal["true", "mean"]:
-    s = str(val or os.environ.get("OCP_NODE_MODEL") or "true").strip().lower()
-    if s not in ("true", "mean"):
-        raise ValidationError(_err("node_model", "node_model must be 'true' or 'mean'"))
-    return s  # type: ignore
-
-def parse_horizon(value: Any | None) -> Dict[str, int] | str:
-    if value is None:
-        return {"days": 30}
-    if isinstance(value, dict) and "days" in value:
-        try:
-            days = int(value["days"])
-        except Exception:
-            raise ValidationError(_err(["horizon", "days"], "days must be an integer", "type_error.integer"))
-        if not (1 <= days <= 3650):
-            raise ValidationError(_err(["horizon", "days"], "days must be between 1 and 3650"))
-        return {"days": days}
-    if isinstance(value, (int, float)) and int(value) == value:
-        days = int(value)
-        if 1 <= days <= 3650:
-            return {"days": days}
-    s = str(value).strip().lower()
-    if s in ("short", "medium", "long"):
-        return s
-    m = re.fullmatch(r"(?:p)?(\d{1,4})d", s)  # "30d" or "P30D"
-    if m:
-        days = int(m.group(1))
-        if 1 <= days <= 3650:
-            return {"days": days}
-    raise ValidationError(_err("horizon", "horizon must be {'days': N}, '30d', 'P30D', integer days, or 'short|medium|long'", "value_error.horizon"))
-
-
-# ───────────────────────────── timescale helpers ─────────────────────────────
-
-def _env_dut1() -> Optional[float]:
-    """
-    Returns DUT1 seconds from env if present.
-
-    Checks ASTRO_DUT1_BROADCAST first, then ASTRO_DUT1.
-    Returns None if not set or unparsable.
-    """
-    s = os.getenv("ASTRO_DUT1_BROADCAST", os.getenv("ASTRO_DUT1"))
-    if s is None:
-        return None
-    try:
-        return float(s)
-    except Exception:
-        return None
-
-def resolve_timescales_from_civil_erfa(d: date, time_str: str, tzinfo: ZoneInfo) -> Dict[str, float]:
-    """
-    Resolve civil inputs into precise timescales using app.core.timescales.build_timescales.
-
-    Returns:
-      {
-        'jd_tt':  JD(TT),
-        'jd_utc': JD(UTC),
-        'jd_ut1': JD(UT1),
-        'jd_ut':  JD(UT1)  # legacy alias; UT ≡ UT1 for our purposes
-      }
-    """
-    try:
-        from app.core.timescales import build_timescales  # lazy import
-    except Exception as e:
-        raise ValidationError(_err([], f"timescales core unavailable: {e}", "runtime_error"))
-
-    dut1_val = _env_dut1()
-    if dut1_val is None:
-        # Builder needs a number; 0.0 keeps behavior deterministic when env absent.
-        dut1_val = 0.0
-
-    tz_name = getattr(tzinfo, "key", None) or "UTC"
-    ts = build_timescales(d.strftime("%Y-%m-%d"), time_str, str(tz_name), float(dut1_val))
-
-    return {
-        "jd_tt":  float(ts.jd_tt),
-        "jd_utc": float(ts.jd_utc),
-        "jd_ut1": float(ts.jd_ut1),  # expose UT1 explicitly
-        "jd_ut":  float(ts.jd_ut1),  # legacy alias: UT = UT1
-    }
-
-
-# ───────────────────────────── payload parsers ─────────────────────────────
+# ───────────────────────── chart / predictions ─────────────────────────
 
 class ChartPayload(TypedDict, total=False):
     date: str
     time: str           # canonical 'HH:MM:SS[.frac]'
-    place_tz: str
-    timezone: str
+    place_tz: Optional[str]
+    timezone: Optional[str]
     latitude: float | None
     longitude: float | None
-    elev_m: float
+    elev_m: Optional[float]
     mode: Literal["sidereal", "tropical"]
     house_system: Optional[str]
     topocentric: bool
-    dut1: float         # optional, validated if provided
+    ayanamsa: float | str | None
+    dut1: float | None  # optional, numeric if present
 
-def parse_chart_payload(data: Dict[str, Any]) -> ChartPayload:
+def parse_chart_payload(body: Dict[str, Any]) -> ChartPayload:
     """
-    Normalize chart inputs for /api/calculate and friends.
-    - require date/time and place_tz
-    - require lat/lon only when topocentric=true (or center=topocentric alias)
-    - allow leap-second ':60' in time
-    - dut1 optional, validated if present
+    Normalize chart inputs for /api/calculate, /api/report, /api/predictions.
+
+    Important:
+    - Require 'date' and 'time'. Do NOT require tz/lat/lon here.
+      routes.py computes timescales and emits specific 422s (e.g. houses coords).
+    - Validate tz only if provided (IANA). routes defaults to 'UTC' if absent.
+    - Accept 'topocentric' flag without forcing coords here.
+    - Pass through ayanamsa (string or number).
+    - Do not clamp elevation; astronomy.py handles warnings (e.g. very_high_elevation_site).
     """
-    place_tz_val = _coalesce(data, "place_tz", "tz", "timezone")
-    _require({"place_tz": place_tz_val}, "place_tz")
-    _require(data, "date", "time")
+    if not isinstance(body, dict):
+        raise ValidationError("payload must be an object")
 
-    d = parse_date(str(data["date"]))
-    t_str = parse_time_str(str(data["time"]))
-    tzinfo = parse_tz(str(place_tz_val), loc_key="place_tz")
+    # Required
+    date_s = body.get("date")
+    time_s = body.get("time")
+    if not isinstance(date_s, str) or not date_s.strip():
+        raise ValidationError(_err("date", "required string", "value_error"))
+    if not isinstance(time_s, str) or not time_s.strip():
+        raise ValidationError(_err("time", "required string", "value_error"))
 
-    # center/topocentric flag (accept both styles)
-    center = parse_center(data.get("center"))
-    topocentric = _to_bool(data.get("topocentric"), center == "topocentric")
+    d = parse_date(date_s)
+    t_str = parse_time_str(time_s)
 
-    lat_val = _coalesce(data, "latitude", "lat")
-    lon_val = _coalesce(data, "longitude", "lon")
-    elev_val = _coalesce(data, "elev_m", "elevation_m", "elevation")
-
-    lat: float | None = None
-    lon: float | None = None
-    if topocentric:
-        _require({"latitude": lat_val, "longitude": lon_val}, "latitude", "longitude")
-        lat, lon = parse_latlon(lat_val, lon_val)
+    # Optional tz
+    tz = body.get("place_tz") or body.get("tz") or body.get("timezone")
+    if tz is not None:
+        if not isinstance(tz, str) or not tz.strip():
+            raise ValidationError(_err("place_tz", "must be a string (IANA)", "value_error"))
+        _validate_iana_tz(tz.strip(), ["place_tz"])
+        tz_out: Optional[str] = tz.strip()
     else:
-        if lat_val is not None and lon_val is not None:
-            lat, lon = parse_latlon(lat_val, lon_val)
+        tz_out = None  # let routes default to UTC
 
-    elev = parse_elev(elev_val)
-    mode = parse_mode(data.get("mode"))
-    house_system = parse_house_system(data.get("house_system") or data.get("system"))
+    # Optional coords (not required here)
+    lat = _as_float(body.get("latitude") if "latitude" in body else body.get("lat"))
+    lon = _as_float(body.get("longitude") if "longitude" in body else body.get("lon"))
+    elev = _as_float(body.get("elevation_m") if "elevation_m" in body else body.get("elev_m"))
+
+    # Mode
+    mode = parse_mode(body.get("mode"))
+
+    # House system
+    house_system = parse_house_system(body.get("house_system") or body.get("system"))
+
+    # Ayanamsa
+    aya = body.get("ayanamsa")
+    if aya is not None and not isinstance(aya, (int, float, str)):
+        raise ValidationError(_err("ayanamsa", "must be string or number", "type_error"))
+
+    # Topocentric boolean (do not enforce coords here)
+    topo = _truthy(body.get("topocentric"))
+    topo = False if topo is None else topo
+
+    # DUT1 (optional numeric; precedence handled in routes)
+    dut1 = body.get("dut1")
+    if dut1 is not None and _as_float(dut1) is None:
+        raise ValidationError(_err("dut1", "must be a number (seconds)", "type_error.float"))
 
     out: ChartPayload = {
         "date": d.strftime("%Y-%m-%d"),
         "time": t_str,
-        "place_tz": str(place_tz_val),
-        "timezone": str(place_tz_val),
-        "latitude": lat,
-        "longitude": lon,
-        "elev_m": elev,
+        "place_tz": tz_out,
+        "timezone": tz_out,
+        "latitude": float(lat) if lat is not None else None,
+        "longitude": float(lon) if lon is not None else None,
+        "elev_m": float(elev) if elev is not None else None,
         "mode": mode,
-        "topocentric": bool(topocentric),
+        "house_system": house_system,
+        "topocentric": bool(topo),
+        "ayanamsa": aya if aya is None or isinstance(aya, (int, float)) else str(aya).strip().lower(),
+        "dut1": float(dut1) if _as_float(dut1) is not None else None,
     }
-
-    # dut1 (optional)
-    if "dut1" in data and data["dut1"] is not None:
-        try:
-            dut1 = float(data["dut1"])
-        except Exception:
-            raise ValidationError(_err("dut1", "must be a number (seconds)", "type_error.float"))
-        if abs(dut1) > 0.9:
-            raise ValidationError(_err("dut1", "DUT1 magnitude must be ≤ 0.9 s", "value_error"))
-        out["dut1"] = dut1
-
-    if house_system:
-        out["house_system"] = house_system
-
-    # Keep tzinfo validated (unused here, but validates immediately)
-    _ = tzinfo
     return out
 
-def parse_prediction_payload(data: Dict[str, Any]) -> Tuple[ChartPayload, Any]:
-    chart = parse_chart_payload(data)
-    horizon = parse_horizon(data.get("horizon"))
+def parse_prediction_payload(body: Dict[str, Any]) -> Tuple[ChartPayload, Any]:
+    chart = parse_chart_payload(body)
+    # horizon is routed through to predictions; validate lightly here
+    horizon = body.get("horizon") or {}
+    if isinstance(horizon, dict):
+        if "days" in horizon and _as_float(horizon["days"]) is None:
+            raise ValidationError(_err(["horizon", "days"], "must be number (days)", "value_error"))
+    elif horizon is not None and not isinstance(horizon, (int, float, str)):
+        raise ValidationError(_err("horizon", "must be an object, number, or string", "value_error"))
     return chart, horizon
 
-def parse_rectification_payload(data: Dict[str, Any]) -> Tuple[ChartPayload, int]:
-    chart = parse_chart_payload(data)
-    wm = data.get("window_minutes", 120)
-    try:
-        wm = int(wm)
-    except Exception:
-        raise ValidationError(_err("window_minutes", "window_minutes must be an integer", "type_error.integer"))
-    if not (5 <= wm <= 7 * 24 * 60):
-        raise ValidationError(_err("window_minutes", "window_minutes must be between 5 and 10080"))
-    return chart, wm
+def parse_rectification_payload(body: Dict[str, Any]) -> Dict[str, Any]:
+    # kept for completeness parity with routes
+    return parse_chart_payload(body)
 
 
-# ─────────────────────── ephemeris-specific payloads ───────────────────────
+# ───────────────────────── ephemeris payload ─────────────────────────
 
 class EphemerisPayload(TypedDict, total=False):
     jd_tt: float
-    jd_utc: float
-    jd_ut1: float
-    jd_ut: float
     frame: Literal["ecliptic-of-date", "ecliptic-j2000"]
-    center: Literal["geocentric", "topocentric"]
-    latitude: float
-    longitude: float
-    elev_m: float
-    node_model: Literal["true", "mean"]
     bodies: List[str]
     names: List[str]
 
-def normalize_bodies_and_names(data: Dict[str, Any]) -> Tuple[List[str], List[str]]:
-    """Make 'names' optional; validate length if provided."""
-    bodies = data.get("bodies")
-    if not isinstance(bodies, list) or not all(isinstance(b, str) and b.strip() for b in bodies):
-        raise ValidationError(_err("bodies", "field required (non-empty list of strings)", "missing"))
-    bodies = [b.strip() for b in bodies]
-    names = data.get("names")
-    if names is None:
-        names = [b.replace("_", " ").title() for b in bodies]
-    elif not (isinstance(names, list) and all(isinstance(n, str) for n in names)):
-        raise ValidationError(_err("names", "must be a list of strings", "type_error.list"))
-    elif len(names) != len(bodies):
-        raise ValidationError(_err("names", "length mismatch with bodies", "value_error"))
-    return bodies, names  # type: ignore
+def _names_from(body: Dict[str, Any]) -> Optional[List[str]]:
+    # accept bodies / names / planets; strings, numbers -> strings
+    for key in ("names", "bodies", "planets"):
+        val = body.get(key)
+        if val is None:
+            continue
+        if not isinstance(val, (list, tuple)):
+            raise ValidationError(_err(key, "must be an array", "type_error.list"))
+        out: List[str] = []
+        for i, v in enumerate(val):
+            if isinstance(v, (str, int, float)):
+                s = str(v).strip()
+                if s:
+                    out.append(s)
+            elif isinstance(v, dict):
+                nm = v.get("name") or v.get("body") or v.get("planet") or v.get("id") or v.get("label")
+                if isinstance(nm, (str, int, float)):
+                    s = str(nm).strip()
+                    if s:
+                        out.append(s)
+                else:
+                    raise ValidationError(_err([key, i], "unsupported element shape", "type_error"))
+            else:
+                raise ValidationError(_err([key, i], "must be string or object", "type_error"))
+        return out
+    return None
 
-def parse_ephemeris_payload(data: Dict[str, Any], *, require_bodies: bool = False) -> EphemerisPayload:
+def parse_ephemeris_payload(body: Dict[str, Any], require_bodies: bool = False) -> EphemerisPayload:
     """
-    - If jd_tt present → use it (number).
-    - Else resolve from civil: require date/time and place_tz (tz alias ok).
-      lat/lon required only if center/topocentric.
-    - frame, center, node_model normalized.
-    - if require_bodies=True, bodies must be non-empty; names optional/derived.
+    Minimal, route-friendly parser:
+      • Require jd_tt (or timescales.jd_tt if provided)
+      • Normalize frame
+      • Extract names/bodies list (required if require_bodies=True)
+    The /api/ephemeris/longitudes route itself resolves topocentric logic & 422s.
     """
-    out: EphemerisPayload = {}
-    out["frame"] = parse_frame(data.get("frame"))
-    out["center"] = parse_center(data.get("center"))
-    out["node_model"] = parse_node_model(data.get("node_model"))
+    if not isinstance(body, dict):
+        raise ValidationError("payload must be an object")
 
-    # timescales
-    jd_tt = data.get("jd_tt")
-    if jd_tt is not None:
-        if not _is_number(jd_tt):
-            raise ValidationError(_err("jd_tt", "must be a number (Julian Day TT)", "type_error.float"))
-        out["jd_tt"] = float(jd_tt)
-        # Optional pass-throughs if the caller provided them
-        for fld in ("jd_utc", "jd_ut1", "jd_ut"):
-            if fld in data and _is_number(data[fld]):
-                out[fld] = float(data[fld])  # type: ignore[index]
-    else:
-        place_tz_val = _coalesce(data, "place_tz", "tz", "timezone")
-        _require({"place_tz": place_tz_val}, "place_tz")
-        _require(data, "date", "time")
-        d = parse_date(str(data["date"]))
-        t_str = parse_time_str(str(data["time"]))
-        tzinfo = parse_tz(str(place_tz_val), loc_key="place_tz")
-        out.update(resolve_timescales_from_civil_erfa(d, t_str, tzinfo))
+    jd_tt = _as_float(body.get("jd_tt"))
+    if jd_tt is None and isinstance(body.get("timescales"), dict):
+        jd_tt = _as_float(body["timescales"].get("jd_tt"))
+    if jd_tt is None:
+        raise ValidationError([{"loc": ["jd_tt"], "msg": "required (or provide timescales.jd_tt)", "type": "value_error"}])
 
-    # coordinates
-    lat_val = _coalesce(data, "latitude", "lat")
-    lon_val = _coalesce(data, "longitude", "lon")
-    elev_val = _coalesce(data, "elev_m", "elevation_m", "elevation")
-    if out["center"] == "topocentric":
-        _require({"latitude": lat_val, "longitude": lon_val}, "latitude", "longitude")
-        lat, lon = parse_latlon(lat_val, lon_val)
-        out["latitude"], out["longitude"] = lat, lon
-        out["elev_m"] = parse_elev(elev_val)
-    else:
-        if lat_val is not None and lon_val is not None:
-            lat, lon = parse_latlon(lat_val, lon_val)
-            out["latitude"], out["longitude"] = lat, lon
-        if elev_val is not None:
-            out["elev_m"] = parse_elev(elev_val)
+    frame = parse_frame(body.get("frame"))
 
-    # bodies
-    if require_bodies:
-        bodies, names = normalize_bodies_and_names(data)
-        out["bodies"], out["names"] = bodies, names
+    names = _names_from(body)
+    if require_bodies and (not names or len(names) == 0):
+        raise ValidationError(_err("bodies", "at least one body is required", "value_error"))
 
-    return out
+    # Preserve caller-provided order for both 'bodies' and 'names'
+    bodies = list(names or [])
+    canon = [str(n).strip() for n in bodies]
+
+    return {"jd_tt": float(jd_tt), "frame": frame, "bodies": bodies, "names": canon}
 
 
 __all__ = [
@@ -442,9 +328,5 @@ __all__ = [
     "parse_prediction_payload",
     "parse_rectification_payload",
     "parse_ephemeris_payload",
-    "normalize_bodies_and_names",
     "parse_frame",
-    "parse_center",
-    "parse_node_model",
-    "resolve_timescales_from_civil_erfa",
 ]
