@@ -1123,7 +1123,15 @@ def ephemeris_longitudes_endpoint():
     elev = elev if isinstance(elev, (int, float)) else 0.0
 
     # Validation
-    coords_valid = (-90 <= lat <= 90 and -180 <= lon <= 180)
+    # Proper coordinate validation that rejects (0,0)
+coords_provided = (
+    isinstance(lat, (int, float)) and isinstance(lon, (int, float)) and
+    -90 <= lat <= 90 and -180 <= lon <= 180 and
+    not (lat == 0.0 and lon == 0.0)  # Reject default origin coordinates
+)
+
+# Auto-enable topocentric when coordinates provided
+topocentric_final = coords_provided  # Coordinates always imply topocentric intent
 
     print(f"=== FIXED ENDPOINT DEBUG ===")
     print(f"body.topocentric: {body.get('topocentric')}")
