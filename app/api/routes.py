@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+import inspect
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -333,7 +334,6 @@ def debug_routes():
     """Simple route index used by the frontend 'Routes' page."""
     rules = []
     for r in current_app.url_map.iter_rules():
-        # Skip static handler
         if r.endpoint == "static":
             continue
         methods = sorted(m for m in r.methods if m not in {"HEAD", "OPTIONS"})
@@ -348,14 +348,10 @@ def timescales_endpoint():
     body = request.get_json(force=True) or {}
     try:
         date = body.get("date")
-        # accept tz aliases
         tz = body.get("tz") or body.get("place_tz") or body.get("timezone")
-
-        # normalize time: allow "HH:MM" by appending ":00"
         time_ = str(body.get("time") or "").strip()
         if re.match(r"^\d{1,2}:\d{2}$", time_):
             time_ = f"{time_}:00"
-
         if not isinstance(date, str) or not isinstance(time_, str) or not isinstance(tz, str):
             errs = []
             if not isinstance(date, str):
@@ -365,7 +361,6 @@ def timescales_endpoint():
             if not isinstance(tz, str):
                 errs.append({"loc": ["tz"], "msg": "required string (IANA zone)", "type": "value_error"})
             raise ValidationError(errs or "invalid payload")
-
         ts = _compute_timescales_from_local(date, time_, tz, payload=body if isinstance(body, dict) else None)
         return jsonify({"ok": True, "timescales": ts}), 200
     except ValidationError as e:
@@ -375,7 +370,6 @@ def timescales_endpoint():
 
 
 # ───────────────────────── chart / houses ─────────────────────────
-# compute_chart engine discovery (primary + fallback)
 _compute_chart = None  # type: ignore
 _CHART_ENGINE_NAME: Optional[str] = None
 try:  # pragma: no cover
@@ -391,7 +385,6 @@ except Exception as e1:  # pragma: no cover
         _CHART_ENGINE_NAME = None
         log.error("No compute_chart available: astronomy failed=%r, chart failed=%r", e1, e2)
 
-# house engine (policy façade preferred)
 _HOUSES_KIND = "policy"
 _can_sys = None
 try:
@@ -419,22 +412,14 @@ def _sig_accepts(fn, *names: str) -> Dict[str, bool]:
     try:
         params = fn.__signature__.parameters  # type: ignore[attr-defined]
     except Exception:
-        import inspect
         params = inspect.signature(fn).parameters
     return {n: (n in params) for n in names}
 
 
 def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Calls the chart engine with maximum compatibility:
-      • Path A: engine(payload) — inject normalized fields & timescales into payload copy
-      • Path B: legacy signatures — only pass kwargs the engine advertises
-    Always attaches engine label + JDs to returned chart.
-    """
     if _compute_chart is None:
         raise RuntimeError("chart_engine_unavailable")
 
-    import inspect
     param_names = set(inspect.signature(_compute_chart).parameters.keys())
 
     def pick(*cands: str) -> Optional[str]:
@@ -461,7 +446,6 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
         q.setdefault("timescales", ts)
         return q
 
-    # Path A
     if "payload" in param_names:
         payload2 = _normalize_payload_for_engine(payload)
         try:
@@ -469,44 +453,35 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
         except Exception as e:
             chart = {
                 "mode": payload.get("mode"),
-                "jd_ut": ts["jd_utc"],
-                "jd_tt": ts["jd_tt"],
-                "jd_ut1": ts["jd_ut1"],
+                "jd_ut": ts["jd_utc"], "jd_tt": ts["jd_tt"], "jd_ut1": ts["jd_ut1"],
                 "meta": {"engine": _CHART_ENGINE_NAME, "warnings": ["chart_failed"]},
                 "error": str(e) if DEBUG_VERBOSE else "chart_failed",
             }
     else:
-        # Path B (legacy)
         kwargs: Dict[str, Any] = {}
-        if pick("date", "date_str", "date_s"):
+        if "date" in payload and pick("date", "date_str", "date_s"):
             kwargs[pick("date", "date_str", "date_s")] = payload.get("date")
-        if pick("time", "time_str", "time_s"):
+        if "time" in payload and pick("time", "time_str", "time_s"):
             kwargs[pick("time", "time_str", "time_s")] = payload.get("time")
-
         if "latitude" in payload and pick("latitude", "lat"):
             kwargs[pick("latitude", "lat")] = payload["latitude"]
         if "longitude" in payload and pick("longitude", "lon"):
             kwargs[pick("longitude", "lon")] = payload["longitude"]
-
         tz_name = payload.get("place_tz") or payload.get("timezone")
         if tz_name and pick("place_tz", "timezone", "tz_name"):
             kwargs[pick("place_tz", "timezone", "tz_name")] = tz_name
-
         if pick("mode", "system") and "mode" in payload:
             kwargs[pick("mode", "system")] = payload["mode"]
         if "ayanamsa" in payload and pick("ayanamsa", "ayanamsha", "aya"):
             kwargs[pick("ayanamsa", "ayanamsha", "aya")] = payload["ayanamsa"]
-
         if "topocentric" in payload and pick("topocentric", "observer_topocentric"):
             kwargs[pick("topocentric", "observer_topocentric")] = bool(payload["topocentric"])
         if "elevation_m" in payload and pick("elevation_m", "elevation"):
             kwargs[pick("elevation_m", "elevation")] = payload["elevation_m"]
-
         if "bodies" in payload and pick("bodies", "names", "planets"):
             kwargs[pick("bodies", "names", "planets")] = payload["bodies"]
         if "frame" in payload and pick("frame"):
             kwargs["frame"] = payload["frame"]
-
         if "timescales" in param_names:
             kwargs["timescales"] = ts
         if "jd_tt" in param_names:
@@ -523,9 +498,7 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
         except Exception as e:
             chart = {
                 "mode": payload.get("mode"),
-                "jd_ut": ts["jd_utc"],
-                "jd_tt": ts["jd_tt"],
-                "jd_ut1": ts["jd_ut1"],
+                "jd_ut": ts["jd_utc"], "jd_tt": ts["jd_tt"], "jd_ut1": ts["jd_ut1"],
                 "meta": {"engine": _CHART_ENGINE_NAME, "warnings": ["chart_failed"]},
                 "error": str(e) if DEBUG_VERBOSE else "chart_failed",
             }
@@ -977,46 +950,72 @@ def predictions_route():
 
 
 # ───────────────────────── ephemeris ─────────────────────────
+def _coerce_float(v: Any) -> Optional[float]:
+    try:
+        if v is None:
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def _truthy(val: Any) -> Optional[bool]:
+    if isinstance(val, bool):
+        return val
+    if val is None:
+        return None
+    s = str(val).strip().lower()
+    if s in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    return None
+
+
 def _norm_rows_from_longitudes(raw: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Normalize longitude results to consistent format."""
     rows: List[Dict[str, Any]] = []
     meta: Dict[str, Any] = {}
-    
+
+    if isinstance(raw, tuple) and len(raw) == 2:
+        raw, meta = raw
+
     if isinstance(raw, dict):
         meta = dict(raw.get("meta") or {})
-    
+
     if raw is None:
         return rows, meta
-    
-    # Handle simple dict of name->longitude mappings
+
     if isinstance(raw, dict) and all(isinstance(v, (int, float)) for v in raw.values()):
         for k, v in raw.items():
             rows.append({"body": str(k).lower(), "name": str(k), "longitude": float(v)})
         return rows, meta
-    
-    # Handle structured results with "results" array
+
     data = raw.get("results") if isinstance(raw, dict) and isinstance(raw.get("results"), list) else raw
     if isinstance(data, list):
         for r in data:
             if isinstance(r, dict):
-                # Handle single key-value longitude mappings
                 if len(r) == 1 and isinstance(next(iter(r.values())), (int, float)):
                     k, v = next(iter(r.items()))
                     rows.append({"body": str(k).lower(), "name": str(k), "longitude": float(v)})
                     continue
-                
-                # Extract body name from various possible fields
+
                 body = (r.get("body") or r.get("name") or r.get("planet") or r.get("id") or r.get("label"))
-                # Extract longitude from various possible fields
                 L = r.get("longitude") or r.get("lon") or r.get("lambda") or r.get("ecliptic_longitude")
-                
+
                 if body and isinstance(L, (int, float)):
-                    rows.append({
-                        "body": str(body).lower(), 
-                        "name": str(r.get("name") or body), 
-                        "longitude": float(L)
-                    })
-    
+                    row: Dict[str, Any] = {
+                        "body": str(body).lower(),
+                        "name": str(r.get("name") or body),
+                        "longitude": float(L),
+                    }
+                    # pass-through extras if present
+                    if _coerce_float(r.get("speed")) is not None:
+                        row["speed"] = float(r.get("speed"))
+                    if _coerce_float(r.get("velocity")) is not None:
+                        row["velocity"] = float(r.get("velocity"))
+                    rows.append(row)
+
     return rows, meta
 
 
@@ -1024,47 +1023,46 @@ def _norm_rows_from_lv(raw: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Normalize longitude+velocity results to consistent format."""
     rows_map: Dict[str, Dict[str, Any]] = {}
     meta: Dict[str, Any] = {}
-    
+
     if isinstance(raw, dict):
         meta = dict(raw.get("meta") or {})
-    
-    # Handle separate longitudes/velocities dictionaries
+
     if isinstance(raw, dict) and "longitudes" in raw and "velocities" in raw:
         for k, v in (raw.get("longitudes") or {}).items():
             rows_map.setdefault(str(k).lower(), {"body": str(k).lower(), "name": str(k)})["longitude"] = float(v)
         for k, v in (raw.get("velocities") or {}).items():
             rows_map.setdefault(str(k).lower(), {"body": str(k).lower(), "name": str(k)})["velocity"] = float(v)
         return list(rows_map.values()), meta
-    
-    # Handle structured results with "results" array
+
     data = raw.get("results") if isinstance(raw, dict) and isinstance(raw.get("results"), list) else raw
     if isinstance(data, list):
         for r in data:
             if not isinstance(r, dict):
                 continue
-            
             body = (r.get("body") or r.get("name") or r.get("planet") or r.get("id") or r.get("label"))
             if not body:
                 continue
-            
             key = str(body).lower()
             rec = rows_map.setdefault(key, {"body": key, "name": str(r.get("name") or body)})
-            
-            # Extract longitude and velocity from various possible fields
             L = r.get("longitude") or r.get("lon") or r.get("lambda") or r.get("ecliptic_longitude")
             V = r.get("velocity") or r.get("vel") or r.get("dlambda_dt") or r.get("deg_per_day") or r.get("speed")
-            
             if isinstance(L, (int, float)):
                 rec["longitude"] = float(L)
             if isinstance(V, (int, float)):
                 rec["velocity"] = float(V)
-    
+
     return list(rows_map.values()), meta
 
 
 @api.post("/api/ephemeris/longitudes")
 def ephemeris_longitudes_endpoint():
-    """Fixed endpoint that properly handles topocentric flag."""
+    """
+    Fixed endpoint that properly handles topocentric flag:
+      • If topocentric:true but no coords -> 422 topocentric_coords_required
+      • If coords present -> force topocentric True (even if flag was false)
+      • center = 'topocentric' iff meta.topocentric truthy; else 'geocentric'
+      • Prefer adapter meta.topocentric; fallback to the resolved value
+    """
     try:
         body = request.get_json(force=True) or {}
         payload = parse_ephemeris_payload(body, require_bodies=True)
@@ -1078,131 +1076,149 @@ def ephemeris_longitudes_endpoint():
     frame = payload.get("frame", "ecliptic-of-date")
     bodies = payload["bodies"]
     names = payload["names"]
-    
-    # CRITICAL FIX: Get topocentric flag directly from request body, not payload
-    topocentric = bool(body.get("topocentric", False))
 
-    # Extract coordinates
-    lat = lon = elev = None
-    observer_obj = body.get("observer", {})
-    
-    # Try observer object first
-    if isinstance(observer_obj, dict):
-        try:
-            lat = float(observer_obj.get("lat", 0))
-            lon = float(observer_obj.get("lon", 0)) 
-            elev = float(observer_obj.get("elevation_m", 0))
-        except (ValueError, TypeError):
-            lat = lon = elev = None
+    # Requested flag (body or query)
+    requested_topo = _truthy(body.get("topocentric"))
+    if requested_topo is None:
+        requested_topo = _truthy(request.args.get("topocentric")) or False
 
-    # Try top-level coordinates
-    try:
-        if lat is None and body.get("latitude") is not None:
-            lat = float(body["latitude"])
-        if lon is None and body.get("longitude") is not None:
-            lon = float(body["longitude"])
-        if elev is None and body.get("elevation_m") is not None:
-            elev = float(body["elevation_m"])
-    except (ValueError, TypeError):
-        pass
+    # Extract coordinates: body.observer, body aliases, query aliases
+    ob = body.get("observer") or {}
+    lat = (
+        _coerce_float(ob.get("lat"))
+        or _coerce_float(ob.get("latitude"))
+        or _coerce_float(body.get("lat"))
+        or _coerce_float(body.get("latitude"))
+        or _coerce_float(request.args.get("lat"))
+        or _coerce_float(request.args.get("latitude"))
+    )
+    lon = (
+        _coerce_float(ob.get("lon"))
+        or _coerce_float(ob.get("lng"))
+        or _coerce_float(ob.get("longitude"))
+        or _coerce_float(body.get("lon"))
+        or _coerce_float(body.get("lng"))
+        or _coerce_float(body.get("longitude"))
+        or _coerce_float(request.args.get("lon"))
+        or _coerce_float(request.args.get("lng"))
+        or _coerce_float(request.args.get("longitude"))
+    )
+    elev = (
+        _coerce_float(ob.get("elevation_m"))
+        or _coerce_float(ob.get("elev_m"))
+        or _coerce_float(body.get("elevation_m"))
+        or _coerce_float(body.get("elev_m"))
+        or _coerce_float(request.args.get("elevation_m"))
+        or _coerce_float(request.args.get("elev_m"))
+    )
 
-    # Query parameters override
-    try:
-        if request.args.get("lat"):
-            lat = float(request.args["lat"])
-        if request.args.get("lon"):
-            lon = float(request.args["lon"])
-        if request.args.get("elev_m"):
-            elev = float(request.args["elev_m"])
-    except (ValueError, TypeError):
-        pass
+    coords_valid = (lat is not None) and (lon is not None)
+    observer = {"lat": lat, "lon": lon, "elevation_m": (elev if elev is not None else 0.0)} if coords_valid else None
 
-    # Ensure we have valid numbers (default to 0 if None)
-    lat = lat if isinstance(lat, (int, float)) else 0.0
-    lon = lon if isinstance(lon, (int, float)) else 0.0
-    elev = elev if isinstance(elev, (int, float)) else 0.0
-
-    # Validation
-    # Proper coordinate validation that rejects (0,0)
-coords_provided = (
-    isinstance(lat, (int, float)) and isinstance(lon, (int, float)) and
-    -90 <= lat <= 90 and -180 <= lon <= 180 and
-    not (lat == 0.0 and lon == 0.0)  # Reject default origin coordinates
-)
-
-# Auto-enable topocentric when coordinates provided
-topocentric_final = coords_provided  # Coordinates always imply topocentric intent
-
-    print(f"=== FIXED ENDPOINT DEBUG ===")
-    print(f"body.topocentric: {body.get('topocentric')}")
-    print(f"topocentric (fixed): {topocentric}")
-    print(f"lat: {lat}, lon: {lon}, elev: {elev}")
-    print(f"coords_valid: {coords_valid}")
-
-    if topocentric and not coords_valid:
+    # Rule 1: explicit topocentric without coords => 422
+    if requested_topo and not coords_valid:
         return _json_error(
-            "invalid_coordinates",
-            {"lat": lat, "lon": lon, "elev": elev, "message": "Invalid coordinates for topocentric mode"},
-            422
+            "topocentric_coords_required",
+            {
+                "message": "topocentric:true requires lat & lon (optional elevation_m) via body.observer or ?lat&lon[&elev_m].",
+                "aliases": {"lat": ["lat", "latitude"], "lon": ["lon", "lng", "longitude"], "elevation_m": ["elev_m", "elevation_m"]},
+            },
+            422,
         )
 
-    # Call adapter
+    # Rule 2: coords force topocentric (override any false flag)
+    resolved_topo = True if coords_valid else bool(requested_topo)
+
+    # Call adapter robustly
     try:
         from app.core import ephemeris_adapter as ea
-        
-        print(f"Calling adapter: topocentric={topocentric}, lat={lat}, lon={lon}, elev={elev}")
-        
-        result = ea.ecliptic_longitudes(
-            jd_tt,
-            names=names,
-            frame=frame,
-            topocentric=topocentric,
-            latitude=lat,
-            longitude=lon,
-            elevation_m=elev
-        )
 
-        adapter_topo = result.get('meta', {}).get('topocentric', False)
-        print(f"Adapter returned topocentric: {adapter_topo}")
-        
+        def _call():
+            if hasattr(ea, "ecliptic_longitudes"):
+                try:
+                    return ea.ecliptic_longitudes(
+                        jd_tt=jd_tt,
+                        bodies=names,                   # modern kw
+                        frame=frame,
+                        topocentric=resolved_topo,
+                        observer=observer if resolved_topo else None,
+                        latitude=lat if resolved_topo else None,   # back-compat
+                        longitude=lon if resolved_topo else None,
+                        elevation_m=(elev if elev is not None else None) if resolved_topo else None,
+                    )
+                except TypeError:
+                    # older signature variants
+                    try:
+                        return ea.ecliptic_longitudes(
+                            jd_tt,
+                            names=names,
+                            frame=frame,
+                            topocentric=resolved_topo,
+                            latitude=lat if resolved_topo else None,
+                            longitude=lon if resolved_topo else None,
+                            elevation_m=(elev if elev is not None else None) if resolved_topo else None,
+                        )
+                    except TypeError:
+                        return ea.ecliptic_longitudes(
+                            jd_tt=jd_tt,
+                            names=names,
+                            frame=frame,
+                            topocentric=resolved_topo,
+                            latitude=lat if resolved_topo else None,
+                            longitude=lon if resolved_topo else None,
+                            elev_m=(elev if elev is not None else None) if resolved_topo else None,
+                        )
+            elif hasattr(ea, "ecliptic_longitudes_and_velocities"):
+                return ea.ecliptic_longitudes_and_velocities(
+                    jd_tt=jd_tt,
+                    bodies=names,
+                    frame=frame,
+                    topocentric=resolved_topo,
+                    observer=observer if resolved_topo else None,
+                )
+            raise RuntimeError("adapter_missing")
+        adapter_ret = _call()
     except Exception as e:
-        print(f"Adapter error: {e}")
         return _json_error("adapter_error", str(e), 500)
 
-    # Process results
-    rows, meta = _norm_rows_from_longitudes(result)
-    
-    # Build response
+    # Normalize
+    if isinstance(adapter_ret, dict) and ("velocities" in adapter_ret or "longitudes" in adapter_ret):
+        rows, meta = _norm_rows_from_lv(adapter_ret)
+    else:
+        rows, meta = _norm_rows_from_longitudes(adapter_ret)
+
+    # Order by requested bodies
     requested = [b.lower() for b in bodies]
     name_map = {b.lower(): n for b, n in zip(bodies, names)}
-    by_body = {r["body"]: r for r in rows}
-    
+    by_body = {r.get("body"): r for r in rows if r.get("body")}
+
     ordered_results = []
     for body_key in requested:
-        if body_key in by_body:
+        r = by_body.get(body_key)
+        if r and isinstance(r.get("longitude"), (int, float)):
             ordered_results.append({
                 "body": body_key,
-                "name": name_map[body_key],
-                "longitude": float(by_body[body_key]["longitude"])
+                "name": name_map.get(body_key, r.get("name", body_key)),
+                "longitude": float(r["longitude"]),
             })
 
-    # Final response
-    final_meta = dict(meta)
+    # Meta + center resolution (prefer adapter meta; fallback to route)
+    final_meta = dict(meta or {})
+    if "topocentric" not in final_meta:
+        final_meta["topocentric"] = resolved_topo
+    center = "topocentric" if (final_meta.get("topocentric") is True or str(final_meta.get("topocentric")).lower() == "true") else "geocentric"
     final_meta.setdefault("frame", frame)
-    topocentric_actual = final_meta.get("topocentric", False)
-    
-    print(f"Final response topocentric: {topocentric_actual}")
-    print(f"=============================")
 
     return jsonify({
         "ok": True,
         "jd_tt": float(jd_tt),
         "frame": frame,
-        "center": "topocentric" if topocentric_actual else "geocentric",
+        "center": center,
         "units": {"angles": "deg"},
         "meta": final_meta,
         "results": ordered_results,
     }), 200
+
 
 # ───────────────────────── system-validation (optional) ─────────────────────────
 @api.get("/system-validation")
