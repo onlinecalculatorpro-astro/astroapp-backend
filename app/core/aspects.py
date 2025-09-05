@@ -1,423 +1,535 @@
 # app/core/aspects.py
 from __future__ import annotations
-"""
-Aspects Engine — research-grade, deterministic, and testable.
 
-Design goals
-- Pure geometry: works on *any* set of longitudes you feed it (tropical or sidereal).
-  (If you use sidereal, pass your ayanamsa-adjusted longitudes here; no hidden offsets.)
-- Robust circular math (wraps, signed/absolute separations).
-- Clear orb policy: base per-aspect caps + per-body moieties; combine via policy ('min' default).
-- Applying/Separating flag using velocities when available (deg/day).
-- Extensible aspect set (majors default; minors/quintiles/etc. available).
-- Deterministic output with stable sort order and structured records.
-
-Quickstart
-----------
-from app.core.aspects import compute_aspects, default_config
-
-hits = compute_aspects(
-    longitudes={"Sun": 123.4, "Moon": 98.7, "Mars": 310.2},
-    velocities={"Sun": 0.9856, "Moon": 13.1764, "Mars": 0.5240},  # optional
-    cfg=default_config()
-)
-"""
-
-from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Optional, Iterable, Literal, Any
+from dataclasses import dataclass, field, asdict
+from typing import Dict, List, Tuple, Optional, Literal, Iterable, Any
+import itertools
 import math
-import os
+import random
 
-# ───────────────────────────── angle helpers ─────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Core math helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _norm360(x: float) -> float:
-    """Wrap angle to [0, 360)."""
-    r = float(x) % 360.0
-    return 0.0 if math.isclose(r, 0.0, abs_tol=1e-12) else r
+    v = float(x) % 360.0
+    return 0.0 if math.isclose(v, 0.0, abs_tol=1e-12) else v
 
-def _signed_short_arc(a: float, b: float) -> float:
-    """
-    Signed shortest difference (b - a) in degrees on (-180, 180].
-    Positive if b is ahead of a going forward through the zodiac.
-    """
-    return ((b - a + 540.0) % 360.0) - 180.0
+def _sep_small(a: float, b: float) -> float:
+    """Smallest separation on circle in [0, 180]."""
+    d = abs(_norm360(a - b))
+    return d if d <= 180.0 else 360.0 - d
 
-def _abs_sep(a: float, b: float) -> float:
-    """Absolute separation in [0, 180]."""
-    return abs(_signed_short_arc(a, b))
+def _near(value: float, target: float) -> float:
+    """Unsigned deviation |value - target| on [0, 180]."""
+    return abs(value - target)
 
-# ───────────────────────────── aspect model ─────────────────────────────
+def _safe_get(d: Optional[Dict[str, float]], k: str, default: float) -> float:
+    if not isinstance(d, dict): return default
+    v = d.get(k, default)
+    try: return float(v)
+    except Exception: return default
 
-@dataclass(frozen=True)
-class AspectSpec:
-    key: str                 # stable identifier, e.g., "conjunction"
-    angle: float             # exact angle in degrees
-    max_orb_deg: float       # absolute cap for this aspect
-    enabled: bool = True
-    weight: float = 1.0      # optional strength weight (used in scoring/ties)
+# ─────────────────────────────────────────────────────────────────────────────
+# Aspect catalog & default orbs
+# (research-sane defaults, easy to override)
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Classic major aspects (Lilly-like caps; tweak via env if desired)
-_DEF_ORB_CONJ = float(os.getenv("ASPECT_ORB_CONJ", "8"))
-_DEF_ORB_OPP  = float(os.getenv("ASPECT_ORB_OPP",  "8"))
-_DEF_ORB_TRI  = float(os.getenv("ASPECT_ORB_TRI",  "7"))
-_DEF_ORB_SQR  = float(os.getenv("ASPECT_ORB_SQR",  "6"))
-_DEF_ORB_SEX  = float(os.getenv("ASPECT_ORB_SEX",  "5"))
-_DEF_ORB_QCX  = float(os.getenv("ASPECT_ORB_QCX",  "3"))  # quincunx/inconjunct
-
-MAJOR_ASPECTS: Dict[str, AspectSpec] = {
-    "conjunction": AspectSpec("conjunction", 0.0,   _DEF_ORB_CONJ, weight=1.30),
-    "opposition":  AspectSpec("opposition",  180.0, _DEF_ORB_OPP,  weight=1.20),
-    "trine":       AspectSpec("trine",       120.0, _DEF_ORB_TRI,  weight=1.00),
-    "square":      AspectSpec("square",       90.0, _DEF_ORB_SQR,  weight=0.95),
-    "sextile":     AspectSpec("sextile",      60.0, _DEF_ORB_SEX,  weight=0.85),
-    "quincunx":    AspectSpec("quincunx",    150.0, _DEF_ORB_QCX,  weight=0.60),
+MAJOR_ASPECTS: Dict[str, float] = {
+    "conjunction": 0.0,
+    "opposition": 180.0,
+    "trine": 120.0,
+    "square": 90.0,
+    "sextile": 60.0,
 }
 
-# Optional minors / harmonics (disabled by default)
-MINOR_ASPECTS: Dict[str, AspectSpec] = {
-    "semisextile":   AspectSpec("semisextile",   30.0, 2.0,  enabled=False, weight=0.40),
-    "semisquare":    AspectSpec("semisquare",    45.0, 2.5,  enabled=False, weight=0.45),
-    "sesquisquare":  AspectSpec("sesquisquare", 135.0, 2.5,  enabled=False, weight=0.45),
-    "quintile":      AspectSpec("quintile",      72.0, 1.5,  enabled=False, weight=0.35),
-    "biquintile":    AspectSpec("biquintile",   144.0, 1.5,  enabled=False, weight=0.35),
-    "novile":        AspectSpec("novile",        40.0, 1.0,  enabled=False, weight=0.30),
-    "septile":       AspectSpec("septile",     360.0/7.0, 1.0, enabled=False, weight=0.30),
-    "biseptile":     AspectSpec("biseptile",  2*360.0/7.0, 0.8, enabled=False, weight=0.28),
-    "triseptile":    AspectSpec("triseptile", 3*360.0/7.0, 0.7, enabled=False, weight=0.26),
+MINOR_ASPECTS: Dict[str, float] = {
+    "quincunx": 150.0,
+    "semisextile": 30.0,
+    "semisquare": 45.0,
+    "sesquiquadrate": 135.0,
+    "quintile": 72.0,
+    "biquintile": 144.0,
 }
 
-# ───────────────────────────── moiety policy ─────────────────────────────
-
-BodyClass = Literal["light", "inner", "social", "outer", "asteroid", "node", "angle", "point", "other"]
-
-def _classify_body(name: str) -> BodyClass:
-    n = (name or "").strip().lower()
-    if n in ("sun", "moon"):
-        return "light"
-    if n in ("mercury", "venus", "mars"):
-        return "inner"
-    if n in ("jupiter", "saturn"):
-        return "social"
-    if n in ("uranus", "neptune", "pluto"):
-        return "outer"
-    if n in ("north node", "south node", "rahu", "ketu", "true node", "mean node"):
-        return "node"
-    if n in ("asc", "ascendant", "mc", "ic", "dsc", "midheaven", "imum coeli"):
-        return "angle"
-    if n.startswith("cusp") or n.startswith("house"):
-        return "angle"
-    if n in ("ceres","pallas","juno","vesta","chiron"):
-        return "asteroid"
-    return "point"
-
-# Lilly-style moieties (half-orbs) by class; tweak via env if desired
-MOIETIES_BY_CLASS: Dict[BodyClass, float] = {
-    "light":   float(os.getenv("ASPECT_MOIETY_LIGHT",   "6.0")),  # Sun~8, Moon~6 traditional → moiety ≈6 for safety
-    "inner":   float(os.getenv("ASPECT_MOIETY_INNER",   "3.0")),
-    "social":  float(os.getenv("ASPECT_MOIETY_SOCIAL",  "3.0")),
-    "outer":   float(os.getenv("ASPECT_MOIETY_OUTER",   "2.0")),
-    "node":    float(os.getenv("ASPECT_MOIETY_NODE",    "1.5")),
-    "angle":   float(os.getenv("ASPECT_MOIETY_ANGLE",   "4.0")),
-    "asteroid":float(os.getenv("ASPECT_MOIETY_AST",     "1.0")),
-    "point":   float(os.getenv("ASPECT_MOIETY_POINT",   "2.0")),
-    "other":   float(os.getenv("ASPECT_MOIETY_OTHER",   "2.0")),
+DEFAULT_ORBS_DEG: Dict[str, float] = {
+    # majors (slightly conservative)
+    "conjunction": 8.0,
+    "opposition": 8.0,
+    "trine": 7.0,
+    "square": 6.0,
+    "sextile": 5.0,
+    # minors
+    "quincunx": 3.0,
+    "semisextile": 2.0,
+    "semisquare": 2.0,
+    "sesquiquadrate": 2.0,
+    "quintile": 2.0,
+    "biquintile": 2.0,
+    # antiscia / declination
+    "antiscia": 1.5,
+    "contra-antiscia": 1.5,
+    "parallel": 0.5,         # declination degrees
+    "contraparallel": 0.5,   # declination degrees
 }
 
-def _moiety_for(name: str) -> float:
-    return MOIETIES_BY_CLASS.get(_classify_body(name), MOIETIES_BY_CLASS["other"])
+# heuristics for body weighting (orb scaling) — conservative, editable
+DEFAULT_BODY_WEIGHTS: Dict[str, float] = {
+    "Sun": 1.00, "Moon": 1.00,
+    "Mercury": 0.85, "Venus": 0.85, "Mars": 0.85,
+    "Jupiter": 0.95, "Saturn": 0.95,
+    "Uranus": 0.80, "Neptune": 0.80, "Pluto": 0.80,
+    "North Node": 0.70, "South Node": 0.70,
+}
 
-OrbCombine = Literal["min", "sum_capped", "aspect_only", "moiety_only"]
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration & results
+# ─────────────────────────────────────────────────────────────────────────────
+
+AspectFamily = Literal["zodiacal", "antiscia", "declination"]
 
 @dataclass
 class AspectConfig:
-    aspects: Dict[str, AspectSpec] = field(default_factory=lambda: {**MAJOR_ASPECTS, **MINOR_ASPECTS})
-    orb_combine: OrbCombine = "min"
-    enable_minors: bool = False
-    # Filter knobs
-    max_orb_percent: float = 1.0       # keep hits with |delta| ≤ percent*allowed_orb (1.0 = full)
-    min_score: float = 0.0             # keep hits with score ≥ this (score = weight * (1 - |delta|/allowed_orb))
-    # Diagnostics / meta
-    include_raw_values: bool = False   # include exact separations & deltas in result rows
-    # Sorting
-    sort_by: Literal["tightness", "score", "a_name", "angle"] = "tightness"
+    include_minors: bool = False
+    include_antiscia: bool = True
+    include_contra_antiscia: bool = True
+    include_declination: bool = True
+    # Orbs & weights
+    orbs_deg: Dict[str, float] = field(default_factory=lambda: dict(DEFAULT_ORBS_DEG))
+    body_orb_weights: Dict[str, float] = field(default_factory=lambda: dict(DEFAULT_BODY_WEIGHTS))
+    # Minimum tightness (observed/orb) to emit a hit (0..1)
+    min_tightness: float = 0.05
+    # Limit pairs to a whitelist (optional). Values are body names as they appear in `points`.
+    allowed_pairs: Optional[Iterable[Tuple[str, str]]] = None
 
 def default_config() -> AspectConfig:
-    cfg = AspectConfig()
-    # disable minors unless explicitly enabled
-    if not cfg.enable_minors:
-        for k, spec in list(cfg.aspects.items()):
-            if k in MINOR_ASPECTS:
-                cfg.aspects[k] = AspectSpec(spec.key, spec.angle, spec.max_orb_deg, enabled=False, weight=spec.weight)
-    return cfg
-
-# ───────────────────────────── core math ─────────────────────────────
-
-def _allowed_orb(a_name: str, b_name: str, spec: AspectSpec, combine: OrbCombine) -> float:
-    """
-    Combine per-aspect cap and moieties per point into a working orb.
-    - 'min'         : min( aspect_cap, moiety(a)+moiety(b) )   ← recommended
-    - 'sum_capped'  : clamp( moiety(a)+moiety(b), 0, aspect_cap )
-    - 'aspect_only' : aspect_cap
-    - 'moiety_only' : moiety(a)+moiety(b)
-    """
-    cap = float(spec.max_orb_deg)
-    msum = float(_moiety_for(a_name) + _moiety_for(b_name))
-    if combine == "min":
-        return min(cap, msum)
-    if combine == "sum_capped":
-        return min(cap, msum)
-    if combine == "aspect_only":
-        return cap
-    if combine == "moiety_only":
-        return msum
-    return min(cap, msum)
-
-def _nearest_enabled_aspect(sep: float, aspects: Dict[str, AspectSpec]) -> Tuple[Optional[AspectSpec], float]:
-    """
-    Given separation in [0,180], return (nearest enabled AspectSpec, delta = sep - angle).
-    """
-    best: Optional[AspectSpec] = None
-    best_delta = 0.0
-    best_abs = float("inf")
-    for spec in aspects.values():
-        if not spec.enabled:
-            continue
-        d = sep - spec.angle
-        ad = abs(d)
-        if ad < best_abs or (math.isclose(ad, best_abs, abs_tol=1e-12) and spec.weight > (best.weight if best else 0.0)):
-            best, best_abs, best_delta = spec, ad, d
-    return best, best_delta
-
-# ───────────────────────────── output model ─────────────────────────────
+    return AspectConfig()
 
 @dataclass
 class AspectHit:
     a: str
     b: str
+    family: AspectFamily
     aspect: str
-    angle: float
-    orb: float                 # |sep - angle| (deg)
-    orb_allowed: float         # working orb (deg)
-    exact: bool
-    applying: Optional[bool]   # None if velocities not provided
-    score: float               # weight * (1 - orb/orb_allowed) in [0, weight]
-    # optional extras for diagnostics
-    a_lon: Optional[float] = None
-    b_lon: Optional[float] = None
-    a_vel: Optional[float] = None
-    b_vel: Optional[float] = None
-    sep: Optional[float] = None         # absolute separation [0..180]
-    delta: Optional[float] = None       # signed (sep - angle)
+    exact_deg: float               # target angle (or 0 for parallels)
+    separation_deg: float          # measured separation (zodiacal), or |sum-180| etc
+    orb_deg: float                 # allowed orb used for this pair
+    delta_deg: float               # |separation - exact| (zodiacal) OR absolute offset (others)
+    tightness: float               # 1 - delta/orb, clipped [0,1]
+    score: float                   # initial = tightness (policy may reweight)
+    meta: Dict[str, Any] = field(default_factory=dict)
 
-# ───────────────────────────── applying/separating logic ─────────────────────────────
+    def as_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        # float hygiene
+        for k in ("exact_deg","separation_deg","orb_deg","delta_deg","tightness","score"):
+            d[k] = float(d[k])
+        return d
 
-def _applying_flag(a_lon: float, b_lon: float, a_vel: float, b_vel: float, angle: float) -> Optional[bool]:
-    """
-    Determine if the pair is applying toward the given aspect angle.
-    Let sep = |wrap_shortest(b-a)|. y = sep - angle. Applying if y is decreasing (y*dy/dt < 0).
-    dy/dt = dsep/dt; with sep = |x|, x = wrap_shortest(b-a), dsep/dt = sign(x) * (b_vel - a_vel).
-    """
-    x = _signed_short_arc(a_lon, b_lon)          # (-180, 180]
-    sep = abs(x)                                  # [0, 180]
-    y = sep - angle
-    # numerical noise guard near exactness
-    if abs(y) < 1e-10:
-        return None
-    dsep_dt = (1.0 if x >= 0.0 else -1.0) * (b_vel - a_vel)
-    if not (math.isfinite(dsep_dt) and abs(dsep_dt) < 1e6):
-        return None
-    return (y * dsep_dt) < 0.0
+# ─────────────────────────────────────────────────────────────────────────────
+# Geometry — Zodiacal aspects
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ───────────────────────────── main API ─────────────────────────────
+def _pair_orb(a: str, b: str, base: float, weights: Dict[str, float]) -> float:
+    wa = _safe_get(weights, a, 0.8)
+    wb = _safe_get(weights, b, 0.8)
+    return base * max(0.25, min(1.25, 0.5 * (wa + wb)))  # clamp extremes
 
-def _pairs(names: List[str]) -> Iterable[Tuple[str, str]]:
-    for i in range(len(names)):
-        for j in range(i + 1, len(names)):
-            yield names[i], names[j]
-
-def compute_aspects(
-    longitudes: Dict[str, float],
-    velocities: Optional[Dict[str, float]] = None,
-    *,
-    cfg: Optional[AspectConfig] = None,
-) -> Dict[str, Any]:
-    """
-    Compute aspects for all unordered pairs in `longitudes`.
-    Inputs:
-      longitudes: {"Sun": λ_sun, "Moon": λ_moon, ...} (degrees 0..360, any zodiac)
-      velocities: optional {"Sun": λdot_sun, ...} (deg/day); used for applying/separating.
-      cfg: AspectConfig (see default_config()).
-
-    Returns:
-      {
-        "hits": [AspectHit, ...] sorted per cfg.sort_by,
-        "meta": { "count_pairs": N, "cfg": { ... } }
-      }
-    """
-    if cfg is None:
-        cfg = default_config()
-
-    # Build the working aspect set (respect enable_minors)
-    aspects = dict(cfg.aspects)
-    if not cfg.enable_minors:
-        for k in MINOR_ASPECTS.keys():
-            if k in aspects:
-                aspects[k] = AspectSpec(aspects[k].key, aspects[k].angle, aspects[k].max_orb_deg, enabled=False, weight=aspects[k].weight)
-
-    names = [k for k in longitudes.keys()]
+def _zodiacal_hits_for_pair(a: str, la: float, b: str, lb: float, cfg: AspectConfig) -> List[AspectHit]:
+    sep = _sep_small(_norm360(lb), _norm360(la))  # [0, 180]
+    catalog = dict(MAJOR_ASPECTS)
+    if cfg.include_minors:
+        catalog.update(MINOR_ASPECTS)
     hits: List[AspectHit] = []
+    for name, angle in catalog.items():
+        base_orb = cfg.orbs_deg.get(name, DEFAULT_ORBS_DEG.get(name, 0.0))
+        orb = _pair_orb(a, b, base_orb, cfg.body_orb_weights)
+        delta = _near(sep, angle)
+        if delta <= orb:
+            tight = max(0.0, 1.0 - (delta / max(1e-12, orb)))
+            if tight >= cfg.min_tightness:
+                hits.append(AspectHit(
+                    a=min(a,b), b=max(a,b),
+                    family="zodiacal", aspect=name, exact_deg=angle,
+                    separation_deg=sep, orb_deg=orb, delta_deg=delta,
+                    tightness=tight, score=tight,
+                    meta={}
+                ))
+    return hits
 
-    for A, B in _pairs(names):
-        a_lon = _norm360(longitudes[A])
-        b_lon = _norm360(longitudes[B])
+# ─────────────────────────────────────────────────────────────────────────────
+# Geometry — Antiscia & Contra-antiscia
+#   antiscia:       (λa + λb) ≈ 180°
+#   contra-antiscia:(λa + λb) ≈   0° (≡ 360°)
+# ─────────────────────────────────────────────────────────────────────────────
 
-        sep = _abs_sep(a_lon, b_lon)  # [0, 180]
-        spec, delta = _nearest_enabled_aspect(sep, aspects)
-        if spec is None:
-            continue
-
-        allowed = _allowed_orb(A, B, spec, cfg.orb_combine)
-        orb = abs(delta)
-
-        # filter by orb limits/percent
-        if orb > allowed * float(cfg.max_orb_percent):
-            continue
-
-        # Applying/separating
-        applying: Optional[bool] = None
-        if velocities is not None and A in velocities and B in velocities:
-            a_vel = float(velocities[A])
-            b_vel = float(velocities[B])
-            applying = _applying_flag(a_lon, b_lon, a_vel, b_vel, spec.angle)
-        else:
-            a_vel = b_vel = None  # type: ignore
-
-        # score in [0, weight] (1 at exact, 0 at edge of allowed orb)
-        tight = max(0.0, 1.0 - (orb / allowed)) if allowed > 0.0 else 0.0
-        score = float(spec.weight * tight)
-
-        if score < cfg.min_score:
-            continue
-
-        hit = AspectHit(
-            a=A, b=B,
-            aspect=spec.key,
-            angle=spec.angle,
-            orb=orb,
-            orb_allowed=allowed,
-            exact=(orb <= 1e-8),
-            applying=applying,
-            score=score,
-            a_lon=a_lon if cfg.include_raw_values else None,
-            b_lon=b_lon if cfg.include_raw_values else None,
-            a_vel=(float(velocities.get(A)) if (velocities and A in velocities and cfg.include_raw_values) else None),  # type: ignore[union-attr]
-            b_vel=(float(velocities.get(B)) if (velocities and B in velocities and cfg.include_raw_values) else None),  # type: ignore[union-attr]
-            sep=(sep if cfg.include_raw_values else None),
-            delta=(delta if cfg.include_raw_values else None),
-        )
-        hits.append(hit)
-
-    # Sorting
-    if cfg.sort_by == "score":
-        hits.sort(key=lambda h: (-h.score, h.aspect, h.a, h.b))
-    elif cfg.sort_by == "a_name":
-        hits.sort(key=lambda h: (h.a, h.b, h.aspect, h.orb))
-    elif cfg.sort_by == "angle":
-        hits.sort(key=lambda h: (h.angle, h.orb, h.a, h.b))
-    else:  # "tightness"
-        hits.sort(key=lambda h: (h.orb / max(h.orb_allowed, 1e-12), -h.score, h.a, h.b))
-
-    meta = {
-        "count_pairs": len(names) * (len(names) - 1) // 2,
-        "cfg": {
-            "orb_combine": cfg.orb_combine,
-            "enable_minors": cfg.enable_minors,
-            "max_orb_percent": cfg.max_orb_percent,
-            "min_score": cfg.min_score,
-            "sort_by": cfg.sort_by,
-        }
-    }
-    return {"hits": hits, "meta": meta}
-
-# ───────────────────────────── convenience APIs ─────────────────────────────
-
-def aspects_between(
-    a_name: str, a_lon: float,
-    b_name: str, b_lon: float,
-    a_vel: Optional[float] = None, b_vel: Optional[float] = None,
-    *, cfg: Optional[AspectConfig] = None
-) -> Optional[AspectHit]:
-    """
-    Compute the single best (nearest) aspect between two points, or None if outside orb.
-    """
-    if cfg is None:
-        cfg = default_config()
-    a_lon = _norm360(a_lon); b_lon = _norm360(b_lon)
-    sep = _abs_sep(a_lon, b_lon)
-    aspects = dict(cfg.aspects)
-    if not cfg.enable_minors:
-        for k in MINOR_ASPECTS.keys():
-            if k in aspects:
-                aspects[k] = AspectSpec(aspects[k].key, aspects[k].angle, aspects[k].max_orb_deg, enabled=False, weight=aspects[k].weight)
-    spec, delta = _nearest_enabled_aspect(sep, aspects)
-    if spec is None:
-        return None
-    allowed = _allowed_orb(a_name, b_name, spec, cfg.orb_combine)
-    orb = abs(delta)
-    if orb > allowed * cfg.max_orb_percent:
-        return None
-    applying = None
-    if a_vel is not None and b_vel is not None:
-        applying = _applying_flag(a_lon, b_lon, float(a_vel), float(b_vel), spec.angle)
-    tight = max(0.0, 1.0 - (orb / allowed)) if allowed > 0.0 else 0.0
-    score = float(spec.weight * tight)
-    return AspectHit(
-        a=a_name, b=b_name, aspect=spec.key, angle=spec.angle,
-        orb=orb, orb_allowed=allowed, exact=(orb <= 1e-8),
-        applying=applying, score=score
-    )
-
-def enable_all_minors(cfg: AspectConfig) -> AspectConfig:
-    """Utility to enable all minor aspects in an existing config."""
-    for k in MINOR_ASPECTS:
-        if k in cfg.aspects:
-            spec = cfg.aspects[k]
-            cfg.aspects[k] = AspectSpec(spec.key, spec.angle, spec.max_orb_deg, enabled=True, weight=spec.weight)
-    cfg.enable_minors = True
-    return cfg
-
-# ───────────────────────────── JSON-friendly serialization ─────────────────────────────
-
-def hits_to_dict(hits: List[AspectHit]) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for h in hits:
-        d = {
-            "a": h.a, "b": h.b,
-            "aspect": h.aspect,
-            "angle": h.angle,
-            "orb": h.orb,
-            "orb_allowed": h.orb_allowed,
-            "exact": h.exact,
-            "applying": h.applying,
-            "score": h.score,
-        }
-        if h.a_lon is not None: d["a_lon"] = h.a_lon
-        if h.b_lon is not None: d["b_lon"] = h.b_lon
-        if h.a_vel is not None: d["a_vel"] = h.a_vel
-        if h.b_vel is not None: d["b_vel"] = h.b_vel
-        if h.sep   is not None: d["sep"]   = h.sep
-        if h.delta is not None: d["delta"] = h.delta
-        out.append(d)
+def _antiscia_hits_for_pair(a: str, la: float, b: str, lb: float, cfg: AspectConfig) -> List[AspectHit]:
+    la = _norm360(la); lb = _norm360(lb)
+    s = (la + lb) % 360.0
+    out: List[AspectHit] = []
+    if cfg.include_antiscia:
+        target = 180.0
+        base = cfg.orbs_deg.get("antiscia", DEFAULT_ORBS_DEG["antiscia"])
+        orb = _pair_orb(a, b, base, cfg.body_orb_weights)
+        delta = min(abs(s - 180.0), 360.0 - abs(s - 180.0))
+        if delta <= orb:
+            tight = max(0.0, 1.0 - (delta / max(1e-12, orb)))
+            if tight >= cfg.min_tightness:
+                out.append(AspectHit(
+                    a=min(a,b), b=max(a,b),
+                    family="antiscia", aspect="antiscia", exact_deg=target,
+                    separation_deg=delta, orb_deg=orb, delta_deg=delta,
+                    tightness=tight, score=tight, meta={}
+                ))
+    if cfg.include_contra_antiscia:
+        target = 0.0
+        base = cfg.orbs_deg.get("contra-antiscia", DEFAULT_ORBS_DEG["contra-antiscia"])
+        orb = _pair_orb(a, b, base, cfg.body_orb_weights)
+        delta = min(s, 360.0 - s)  # distance to 0°/360°
+        if delta <= orb:
+            tight = max(0.0, 1.0 - (delta / max(1e-12, orb)))
+            if tight >= cfg.min_tightness:
+                out.append(AspectHit(
+                    a=min(a,b), b=max(a,b),
+                    family="antiscia", aspect="contra-antiscia", exact_deg=0.0,
+                    separation_deg=delta, orb_deg=orb, delta_deg=delta,
+                    tightness=tight, score=tight, meta={}
+                ))
     return out
 
-__all__ = [
-    "AspectSpec",
-    "AspectConfig",
-    "default_config",
-    "MAJOR_ASPECTS",
-    "MINOR_ASPECTS",
-    "compute_aspects",
-    "aspects_between",
-    "enable_all_minors",
-    "hits_to_dict",
-]
+# ─────────────────────────────────────────────────────────────────────────────
+# Geometry — Declination Parallels
+#   parallel:       sign(dec_a)==sign(dec_b) and |dec_a - dec_b| ≤ orb
+#   contraparallel: sign differs and |dec_a + dec_b| ≤ orb
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _declination_hits_for_pair(a: str, da: Optional[float], b: str, db: Optional[float], cfg: AspectConfig) -> List[AspectHit]:
+    if da is None or db is None:
+        return []
+    out: List[AspectHit] = []
+    base_p = cfg.orbs_deg.get("parallel", DEFAULT_ORBS_DEG["parallel"])
+    base_c = cfg.orbs_deg.get("contraparallel", DEFAULT_ORBS_DEG["contraparallel"])
+    orb_p = _pair_orb(a, b, base_p, cfg.body_orb_weights)
+    orb_c = _pair_orb(a, b, base_c, cfg.body_orb_weights)
+
+    same = (da >= 0) == (db >= 0)
+    if same:
+        delta = abs(da - db)
+        if delta <= orb_p:
+            tight = max(0.0, 1.0 - (delta / max(1e-12, orb_p)))
+            if tight >= cfg.min_tightness:
+                out.append(AspectHit(
+                    a=min(a,b), b=max(a,b),
+                    family="declination", aspect="parallel", exact_deg=0.0,
+                    separation_deg=delta, orb_deg=orb_p, delta_deg=delta,
+                    tightness=tight, score=tight, meta={"dec_a": da, "dec_b": db}
+                ))
+    else:
+        delta = abs(da + db)  # distance to zero when mirrored
+        if delta <= orb_c:
+            tight = max(0.0, 1.0 - (delta / max(1e-12, orb_c)))
+            if tight >= cfg.min_tightness:
+                out.append(AspectHit(
+                    a=min(a,b), b=max(a,b),
+                    family="declination", aspect="contraparallel", exact_deg=0.0,
+                    separation_deg=delta, orb_deg=orb_c, delta_deg=delta,
+                    tightness=tight, score=tight, meta={"dec_a": da, "dec_b": db}
+                ))
+    return out
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public Geometry API
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _pair_iter(names: List[str], whitelist: Optional[Iterable[Tuple[str, str]]]) -> Iterable[Tuple[str, str]]:
+    if whitelist is None:
+        for a, b in itertools.combinations(names, 2):
+            yield a, b
+        return
+    # normalize whitelist to ordered tuples
+    allow = {(min(x), max(x)) for x in whitelist}
+    for a, b in itertools.combinations(names, 2):
+        key = (min(a,b), max(a,b))
+        if key in allow:
+            yield a, b
+
+def compute_aspects(
+    points_deg: Dict[str, float],
+    *,
+    declinations_deg: Optional[Dict[str, float]] = None,
+    config: Optional[AspectConfig] = None
+) -> List[AspectHit]:
+    """
+    Compute geometric relationships for a single chart (or inter-chart if you union inputs).
+    - points_deg: longitudes (deg) per body.
+    - declinations_deg: optional declinations (deg) for parallels.
+    Returns a flat list of AspectHit.
+    """
+    cfg = config or default_config()
+    names = sorted(points_deg.keys())
+    out: List[AspectHit] = []
+    for a, b in _pair_iter(names, cfg.allowed_pairs):
+        la = _norm360(points_deg[a]); lb = _norm360(points_deg[b])
+        out.extend(_zodiacal_hits_for_pair(a, la, b, lb, cfg))
+        out.extend(_antiscia_hits_for_pair(a, la, b, lb, cfg))
+        if cfg.include_declination:
+            da = None if declinations_deg is None else declinations_deg.get(a)
+            db = None if declinations_deg is None else declinations_deg.get(b)
+            out.extend(_declination_hits_for_pair(a, da, b, db, cfg))
+    return out
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Policy Layer — weighting, conflict handling, features
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class CategoryWeights:
+    zodiacal: float = 1.0
+    antiscia: float = 0.5
+    declination: float = 0.6
+
+@dataclass
+class ConflictPolicy:
+    strategy: Literal["zodiacal_dominant", "weighted_sum", "max_score"] = "zodiacal_dominant"
+    cat_weights: CategoryWeights = field(default_factory=CategoryWeights)
+    min_tightness: float = 0.2    # prefilter guard before any scoring
+
+def _key_pair(hit: AspectHit) -> Tuple[str, str]:
+    return (hit.a, hit.b)
+
+def score_hits(hits: List[AspectHit], policy: Optional[ConflictPolicy] = None) -> List[AspectHit]:
+    """
+    Reweights hit.score by category weights; optionally down-selects by policy.
+    """
+    pol = policy or ConflictPolicy()
+    # apply category weights
+    for h in hits:
+        if h.tightness < pol.min_tightness:
+            h.score = 0.0
+            continue
+        w = getattr(pol.cat_weights, h.family)
+        h.score = h.tightness * float(w)
+
+    if pol.strategy == "weighted_sum":
+        return hits
+
+    # group by pair
+    by_pair: Dict[Tuple[str,str], List[AspectHit]] = {}
+    for h in hits:
+        by_pair.setdefault(_key_pair(h), []).append(h)
+
+    reweighted: List[AspectHit] = []
+    for key, grp in by_pair.items():
+        if pol.strategy == "max_score":
+            # keep only the highest-score hit for this pair
+            best = max(grp, key=lambda x: (x.score, x.tightness), default=None)
+            if best and best.score > 0.0:
+                reweighted.append(best)
+            continue
+
+        # zodiacal_dominant:
+        zods = [h for h in grp if h.family == "zodiacal" and h.score > 0.0]
+        if zods:
+            # keep all zodiacal; keep others only as modifiers (mark in meta)
+            best_z = max(zods, key=lambda x: (x.score, x.tightness))
+            modifiers = [h for h in grp if h.family != "zodiacal" and h.score > 0.0]
+            # gently boost the best zodiacal with modifiers (bounded)
+            boost = sum(m.score for m in modifiers)
+            best = AspectHit(**{**best_z.as_dict(), "meta": {**best_z.meta, "modifiers": [m.as_dict() for m in modifiers]}})
+            best.score = min(1.0, best.score + 0.5 * boost)
+            reweighted.append(best)
+        else:
+            # no zodiacal → keep strongest single signal
+            best = max(grp, key=lambda x: (x.score, x.tightness), default=None)
+            if best and best.score > 0.0:
+                reweighted.append(best)
+
+    return reweighted
+
+# features per pair (ML-ready)
+def build_pair_features(hits: List[AspectHit]) -> Dict[Tuple[str,str], Dict[str, float]]:
+    """
+    Aggregate per (a,b) pair:
+      - max_zodiacal, max_antiscia, max_declination
+      - combined_score (max of family maxima)
+      - flags: count_* for quick heuristics
+    """
+    feats: Dict[Tuple[str,str], Dict[str, float]] = {}
+    for h in hits:
+        k = _key_pair(h)
+        f = feats.setdefault(k, {
+            "max_zodiacal": 0.0,
+            "max_antiscia": 0.0,
+            "max_declination": 0.0,
+            "count_zodiacal": 0.0,
+            "count_antiscia": 0.0,
+            "count_declination": 0.0,
+        })
+        if h.family == "zodiacal":
+            f["max_zodiacal"] = max(f["max_zodiacal"], h.score)
+            f["count_zodiacal"] += 1.0
+        elif h.family == "antiscia":
+            f["max_antiscia"] = max(f["max_antiscia"], h.score)
+            f["count_antiscia"] += 1.0
+        else:
+            f["max_declination"] = max(f["max_declination"], h.score)
+            f["count_declination"] += 1.0
+    for k, f in feats.items():
+        f["combined_score"] = max(f["max_zodiacal"], f["max_antiscia"], f["max_declination"])
+    return feats
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Validation gate — permutation FDR (Benjamini–Hochberg)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class FDRGate:
+    num_permutations: int = 0      # 0 disables FDR
+    q_level: float = 0.05
+    seed: Optional[int] = 123
+    preserve_decl_signs: bool = True
+
+def _bh_threshold(pvals: List[float], q: float) -> float:
+    """
+    Benjamini–Hochberg cutoff. Returns p* such that keep p_i ≤ p*.
+    """
+    m = len(pvals)
+    if m == 0: return 0.0
+    pairs = sorted((p, i+1) for i, p in enumerate(pvals))  # (p, rank)
+    cutoff = 0.0
+    for p, r in pairs:
+        if p <= (r / m) * q:
+            cutoff = max(cutoff, p)
+    return cutoff
+
+def _shuffle_longitudes(points: Dict[str, float], rng: random.Random) -> Dict[str, float]:
+    # independent random rotations (break pair structure while preserving marginal)
+    return {k: _norm360(rng.random() * 360.0) for k in points.keys()}
+
+def _permute_declinations(decs: Optional[Dict[str, float]], rng: random.Random) -> Optional[Dict[str, float]]:
+    if decs is None: return None
+    names = list(decs.keys())
+    vals = [decs[k] for k in names]
+    rng.shuffle(vals)
+    return {k: float(v) for k, v in zip(names, vals)}
+
+def apply_fdr(
+    points_deg: Dict[str, float],
+    hits: List[AspectHit],
+    *,
+    declinations_deg: Optional[Dict[str, float]] = None,
+    config: Optional[AspectConfig] = None,
+    gate: Optional[FDRGate] = None
+) -> Tuple[List[AspectHit], Dict[int, float], float]:
+    """
+    Permutation-based p-values on hit.score; BH FDR gate at q_level.
+    Returns (kept_hits, pvals_by_index, bh_cutoff).
+    """
+    cfg = config or default_config()
+    g = gate or FDRGate()
+    if g.num_permutations <= 0:
+        # trivial pass-through with unit p-values
+        return hits, {i: 1.0 for i in range(len(hits))}, 1.0
+
+    rng = random.Random(g.seed)
+    # observed scores
+    obs_scores = [max(0.0, float(h.score)) for h in hits]
+    null_scores: List[float] = []
+
+    for _ in range(max(1, g.num_permutations)):
+        p_shuf = _shuffle_longitudes(points_deg, rng)
+        d_shuf = _permute_declinations(declinations_deg, rng) if g.preserve_decl_signs else None
+        null_hits = compute_aspects(p_shuf, declinations_deg=d_shuf, config=cfg)
+        null_hits = score_hits(null_hits, ConflictPolicy(strategy="weighted_sum"))  # same scoring
+        null_scores.extend(max(0.0, float(h.score)) for h in null_hits)
+
+    # conservative p-value: proportion of null >= observed (add-one to avoid zeros)
+    N = max(1, len(null_scores))
+    null_sorted = sorted(null_scores)
+    pvals: Dict[int, float] = {}
+    for i, s in enumerate(obs_scores):
+        # number of null scores >= s
+        # binary search for first >= s
+        lo, hi = 0, N
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if null_sorted[mid] >= s:
+                hi = mid
+            else:
+                lo = mid + 1
+        ge_count = N - lo
+        p = (ge_count + 1) / (N + 1)   # +1 smoothing
+        pvals[i] = p
+
+    cutoff = _bh_threshold(list(pvals.values()), g.q_level)
+    kept = [h for i, h in enumerate(hits) if pvals[i] <= cutoff] if cutoff > 0.0 else []
+    return kept, pvals, cutoff
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Convenience — one-shot pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+
+def analyze_aspects(
+    points_deg: Dict[str, float],
+    *,
+    declinations_deg: Optional[Dict[str, float]] = None,
+    geometry_config: Optional[AspectConfig] = None,
+    conflict_policy: Optional[ConflictPolicy] = None,
+    fdr_gate: Optional[FDRGate] = None
+) -> Dict[str, Any]:
+    """
+    End-to-end:
+      1) geometry → hits
+      2) policy weighting/selection → scored_hits
+      3) optional FDR → filtered_hits
+      4) features per pair
+    """
+    gcfg = geometry_config or default_config()
+    hits = compute_aspects(points_deg, declinations_deg=declinations_deg, config=gcfg)
+    scored = score_hits(hits, conflict_policy or ConflictPolicy())
+    kept, pvals, cutoff = apply_fdr(points_deg, scored, declinations_deg=declinations_deg,
+                                    config=gcfg, gate=fdr_gate or FDRGate(num_permutations=0))
+    features = build_pair_features(kept if (fdr_gate and fdr_gate.num_permutations > 0) else scored)
+
+    return {
+        "hits": [h.as_dict() for h in scored],
+        "hits_after_fdr": [h.as_dict() for h in kept] if (fdr_gate and fdr_gate.num_permutations > 0) else None,
+        "pvals": pvals if (fdr_gate and fdr_gate.num_permutations > 0) else None,
+        "bh_cutoff": cutoff if (fdr_gate and fdr_gate.num_permutations > 0) else None,
+        "features_by_pair": {f"{a}~{b}": feats for (a,b), feats in features.items()},
+        "config": {
+            "geometry": asdict(gcfg),
+            "policy": asdict(conflict_policy or ConflictPolicy()),
+            "fdr_gate": asdict(fdr_gate or FDRGate()),
+        }
+    }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Minimal sanity test (can be removed; kept here for quick manual checks)
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    # toy chart (degrees)
+    pts = {
+        "Sun": 15.0, "Moon": 103.0, "Mercury": 42.0, "Venus": 195.0, "Mars": 285.0,
+        "Jupiter": 120.0, "Saturn": 300.0, "Uranus": 60.0, "Neptune": 330.0, "Pluto": 210.0,
+        "North Node": 10.0, "South Node": 190.0,
+    }
+    decs = {
+        "Sun": 10.0, "Moon": 18.0, "Mercury": 5.0, "Venus": -13.2, "Mars": -18.0,
+        "Jupiter": 21.0, "Saturn": -22.0, "Uranus": 8.0, "Neptune": -9.5, "Pluto": -22.5,
+        "North Node": 0.0, "South Node": 0.0,
+    }
+    res = analyze_aspects(
+        pts,
+        declinations_deg=decs,
+        geometry_config=AspectConfig(include_minors=True),
+        conflict_policy=ConflictPolicy(strategy="zodiacal_dominant"),
+        fdr_gate=FDRGate(num_permutations=0)  # set >0 to enable FDR
+    )
+    from pprint import pprint
+    print("— hits (scored) —")
+    pprint(res["hits"][:8])
+    print("— features_by_pair (sample) —")
+    for k, v in list(res["features_by_pair"].items())[:5]:
+        print(k, v)
