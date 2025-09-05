@@ -1132,5 +1132,5 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
         "meta": meta,
         "warnings": warnings,  # top-level mirror (deduped)
     }
-    return out ---
+    return out
     
