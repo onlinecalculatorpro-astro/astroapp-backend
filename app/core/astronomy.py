@@ -516,7 +516,7 @@ def _ayanamsa_deg_cached(jd_tt_q: float, ay_key: str) -> Tuple[float, str]:
     return base, f"ayanamsa_fallback_to_lahiri({name})"
 
 
-def _resolve_ayanamsa(jd_tt: float, ayanamsa: Any, warnings: List[str], seen: set[str]) -> Tuple[Optional[float], Optional[str]]]:
+def _resolve_ayanamsa(jd_tt: float, ayanamsa: Any, warnings: List[str], seen: set[str]) -> Tuple[Optional[float], Optional[str]]:
     if ayanamsa is None or (isinstance(ayanamsa, str) and not str(ayanamsa).strip()):
         key = CFG.ayanamsa_default
     elif isinstance(ayanamsa, (int, float)):
@@ -935,7 +935,7 @@ def _longitudes_and_speeds(
         spd: Optional[float] = float(now_spd[nm]) if nm in now_spd and now_spd[nm] is not None else None
         if l0 is None:
             # keep placeholder; will try geo fallback in build phase
-            out[nm] = (float("nan"), None)  # type: ignore
+            out[nm] = (None, None)  # sentinel -> treated as missing
             continue
         if spd is None:
             step = _adaptive_speed_step(nm, speed_step_days)
