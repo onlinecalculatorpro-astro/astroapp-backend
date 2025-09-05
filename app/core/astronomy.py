@@ -141,6 +141,7 @@ class _W:
     LAT_CLAMP = "latitude_clamped_to_range"
     LAT_SOFT_NUDGE = "latitude_soft_nudged_from_pole"
     TOPO_DISABLED_NEAR_POLE = "topocentric_disabled_near_pole(hard)"
+    TOPO_MISSING_COORDS = "topocentric_missing_coords_fallback_geocentric"
     ANTIM_MERIDIAN = "near_antimeridian_longitude"
     ELEV_CLAMP_MIN = "elevation_clamped_min"
     ELEV_CLAMP_MAX = "elevation_clamped_max"
@@ -371,7 +372,6 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
                 return ju, jt, j1
 
             # If we got here, try next kernel entrypoint
-        # end for kernel funcs
 
     # 3) Fallback: app.core.timescales or stdlib JD builder
     if not isinstance(d, str) or not isinstance(t, str):
@@ -516,7 +516,7 @@ def _ayanamsa_deg_cached(jd_tt_q: float, ay_key: str) -> Tuple[float, str]:
     return base, f"ayanamsa_fallback_to_lahiri({name})"
 
 
-def _resolve_ayanamsa(jd_tt: float, ayanamsa: Any, warnings: List[str], seen: set[str]) -> Tuple[Optional[float], Optional[str]]:
+def _resolve_ayanamsa(jd_tt: float, ayanamsa: Any, warnings: List[str], seen: set[str]) -> Tuple[Optional[float], Optional[str]]]:
     if ayanamsa is None or (isinstance(ayanamsa, str) and not str(ayanamsa).strip()):
         key = CFG.ayanamsa_default
     elif isinstance(ayanamsa, (int, float)):
@@ -1062,17 +1062,23 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
     # Timescales (handles jd_* direct OR civil; adds "leap_second" token if ':60' seen)
     jd_ut, jd_tt, jd_ut1 = _ensure_timescales(payload, warnings, _seen)
 
-    # Observer
+    # Observer (graceful downgrade if coords missing)
     topocentric = _coerce_bool(payload.get("topocentric"), False)
+    lat: Optional[float]; lon: Optional[float]; elev: Optional[float]
     if topocentric:
-        # accept either 'elev_m' (route/validator output) or 'elevation_m'/'elevation'
+        lat_in = payload.get("latitude")
+        lon_in = payload.get("longitude")
         elev_in = payload.get("elev_m") or payload.get("elevation_m") or payload.get("elevation")
-        lat, lon, elev, downgraded = _validate_and_normalize_geo_for_topo(
-            payload.get("latitude"), payload.get("longitude"), elev_in, warnings, _seen
-        )
-        if downgraded:
+        if not (_is_finite(lat_in) and _is_finite(lon_in)):
+            # soft fallback instead of raising
+            _warn_add(warnings, _seen, _W.TOPO_MISSING_COORDS)
             topocentric = False
             lat = lon = elev = None
+        else:
+            lat, lon, elev, downgraded = _validate_and_normalize_geo_for_topo(lat_in, lon_in, elev_in, warnings, _seen)
+            if downgraded:
+                topocentric = False
+                lat = lon = elev = None
     else:
         lat = float(payload.get("latitude")) if _is_finite(payload.get("latitude")) else None
         lon = float(payload.get("longitude")) if _is_finite(payload.get("longitude")) else None
@@ -1136,7 +1142,6 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
             "lat": None,
         })
 
-    # --- bodies built above ---
     if missing_bodies:
         _warn_add(warnings, _seen, _W.ADAPTER_MISS_BODIES, ", ".join(missing_bodies))
 
