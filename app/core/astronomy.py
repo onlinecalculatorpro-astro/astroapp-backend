@@ -67,6 +67,16 @@ def _bool_env(name: str, default: bool) -> bool:
     return str(v).strip().lower() in ("1", "true", "t", "yes", "y", "on")
 
 
+def _float_env(*names: str, default: float) -> float:
+    for n in names:
+        if n and os.getenv(n) not in (None, ""):
+            try:
+                return float(os.getenv(n, ""))
+            except Exception:
+                pass
+    return float(default)
+
+
 @dataclass(frozen=True)
 class _AstroCfg:
     ayanamsa_default: str
@@ -91,13 +101,16 @@ CFG = _AstroCfg(
     ll_quant=float(os.getenv("OCP_ASTRO_LL_QUANT", "1e-6")),       # ~0.11 m
     elev_quant=float(os.getenv("OCP_GEO_ELEV_QUANT", "0.1")),      # 10 cm
     speed_fd_step_days=float(os.getenv("OCP_SPEED_FD_STEP_DAYS", "0.25")),  # ±6 h
-    geo_soft_lat=float(os.getenv("OCP_GEO_SOFT_LAT", "89.5")),
-    geo_hard_lat=float(os.getenv("OCP_GEO_HARD_LAT", "89.9")),
+    # Prefer ASTRO_* polar limits, fall back to OCP_*
+    geo_soft_lat=_float_env("ASTRO_POLAR_SOFT_LAT", "OCP_GEO_SOFT_LAT", default=89.5),
+    geo_hard_lat=_float_env("ASTRO_POLAR_HARD_LAT", "OCP_GEO_HARD_LAT", default=89.9),
     elev_min=float(os.getenv("OCP_GEO_ELEV_MIN", "-500.0")),
     elev_max=float(os.getenv("OCP_GEO_ELEV_MAX", "10000.0")),
-    elev_warn=float(os.getenv("OCP_GEO_ELEV_WARN", "3000.0")),
+    # Prefer ASTRO_ELEV_WARN_M (default 4500 m), fall back to OCP_GEO_ELEV_WARN
+    elev_warn=_float_env("ASTRO_ELEV_WARN_M", "OCP_GEO_ELEV_WARN", default=4500.0),
     antimer_warn_lon=float(os.getenv("OCP_GEO_ANTI_WARN", "179.9")),
-    dut1_seconds=float(os.getenv("ASTRO_DUT1_BROADCAST", os.getenv("OCP_DUT1_SECONDS", "0.0"))),
+    # DUT1 precedence: ASTRO_DUT1_BROADCAST → ASTRO_DUT1 → OCP_DUT1_SECONDS → 0.0
+    dut1_seconds=_float_env("ASTRO_DUT1_BROADCAST", "ASTRO_DUT1", "OCP_DUT1_SECONDS", default=0.0),
     always_include_majors_with_points=_bool_env("OCP_ALWAYS_INCLUDE_MAJORS_WITH_POINTS", True),
     cache_ttl_sec=float(os.getenv("OCP_ASTRO_CACHE_TTL_SEC", "600")),  # 10 min
 )
@@ -312,6 +325,8 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
             # DUT1: from payload or config broadcast
             dut1_val = payload.get("dut1")
             if not isinstance(dut1_val, (int, float)):
+                dut1_val = payload.get("dut1_seconds")
+            if not isinstance(dut1_val, (int, float)):
                 dut1_val = CFG.dut1_seconds
             if "dut1" in params:          kwargs["dut1"] = float(dut1_val)
             if "dut1_seconds" in params:  kwargs["dut1_seconds"] = float(dut1_val)
@@ -412,6 +427,8 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
 
     # UT and UT1 (apply DUT1 seconds if available; fallback to CFG)
     dut1_s = payload.get("dut1")
+    if not isinstance(dut1_s, (int, float)):
+        dut1_s = payload.get("dut1_seconds")
     if not isinstance(dut1_s, (int, float)):
         dut1_s = CFG.dut1_seconds
 
@@ -1051,11 +1068,8 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
         # accept either 'elev_m' (route/validator output) or 'elevation_m'/'elevation'
         elev_in = payload.get("elev_m") or payload.get("elevation_m") or payload.get("elevation")
         lat, lon, elev, downgraded = _validate_and_normalize_geo_for_topo(
-        payload.get("latitude"), payload.get("longitude"), elev_in, warnings, _seen
+            payload.get("latitude"), payload.get("longitude"), elev_in, warnings, _seen
         )
-
-
-
         if downgraded:
             topocentric = False
             lat = lon = elev = None
@@ -1177,19 +1191,27 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
         mode=mode, ayanamsa_deg=ay_deg, warnings=warnings, seen=_seen,
     )
 
+    # --- meta & output ---
+    center = "topocentric" if topocentric else "geocentric"
+
     meta: Dict[str, Any] = {
         "mode": mode,
         "ayanamsa_deg": float(ay_deg) if ay_deg is not None else None,
         "frame": "ecliptic-of-date",
-        "observer": "topocentric" if topocentric else "geocentric",
+        # New canonical fields (keep 'observer' for back-compat)
+        "center": center,
+        "topocentric": bool(topocentric),
+        "observer": center,  # legacy alias
         "source": str(source_tag),
         "angles_engine": ("ERFA gst06a + true_obliquity" if erfa is not None else "Meeus fallback"),
         "module": _PROJECT_SOURCE_TAG,
         **dbg,
     }
+    if topocentric and isinstance(elev, (int, float)):
+        meta["elevation_m"] = float(elev)
     if warnings:
         meta["warnings"] = list(warnings)
-        
+
     out: Dict[str, Any] = {
         "mode": mode,
         "ayanamsa_deg": float(ay_deg) if ay_deg is not None else None,
@@ -1206,6 +1228,6 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
         "asc_deg": (float(asc_deg) if asc_deg is not None else None),
         "mc_deg": (float(mc_deg) if mc_deg is not None else None),
         "meta": meta,
-        "warnings": warnings,  # top-level mirror (deduped)
+        "warnings": list(warnings),  # top-level mirror (deduped)
     }
     return out
