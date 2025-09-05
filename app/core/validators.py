@@ -56,8 +56,10 @@ def _to_bool(x: Any, default: bool = False) -> bool:
         return bool(x)
     if isinstance(x, str):
         s = x.strip().lower()
-        if s in ("1", "true", "t", "yes", "y", "on"): return True
-        if s in ("0", "false", "f", "no", "n", "off"): return False
+        if s in ("1", "true", "t", "yes", "y", "on"):
+            return True
+        if s in ("0", "false", "f", "no", "n", "off"):
+            return False
     return default
 
 
@@ -202,6 +204,12 @@ def parse_horizon(value: Any | None) -> Dict[str, int] | str:
 # ───────────────────────────── timescale helpers ─────────────────────────────
 
 def _env_dut1() -> Optional[float]:
+    """
+    Returns DUT1 seconds from env if present.
+
+    Checks ASTRO_DUT1_BROADCAST first, then ASTRO_DUT1.
+    Returns None if not set or unparsable.
+    """
     s = os.getenv("ASTRO_DUT1_BROADCAST", os.getenv("ASTRO_DUT1"))
     if s is None:
         return None
@@ -212,8 +220,15 @@ def _env_dut1() -> Optional[float]:
 
 def resolve_timescales_from_civil_erfa(d: date, time_str: str, tzinfo: ZoneInfo) -> Dict[str, float]:
     """
-    Use app.core.timescales.build_timescales(date, time, tz, dut1)
-    Return: {'jd_tt', 'jd_utc', 'jd_ut'} (UT mirrors UTC if UT1 not provided).
+    Resolve civil inputs into precise timescales using app.core.timescales.build_timescales.
+
+    Returns:
+      {
+        'jd_tt':  JD(TT),
+        'jd_utc': JD(UTC),
+        'jd_ut1': JD(UT1),
+        'jd_ut':  JD(UT1)  # legacy alias; UT ≡ UT1 for our purposes
+      }
     """
     try:
         from app.core.timescales import build_timescales  # lazy import
@@ -228,13 +243,13 @@ def resolve_timescales_from_civil_erfa(d: date, time_str: str, tzinfo: ZoneInfo)
     tz_name = getattr(tzinfo, "key", None) or "UTC"
     ts = build_timescales(d.strftime("%Y-%m-%d"), time_str, str(tz_name), float(dut1_val))
 
-    out = {
+    return {
         "jd_tt":  float(ts.jd_tt),
         "jd_utc": float(ts.jd_utc),
         "jd_ut1": float(ts.jd_ut1),  # expose UT1 explicitly
-        "jd_ut":  float(ts.jd_ut1),  # legacy alias: UT ≡ UT1 for our purposes
+        "jd_ut":  float(ts.jd_ut1),  # legacy alias: UT = UT1
     }
-    return out
+
 
 # ───────────────────────────── payload parsers ─────────────────────────────
 
@@ -313,6 +328,8 @@ def parse_chart_payload(data: Dict[str, Any]) -> ChartPayload:
     if house_system:
         out["house_system"] = house_system
 
+    # Keep tzinfo validated (unused here, but validates immediately)
+    _ = tzinfo
     return out
 
 def parse_prediction_payload(data: Dict[str, Any]) -> Tuple[ChartPayload, Any]:
@@ -337,6 +354,7 @@ def parse_rectification_payload(data: Dict[str, Any]) -> Tuple[ChartPayload, int
 class EphemerisPayload(TypedDict, total=False):
     jd_tt: float
     jd_utc: float
+    jd_ut1: float
     jd_ut: float
     frame: Literal["ecliptic-of-date", "ecliptic-j2000"]
     center: Literal["geocentric", "topocentric"]
@@ -381,6 +399,10 @@ def parse_ephemeris_payload(data: Dict[str, Any], *, require_bodies: bool = Fals
         if not _is_number(jd_tt):
             raise ValidationError(_err("jd_tt", "must be a number (Julian Day TT)", "type_error.float"))
         out["jd_tt"] = float(jd_tt)
+        # Optional pass-throughs if the caller provided them
+        for fld in ("jd_utc", "jd_ut1", "jd_ut"):
+            if fld in data and _is_number(data[fld]):
+                out[fld] = float(data[fld])  # type: ignore[index]
     else:
         place_tz_val = _coalesce(data, "place_tz", "tz", "timezone")
         _require({"place_tz": place_tz_val}, "place_tz")
@@ -424,4 +446,5 @@ __all__ = [
     "parse_frame",
     "parse_center",
     "parse_node_model",
+    "resolve_timescales_from_civil_erfa",
 ]
