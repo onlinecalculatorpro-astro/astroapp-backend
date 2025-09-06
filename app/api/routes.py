@@ -10,7 +10,7 @@ AstroApp — Canonical API Routes
 Notes:
 - Topocentric ephemeris honored via either center:"topocentric" or topocentric:true
 - Ephemeris responses include adapter meta (with meta.topocentric)
-- Adapter/kernel meta is bubbled up to API responses so dev tools can verify DE420/DE421 quickly.
+- Adapter/kernel meta is bubbled up to API responses so dev tools can verify DE440s/DE421 quickly.
 """
 
 from __future__ import annotations
