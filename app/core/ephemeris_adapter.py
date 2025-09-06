@@ -9,7 +9,7 @@
 # • Topocentric honored via (topocentric=True + observer or lat/lon/elevation); safe fallback to geocentric with warning.
 # • Velocities via adaptive Richardson + independent XY estimator cross-check.
 # • Robust lunar nodes (true via angular-momentum; mean as policy/fallback), with speed via central diff.
-# • Clean error taxonomy in warnings; JD guard aligned to DE420 span (configurable).
+# • Clean error taxonomy in warnings; JD guard aligned to DE420/DE421 span (configurable).
 # • Optional SPICE for selected small bodies (Ceres, Pallas, Juno, Vesta, Chiron) when enabled.
 # -----------------------------------------------------------------------------
 from __future__ import annotations
@@ -84,7 +84,7 @@ except Exception:
     _SPICE_OK = False
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Kernel path resolution (single source of truth) + BSP introspection
+# Kernel path resolution (single source of truth)
 # ─────────────────────────────────────────────────────────────────────────────
 def _env_ephemeris_path() -> Optional[str]:
     """
@@ -102,32 +102,25 @@ def _env_ephemeris_path() -> Optional[str]:
     return None
 
 # Resolve once for telemetry; loader will reuse or fallback if missing
-EPHEMERIS_PATH = _env_ephemeris_path()
-EPHEMERIS_NAME = os.path.basename(EPHEMERIS_PATH or "") or EPHEMERIS_NAME_DEFAULT
+EPHEMERIS_PATH: Optional[str] = _env_ephemeris_path()
+EPHEMERIS_NAME: str = os.path.basename(EPHEMERIS_PATH or "") or EPHEMERIS_NAME_DEFAULT
 
-# --- Kernel identity & coverage (debug/telemetry) ---
-# Uses jplephem only for coverage; does not affect Skyfield flow.
-try:
-    from jplephem.spk import SPK  # type: ignore
-    _cov = None
-    if EPHEMERIS_PATH and os.path.isfile(EPHEMERIS_PATH):
-        _spk = SPK.open(EPHEMERIS_PATH)
-        _cov = (
-            min(seg.start_jd for seg in _spk.segments),
-            max(seg.end_jd for seg in _spk.segments),
-        )
-        _spk.close()
-    KERNEL_COVERAGE_JD: Optional[Tuple[float, float]] = _cov
-except Exception:
-    KERNEL_COVERAGE_JD = None
+# Kernel coverage (populate lazily after kernel load)
+KERNEL_COVERAGE_JD: Optional[Tuple[float, float]] = None
 
 def current_kernel_name() -> str:
-    """Short BSP filename(s). If not yet loaded, returns env-derived name or default."""
+    """Short BSP filename, or default label."""
     return EPHEMERIS_NAME
 
 def current_kernel_path() -> Optional[str]:
-    """Absolute/relative path to main BSP (env-resolved)."""
-    return EPHEMERIS_PATH
+    """Absolute/relative path to main BSP."""
+    if EPHEMERIS_PATH:
+        return EPHEMERIS_PATH
+    # fallback to what's been loaded already
+    if _KERNEL_PATHS:
+        return _KERNEL_PATHS[0]
+    # or try resolving now
+    return _resolve_kernel_path()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Adapter configuration
@@ -250,18 +243,25 @@ def _speed_step_for(name: str) -> float:
 def _resolve_kernel_path() -> Optional[str]:
     """
     Prefer the env-resolved EPHEMERIS_PATH (OCP_EPHEMERIS or EPHEM_DIR+EPHEM_FILE),
-    else fallback to app/data/de421.bsp if present.
+    else fallback to app/data/de421.bsp if present — and record that fallback.
     """
     global EPHEMERIS_PATH, EPHEMERIS_NAME
     if EPHEMERIS_PATH and os.path.isfile(EPHEMERIS_PATH):
         return EPHEMERIS_PATH
+
     p = _env_ephemeris_path()
     if p and os.path.isfile(p):
         EPHEMERIS_PATH = p
         EPHEMERIS_NAME = os.path.basename(p) or EPHEMERIS_NAME_DEFAULT
         return p
+
     fallback = os.path.join(os.getcwd(), "app", "data", "de421.bsp")
-    return fallback if os.path.isfile(fallback) else None
+    if os.path.isfile(fallback):
+        EPHEMERIS_PATH = fallback
+        EPHEMERIS_NAME = os.path.basename(fallback) or EPHEMERIS_NAME_DEFAULT
+        return fallback
+
+    return None
 
 def _extra_spk_paths() -> List[str]:
     files = os.getenv("OCP_EXTRA_SPK_FILES")
@@ -310,7 +310,7 @@ def _load_kernel(path: str):
 
 def _get_kernels():
     """Thread-safe lazy load of main and extra kernels."""
-    global _MAIN, _EXTRA, _KERNEL_PATHS
+    global _MAIN, _EXTRA, _KERNEL_PATHS, EPHEMERIS_PATH, EPHEMERIS_NAME, KERNEL_COVERAGE_JD
     if _MAIN is not None:
         return _MAIN, _EXTRA
 
@@ -328,8 +328,27 @@ def _get_kernels():
             raise EphemerisError("kernel", f"Kernel looks like a Git LFS pointer: {path}")
 
         _MAIN = _load_kernel(path)
+
+        # Ensure globals reflect the real, loaded kernel (even if it was a fallback)
+        EPHEMERIS_PATH = path
+        EPHEMERIS_NAME = os.path.basename(path) or EPHEMERIS_NAME_DEFAULT
+
         if path not in _KERNEL_PATHS:
             _KERNEL_PATHS.append(path)
+
+        # Populate coverage lazily now that the kernel is actually loaded
+        try:
+            from jplephem.spk import SPK  # type: ignore
+            spk = SPK.open(path)
+            cov = (
+                min(seg.start_jd for seg in spk.segments),
+                max(seg.end_jd for seg in spk.segments),
+            )
+            spk.close()
+            KERNEL_COVERAGE_JD = cov
+        except Exception:
+            # leave as-is if not available
+            pass
 
         _EXTRA = []
         for p in _extra_spk_paths():
@@ -841,7 +860,7 @@ class EphemerisAdapter:
     # ---- rows ---------------------------------------------------------------
     @staticmethod
     def _mk_row(name: str, lon: float, *, lat: Optional[float] = None,
-                vel: Optional[float] = None, node_model: Optional[float] = None,
+                vel: Optional[float] = None, node_model: Optional[str] = None,
                 node_fallback: Optional[str] = None) -> Dict[str, Any]:
         row: Dict[str, Any] = {"name": name, "longitude": float(lon), "lon": float(lon)}
         if lat is not None and math.isfinite(lat):
@@ -879,7 +898,7 @@ class EphemerisAdapter:
             return float(xyz.au[0]), float(xyz.au[1])
 
         h0 = _speed_step_for(name)
-        vel_R, h_used, Rinfo = _richardson_velocity(
+        vel_R, h_used, _Rinfo = _richardson_velocity(
             _lon_at, jd_tt, h0,
             tol_deg_per_day=self.cfg.speed_tol_arcsec / 3600.0,
             h_min=self.cfg.speed_min_step_d
@@ -1096,6 +1115,7 @@ class EphemerisAdapter:
             "node_cache": node_cache,
             "smalls_enabled": self.cfg.enable_smalls and _SPICE_OK,
             "jd_guard": {"enforced": self.cfg.enforce_jd_range, "min": self.cfg.jd_min, "max": self.cfg.jd_max},
+            "coverage_jd": KERNEL_COVERAGE_JD,
         }
 
     def clear_caches(self) -> None:
