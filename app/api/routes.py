@@ -674,6 +674,53 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
         log.error(f"House calculation failed: {type(e).__name__}: {e}")
         raise
 
+def _call_compute_aspects(payload: Dict[str, Any], chart: Dict[str, Any], houses: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    try:
+        from app.core.aspects import compute_aspects
+    except ImportError:
+        raise RuntimeError("aspects engine not available")
+
+    # Extract planetary positions from chart
+    bodies = chart.get("bodies", [])
+    points = chart.get("points", [])
+    
+    # Build positions dictionary
+    positions = {}
+    for body in bodies:
+        if "name" in body and "longitude_deg" in body:
+            positions[body["name"]] = body["longitude_deg"]
+    
+    for point in points:
+        if "name" in point and "longitude_deg" in point:
+            positions[point["name"]] = point["longitude_deg"]
+    
+    # Add house cusps if available
+    if houses and houses.get("cusps"):
+        cusps = houses["cusps"]
+        positions.update({
+            f"House {i+1}": cusps[i] for i in range(len(cusps))
+        })
+        # Add angles
+        if "asc" in houses:
+            positions["Ascendant"] = houses["asc"]
+        if "mc" in houses:
+            positions["Midheaven"] = houses["mc"]
+
+    # Prepare aspects configuration
+    aspects_config = {
+        "positions": positions,
+        "orbs": payload.get("orbs", None),
+        "aspects": payload.get("aspects", None),
+        "mode": payload.get("mode", "tropical")
+    }
+
+    # Call aspects engine
+    try:
+        return compute_aspects(**aspects_config)
+    except Exception as e:
+        # Fallback with just planetary positions
+        return compute_aspects(positions=positions)
+
 def _extract_ayanamsa_from_chart(chart: Dict[str, Any]) -> Optional[float]:
     if not isinstance(chart, dict):
         return None
@@ -886,11 +933,21 @@ def calculate():
     # Merge adapter/kernel info (lazy; won't force-load)
     meta.update(_snapshot_ephemeris_meta(chart.get("meta")))
 
+    # Calculate aspects if requested
+    aspects_result = None
+    if body.get("aspects", False):  # Only if explicitly requested
+        try:
+            aspects_result = _call_compute_aspects(payload, chart, houses)
+        except Exception as e:
+            if DEBUG_VERBOSE:
+                aspects_result = {"error": str(e)}
+
     resp = {"ok": True, "timescales": ts, "chart": chart, "meta": meta}
     if want_houses:
         resp["houses"] = houses
+    if aspects_result:
+        resp["aspects"] = aspects_result
     return jsonify(resp), 200
-
 
 @api.post("/api/report")
 def report():
@@ -1125,6 +1182,69 @@ def predictions_route():
     meta.update(_snapshot_ephemeris_meta(chart.get("meta")))
     resp = {"ok": True, "predictions": preds, "meta": meta}
     return jsonify(resp), 200
+
+# ───────────────────────── aspects ─────────────────────────
+
+@api.post("/api/aspects")
+def aspects():
+    try:
+        body = request.get_json(force=True) or {}
+        payload = parse_chart_payload(body)
+        
+        # Allow additional aspects-specific parameters
+        for k in ("orbs", "aspects", "bodies", "points", "mode", "houses"):
+            if k in body:
+                payload[k] = body[k]
+                
+    except ValidationError as e:
+        return _json_error("validation_error", e.errors(), 400)
+    except Exception as e:
+        return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
+
+    tz_name = payload.get("place_tz") or payload.get("timezone") or "UTC"
+    try:
+        ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name, payload=payload)
+    except ValidationError as e:
+        return _json_error("validation_error", e.errors(), 400)
+
+    # Get chart data
+    try:
+        chart = _call_compute_chart(payload, ts)
+    except Exception as e:
+        return _json_error("chart_internal", str(e) if DEBUG_VERBOSE else "chart_failed", 500)
+
+    # Get houses if needed
+    houses = None
+    if payload.get("houses", True):
+        try:
+            _require_coords_for_houses(payload)
+            houses = _call_compute_houses(payload, ts)
+            houses = _normalize_houses_payload(houses)
+        except Exception as e:
+            return _json_error("houses_internal", str(e) if DEBUG_VERBOSE else "houses_failed", 500)
+
+    # Calculate aspects
+    try:
+        aspects_result = _call_compute_aspects(payload, chart, houses)
+    except Exception as e:
+        return _json_error("aspects_internal", str(e) if DEBUG_VERBOSE else "aspects_failed", 500)
+
+    meta = {
+        "timescales": ts,
+        "chart_engine": _CHART_ENGINE_NAME,
+        "houses_engine": _HOUSES_KIND if houses else "skipped",
+        "aspects_engine": "aspects.py",
+    }
+    meta.update(_snapshot_ephemeris_meta(chart.get("meta")))
+
+    return jsonify({
+        "ok": True,
+        "timescales": ts,
+        "chart": chart,
+        "houses": houses,
+        "aspects": aspects_result,
+        "meta": meta
+    }), 200
 
 
 # ───────────────────────── ephemeris ─────────────────────────
