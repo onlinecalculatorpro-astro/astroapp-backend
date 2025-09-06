@@ -172,7 +172,7 @@ _PLANET_KEYS: Dict[str, str] = {
     "Moon": "moon",
     "Mercury": "mercury",
     "Venus": "venus",
-    "Mars": "mars",
+    "Mars": "mars barycenter",
     "Jupiter": "jupiter barycenter",
     "Saturn": "saturn barycenter",
     "Uranus": "uranus barycenter",
