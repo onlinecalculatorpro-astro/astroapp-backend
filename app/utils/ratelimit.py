@@ -1,4 +1,19 @@
+# app/utils/ratelimit.py
 from __future__ import annotations
+
+"""
+Simple, production-friendly token-bucket rate limiter for Flask.
+
+Features
+- Per-client buckets with optional per-route scoping
+- Pluggable key function (use API key, bearer token, or IP)
+- Dynamic request "cost" (e.g., heavier endpoints can cost more tokens)
+- Thread-safe (per-process) via RLock
+- Standards-ish headers: X-RateLimit-* and Retry-After on 429
+- Env toggles:
+    ASTRO_RL_DISABLE       -> disable limiter entirely
+    ASTRO_RL_ALLOWLIST     -> comma-separated list of client ids/IPs to skip
+"""
 
 import math
 import os
@@ -6,78 +21,133 @@ import time
 from dataclasses import dataclass
 from functools import wraps
 from threading import RLock
-from typing import Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
-from flask import request, jsonify
+from flask import request, jsonify, make_response
 
-# In-memory token buckets (per key). Note: per-process only (typical for WSGI).
-_buckets: Dict[str, "Bucket"] = {}
+__all__ = ["rate_limit", "ip_key", "endpoint_key", "client_key"]
+
+# ───────────────────────── storage / globals ─────────────────────────
+_buckets: Dict[str, "Bucket"] = {}  # in-memory; per-process
 _lock = RLock()
 
-# Opt-in env toggles
 _DISABLE_ALL = os.getenv("ASTRO_RL_DISABLE", "0").lower() in ("1", "true", "yes", "on")
-_ALLOWLIST = {s.strip() for s in os.getenv("ASTRO_RL_ALLOWLIST", "").split(",") if s.strip()}
+_ALLOWLIST = {
+    s.strip()
+    for s in os.getenv("ASTRO_RL_ALLOWLIST", "").split(",")
+    if s.strip()
+}
 
-# Default key: client IP (X-Forwarded-For aware) + endpoint
-def _default_key(req) -> str:
-    ip = (req.headers.get("X-Forwarded-For", "").split(",")[0].strip()) or (req.remote_addr or "anon")
-    return f"{ip}:{(req.endpoint or req.path) or '*'}"
+# ───────────────────────── key functions ─────────────────────────
+def _first_forwarded_for(req) -> str:
+    xff = req.headers.get("X-Forwarded-For", "")
+    return (xff.split(",")[0].strip() if xff else "") or (req.remote_addr or "anon")
 
+
+def ip_key(req) -> str:
+    """Bucket per client IP (no route scoping)."""
+    return _first_forwarded_for(req)
+
+
+def endpoint_key(req) -> str:
+    """Bucket per client IP + endpoint (route-scoped)."""
+    return f"{_first_forwarded_for(req)}:{(req.endpoint or req.path) or '*'}"
+
+
+def client_key(req) -> str:
+    """
+    Prefer API credential; fall back to IP. Route-scoped.
+    Credential order:
+      1) X-API-Key
+      2) Authorization: Bearer <token>
+      3) IP
+    """
+    api_key = (req.headers.get("X-API-Key") or "").strip()
+    if not api_key:
+        auth = (req.headers.get("Authorization") or "").strip()
+        if auth.lower().startswith("bearer "):
+            api_key = auth.split(None, 1)[1]
+
+    ident = api_key or _first_forwarded_for(req)
+    route = (req.endpoint or req.path) or "*"
+    return f"{ident}:{route}"
+
+
+# ───────────────────────── bucket / math ─────────────────────────
 @dataclass
 class Bucket:
-    tokens: float
-    capacity: float          # burst capacity
-    rate: float              # tokens per second
-    ts: float                # last refill time (monotonic)
-    limit: int               # advertised limit (per window)
-    window: float            # window seconds (for headers/cleanup)
+    tokens: float       # current tokens
+    capacity: float     # burst capacity
+    rate: float         # tokens per second
+    ts: float           # last refill time (monotonic)
+    limit: int          # advertised limit (per minute)
+    window: float       # window seconds (informational / headers)
+
 
 def _now() -> float:
-    # monotonic avoids wall-clock jumps
-    return time.monotonic()
+    return time.monotonic()  # immune to wall-clock jumps
+
+
+def _refill(b: Bucket, now: float) -> None:
+    if now > b.ts:
+        b.tokens = min(b.capacity, b.tokens + (now - b.ts) * b.rate)
+        b.ts = now
+
 
 def _cleanup(now: float) -> None:
-    """Opportunistically evict idle full buckets to cap memory."""
-    # Light sweep at most every ~30s
-    sweep_every = 30.0
+    """
+    Opportunistically evict idle, full buckets so memory stays bounded.
+    """
     last = getattr(_cleanup, "_last", 0.0)
-    if now - last < sweep_every:
+    if now - last < 30.0:  # at most every 30s
         return
     setattr(_cleanup, "_last", now)
 
-    idle_for = 3 * 60.0  # ≈3 windows by default
-    dead: list[str] = []
-    for k, b in _buckets.items():
-        if b.tokens >= b.capacity and (now - b.ts) > max(idle_for, 3 * b.window):
-            dead.append(k)
-    for k in dead:
+    idle_for = 3 * 60.0  # ~3 minutes by default
+    to_del = [
+        k for k, b in _buckets.items()
+        if b.tokens >= b.capacity and (now - b.ts) > max(idle_for, 3 * b.window)
+    ]
+    for k in to_del:
         _buckets.pop(k, None)
 
+
+# ───────────────────────── public decorator ─────────────────────────
 def rate_limit(
     max_per_minute: int,
-    key_fn: Optional[Callable] = None,
+    key_fn: Optional[Callable[[Any], str]] = None,
     *,
     burst: Optional[int] = None,
     window: float = 60.0,
     cost: float = 1.0,
-    cost_fn: Optional[Callable] = None,
+    cost_fn: Optional[Callable[[Any], float]] = None,
 ):
     """
-    Token-bucket rate limiter (per-process).
+    Token-bucket rate limiter.
 
     Args:
-        max_per_minute: steady rate (tokens/min).
-        key_fn: function(request) -> str to partition buckets. Defaults to IP+endpoint.
-        burst: bucket capacity (defaults to max_per_minute).
-        window: informational window (seconds) for headers. Rate = max_per_minute / 60.
-        cost: static token cost per call (can be fractional).
-        cost_fn: function(request) -> float to compute dynamic cost.
+        max_per_minute: Allowed steady rate (tokens/min).
+        key_fn: function(request) -> str identifying a bucket.
+                Defaults to endpoint_key (IP + route).
+        burst: Optional bucket capacity (defaults to max_per_minute).
+        window: Logical window for headers (seconds). Rate is still per-minute.
+        cost: Static token cost per call (can be fractional).
+        cost_fn: function(request) -> float for dynamic cost.
 
-    Returns:
-        Flask decorator producing 429 with JSON + Retry-After when limited.
+    Behavior:
+        • On limit, returns 429 JSON:
+            {"ok": False, "error": "rate_limited", "details": {"retry_after_seconds": N}}
+        • Adds headers on both success and 429:
+            X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, X-RateLimit-Policy
+            (and Retry-After on 429)
     """
+    if max_per_minute <= 0:
+        raise ValueError("max_per_minute must be > 0")
+    if window <= 0:
+        raise ValueError("window must be > 0")
+
     limit = int(max_per_minute)
-    cap = float(burst if burst is not None else max(limit, 1))
+    capacity = float(burst if burst is not None else max(limit, 1))
     rate = float(limit) / 60.0  # tokens per second
 
     def decorator(f):
@@ -86,74 +156,69 @@ def rate_limit(
             if _DISABLE_ALL:
                 return f(*args, **kwargs)
 
-            # Skip lightweight methods
+            # Don’t rate limit preflight/lightweight methods
             if request.method in ("HEAD", "OPTIONS"):
                 return f(*args, **kwargs)
 
-            # Build key and allowlist check
-            kfun = key_fn or _default_key
-            key = str(kfun(request))
-            ip_part = key.split(":", 1)[0]
-            if ip_part in _ALLOWLIST:
+            # Key + allowlist
+            kfun = key_fn or endpoint_key
+            bucket_key = str(kfun(request))
+            # Allowlist matches either full key or its leading identifier (left of ':')
+            leading = bucket_key.split(":", 1)[0]
+            if bucket_key in _ALLOWLIST or leading in _ALLOWLIST:
                 return f(*args, **kwargs)
 
             now = _now()
             with _lock:
                 _cleanup(now)
-                b = _buckets.get(key)
+                b = _buckets.get(bucket_key)
                 if b is None:
-                    b = Bucket(tokens=cap, capacity=cap, rate=rate, ts=now, limit=limit, window=window)
-                    _buckets[key] = b
-                # Refill
-                elapsed = max(0.0, now - b.ts)
-                b.tokens = min(b.capacity, b.tokens + elapsed * b.rate)
-                b.ts = now
+                    b = Bucket(tokens=capacity, capacity=capacity, rate=rate,
+                               ts=now, limit=limit, window=window)
+                    _buckets[bucket_key] = b
+                else:
+                    _refill(b, now)
 
-                # Determine request cost
-                c = float(cost_fn(request)) if cost_fn else float(cost)
-                c = max(0.0, c)
+                # Determine cost
+                req_cost = float(cost_fn(request)) if cost_fn else float(cost)
+                req_cost = max(0.0, req_cost)
 
-                # Not enough tokens? compute Retry-After
-                if b.tokens + 1e-12 < c:
-                    deficit = max(0.0, c - b.tokens)
+                # Out of tokens?
+                if b.tokens + 1e-12 < req_cost:
+                    deficit = max(0.0, req_cost - b.tokens)
                     retry_after = max(1, math.ceil(deficit / b.rate))  # seconds
                     headers = {
                         "Retry-After": str(retry_after),
                         "X-RateLimit-Limit": str(b.limit),
-                        "X-RateLimit-Remaining": str(max(0, math.floor(b.tokens))),
-                        "X-RateLimit-Window": str(int(b.window)),
-                        "X-RateLimit-Policy": f"token-bucket; window={int(b.window)}s; burst={int(b.capacity)}",
+                        "X-RateLimit-Remaining": "0",
+                        "X-RateLimit-Reset": str(retry_after),
+                        "X-RateLimit-Policy": f"{b.limit};w={int(b.window)};burst={int(b.capacity)}",
                     }
                     payload = {
                         "ok": False,
                         "error": "rate_limited",
-                        "details": {"retry_after_seconds": retry_after, "key": key},
+                        "details": {"retry_after_seconds": retry_after},
                     }
-                    return jsonify(payload), 429, headers
+                    resp = make_response(jsonify(payload), 429)
+                    for k, v in headers.items():
+                        resp.headers[k] = v
+                    return resp
 
                 # Consume and proceed
-                b.tokens -= c
-                remaining = max(0, math.floor(b.tokens))
-                # Approximate seconds to full (informational)
-                to_full = 0 if b.tokens >= b.capacity else math.ceil((b.capacity - b.tokens) / b.rate)
+                b.tokens -= req_cost
+                remaining = max(0, int(b.tokens))
+                # Seconds until *next* token (not until full)
+                next_token_sec = max(0, math.ceil((1.0 - (b.tokens % 1.0)) / b.rate)) if b.tokens < b.capacity else 0
 
-            # Set headers on successful responses too
-            resp = f(*args, **kwargs)
-            try:
-                # Flask allows (body, status, headers) tuples; merge if needed
-                body, status, headers = (resp if isinstance(resp, tuple) else (resp, None, {}))
-            except Exception:
-                body, status, headers = resp, None, {}
-
-            # Merge rate headers
-            hdrs = dict(headers or {})
-            hdrs.setdefault("X-RateLimit-Limit", str(limit))
-            hdrs["X-RateLimit-Remaining"] = str(remaining)
-            hdrs.setdefault("X-RateLimit-Window", str(int(window)))
-            hdrs.setdefault("X-RateLimit-Policy", f"token-bucket; window={int(window)}s; burst={int(cap)}")
-            hdrs["X-RateLimit-Reset-After"] = str(int(to_full))
-
-            return (body, status, hdrs) if status is not None else (body, 200, hdrs)
+            # Call the view and attach headers
+            rv = f(*args, **kwargs)
+            resp = make_response(rv)
+            resp.headers.setdefault("X-RateLimit-Limit", str(limit))
+            resp.headers["X-RateLimit-Remaining"] = str(remaining)
+            resp.headers.setdefault("X-RateLimit-Reset", str(next_token_sec))
+            resp.headers.setdefault("X-RateLimit-Policy", f"{limit};w={int(window)};burst={int(capacity)}")
+            return resp
 
         return wrapper
+
     return decorator
