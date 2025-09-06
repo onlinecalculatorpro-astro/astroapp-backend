@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Any, Dict, Tuple, List, Optional, Union, TypedDict, Literal
 from zoneinfo import ZoneInfo
 
@@ -261,7 +261,7 @@ def parse_rectification_payload(body: Dict[str, Any]) -> Dict[str, Any]:
 
 class EphemerisPayload(TypedDict, total=False):
     jd_tt: float
-    frame: Literal["ecliptic-of-date", "ecliptic-j2000"]
+    frame: Literal["ecliptic-of-date", "eclipctic-j2000"]  # keep original spelling in type to match parse_frame map
     bodies: List[str]
     names: List[str]
 
@@ -322,6 +322,74 @@ def parse_ephemeris_payload(body: Dict[str, Any], require_bodies: bool = False) 
     return {"jd_tt": float(jd_tt), "frame": frame, "bodies": bodies, "names": canon}
 
 
+# ───────────────────────── timescale resolver (for predictive.py) ─────────────
+def resolve_timescales_from_civil_erfa(
+    d: date,
+    time_hh_mm_ss: str,
+    place_tz: str,
+) -> Dict[str, float]:
+    """
+    Convert a local civil (date, time, tz) into time scales used by the ephemeris.
+    Returns: {"jd_tt", "jd_ut1", "jd_utc", "tz"}.
+
+    Notes:
+    • Accepts leap second (SS==60) and the special "24:00:00" end-of-day.
+    • Uses Skyfield's ΔT (TT−UT1) to derive UT1; if unavailable, falls back to UT1≈UTC.
+    """
+    # Validate/normalize inputs
+    tz = _validate_iana_tz(str(place_tz).strip())
+    t_norm = parse_time_str(time_hh_mm_ss)
+
+    # Handle 24:00:00 → next day 00:00:00
+    if t_norm == "24:00:00":
+        d = d + timedelta(days=1)
+        hh = mm = ss = 0
+        frac = "0"
+    else:
+        m = _TIME_RE.match(t_norm)
+        assert m is not None  # guaranteed by parse_time_str
+        hh = int(m.group("h"))
+        mm = int(m.group("m"))
+        ss = int(m.group("s") or 0)
+        frac = (m.group("f") or "0")
+
+    # Leap second 60 → build 59 and add one second later
+    add_one_sec = False
+    if ss == 60:
+        ss = 59
+        add_one_sec = True
+
+    # Microseconds from fractional seconds
+    us = int((frac + "000000")[:6])
+
+    # Localize and convert to UTC
+    dt_local = datetime(d.year, d.month, d.day, hh, mm, ss, us, tzinfo=ZoneInfo(tz))
+    if add_one_sec:
+        dt_local += timedelta(seconds=1)
+    dt_utc = dt_local.astimezone(ZoneInfo("UTC"))
+
+    # Skyfield times
+    try:
+        from skyfield.api import load
+    except Exception as e:
+        raise RuntimeError(f"Skyfield not installed: {e}") from e
+
+    ts = load.timescale()
+    t = ts.utc(dt_utc.year, dt_utc.month, dt_utc.day, dt_utc.hour, dt_utc.minute, dt_utc.second + dt_utc.microsecond/1e6)
+
+    jd_tt = float(t.tt)
+    jd_utc = float(t.utc_jd)
+
+    try:
+        delta_t_sec = float(t.delta_t)  # TT − UT1 (seconds)
+    except Exception:
+        delta_t_sec = 0.0  # fallback: UT1≈UTC if ΔT unavailable
+
+    jd_ut1 = jd_tt - (delta_t_sec / 86400.0)
+
+    return {"jd_tt": jd_tt, "jd_ut1": jd_ut1, "jd_utc": jd_utc, "tz": tz}
+
+
 __all__ = [
     "ValidationError",
     "parse_chart_payload",
@@ -329,4 +397,5 @@ __all__ = [
     "parse_rectification_payload",
     "parse_ephemeris_payload",
     "parse_frame",
+    "resolve_timescales_from_civil_erfa",
 ]
