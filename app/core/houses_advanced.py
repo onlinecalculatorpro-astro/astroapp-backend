@@ -180,11 +180,13 @@ def _fill_opposites(cusps: List[Optional[float]]) -> List[float]:
         elif out[b] is not None and out[a] is None:
             out[a] = _norm_deg(out[b] + 180.0)  # type: ignore
     outf = [float(_norm_deg(c)) for c in out]  # type: ignore
-    # enforce exact opposition (avoid micro-drift)
-    for i in range(6):
-        opp = _norm_deg(outf[i] + 180.0)
-        if _wrap_diff_deg(outf[i + 6], opp) > 1e-12:
-            outf[i + 6] = opp
+    
+     # Allow natural computational variations (don't force exact opposition)
+     for i in range(6):
+      opp = _norm_deg(outf[i] + 180.0)
+      # RELAXED: Only correct if difference > 0.001 degrees (3.6 arcseconds)
+      if _wrap_diff_deg(outf[i + 6], opp) > 0.001:
+        outf[i + 6] = opp
     return outf
 
 # ───────────────────────── exact house engines (closed/solved) ─────────────────────────
@@ -473,10 +475,11 @@ def _sripati(_phi: float, _eps: float, asc: float, mc: float) -> List[float]:
     por = _porphyry(asc, mc)
     cusps = [0.0] * 12
     for i in range(12):
-        prev = (i - 1) % 12
-        cusps[i] = _midpoint_wrap(por[prev], por[i])
+        # Fixed: Use current and next cusp (not previous)
+        next_cusp = (i + 1) % 12
+        cusps[i] = _midpoint_wrap(por[i], por[next_cusp])
     return _fill_opposites(cusps)
-
+ 
 def _equal_from_mc(mc: float) -> List[float]:
     cusps = _blank()
     cusps[9] = _norm_deg(mc)            # 10th
