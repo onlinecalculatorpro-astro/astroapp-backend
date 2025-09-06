@@ -18,6 +18,10 @@ import os
 import inspect
 import time
 import traceback
+import warnings  # NEW: to optionally silence ERFA "dubious year" warnings
+
+# Optional: silence ERFA “dubious year” warnings
+warnings.filterwarnings("ignore", message=r"ERFA function .*dubious year")
 
 __all__ = ["compute_chart", "clear_ephemeris_cache"]
 
@@ -595,6 +599,21 @@ def _adapter_source_tag() -> str:
         return str(tag())
     except Exception:
         return str(tag)
+
+# NEW: helper to surface ephemeris kernel path and coverage from the adapter
+def _adapter_kernel_info():
+    path = None
+    coverage = None
+    try:
+        get_path = getattr(eph, "current_kernel_path", None)
+        path = get_path() if callable(get_path) else getattr(eph, "EPHEMERIS_PATH", None)
+    except Exception:
+        pass
+    try:
+        coverage = getattr(eph, "KERNEL_COVERAGE_JD", None)
+    except Exception:
+        pass
+    return path, coverage
 
 
 def _adapter_callable(*names: str) -> Optional[Callable[..., Any]]:
@@ -1371,6 +1390,16 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
         meta["elevation_m"] = float(elev)
     if warnings:
         meta["warnings"] = list(warnings)
+
+    # NEW: Ephemeris debug — expose which kernel is actually loaded
+    _kpath, _kcov = _adapter_kernel_info()
+    if _kpath:
+        meta["ephemeris_path"] = str(_kpath)
+    if _kcov and isinstance(_kcov, (tuple, list)) and len(_kcov) == 2:
+        try:
+            meta["ephemeris_coverage_jd"] = {"start": float(_kcov[0]), "end": float(_kcov[1])}
+        except Exception:
+            pass
 
     out: Dict[str, Any] = {
         "mode": mode,
