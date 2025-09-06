@@ -29,8 +29,8 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 EPHEMERIS_NAME_DEFAULT = "de421"
 
-DE421_JD_MIN = float(os.getenv("OCP_DE421_JD_MIN", "2414992.5"))  # 1899-12-31
-DE421_JD_MAX = float(os.getenv("OCP_DE421_JD_MAX", "2469807.5"))  # 2053-10-09
+DE421_JD_MIN = float(os.getenv("OCP_DE421_JD_MIN", "2396752.5"))  # 1849-12-26
+DE421_JD_MAX = float(os.getenv("OCP_DE421_JD_MAX", "2506352.5"))  # 2150-01-22
 ENFORCE_JD_RANGE = os.getenv("OCP_ENFORCE_JD_RANGE", "1").lower() in ("1", "true", "yes", "on")
 
 _ENABLE_SMALLS_ENV = os.getenv("OCP_ENABLE_SMALL_BODIES", "0").lower() in ("1", "true", "yes", "on")
