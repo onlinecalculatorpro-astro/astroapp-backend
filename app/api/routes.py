@@ -1363,6 +1363,7 @@ def ephemeris_longitudes_endpoint():
 
 
 # ───────────────────────── ephemeris diagnostics (for dev tools) ─────────────────────────
+# ───────────────────────── ephemeris diagnostics (for dev tools) ─────────────────────────
 @api.get("/api/ephemeris/diagnostics")
 def ephemeris_diagnostics_route():
     """
@@ -1409,6 +1410,126 @@ def ephemeris_diagnostics_route():
     except Exception as e:
         return _json_error("adapter_error", str(e) if DEBUG_VERBOSE else "adapter_error", 500)
 
+
+# ───────────────────────── DEBUG: House Engine Detection ─────────────────────────
+@api.get("/api/debug/engine-test")
+def debug_engine_test():
+    """Test direct call to advanced engine with diagnostics enabled."""
+    try:
+        from app.core.houses_advanced import PreciseHouseCalculator
+        
+        calc = PreciseHouseCalculator(
+            require_strict_timescales=True,
+            enable_diagnostics=True,
+            enable_validation=True
+        )
+        
+        result = calc.calculate_houses(
+            latitude=40.7128,
+            longitude=-74.0060,
+            jd_ut=2460000.5,
+            house_system="placidus",
+            jd_tt=2460000.501,
+            jd_ut1=2460000.499
+        )
+        
+        return jsonify({
+            "ok": True,
+            "direct_engine_result": {
+                "system": result.system,
+                "asc": result.ascendant,
+                "mc": result.midheaven,
+                "cusps": result.cusps,
+                "has_solver_stats": result.solver_stats is not None,
+                "solver_stats_keys": list(result.solver_stats.keys()) if result.solver_stats else None,
+                "has_error_budget": result.error_budget is not None,
+                "warnings": result.warnings,
+                "validation_count": len(result.validation_results)
+            }
+        }), 200
+    except Exception as e:
+        return _json_error("engine_test_error", str(e), 500)
+
+
+@api.get("/api/debug/precision-test")
+def debug_precision_test():
+    """Run multiple calculations to check for micro-variations."""
+    try:
+        results = []
+        
+        for i in range(5):
+            # Tiny time variations to trigger different computational paths
+            ts = {
+                "jd_tt": 2460000.5 + i * 1e-8,
+                "jd_ut1": 2460000.499 + i * 1e-8,
+                "jd_utc": 2460000.5
+            }
+            
+            payload = {
+                "latitude": 40.7128,
+                "longitude": -74.0060,
+                "house_system": "placidus"
+            }
+            
+            houses = _call_compute_houses(payload, ts)
+            
+            results.append({
+                "run": i,
+                "asc": getattr(houses, 'asc', getattr(houses, 'asc_deg', 'missing')),
+                "mc": getattr(houses, 'mc', getattr(houses, 'mc_deg', 'missing')),
+                "cusps_sample": getattr(houses, 'cusps', [])[:3] if hasattr(houses, 'cusps') else [],
+                "has_solver_stats": hasattr(houses, 'solver_stats'),
+                "warnings": getattr(houses, 'warnings', [])
+            })
+        
+        # Check for variations
+        asc_values = [r["asc"] for r in results if isinstance(r["asc"], (int, float))]
+        variation = max(asc_values) - min(asc_values) if len(asc_values) > 1 else 0.0
+        
+        return jsonify({
+            "ok": True,
+            "results": results,
+            "asc_variation_degrees": variation,
+            "expected_variation": "> 1e-9 for advanced engine",
+            "likely_advanced_engine": variation > 1e-9
+        }), 200
+    except Exception as e:
+        return _json_error("precision_test_error", str(e), 500)
+
+
+@api.get("/api/debug/function-signatures")
+def debug_function_signatures():
+    """Examine what functions are actually being called."""
+    try:
+        import inspect
+        
+        info = {
+            "houses_function": str(_houses_fn),
+            "houses_function_name": getattr(_houses_fn, '__name__', 'unknown'),
+            "houses_function_module": getattr(_houses_fn, '__module__', 'unknown'),
+            "houses_kind": _HOUSES_KIND,
+            "chart_engine": _CHART_ENGINE_NAME
+        }
+        
+        if _houses_fn:
+            try:
+                info["houses_function_signature"] = str(inspect.signature(_houses_fn))
+                info["houses_function_file"] = getattr(inspect.getmodule(_houses_fn), '__file__', 'unknown')
+            except Exception as e:
+                info["signature_error"] = str(e)
+        
+        # Test advanced engine import
+        try:
+            from app.core.houses_advanced import PreciseHouseCalculator
+            info["advanced_engine_importable"] = True
+            info["advanced_engine_file"] = inspect.getfile(PreciseHouseCalculator)
+        except Exception as e:
+            info["advanced_engine_importable"] = False
+            info["advanced_engine_error"] = str(e)
+        
+        return jsonify({"ok": True, "debug_info": info}), 200
+    except Exception as e:
+        return _json_error("function_signatures_error", str(e), 500)
 
 # ───────────────────────── system-validation (optional) ─────────────────────────
 @api.get("/system-validation")
