@@ -7,6 +7,16 @@ import itertools
 import math
 import random
 
+__all__ = [
+    "AspectConfig",
+    "AspectHit",
+    "ConflictPolicy",
+    "FDRGate",
+    "compute_aspects",   # PURE geometry function (list of hits)
+    "analyze_aspects",   # pipeline (geometry → score → optional FDR → features)
+    "run_aspects_api",   # HTTP adapter (no recursion)
+]
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Core math helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -21,18 +31,20 @@ def _sep_small(a: float, b: float) -> float:
     return d if d <= 180.0 else 360.0 - d
 
 def _near(value: float, target: float) -> float:
-    """Unsigned deviation |value - target| on [0, 180]."""
+    """Unsigned deviation |value - target| on [0, 180] (inputs already folded)."""
     return abs(value - target)
 
 def _safe_get(d: Optional[Dict[str, float]], k: str, default: float) -> float:
-    if not isinstance(d, dict): return default
+    if not isinstance(d, dict):
+        return default
     v = d.get(k, default)
-    try: return float(v)
-    except Exception: return default
+    try:
+        return float(v)
+    except Exception:
+        return default
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Aspect catalog & default orbs
-# (research-sane defaults, easy to override)
 # ─────────────────────────────────────────────────────────────────────────────
 
 MAJOR_ASPECTS: Dict[str, float] = {
@@ -53,7 +65,7 @@ MINOR_ASPECTS: Dict[str, float] = {
 }
 
 DEFAULT_ORBS_DEG: Dict[str, float] = {
-    # majors (slightly conservative)
+    # majors (conservative but practical)
     "conjunction": 8.0,
     "opposition": 8.0,
     "trine": 7.0,
@@ -73,7 +85,7 @@ DEFAULT_ORBS_DEG: Dict[str, float] = {
     "contraparallel": 0.5,   # declination degrees
 }
 
-# heuristics for body weighting (orb scaling) — conservative, editable
+# Orb scaling heuristics per body (editable)
 DEFAULT_BODY_WEIGHTS: Dict[str, float] = {
     "Sun": 1.00, "Moon": 1.00,
     "Mercury": 0.85, "Venus": 0.85, "Mars": 0.85,
@@ -99,11 +111,10 @@ class AspectConfig:
     body_orb_weights: Dict[str, float] = field(default_factory=lambda: dict(DEFAULT_BODY_WEIGHTS))
     # Minimum tightness (observed/orb) to emit a hit (0..1)
     min_tightness: float = 0.05
-    # Limit pairs to a whitelist (optional). Values are body names as they appear in `points`.
+    # Optional white/allow list of pairs
     allowed_pairs: Optional[Iterable[Tuple[str, str]]] = None
-
-def default_config() -> AspectConfig:
-    return AspectConfig()
+    # NEW: restrict which aspect names are allowed (e.g., {"conjunction","square"})
+    allowed_aspects: Optional[set[str]] = None
 
 @dataclass
 class AspectHit:
@@ -112,7 +123,7 @@ class AspectHit:
     family: AspectFamily
     aspect: str
     exact_deg: float               # target angle (or 0 for parallels)
-    separation_deg: float          # measured separation (zodiacal), or |sum-180| etc
+    separation_deg: float          # measured separation (zodiacal) or |sum-180| etc.
     orb_deg: float                 # allowed orb used for this pair
     delta_deg: float               # |separation - exact| (zodiacal) OR absolute offset (others)
     tightness: float               # 1 - delta/orb, clipped [0,1]
@@ -121,13 +132,12 @@ class AspectHit:
 
     def as_dict(self) -> Dict[str, Any]:
         d = asdict(self)
-        # float hygiene
         for k in ("exact_deg","separation_deg","orb_deg","delta_deg","tightness","score"):
             d[k] = float(d[k])
         return d
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Geometry — Zodiacal aspects
+# Geometry — helpers per family
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _pair_orb(a: str, b: str, base: float, weights: Dict[str, float]) -> float:
@@ -137,9 +147,13 @@ def _pair_orb(a: str, b: str, base: float, weights: Dict[str, float]) -> float:
 
 def _zodiacal_hits_for_pair(a: str, la: float, b: str, lb: float, cfg: AspectConfig) -> List[AspectHit]:
     sep = _sep_small(_norm360(lb), _norm360(la))  # [0, 180]
+    # Build catalog per config
     catalog = dict(MAJOR_ASPECTS)
     if cfg.include_minors:
         catalog.update(MINOR_ASPECTS)
+    if cfg.allowed_aspects is not None:
+        catalog = {k: v for k, v in catalog.items() if k in cfg.allowed_aspects}
+
     hits: List[AspectHit] = []
     for name, angle in catalog.items():
         base_orb = cfg.orbs_deg.get(name, DEFAULT_ORBS_DEG.get(name, 0.0))
@@ -152,22 +166,18 @@ def _zodiacal_hits_for_pair(a: str, la: float, b: str, lb: float, cfg: AspectCon
                     a=min(a,b), b=max(a,b),
                     family="zodiacal", aspect=name, exact_deg=angle,
                     separation_deg=sep, orb_deg=orb, delta_deg=delta,
-                    tightness=tight, score=tight,
-                    meta={}
+                    tightness=tight, score=tight, meta={}
                 ))
     return hits
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Geometry — Antiscia & Contra-antiscia
-#   antiscia:       (λa + λb) ≈ 180°
-#   contra-antiscia:(λa + λb) ≈   0° (≡ 360°)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _antiscia_hits_for_pair(a: str, la: float, b: str, lb: float, cfg: AspectConfig) -> List[AspectHit]:
     la = _norm360(la); lb = _norm360(lb)
     s = (la + lb) % 360.0
     out: List[AspectHit] = []
-    if cfg.include_antiscia:
+
+    # antiscia
+    want_antiscia = cfg.include_antiscia and (cfg.allowed_aspects is None or "antiscia" in cfg.allowed_aspects)
+    if want_antiscia:
         target = 180.0
         base = cfg.orbs_deg.get("antiscia", DEFAULT_ORBS_DEG["antiscia"])
         orb = _pair_orb(a, b, base, cfg.body_orb_weights)
@@ -181,7 +191,10 @@ def _antiscia_hits_for_pair(a: str, la: float, b: str, lb: float, cfg: AspectCon
                     separation_deg=delta, orb_deg=orb, delta_deg=delta,
                     tightness=tight, score=tight, meta={}
                 ))
-    if cfg.include_contra_antiscia:
+
+    # contra-antiscia
+    want_contra = cfg.include_contra_antiscia and (cfg.allowed_aspects is None or "contra-antiscia" in cfg.allowed_aspects)
+    if want_contra:
         target = 0.0
         base = cfg.orbs_deg.get("contra-antiscia", DEFAULT_ORBS_DEG["contra-antiscia"])
         orb = _pair_orb(a, b, base, cfg.body_orb_weights)
@@ -197,23 +210,28 @@ def _antiscia_hits_for_pair(a: str, la: float, b: str, lb: float, cfg: AspectCon
                 ))
     return out
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Geometry — Declination Parallels
-#   parallel:       sign(dec_a)==sign(dec_b) and |dec_a - dec_b| ≤ orb
-#   contraparallel: sign differs and |dec_a + dec_b| ≤ orb
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _declination_hits_for_pair(a: str, da: Optional[float], b: str, db: Optional[float], cfg: AspectConfig) -> List[AspectHit]:
     if da is None or db is None:
         return []
     out: List[AspectHit] = []
+
+    # Only consider declination if either not restricted or explicitly included
+    want_decl = cfg.include_declination and (
+        cfg.allowed_aspects is None or
+        ("parallel" in cfg.allowed_aspects or "contraparallel" in cfg.allowed_aspects)
+    )
+    if not want_decl:
+        return out
+
     base_p = cfg.orbs_deg.get("parallel", DEFAULT_ORBS_DEG["parallel"])
     base_c = cfg.orbs_deg.get("contraparallel", DEFAULT_ORBS_DEG["contraparallel"])
     orb_p = _pair_orb(a, b, base_p, cfg.body_orb_weights)
     orb_c = _pair_orb(a, b, base_c, cfg.body_orb_weights)
 
     same = (da >= 0) == (db >= 0)
-    if same:
+
+    # parallel
+    if same and (cfg.allowed_aspects is None or "parallel" in cfg.allowed_aspects):
         delta = abs(da - db)
         if delta <= orb_p:
             tight = max(0.0, 1.0 - (delta / max(1e-12, orb_p)))
@@ -224,7 +242,9 @@ def _declination_hits_for_pair(a: str, da: Optional[float], b: str, db: Optional
                     separation_deg=delta, orb_deg=orb_p, delta_deg=delta,
                     tightness=tight, score=tight, meta={"dec_a": da, "dec_b": db}
                 ))
-    else:
+
+    # contraparallel
+    if (not same) and (cfg.allowed_aspects is None or "contraparallel" in cfg.allowed_aspects):
         delta = abs(da + db)  # distance to zero when mirrored
         if delta <= orb_c:
             tight = max(0.0, 1.0 - (delta / max(1e-12, orb_c)))
@@ -238,18 +258,16 @@ def _declination_hits_for_pair(a: str, da: Optional[float], b: str, db: Optional
     return out
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Public Geometry API
+# PURE Geometry API (NO side effects; NO recursion)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _pair_iter(names: List[str], whitelist: Optional[Iterable[Tuple[str, str]]]) -> Iterable[Tuple[str, str]]:
     if whitelist is None:
-        for a, b in itertools.combinations(names, 2):
-            yield a, b
+        yield from itertools.combinations(names, 2)
         return
-    # normalize whitelist to ordered tuples
     allow = {(min(x), max(x)) for x in whitelist}
     for a, b in itertools.combinations(names, 2):
-        key = (min(a,b), max(a,b))
+        key = (min(a, b), max(a, b))
         if key in allow:
             yield a, b
 
@@ -260,12 +278,13 @@ def compute_aspects(
     config: Optional[AspectConfig] = None
 ) -> List[AspectHit]:
     """
-    Compute geometric relationships for a single chart (or inter-chart if you union inputs).
+    PURE geometry: compute hits for a single chart (or inter-chart if you union inputs).
     - points_deg: longitudes (deg) per body.
     - declinations_deg: optional declinations (deg) for parallels.
+    - config: AspectConfig.
     Returns a flat list of AspectHit.
     """
-    cfg = config or default_config()
+    cfg = config or AspectConfig()
     names = sorted(points_deg.keys())
     out: List[AspectHit] = []
     for a, b in _pair_iter(names, cfg.allowed_pairs):
@@ -277,72 +296,6 @@ def compute_aspects(
             db = None if declinations_deg is None else declinations_deg.get(b)
             out.extend(_declination_hits_for_pair(a, da, b, db, cfg))
     return out
-
-def compute_aspects(
-    positions: Optional[Dict[str, float]] = None,
-    orbs: Optional[Dict[str, float]] = None,
-    aspects: Optional[List[str]] = None,
-    mode: str = "tropical",
-    **kwargs
-) -> Dict[str, Any]:
-    """
-    API adapter function for the comprehensive aspects engine.
-    
-    Args:
-        positions: Dict of body_name -> longitude_deg
-        orbs: Optional orb overrides per aspect
-        aspects: Optional list of aspects to include
-        mode: "tropical" or "sidereal" (currently unused)
-        **kwargs: Additional parameters
-    
-    Returns:
-        Dict with aspects results compatible with API
-    """
-    if not positions:
-        return {"aspects": [], "meta": {"error": "no_positions"}}
-    
-    # Build configuration
-    config = AspectConfig()
-    
-    # Apply orb overrides
-    if orbs:
-        config.orbs_deg.update(orbs)
-    
-    # Apply aspect filtering
-    if aspects:
-        # Filter available aspects based on request
-        aspect_names = set(aspects)
-        available_majors = {k: v for k, v in MAJOR_ASPECTS.items() if k in aspect_names}
-        available_minors = {k: v for k, v in MINOR_ASPECTS.items() if k in aspect_names}
-        
-        # Update config to include minors if any were requested
-        config.include_minors = bool(available_minors)
-        
-        # Could implement aspect filtering in geometry calculation if needed
-    
-    # Run the comprehensive analysis
-    result = analyze_aspects(
-        positions,
-        geometry_config=config,
-        conflict_policy=ConflictPolicy(strategy="zodiacal_dominant"),
-        fdr_gate=FDRGate(num_permutations=0)  # Disable FDR for API use
-    )
-    
-    # Transform to API-compatible format
-    return {
-        "aspects": result["hits"],
-        "count": len(result["hits"]),
-        "config": {
-            "orbs_used": config.orbs_deg,
-            "include_minors": config.include_minors,
-            "mode": mode
-        },
-        "meta": {
-            "engine": "aspects.py",
-            "features_computed": len(result["features_by_pair"])
-        }
-    }
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Policy Layer — weighting, conflict handling, features
@@ -387,7 +340,6 @@ def score_hits(hits: List[AspectHit], policy: Optional[ConflictPolicy] = None) -
     reweighted: List[AspectHit] = []
     for key, grp in by_pair.items():
         if pol.strategy == "max_score":
-            # keep only the highest-score hit for this pair
             best = max(grp, key=lambda x: (x.score, x.tightness), default=None)
             if best and best.score > 0.0:
                 reweighted.append(best)
@@ -396,23 +348,19 @@ def score_hits(hits: List[AspectHit], policy: Optional[ConflictPolicy] = None) -
         # zodiacal_dominant:
         zods = [h for h in grp if h.family == "zodiacal" and h.score > 0.0]
         if zods:
-            # keep all zodiacal; keep others only as modifiers (mark in meta)
             best_z = max(zods, key=lambda x: (x.score, x.tightness))
             modifiers = [h for h in grp if h.family != "zodiacal" and h.score > 0.0]
-            # gently boost the best zodiacal with modifiers (bounded)
             boost = sum(m.score for m in modifiers)
             best = AspectHit(**{**best_z.as_dict(), "meta": {**best_z.meta, "modifiers": [m.as_dict() for m in modifiers]}})
             best.score = min(1.0, best.score + 0.5 * boost)
             reweighted.append(best)
         else:
-            # no zodiacal → keep strongest single signal
             best = max(grp, key=lambda x: (x.score, x.tightness), default=None)
             if best and best.score > 0.0:
                 reweighted.append(best)
 
     return reweighted
 
-# features per pair (ML-ready)
 def build_pair_features(hits: List[AspectHit]) -> Dict[Tuple[str,str], Dict[str, float]]:
     """
     Aggregate per (a,b) pair:
@@ -456,11 +404,9 @@ class FDRGate:
     preserve_decl_signs: bool = True
 
 def _bh_threshold(pvals: List[float], q: float) -> float:
-    """
-    Benjamini–Hochberg cutoff. Returns p* such that keep p_i ≤ p*.
-    """
     m = len(pvals)
-    if m == 0: return 0.0
+    if m == 0:
+        return 0.0
     pairs = sorted((p, i+1) for i, p in enumerate(pvals))  # (p, rank)
     cutoff = 0.0
     for p, r in pairs:
@@ -473,7 +419,8 @@ def _shuffle_longitudes(points: Dict[str, float], rng: random.Random) -> Dict[st
     return {k: _norm360(rng.random() * 360.0) for k in points.keys()}
 
 def _permute_declinations(decs: Optional[Dict[str, float]], rng: random.Random) -> Optional[Dict[str, float]]:
-    if decs is None: return None
+    if decs is None:
+        return None
     names = list(decs.keys())
     vals = [decs[k] for k in names]
     rng.shuffle(vals)
@@ -491,7 +438,7 @@ def apply_fdr(
     Permutation-based p-values on hit.score; BH FDR gate at q_level.
     Returns (kept_hits, pvals_by_index, bh_cutoff).
     """
-    cfg = config or default_config()
+    cfg = config or AspectConfig()
     g = gate or FDRGate()
     if g.num_permutations <= 0:
         # trivial pass-through with unit p-values
@@ -514,7 +461,6 @@ def apply_fdr(
     null_sorted = sorted(null_scores)
     pvals: Dict[int, float] = {}
     for i, s in enumerate(obs_scores):
-        # number of null scores >= s
         # binary search for first >= s
         lo, hi = 0, N
         while lo < hi:
@@ -550,8 +496,8 @@ def analyze_aspects(
       3) optional FDR → filtered_hits
       4) features per pair
     """
-    gcfg = geometry_config or default_config()
-    hits = compute_aspects(points_deg, declinations_deg=declinations_deg, config=gcfg)
+    gcfg = geometry_config or AspectConfig()
+    hits = compute_aspects(points_deg, declinations_deg=declinations_deg, config=gcfg)  # PURE call
     scored = score_hits(hits, conflict_policy or ConflictPolicy())
     kept, pvals, cutoff = apply_fdr(points_deg, scored, declinations_deg=declinations_deg,
                                     config=gcfg, gate=fdr_gate or FDRGate(num_permutations=0))
@@ -571,31 +517,82 @@ def analyze_aspects(
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Minimal sanity test (can be removed; kept here for quick manual checks)
+# HTTP-layer adapter (NO name collision with compute_aspects)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_aspects_api(
+    *,
+    positions: Optional[Dict[str, float]] = None,
+    orbs: Optional[Dict[str, float]] = None,
+    aspects: Optional[List[str]] = None,
+    declinations: Optional[Dict[str, float]] = None,
+    mode: str = "tropical",
+    **kwargs
+) -> Dict[str, Any]:
+    """
+    Thin API adapter around the pure engine.
+    - positions: Dict of body_name -> longitude_deg
+    - declinations: Dict of body_name -> declination_deg (for parallel/contraparallel)
+    - orbs: per-aspect orbs, e.g., {"conjunction":8, "square":6}
+    - aspects: list of aspect names to include; if omitted, defaults apply
+    - mode: "tropical" or "sidereal" (metadata only here)
+    """
+    if not positions:
+        return {"aspects": [], "count": 0, "meta": {"error": "no_positions"}}
+
+    config = AspectConfig()
+
+    # Apply orb overrides (validate)
+    if orbs:
+        for k, v in orbs.items():
+            if isinstance(v, (int, float)) and v >= 0:
+                config.orbs_deg[str(k)] = float(v)
+
+    # Apply aspect filtering / feature toggles
+    if aspects:
+        allowed = {str(a) for a in aspects}
+        config.allowed_aspects = allowed
+        # minors requested?
+        config.include_minors = any(a in MINOR_ASPECTS for a in allowed)
+        # antiscia families only if explicitly requested
+        config.include_antiscia = "antiscia" in allowed
+        config.include_contra_antiscia = "contra-antiscia" in allowed
+        # declination families only if explicitly requested
+        wants_decl = ("parallel" in allowed) or ("contraparallel" in allowed)
+        config.include_declination = wants_decl
+
+    result = analyze_aspects(
+        positions,
+        declinations_deg=declinations,
+        geometry_config=config,
+        conflict_policy=ConflictPolicy(strategy="zodiacal_dominant"),
+        fdr_gate=FDRGate(num_permutations=0),  # disabled in API path
+    )
+
+    return {
+        "aspects": result["hits"],
+        "count": len(result["hits"]),
+        "config": {
+            "orbs_used": config.orbs_deg,
+            "include_minors": config.include_minors,
+            "include_antiscia": config.include_antiscia,
+            "include_contra_antiscia": config.include_contra_antiscia,
+            "include_declination": config.include_declination,
+            "mode": mode,
+            "allowed_aspects": sorted(list(config.allowed_aspects)) if config.allowed_aspects else None,
+        },
+        "meta": {
+            "engine": "aspects.py",
+            "features_computed": len(result["features_by_pair"]),
+        },
+    }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Minimal manual check
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # toy chart (degrees)
-    pts = {
-        "Sun": 15.0, "Moon": 103.0, "Mercury": 42.0, "Venus": 195.0, "Mars": 285.0,
-        "Jupiter": 120.0, "Saturn": 300.0, "Uranus": 60.0, "Neptune": 330.0, "Pluto": 210.0,
-        "North Node": 10.0, "South Node": 190.0,
-    }
-    decs = {
-        "Sun": 10.0, "Moon": 18.0, "Mercury": 5.0, "Venus": -13.2, "Mars": -18.0,
-        "Jupiter": 21.0, "Saturn": -22.0, "Uranus": 8.0, "Neptune": -9.5, "Pluto": -22.5,
-        "North Node": 0.0, "South Node": 0.0,
-    }
-    res = analyze_aspects(
-        pts,
-        declinations_deg=decs,
-        geometry_config=AspectConfig(include_minors=True),
-        conflict_policy=ConflictPolicy(strategy="zodiacal_dominant"),
-        fdr_gate=FDRGate(num_permutations=0)  # set >0 to enable FDR
-    )
+    pts = {"A": 0.0, "B": 90.0, "C": 120.0}
+    out = run_aspects_api(positions=pts, aspects=["square","trine"], orbs={"square": 6, "trine": 6})
     from pprint import pprint
-    print("— hits (scored) —")
-    pprint(res["hits"][:8])
-    print("— features_by_pair (sample) —")
-    for k, v in list(res["features_by_pair"].items())[:5]:
-        print(k, v)
+    pprint(out)
