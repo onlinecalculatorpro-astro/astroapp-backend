@@ -733,14 +733,16 @@ def _recompute_houses_angles_if_needed(
     mc_old = h.get("mc_deg") if isinstance(h.get("mc_deg"), (int, float)) else h.get("mc")
     warn_list = h.get("warnings") or []
     changed = False
-       if isinstance(asc_old, (int, float)):
-            d_asc = _delta_arcsec(asc_new, float(asc_old))
-            # DISABLED: Don't override advanced engine calculations
-            # if d_asc > ARCSEC_TOL:
-            #     h["asc_deg"] = _wrap360(asc_new); h["asc"] = h["asc_deg"]; changed = True
+    
+    if isinstance(asc_old, (int, float)):
+        d_asc = _delta_arcsec(asc_new, float(asc_old))
+        # DISABLED: Don't override advanced engine calculations
+        # if d_asc > ARCSEC_TOL:
+        #     h["asc_deg"] = _wrap360(asc_new); h["asc"] = h["asc_deg"]; changed = True
         #     warn_list.append(f"asc_corrected_for_parity({d_asc:.2f}arcsec)")
-       else:
+    else:
         h["asc_deg"] = _wrap360(asc_new); h["asc"] = h["asc_deg"]; changed = True
+        
     if isinstance(mc_old, (int, float)):
         d_mc = _delta_arcsec(mc_new, float(mc_old))
         if d_mc > ARCSEC_TOL:
@@ -748,10 +750,10 @@ def _recompute_houses_angles_if_needed(
             warn_list.append(f"mc_corrected_for_parity({d_mc:.2f}arcsec)")
     else:
         h["mc_deg"] = _wrap360(mc_new); h["mc"] = h["mc_deg"]; changed = True
+        
     if changed:
         h["warnings"] = warn_list
     return _normalize_houses_payload(h)
-
 
 def _prepare_chart_for_predict(chart: Dict[str, Any]) -> Dict[str, Any]:
     ch = dict(chart)
