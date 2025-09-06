@@ -278,6 +278,72 @@ def compute_aspects(
             out.extend(_declination_hits_for_pair(a, da, b, db, cfg))
     return out
 
+def compute_aspects(
+    positions: Optional[Dict[str, float]] = None,
+    orbs: Optional[Dict[str, float]] = None,
+    aspects: Optional[List[str]] = None,
+    mode: str = "tropical",
+    **kwargs
+) -> Dict[str, Any]:
+    """
+    API adapter function for the comprehensive aspects engine.
+    
+    Args:
+        positions: Dict of body_name -> longitude_deg
+        orbs: Optional orb overrides per aspect
+        aspects: Optional list of aspects to include
+        mode: "tropical" or "sidereal" (currently unused)
+        **kwargs: Additional parameters
+    
+    Returns:
+        Dict with aspects results compatible with API
+    """
+    if not positions:
+        return {"aspects": [], "meta": {"error": "no_positions"}}
+    
+    # Build configuration
+    config = AspectConfig()
+    
+    # Apply orb overrides
+    if orbs:
+        config.orbs_deg.update(orbs)
+    
+    # Apply aspect filtering
+    if aspects:
+        # Filter available aspects based on request
+        aspect_names = set(aspects)
+        available_majors = {k: v for k, v in MAJOR_ASPECTS.items() if k in aspect_names}
+        available_minors = {k: v for k, v in MINOR_ASPECTS.items() if k in aspect_names}
+        
+        # Update config to include minors if any were requested
+        config.include_minors = bool(available_minors)
+        
+        # Could implement aspect filtering in geometry calculation if needed
+    
+    # Run the comprehensive analysis
+    result = analyze_aspects(
+        positions,
+        geometry_config=config,
+        conflict_policy=ConflictPolicy(strategy="zodiacal_dominant"),
+        fdr_gate=FDRGate(num_permutations=0)  # Disable FDR for API use
+    )
+    
+    # Transform to API-compatible format
+    return {
+        "aspects": result["hits"],
+        "count": len(result["hits"]),
+        "config": {
+            "orbs_used": config.orbs_deg,
+            "include_minors": config.include_minors,
+            "mode": mode
+        },
+        "meta": {
+            "engine": "aspects.py",
+            "features_computed": len(result["features_by_pair"])
+        }
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Policy Layer — weighting, conflict handling, features
 # ─────────────────────────────────────────────────────────────────────────────
