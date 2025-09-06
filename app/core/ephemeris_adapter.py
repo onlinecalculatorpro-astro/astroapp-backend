@@ -9,7 +9,7 @@
 # • Topocentric honored via (topocentric=True + observer or lat/lon/elevation); safe fallback to geocentric with warning.
 # • Velocities via adaptive Richardson + independent XY estimator cross-check.
 # • Robust lunar nodes (true via angular-momentum; mean as policy/fallback), with speed via central diff.
-# • Clean error taxonomy in warnings; JD guard aligned to DE420/DE421 span (configurable).
+# • Clean error taxonomy in warnings; JD guard aligned to DE421 span by default (override via env).
 # • Optional SPICE for selected small bodies (Ceres, Pallas, Juno, Vesta, Chiron) when enabled.
 # -----------------------------------------------------------------------------
 from __future__ import annotations
@@ -25,7 +25,7 @@ import threading
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Constants / environment (mapped into Config defaults)
+# Constants / environment
 # ─────────────────────────────────────────────────────────────────────────────
 EPHEMERIS_NAME_DEFAULT = "de421"
 
@@ -48,9 +48,9 @@ _SPEED_STEP_DEFAULT = float(os.getenv("OCP_SPEED_STEP_DEFAULT", "0.5"))  # ±12 
 
 # Diagnostics tolerances
 _SPEED_TOL_ARCSEC_ENV = float(os.getenv("OCP_SPEED_TOL_ARCSEC", "0.05"))  # Richardson vs XY abs tol (arcsec/day)
-_SPEED_MIN_STEP_D_ENV = float(os.getenv("OCP_SPEED_MIN_STEP_D", "0.01"))  # minimum h (days) for differencing
+_SPEED_MIN_STEP_D_ENV = float(os.getenv("OCP_SPEED_MIN_STEP_D", "0.01"))  # minimum step (days)
 
-# Node cache tick resolution in seconds (0→nanosecond ticks)
+# Node cache tick resolution (seconds); 0 → ns ticks
 _NODE_CACHE_RES_S_ENV = float(os.getenv("OCP_NODE_CACHE_RES_S", "0.0"))
 
 _ABS_ZERO_TOL_DEG_ENV = float(os.getenv("OCP_ABS_ZERO_TOL_DEG", "1e-13"))
@@ -116,10 +116,8 @@ def current_kernel_path() -> Optional[str]:
     """Absolute/relative path to main BSP."""
     if EPHEMERIS_PATH:
         return EPHEMERIS_PATH
-    # fallback to what's been loaded already
     if _KERNEL_PATHS:
         return _KERNEL_PATHS[0]
-    # or try resolving now
     return _resolve_kernel_path()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -151,7 +149,7 @@ class Config:
     jd_max: float = DE421_JD_MAX
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Global singletons (legacy facade; the class can be used independently)
+# Global singletons
 # ─────────────────────────────────────────────────────────────────────────────
 _TS = None                 # Skyfield timescale
 _MAIN = None               # Main DE kernel
@@ -167,11 +165,13 @@ _LOCK_SPICE  = threading.Lock()
 # ─────────────────────────────────────────────────────────────────────────────
 # Catalogs & canonicalization
 # ─────────────────────────────────────────────────────────────────────────────
+# Primary labels favor barycenters to match de440s.bsp coverage.
 _PLANET_KEYS: Dict[str, str] = {
     "Sun": "sun",
     "Moon": "moon",
-    "Mercury": "mercury",
-    "Venus": "venus",
+    "Mercury": "mercury barycenter",
+    "Venus": "venus barycenter",
+    "Earth": "earth barycenter",
     "Mars": "mars barycenter",
     "Jupiter": "jupiter barycenter",
     "Saturn": "saturn barycenter",
@@ -180,6 +180,21 @@ _PLANET_KEYS: Dict[str, str] = {
     "Pluto": "pluto barycenter",
 }
 _MAJOR_CANON = {k.lower(): k for k in _PLANET_KEYS.keys()}
+
+# Fallback labels if the primary isn't present in the kernel
+_PLANET_ALIASES = {
+    "Sun":     ["sun"],
+    "Moon":    ["moon"],
+    "Mercury": ["mercury"],
+    "Venus":   ["venus"],
+    "Earth":   ["earth"],
+    "Mars":    ["mars"],
+    "Jupiter": ["jupiter"],
+    "Saturn":  ["saturn"],
+    "Uranus":  ["uranus"],
+    "Neptune": ["neptune"],
+    "Pluto":   ["pluto"],
+}
 
 _NODE_ALIAS: Dict[str, Tuple[str, Optional[str]]] = {
     "north node": ("North Node", None),
@@ -202,20 +217,6 @@ _SMALLBODY_HINTS: Dict[str, List[str]] = {
     "Vesta":  ["4 Vesta", "Vesta", "00004 Vesta", "2000004", "4"],
     "Chiron": ["2060 Chiron", "Chiron", "2002060", "2060", "95P/Chiron"],
 }
-
-# Fallback labels if the primary isn't present in the kernel
-_PLANET_ALIASES = {
-    "Mercury": ["mercury barycenter"],
-    "Venus":   ["venus barycenter"],
-    "Earth":   ["earth barycenter"],
-    "Mars":    ["mars barycenter"],
-    "Jupiter": ["jupiter"],  # primary is barycenter above
-    "Saturn":  ["saturn"],
-    "Uranus":  ["uranus"],
-    "Neptune": ["neptune"],
-    "Pluto":   ["pluto"],
-}
-
 
 def _canon_node(nm: str) -> Tuple[str, Optional[str]]:
     low = (nm or "").strip().lower()
@@ -256,8 +257,7 @@ def _speed_step_for(name: str) -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 def _resolve_kernel_path() -> Optional[str]:
     """
-    Prefer the env-resolved EPHEMERIS_PATH (OCP_EPHEMERIS or EPHEM_DIR+EPHEM_FILE),
-    else fallback to app/data/de421.bsp if present — and record that fallback.
+    Prefer the env-resolved EPHEMERIS_PATH, else fallback to app/data/de421.bsp.
     """
     global EPHEMERIS_PATH, EPHEMERIS_NAME
     if EPHEMERIS_PATH and os.path.isfile(EPHEMERIS_PATH):
@@ -343,14 +343,14 @@ def _get_kernels():
 
         _MAIN = _load_kernel(path)
 
-        # Ensure globals reflect the real, loaded kernel (even if it was a fallback)
+        # Ensure globals reflect the real, loaded kernel
         EPHEMERIS_PATH = path
         EPHEMERIS_NAME = os.path.basename(path) or EPHEMERIS_NAME_DEFAULT
 
         if path not in _KERNEL_PATHS:
             _KERNEL_PATHS.append(path)
 
-        # Populate coverage lazily now that the kernel is actually loaded
+        # Populate coverage
         try:
             from jplephem.spk import SPK  # type: ignore
             spk = SPK.open(path)
@@ -361,7 +361,6 @@ def _get_kernels():
             spk.close()
             KERNEL_COVERAGE_JD = cov
         except Exception:
-            # leave as-is if not available
             pass
 
         _EXTRA = []
@@ -670,7 +669,7 @@ def _node_tick(jd_tt: float, res_s: float) -> int:
 @lru_cache(maxsize=8192)
 def _true_node_geocentric_tick(cache_key: Tuple[int, float, float]) -> float:
     """Compute true node (North) longitude in ecliptic-of-date using lunar angular-momentum vector."""
-    tick, jd_tt, step = cache_key  # tick only ensures robust hashing
+    _tick, jd_tt, step = cache_key
     try:
         from skyfield.framelib import ecliptic_frame  # type: ignore
     except Exception:
@@ -705,7 +704,7 @@ def _true_node_geocentric_tick(cache_key: Tuple[int, float, float]) -> float:
             return float("nan")
         return (math.degrees(math.atan2(ny, nx)) % 360.0)
     except Exception as e:
-        log.debug("true-node compute failed: %s", e)
+        log.debug("true-node compute failed %s", e)
         return float("nan")
 
 def _node_longitude(
@@ -842,13 +841,25 @@ class EphemerisAdapter:
 
     @lru_cache(maxsize=2048)
     def _get_body(self, name: str):
+        # Major planets: primary key then fallbacks, then heuristic substring scan
         if name in _PLANET_KEYS:
-            key = _PLANET_KEYS[name]
+            labels = [_PLANET_KEYS[name]] + _PLANET_ALIASES.get(name, [])
             for k in self._kernels_iter():
-                try:
-                    return k[key]
-                except Exception:
-                    continue
+                for lab in labels:
+                    try:
+                        return k[lab]
+                    except Exception:
+                        continue
+            # last-resort: substring scan of kernel labels
+            needle = name.lower()
+            for k in self._kernels_iter():
+                for lab in self._all_kernel_labels(k):
+                    try:
+                        if needle in lab.lower():
+                            return k[lab]
+                    except Exception:
+                        continue
+        # Smalls via hints/scan
         if name in _SMALL_CANON.values():
             b = self._resolve_small_body(name)
             if b is not None:
@@ -869,6 +880,11 @@ class EphemerisAdapter:
         }
         if diags:
             base["diagnostics"] = diags
+        # helpful extras if available
+        if KERNEL_COVERAGE_JD:
+            base["ephemeris_coverage_jd"] = list(KERNEL_COVERAGE_JD)
+        if EPHEMERIS_PATH:
+            base["ephemeris_path"] = EPHEMERIS_PATH
         return base
 
     # ---- rows ---------------------------------------------------------------
@@ -894,7 +910,7 @@ class EphemerisAdapter:
         if self.cfg.enforce_jd_range and not (self.cfg.jd_min <= float(jd_tt) <= self.cfg.jd_max):
             raise EphemerisError("validation", "Julian date outside DE421 nominal span", jd_tt=float(jd_tt))
 
-    # ---- public computations ------------------------------------------------
+    # ---- major computation ---------------------------------------------------
     def _compute_major_row(self, *, body, obs, ef, jd_tt: float, name: str, ts, warnings: List[str], diags: Dict[str, Any]) -> Dict[str, Any]:
         # lon/lat now
         geo_now = obs.at(ts.tt_jd(jd_tt)).observe(body).apparent()
@@ -939,6 +955,7 @@ class EphemerisAdapter:
 
         return self._mk_row(name, lon_now, lat=lat_now, vel=vel)
 
+    # ---- public computations -------------------------------------------------
     def ecliptic_longitudes(
         self,
         jd_tt: float,
@@ -982,6 +999,7 @@ class EphemerisAdapter:
             wanted = (list(wanted_src) if wanted_src else list(_PLANET_KEYS.keys()))
             rows: List[Dict[str, Any]] = []
 
+            # preserve request order
             for raw in wanted:
                 canon, kind, node_override = _canon_name(raw)
 
@@ -1097,6 +1115,7 @@ class EphemerisAdapter:
                     candidates = []
                     if nm in _PLANET_KEYS:
                         candidates.append(_PLANET_KEYS[nm])
+                        candidates += _PLANET_ALIASES.get(nm, [])
                     candidates += _SMALLBODY_HINTS.get(nm, [])
                     for lab in candidates:
                         try:
