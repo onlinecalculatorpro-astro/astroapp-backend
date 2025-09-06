@@ -847,7 +847,7 @@ class EphemerisAdapter:
             "ok": not any(w.startswith("error:") for w in warnings),
             "warnings": warnings,
             "kernel": current_kernel_name(),
-            "kernels": [os.path.basename(p) for p in _KERNEL_PATHS] or [EPHEMERIS_NAME_DEFAULT],
+            "kernels": [os.path.basename(p) for p in dict.fromkeys(_KERNEL_PATHS)] or [EPHEMERIS_NAME_DEFAULT],
             "frame": "ecliptic-j2000" if frame.lower() in ("ecliptic-j2000", "j2000", "ecl-j2000") else "ecliptic-of-date",
             "topocentric": bool(topocentric_resolved),
             "node_model": self.cfg.node_model,
