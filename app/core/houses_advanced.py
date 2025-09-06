@@ -181,14 +181,14 @@ def _fill_opposites(cusps: List[Optional[float]]) -> List[float]:
             out[a] = _norm_deg(out[b] + 180.0)  # type: ignore
     outf = [float(_norm_deg(c)) for c in out]  # type: ignore
     
-     # Allow natural computational variations (don't force exact opposition)
-     for i in range(6):
-      opp = _norm_deg(outf[i] + 180.0)
-      # RELAXED: Only correct if difference > 0.001 degrees (3.6 arcseconds)
-      if _wrap_diff_deg(outf[i + 6], opp) > 0.001:
-        outf[i + 6] = opp
+    # Allow natural computational variations (don't force exact opposition)
+    for i in range(6):
+        opp = _norm_deg(outf[i] + 180.0)
+        # RELAXED: Only correct if difference > 0.001 degrees (3.6 arcseconds)
+        if _wrap_diff_deg(outf[i + 6], opp) > 0.001:
+            outf[i + 6] = opp
     return outf
-
+ 
 # ───────────────────────── exact house engines (closed/solved) ─────────────────────────
 
 def _equal(asc: float) -> List[float]:
