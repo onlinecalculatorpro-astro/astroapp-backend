@@ -588,7 +588,7 @@ def _frame_latlon(geo, ecliptic_frame, *, abs_zero_tol_deg: float) -> Tuple[floa
         x, y, z = (float(xyz.au[0]), float(xyz.au[1]), float(xyz.au[2]))
         rho = math.hypot(x, y)
         if math.isfinite(x) and math.isfinite(y) and math.isfinite(z) and (rho > 0.0 or z != 0.0):
-            lon = _atan2deg(y, x, abs_zero_tol_deg=abs_zero_tol_deg)
+            lon = _atan2deg(y, x, abs_zero_tol_deg=self.cfg.abs_zero_tol_deg)  # type: ignore[attr-defined]
             lat = math.degrees(math.atan2(z, rho)) if rho > 0.0 else (90.0 if z > 0.0 else -90.0)
             return lon % 360.0, float(lat)
     except Exception:
@@ -912,7 +912,8 @@ class EphemerisAdapter:
     def _mk_row(name: str, lon: float, *, lat: Optional[float] = None,
                 vel: Optional[float] = None, node_model: Optional[str] = None,
                 node_fallback: Optional[str] = None) -> Dict[str, Any]:
-        row: Dict[str, Any] = {"name": name, "longitude": float(lon), "lon": float(lon)}
+        # For predictive.py compatibility, include both "name" (as requested) and "body" (lower-case).
+        row: Dict[str, Any] = {"name": name, "body": str(name).lower(), "longitude": float(lon), "lon": float(lon)}
         if lat is not None and math.isfinite(lat):
             row["lat"] = float(lat)
             row["latitude"] = float(lat)
@@ -1219,20 +1220,48 @@ def ecliptic_longitudes_and_velocities(*args, **kwargs):
     return _get_default_adapter().ecliptic_longitudes_and_velocities(*args, **kwargs)
 
 def rows_to_maps(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
+    """
+    Build {"longitudes": {...}, "velocities": {...}} maps keyed by both the
+    request "name" (preserving case) **and** a lower-cased "body" alias.
+
+    This ensures callers like predictive.TransitEngine can retrieve by the exact
+    string they passed (e.g., "Moon") while also supporting "moon".
+    """
     lon_map: Dict[str, float] = {}
     vel_map: Dict[str, float] = {}
+
     for r in rows:
+        # keys we will populate for this row
+        keys: List[str] = []
         nm = r.get("name")
-        if not nm:
-            continue
-        if "longitude" in r:
-            lon_map[nm] = float(r["longitude"])
-        elif "lon" in r:
-            lon_map[nm] = float(r["lon"])
-        if "velocity" in r:
-            vel_map[nm] = float(r["velocity"])
-        elif "speed" in r:
-            vel_map[nm] = float(r["speed"])
+        if nm:
+            keys.append(str(nm))
+        body = r.get("body") or (str(nm).lower() if nm else None)
+        if body:
+            keys.append(str(body))
+
+        # longitude
+        if "longitude" in r or "lon" in r:
+            val = r.get("longitude", r.get("lon"))
+            try:
+                fval = float(val)  # type: ignore[arg-type]
+            except Exception:
+                fval = None  # type: ignore[assignment]
+            if fval is not None and math.isfinite(fval):
+                for k in keys:
+                    lon_map[k] = fval
+
+        # velocity
+        if "velocity" in r or "speed" in r:
+            v = r.get("velocity", r.get("speed"))
+            try:
+                fvel = float(v)  # type: ignore[arg-type]
+            except Exception:
+                fvel = None  # type: ignore[assignment]
+            if fvel is not None and math.isfinite(fvel):
+                for k in keys:
+                    vel_map[k] = fvel
+
     return {"longitudes": lon_map, "velocities": vel_map}
 
 def ephemeris_diagnostics(*args, **kwargs) -> Dict[str, Any]:
