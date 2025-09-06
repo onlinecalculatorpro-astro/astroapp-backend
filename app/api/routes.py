@@ -39,6 +39,8 @@ from app.core.validators import (
     parse_prediction_payload,
     parse_rectification_payload,  # noqa: F401 (kept for completeness)
     parse_ephemeris_payload,
+    parse_frame,
+    parse_latlon,
 )
 
 # Timescales core
@@ -1355,8 +1357,18 @@ def predictive_transits():
     lat = float(body.get("latitude")) if isinstance(body.get("latitude"), (int, float)) else None
     lon = float(body.get("longitude")) if isinstance(body.get("longitude"), (int, float)) else None
     elev = float(body.get("elevation_m")) if isinstance(body.get("elevation_m"), (int, float)) else None
-    frame = body.get("frame") or "ecliptic-of-date"
+    # Normalize frame (accepts aliases like 'ecl-j2000')
+    frame = parse_frame(body.get("frame"))
+    # Step minutes must be positive
     step_min = float(body.get("step_minutes") or 30.0)
+    if not (step_min > 0):
+        return _json_error("validation_error", [{"loc": ["step_minutes"], "msg": "must be > 0"}], 400)
+    # Optional: validate lat/lon if user provided either
+    if topocentric and (lat is not None or lon is not None):
+        try:
+            lat, lon = parse_latlon(lat, lon)
+        except ValidationError as e:
+            return _json_error("validation_error", e.errors(), 400)
 
     include_antiscia = bool(body.get("include_antiscia", False))
     antiscia_orb_deg = float(body.get("antiscia_orb_deg", 2.0))
@@ -1437,7 +1449,7 @@ def predictive_ingresses():
         movers = body.get("movers") or ["Sun","Mercury","Venus","Mars","Jupiter","Saturn"]
         from app.core import predictive as pred
         eng = pred.TransitEngine(
-            frame=body.get("frame") or "ecliptic-of-date",
+            frame=parse_frame(body.get("frame")),
             topocentric=bool(body.get("topocentric")),
             latitude=float(body.get("latitude")) if isinstance(body.get("latitude"), (int,float)) else None,
             longitude=float(body.get("longitude")) if isinstance(body.get("longitude"), (int,float)) else None,
@@ -1478,7 +1490,7 @@ def predictive_stations():
         movers = body.get("movers") or ["Mercury","Venus","Mars","Jupiter","Saturn","Uranus","Neptune","Pluto"]
         from app.core import predictive as pred
         eng = pred.TransitEngine(
-            frame=body.get("frame") or "ecliptic-of-date",
+            frame=parse_frame(body.get("frame")),
             topocentric=bool(body.get("topocentric")),
             latitude=float(body.get("latitude")) if isinstance(body.get("latitude"), (int,float)) else None,
             longitude=float(body.get("longitude")) if isinstance(body.get("longitude"), (int,float)) else None,
