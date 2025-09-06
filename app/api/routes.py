@@ -392,28 +392,32 @@ except Exception as e1:  # pragma: no cover
         _CHART_ENGINE_NAME = None
         log.error("No compute_chart available: astronomy failed=%r, chart failed=%r", e1, e2)
 
-_HOUSES_KIND = "policy"
+_HOUSES_KIND = "advanced"
 _can_sys = None
 try:
-    from app.core.house import (  # type: ignore
-        compute_houses_with_policy as _houses_fn,
-        canonicalize_system as _can_sys,
-        POLAR_SOFT_LIMIT_DEG,
-        POLAR_HARD_LIMIT_DEG,
-    )
-except Exception:
+    # FORCE: Use advanced engine directly
+    from app.core.houses_advanced import compute_house_system as _houses_fn  # type: ignore
+    _HOUSES_KIND = "advanced"
+    POLAR_SOFT_LIMIT_DEG = float(os.getenv("ASTRO_POLAR_SOFT_LAT", "66.0"))
+    POLAR_HARD_LIMIT_DEG = float(os.getenv("ASTRO_POLAR_HARD_LAT", "80.0"))
+    log.info("Using advanced house engine directly")
+except Exception as e1:
+    # Fallback to policy facade if advanced engine fails
     try:
-        from app.core.houses_advanced import compute_house_system as _houses_fn  # type: ignore
-        _HOUSES_KIND = "legacy"
-        POLAR_SOFT_LIMIT_DEG = float(os.getenv("ASTRO_POLAR_SOFT_LAT", "66.0"))
-        POLAR_HARD_LIMIT_DEG = float(os.getenv("ASTRO_POLAR_HARD_LAT", "80.0"))
-    except Exception as e:
+        from app.core.house import (  # type: ignore
+            compute_houses_with_policy as _houses_fn,
+            canonicalize_system as _can_sys,
+            POLAR_SOFT_LIMIT_DEG,
+            POLAR_HARD_LIMIT_DEG,
+        )
+        _HOUSES_KIND = "policy"
+        log.warning("Advanced engine failed, using policy facade: %r", e1)
+    except Exception as e2:
         _houses_fn = None  # type: ignore
         _HOUSES_KIND = "unavailable"
         POLAR_SOFT_LIMIT_DEG = float(os.getenv("ASTRO_POLAR_SOFT_LAT", "66.0"))
         POLAR_HARD_LIMIT_DEG = float(os.getenv("ASTRO_POLAR_HARD_LAT", "80.0"))
-        log.error("No house engine available: %r", e)
-
+        log.error("No house engine available: advanced=%r, policy=%r", e1, e2)
 
 def _sig_accepts(fn, *names: str) -> Dict[str, bool]:
     try:
