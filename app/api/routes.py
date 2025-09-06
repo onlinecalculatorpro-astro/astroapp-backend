@@ -675,51 +675,66 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
         raise
 
 def _call_compute_aspects(payload: Dict[str, Any], chart: Dict[str, Any], houses: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Build a positions dict from chart (and optional houses) and delegate to the
+    HTTP-facing aspects adapter (run_aspects_api). All angles are normalized to [0, 360).
+    """
     try:
-        from app.core.aspects import compute_aspects
+        from app.core.aspects import run_aspects_api
     except ImportError:
         raise RuntimeError("aspects engine not available")
 
-    # Extract planetary positions from chart
-    bodies = chart.get("bodies", [])
-    points = chart.get("points", [])
-    
-    # Build positions dictionary
-    positions = {}
-    for body in bodies:
-        if "name" in body and "longitude_deg" in body:
-            positions[body["name"]] = body["longitude_deg"]
-    
-    for point in points:
-        if "name" in point and "longitude_deg" in point:
-            positions[point["name"]] = point["longitude_deg"]
-    
-    # Add house cusps if available
-    if houses and houses.get("cusps"):
-        cusps = houses["cusps"]
-        positions.update({
-            f"House {i+1}": cusps[i] for i in range(len(cusps))
-        })
-        # Add angles
-        if "asc" in houses:
-            positions["Ascendant"] = houses["asc"]
-        if "mc" in houses:
-            positions["Midheaven"] = houses["mc"]
+    # --- Collect ecliptic longitudes (deg) from chart bodies/points ---
+    positions: Dict[str, float] = {}
+    for src in ("bodies", "points"):
+        for rec in (chart.get(src) or []):
+            if not isinstance(rec, dict):
+                continue
+            name = rec.get("name")
+            L = rec.get("longitude_deg")
+            if isinstance(name, str) and isinstance(L, (int, float)):
+                positions[name] = _wrap360(float(L))
 
-    # Prepare aspects configuration
-    aspects_config = {
+    # --- Optionally add house cusps and angles if provided ---
+    if isinstance(houses, dict):
+        cusps = houses.get("cusps") or houses.get("cusps_deg")
+        if isinstance(cusps, list):
+            for i, c in enumerate(cusps):
+                if isinstance(c, (int, float)):
+                    positions[f"House {i+1}"] = _wrap360(float(c))
+
+        # Add angles (Asc/MC) when present
+        asc_v = houses.get("asc") if isinstance(houses.get("asc"), (int, float)) else houses.get("asc_deg")
+        mc_v  = houses.get("mc")  if isinstance(houses.get("mc"), (int, float))  else houses.get("mc_deg")
+        if isinstance(asc_v, (int, float)):
+            positions["Ascendant"] = _wrap360(float(asc_v))
+        if isinstance(mc_v, (int, float)):
+            positions["Midheaven"] = _wrap360(float(mc_v))
+
+    # --- Optional declinations for parallels/contra-parallels ---
+    decls: Dict[str, float] = {}
+    for src in ("bodies", "points"):
+        for rec in (chart.get(src) or []):
+            if not isinstance(rec, dict):
+                continue
+            name = rec.get("name")
+            d = rec.get("declination_deg")
+            if isinstance(name, str) and isinstance(d, (int, float)):
+                decls[name] = float(d)
+
+    # --- Prepare adapter config ---
+    aspects_config: Dict[str, Any] = {
         "positions": positions,
-        "orbs": payload.get("orbs", None),
-        "aspects": payload.get("aspects", None),
-        "mode": payload.get("mode", "tropical")
+        "orbs": payload.get("orbs") or None,
+        "aspects": payload.get("aspects") or None,
+        "mode": (payload.get("mode") or "tropical"),
     }
+    if decls:
+        aspects_config["declinations"] = decls  # only enables parallels if requested in `aspects`
 
-    # Call aspects engine
-    try:
-        return compute_aspects(**aspects_config)
-    except Exception as e:
-        # Fallback with just planetary positions
-        return compute_aspects(positions=positions)
+    # --- Run aspects engine (adapter handles empty positions gracefully) ---
+    return run_aspects_api(**aspects_config)
+
 
 def _extract_ayanamsa_from_chart(chart: Dict[str, Any]) -> Optional[float]:
     if not isinstance(chart, dict):
