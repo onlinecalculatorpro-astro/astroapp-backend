@@ -841,7 +841,7 @@ class EphemerisAdapter:
     # ---- rows ---------------------------------------------------------------
     @staticmethod
     def _mk_row(name: str, lon: float, *, lat: Optional[float] = None,
-                vel: Optional[float] = None, node_model: Optional[str] = None,
+                vel: Optional[float] = None, node_model: Optional[float] = None,
                 node_fallback: Optional[str] = None) -> Dict[str, Any]:
         row: Dict[str, Any] = {"name": name, "longitude": float(lon), "lon": float(lon)}
         if lat is not None and math.isfinite(lat):
