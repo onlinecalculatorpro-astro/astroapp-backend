@@ -4,9 +4,9 @@
 #
 # Guarantees
 # • ALWAYS returns {"results": [ {name, longitude, ...} ], "meta": {...}, "center": "..."}.
-# • Accepts both argument names: names=[] or bodies=[].
+# • Accepts both argument names: names=[] or bodies=[] (case-insensitive).
 # • Frame: "ecliptic-of-date" (default) or "ecliptic-j2000", via ERFA when available.
-# • Topocentric honored via (topocentric=True + observer or lat/lon/elevation); safe fallback to geocentric with warning.
+# • Topocentric honored via (topocentric=True + observer or lat/lon/elevation); safe fallback with warning.
 # • Velocities via adaptive Richardson + independent XY estimator cross-check.
 # • Robust lunar nodes (true via angular-momentum; mean as policy/fallback), with speed via central diff.
 # • Clean error taxonomy in warnings; JD guard aligned to DE421 span by default (override via env).
@@ -181,7 +181,7 @@ _PLANET_KEYS: Dict[str, str] = {
 }
 _MAJOR_CANON = {k.lower(): k for k in _PLANET_KEYS.keys()}
 
-# Fallback labels if the primary isn't present in the kernel
+# Accept planet-centered fallbacks too
 _PLANET_ALIASES = {
     "Sun":     ["sun"],
     "Moon":    ["moon"],
@@ -194,6 +194,21 @@ _PLANET_ALIASES = {
     "Uranus":  ["uranus"],
     "Neptune": ["neptune"],
     "Pluto":   ["pluto"],
+}
+
+# NAIF numeric fallbacks (barycenter first, then planet)
+_NAIF_IDS = {
+    "Sun":     [10],
+    "Moon":    [301],
+    "Mercury": [1, 199],
+    "Venus":   [2, 299],
+    "Earth":   [3, 399],
+    "Mars":    [4, 499],
+    "Jupiter": [5, 599],
+    "Saturn":  [6, 699],
+    "Uranus":  [7, 799],
+    "Neptune": [8, 899],
+    "Pluto":   [9, 999],
 }
 
 _NODE_ALIAS: Dict[str, Tuple[str, Optional[str]]] = {
@@ -704,7 +719,7 @@ def _true_node_geocentric_tick(cache_key: Tuple[int, float, float]) -> float:
             return float("nan")
         return (math.degrees(math.atan2(ny, nx)) % 360.0)
     except Exception as e:
-        log.debug("true-node compute failed %s", e)
+        log.debug("true-node compute failed %s: %s", e)
         return float("nan")
 
 def _node_longitude(
@@ -804,8 +819,6 @@ class EphemerisAdapter:
                     labels.extend(list(obj.keys()))
             except Exception:
                 pass
-        for lst in _SMALLBODY_HINTS.values():
-            labels.extend(lst)
         # uniq
         seen = set(); out: List[str] = []
         for s in labels:
@@ -841,16 +854,23 @@ class EphemerisAdapter:
 
     @lru_cache(maxsize=2048)
     def _get_body(self, name: str):
-        # Major planets: primary key then fallbacks, then heuristic substring scan
+        # Major planets: primary key → aliases → NAIF codes → substring scan
         if name in _PLANET_KEYS:
             labels = [_PLANET_KEYS[name]] + _PLANET_ALIASES.get(name, [])
             for k in self._kernels_iter():
+                # 1) string labels
                 for lab in labels:
                     try:
                         return k[lab]
                     except Exception:
-                        continue
-            # last-resort: substring scan of kernel labels
+                        pass
+                # 2) numeric NAIF codes (Skyfield supports int codes for SPK)
+                for code in _NAIF_IDS.get(name, []):
+                    try:
+                        return k[code]
+                    except Exception:
+                        pass
+            # 3) last-resort: substring scan of kernel label namespaces
             needle = name.lower()
             for k in self._kernels_iter():
                 for lab in self._all_kernel_labels(k):
@@ -858,7 +878,8 @@ class EphemerisAdapter:
                         if needle in lab.lower():
                             return k[lab]
                     except Exception:
-                        continue
+                        pass
+
         # Smalls via hints/scan
         if name in _SMALL_CANON.values():
             b = self._resolve_small_body(name)
@@ -880,7 +901,6 @@ class EphemerisAdapter:
         }
         if diags:
             base["diagnostics"] = diags
-        # helpful extras if available
         if KERNEL_COVERAGE_JD:
             base["ephemeris_coverage_jd"] = list(KERNEL_COVERAGE_JD)
         if EPHEMERIS_PATH:
