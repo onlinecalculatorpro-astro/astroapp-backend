@@ -203,6 +203,20 @@ _SMALLBODY_HINTS: Dict[str, List[str]] = {
     "Chiron": ["2060 Chiron", "Chiron", "2002060", "2060", "95P/Chiron"],
 }
 
+# Fallback labels if the primary isn't present in the kernel
+_PLANET_ALIASES = {
+    "Mercury": ["mercury barycenter"],
+    "Venus":   ["venus barycenter"],
+    "Earth":   ["earth barycenter"],
+    "Mars":    ["mars barycenter"],
+    "Jupiter": ["jupiter"],  # primary is barycenter above
+    "Saturn":  ["saturn"],
+    "Uranus":  ["uranus"],
+    "Neptune": ["neptune"],
+    "Pluto":   ["pluto"],
+}
+
+
 def _canon_node(nm: str) -> Tuple[str, Optional[str]]:
     low = (nm or "").strip().lower()
     return _NODE_ALIAS.get(low, (nm, None))
