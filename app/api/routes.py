@@ -32,7 +32,7 @@ from zoneinfo import ZoneInfo
 from app.version import VERSION
 from app.utils.config import load_config
 from app.utils.hc import flag_predictions
-from app.utils.ratelimit import rate_limit
+from app.utils.ratelimit import rate_limit, client_key, endpoint_key
 from app.core.validators import (
     ValidationError,
     parse_chart_payload,
