@@ -9,7 +9,7 @@
 # • Topocentric honored via (topocentric=True + observer or lat/lon/elevation); safe fallback to geocentric with warning.
 # • Velocities via adaptive Richardson + independent XY estimator cross-check.
 # • Robust lunar nodes (true via angular-momentum; mean as policy/fallback), with speed via central diff.
-# • Clean error taxonomy in warnings; JD guard aligned to DE421 span (configurable).
+# • Clean error taxonomy in warnings; JD guard aligned to DE420 span (configurable).
 # • Optional SPICE for selected small bodies (Ceres, Pallas, Juno, Vesta, Chiron) when enabled.
 # -----------------------------------------------------------------------------
 from __future__ import annotations
@@ -84,6 +84,52 @@ except Exception:
     _SPICE_OK = False
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Kernel path resolution (single source of truth) + BSP introspection
+# ─────────────────────────────────────────────────────────────────────────────
+def _env_ephemeris_path() -> Optional[str]:
+    """
+    Return path from env:
+      1) OCP_EPHEMERIS
+      2) EPHEM_DIR + EPHEM_FILE
+    """
+    p = os.getenv("OCP_EPHEMERIS")
+    if p:
+        return p
+    d = os.getenv("EPHEM_DIR", "")
+    f = os.getenv("EPHEM_FILE", "")
+    if d or f:
+        return os.path.join(d, f)
+    return None
+
+# Resolve once for telemetry; loader will reuse or fallback if missing
+EPHEMERIS_PATH = _env_ephemeris_path()
+EPHEMERIS_NAME = os.path.basename(EPHEMERIS_PATH or "") or EPHEMERIS_NAME_DEFAULT
+
+# --- Kernel identity & coverage (debug/telemetry) ---
+# Uses jplephem only for coverage; does not affect Skyfield flow.
+try:
+    from jplephem.spk import SPK  # type: ignore
+    _cov = None
+    if EPHEMERIS_PATH and os.path.isfile(EPHEMERIS_PATH):
+        _spk = SPK.open(EPHEMERIS_PATH)
+        _cov = (
+            min(seg.start_jd for seg in _spk.segments),
+            max(seg.end_jd for seg in _spk.segments),
+        )
+        _spk.close()
+    KERNEL_COVERAGE_JD: Optional[Tuple[float, float]] = _cov
+except Exception:
+    KERNEL_COVERAGE_JD = None
+
+def current_kernel_name() -> str:
+    """Short BSP filename(s). If not yet loaded, returns env-derived name or default."""
+    return EPHEMERIS_NAME
+
+def current_kernel_path() -> Optional[str]:
+    """Absolute/relative path to main BSP (env-resolved)."""
+    return EPHEMERIS_PATH
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Adapter configuration
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
@@ -115,7 +161,7 @@ class Config:
 # Global singletons (legacy facade; the class can be used independently)
 # ─────────────────────────────────────────────────────────────────────────────
 _TS = None                 # Skyfield timescale
-_MAIN = None               # Main DE421 kernel
+_MAIN = None               # Main DE kernel
 _EXTRA: List[Any] = []     # Extra SPKs
 _KERNEL_PATHS: List[str] = []
 
@@ -202,9 +248,18 @@ def _speed_step_for(name: str) -> float:
 # Kernel I/O
 # ─────────────────────────────────────────────────────────────────────────────
 def _resolve_kernel_path() -> Optional[str]:
-    path = os.getenv("OCP_EPHEMERIS")
-    if path and os.path.isfile(path):
-        return path
+    """
+    Prefer the env-resolved EPHEMERIS_PATH (OCP_EPHEMERIS or EPHEM_DIR+EPHEM_FILE),
+    else fallback to app/data/de421.bsp if present.
+    """
+    global EPHEMERIS_PATH, EPHEMERIS_NAME
+    if EPHEMERIS_PATH and os.path.isfile(EPHEMERIS_PATH):
+        return EPHEMERIS_PATH
+    p = _env_ephemeris_path()
+    if p and os.path.isfile(p):
+        EPHEMERIS_PATH = p
+        EPHEMERIS_NAME = os.path.basename(p) or EPHEMERIS_NAME_DEFAULT
+        return p
     fallback = os.path.join(os.getcwd(), "app", "data", "de421.bsp")
     return fallback if os.path.isfile(fallback) else None
 
@@ -268,12 +323,13 @@ def _get_kernels():
 
         path = _resolve_kernel_path()
         if not path:
-            raise EphemerisError("kernel", "No local DE421 found (set OCP_EPHEMERIS or place app/data/de421.bsp)")
+            raise EphemerisError("kernel", "No local DE kernel found (set OCP_EPHEMERIS or EPHEM_DIR+EPHEM_FILE)")
         if _looks_like_lfs_pointer(path):
             raise EphemerisError("kernel", f"Kernel looks like a Git LFS pointer: {path}")
 
         _MAIN = _load_kernel(path)
-        _KERNEL_PATHS.append(path)
+        if path not in _KERNEL_PATHS:
+            _KERNEL_PATHS.append(path)
 
         _EXTRA = []
         for p in _extra_spk_paths():
@@ -288,11 +344,6 @@ def _get_kernels():
             _KERNEL_PATHS.append(p)
 
     return _MAIN, _EXTRA
-
-def current_kernel_name() -> str:
-    if _KERNEL_PATHS:
-        return ", ".join(os.path.basename(p) for p in _KERNEL_PATHS)
-    return EPHEMERIS_NAME_DEFAULT
 
 def load_kernel(kernel_name: str = "de421"):
     """Load configured Skyfield kernels (main + extras)."""
@@ -322,15 +373,15 @@ def _spice_bootstrap(warnings: Optional[List[str]] = None) -> bool:
                 pass
             furnished: List[str] = []
 
-            de421_path = _resolve_kernel_path()
-            if de421_path and os.path.isfile(de421_path):
-                if _looks_like_lfs_pointer(de421_path):
-                    msg = f"Kernel looks like a Git LFS pointer: {de421_path}"
+            de_path = _resolve_kernel_path()
+            if de_path and os.path.isfile(de_path):
+                if _looks_like_lfs_pointer(de_path):
+                    msg = f"Kernel looks like a Git LFS pointer: {de_path}"
                     if warnings is not None:
                         warnings.append(f"spice:{msg}")
                     raise EphemerisError("spice", msg)
-                sp.furnsh(de421_path)  # type: ignore
-                furnished.append(de421_path)
+                sp.furnsh(de_path)  # type: ignore
+                furnished.append(de_path)
 
             for p in _extra_spk_paths():
                 if _looks_like_lfs_pointer(p):
@@ -1140,6 +1191,9 @@ __all__ = [
     "ephemeris_diagnostics",
     "load_kernel",
     "current_kernel_name",
+    "current_kernel_path",
+    "EPHEMERIS_PATH",
+    "KERNEL_COVERAGE_JD",
     "clear_adapter_caches",
     "get_ecliptic_longitudes",
     "get_node_longitude",
