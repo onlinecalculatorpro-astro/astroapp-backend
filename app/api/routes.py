@@ -5,6 +5,7 @@ AstroApp — Canonical API Routes
 - Chart + Houses
 - Predictions
 - Ephemeris
+- Predictive toolkit
 - Ops: /api/health, /api/config, /api/openapi, /__debug/routes
 
 Notes:
@@ -19,6 +20,7 @@ import json
 import logging
 import os
 import re
+import math
 import inspect
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
@@ -54,6 +56,17 @@ api = Blueprint("api", __name__)
 DEBUG_VERBOSE = os.getenv("ASTRO_DEBUG_VERBOSE", "0").lower() in ("1", "true", "yes", "on")
 ARCSEC_TOL = float(os.getenv("ASTRO_ASC_TOL_ARCSEC", "3.6"))  # 0.001°
 
+# ── per-endpoint rate-limit caps (calls per minute, env-overridable) ───────────
+_RL = lambda k, d: int(os.getenv(k, str(d)))
+RL_TIMESCALES   = _RL("ASTRO_RL_TIMESCALES_PER_MIN",   60)
+RL_CALCULATE    = _RL("ASTRO_RL_CALCULATE_PER_MIN",    24)
+RL_REPORT       = _RL("ASTRO_RL_REPORT_PER_MIN",       12)
+RL_ASPECTS      = _RL("ASTRO_RL_ASPECTS_PER_MIN",      18)
+RL_EPHEM        = _RL("ASTRO_RL_EPHEM_PER_MIN",        30)
+RL_PREDICTIONS  = _RL("ASTRO_RL_PREDICTIONS_PER_MIN",   6)
+RL_PREDICTIVE   = _RL("ASTRO_RL_PREDICTIVE_PER_MIN",   12)
+RL_DEBUG        = _RL("ASTRO_RL_DEBUG_PER_MIN",         6)
+
 
 # ───────────────────────── helpers ─────────────────────────
 def _wrap360(x: float) -> float:
@@ -86,20 +99,20 @@ def _split_jd(jd: float) -> tuple[float, float]:
 
 
 def _sind(a: float) -> float:
-    import math
-    return math.sin(math.radians(a))
+    import math as _m
+    return _m.sin(_m.radians(a))
 
 
 def _cosd(a: float) -> float:
-    import math
-    return math.cos(math.radians(a))
+    import math as _m
+    return _m.cos(_m.radians(a))
 
 
 def _atan2d(y: float, x: float) -> float:
-    import math
+    import math as _m
     if abs(x) < 1e-18 and abs(y) < 1e-18:
         raise ValueError("atan2(0,0) undefined")
-    return _wrap360(math.degrees(math.atan2(y, x)))
+    return _wrap360(_m.degrees(_m.atan2(y, x)))
 
 
 def _gast_deg(jd_ut1: float, jd_tt: float) -> float:
@@ -108,10 +121,10 @@ def _gast_deg(jd_ut1: float, jd_tt: float) -> float:
         d1u, d2u = _split_jd(jd_ut1)
         d1t, d2t = _split_jd(jd_tt)
         gst_rad = erfa.gst06a(d1u, d2u, d1t, d2t)
-        import math
-        return _wrap360(math.degrees(gst_rad))
+        import math as _m
+        return _wrap360(_m.degrees(gst_rad))
     except Exception:
-        import math
+        import math as _m
         T = (float(jd_ut1) - 2451545.0) / 36525.0
         theta = (
             280.46061837
@@ -128,10 +141,10 @@ def _true_obliquity_deg(jd_tt: float) -> float:
         d1, d2 = _split_jd(jd_tt)
         eps0 = erfa.obl06(d1, d2)
         _dpsi, deps = erfa.nut06a(d1, d2)
-        import math
-        return math.degrees(eps0 + deps)
+        import math as _m
+        return _m.degrees(eps0 + deps)
     except Exception:
-        import math
+        import math as _m
         T = (float(jd_tt) - 2451545.0) / 36525.0
         eps_arcsec = 84381.448 - 46.8150 * T - 0.00059 * (T**2) + 0.001813 * (T**3)
         return eps_arcsec / 3600.0
@@ -146,14 +159,14 @@ def _mc_from_ramc(ramc: float, eps: float) -> float:
 
 
 def _asc_from_phi_ramc(phi: float, ramc: float, eps: float) -> float:
-    import math
+    import math as _m
 
     def _acotd(x: float) -> float:
-        return _wrap360(math.degrees(math.atan2(1.0, x)))
+        return _wrap360(_m.degrees(_m.atan2(1.0, x)))
 
-    num = -((math.tan(math.radians(phi)) * _sind(eps)) + (_sind(ramc) * _cosd(eps)))
+    num = -((_m.tan(_m.radians(phi)) * _sind(eps)) + (_sind(ramc) * _cosd(eps)))
     den = _cosd(ramc)
-    den = den if abs(den) > 1e-15 else math.copysign(1e-15, den if den != 0 else 1.0)
+    den = den if abs(den) > 1e-15 else _m.copysign(1e-15, den if den != 0 else 1.0)
     return _acotd(num / den)
 
 
@@ -324,6 +337,7 @@ def config_info():
 
 
 @api.get("/api/openapi")
+@rate_limit(RL_DEBUG)
 def openapi_spec():
     import yaml
     base = os.path.dirname(__file__)
@@ -337,6 +351,7 @@ def openapi_spec():
 
 
 @api.get("/__debug/routes")
+@rate_limit(RL_DEBUG)
 def debug_routes():
     """Simple route index used by the frontend 'Routes' page."""
     rules = []
@@ -351,6 +366,7 @@ def debug_routes():
 
 # ───────────────────────── timescales ─────────────────────────
 @api.post("/api/timescales")
+@rate_limit(RL_TIMESCALES)
 def timescales_endpoint():
     body = request.get_json(force=True) or {}
     try:
@@ -413,7 +429,7 @@ except Exception:
         POLAR_SOFT_LIMIT_DEG = float(os.getenv("ASTRO_POLAR_SOFT_LAT", "66.0"))
         POLAR_HARD_LIMIT_DEG = float(os.getenv("ASTRO_POLAR_HARD_LAT", "80.0"))
         log.error("No house engine available: %r", e)
-        
+
 def _sig_accepts(fn, *names: str) -> Dict[str, bool]:
     try:
         params = fn.__signature__.parameters  # type: ignore[attr-defined]
@@ -422,7 +438,7 @@ def _sig_accepts(fn, *names: str) -> Dict[str, bool]:
     return {n: (n in params) for n in names}
 
 
-# ---------- NEW: adapter/kernel meta snapshot (for dev tools visibility) ----------
+# ---------- adapter/kernel meta snapshot (for dev tools visibility) ----------
 def _snapshot_ephemeris_meta(chart_meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Return a small dict with adapter/kernel information WITHOUT forcing a kernel
@@ -477,12 +493,6 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
         raise RuntimeError("chart_engine_unavailable")
 
     param_names = set(inspect.signature(_compute_chart).parameters.keys())
-
-    def pick(*cands: str) -> Optional[str]:
-        for c in cands:
-            if c in param_names:
-                return c
-        return None
 
     def _normalize_payload_for_engine(p: Dict[str, Any]) -> Dict[str, Any]:
         q = dict(p)
@@ -585,14 +595,14 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
         raise RuntimeError("houses_engine_unavailable")
 
     # DEBUG: Add comprehensive logging
-    log.info(f"=== HOUSE CALC START ===")
-    log.info(f"Function: {_houses_fn.__name__} from {_houses_fn.__module__}")
-    log.info(f"Houses kind: {_HOUSES_KIND}")
-    log.info(f"Payload keys: {list(payload.keys())}")
-    log.info(f"Timescales: jd_tt={ts.get('jd_tt')}, jd_ut1={ts.get('jd_ut1')}")
+    log.info("=== HOUSE CALC START ===")
+    log.info("Function: %s from %s", getattr(_houses_fn, "__name__", "?"), getattr(_houses_fn, "__module__", "?"))
+    log.info("Houses kind: %s", _HOUSES_KIND)
+    log.info("Payload keys: %s", list(payload.keys()))
+    log.info("Timescales: jd_tt=%s, jd_ut1=%s", ts.get("jd_tt"), ts.get("jd_ut1"))
 
     acc = _sig_accepts_houses()
-    log.info(f"Function signature accepts: {acc}")
+    log.info("Function signature accepts: %s", acc)
 
     lat_raw = payload.get("latitude")
     lon_raw = payload.get("longitude")
@@ -608,15 +618,11 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
         else (requested_system_raw.lower() or None)
     )
 
-    log.info(f"System: {requested_system_raw} -> {requested_system}")
+    log.info("System: %s -> %s", requested_system_raw, requested_system)
 
     # Force diagnostic parameters
-    payload_with_diagnostics = dict(payload)
-    payload_with_diagnostics["diagnostics"] = True
-    payload_with_diagnostics["validation"] = True
-    
     kwargs: Dict[str, Any] = {}
-    
+
     # Coordinate parameters
     if acc.get("lat"):
         kwargs["lat"] = lat
@@ -655,24 +661,25 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
     if acc.get("validation"):
         kwargs["validation"] = True
 
-    log.info(f"Calling {_houses_fn.__name__} with kwargs: {list(kwargs.keys())}")
-    log.info(f"Kwargs values: {kwargs}")
+    log.info("Calling %s with kwargs: %s", getattr(_houses_fn, "__name__", "?"), list(kwargs.keys()))
+    log.info("Kwargs values: %s", kwargs)
 
     try:
         result = _houses_fn(**kwargs)
-        log.info(f"Result type: {type(result)}")
-        log.info(f"Result keys: {list(result.keys()) if hasattr(result, 'keys') else 'not_dict'}")
-        
+        log.info("Result type: %s", type(result))
+        log.info("Result keys: %s", list(result.keys()) if hasattr(result, "keys") else "not_dict")
+
         # Check for advanced engine indicators
-        has_solver = hasattr(result, 'solver_stats') or (hasattr(result, 'get') and result.get('solver_stats'))
-        has_budget = hasattr(result, 'error_budget') or (hasattr(result, 'get') and result.get('error_budget'))
-        log.info(f"Advanced indicators: solver_stats={has_solver}, error_budget={has_budget}")
-        
+        has_solver = hasattr(result, "solver_stats") or (hasattr(result, "get") and result.get("solver_stats"))
+        has_budget = hasattr(result, "error_budget") or (hasattr(result, "get") and result.get("error_budget"))
+        log.info("Advanced indicators: solver_stats=%s, error_budget=%s", has_solver, has_budget)
+
         return result
-        
+
     except Exception as e:
-        log.error(f"House calculation failed: {type(e).__name__}: {e}")
+        log.error("House calculation failed: %s: %s", type(e).__name__, e)
         raise
+
 
 def _call_compute_aspects(payload: Dict[str, Any], chart: Dict[str, Any], houses: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """
@@ -795,16 +802,13 @@ def _recompute_houses_angles_if_needed(
     mc_old = h.get("mc_deg") if isinstance(h.get("mc_deg"), (int, float)) else h.get("mc")
     warn_list = h.get("warnings") or []
     changed = False
-    
+
     if isinstance(asc_old, (int, float)):
-        d_asc = _delta_arcsec(asc_new, float(asc_old))
-        # DISABLED: Don't override advanced engine calculations
-        # if d_asc > ARCSEC_TOL:
-        #     h["asc_deg"] = _wrap360(asc_new); h["asc"] = h["asc_deg"]; changed = True
-        #     warn_list.append(f"asc_corrected_for_parity({d_asc:.2f}arcsec)")
+        _ = _delta_arcsec(asc_new, float(asc_old))
+        # (keep ASC parity correction disabled; advanced engine authoritative)
     else:
         h["asc_deg"] = _wrap360(asc_new); h["asc"] = h["asc_deg"]; changed = True
-        
+
     if isinstance(mc_old, (int, float)):
         d_mc = _delta_arcsec(mc_new, float(mc_old))
         if d_mc > ARCSEC_TOL:
@@ -812,10 +816,11 @@ def _recompute_houses_angles_if_needed(
             warn_list.append(f"mc_corrected_for_parity({d_mc:.2f}arcsec)")
     else:
         h["mc_deg"] = _wrap360(mc_new); h["mc"] = h["mc_deg"]; changed = True
-        
+
     if changed:
         h["warnings"] = warn_list
     return _normalize_houses_payload(h)
+
 
 def _prepare_chart_for_predict(chart: Dict[str, Any]) -> Dict[str, Any]:
     ch = dict(chart)
@@ -866,6 +871,7 @@ def _want_houses(body: Dict[str, Any]) -> bool:
 
 # ───────────────────────── endpoints ─────────────────────────
 @api.post("/api/calculate")
+@rate_limit(RL_CALCULATE)
 def calculate():
     try:
         body = request.get_json(force=True) or {}
@@ -882,7 +888,7 @@ def calculate():
     except Exception as e:
         return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
 
-    # NEW: decide houses policy up-front
+    # decide houses policy up-front
     want_houses = _want_houses(body)
     payload["houses"] = bool(want_houses)  # harmless for engines that ignore it
 
@@ -945,7 +951,6 @@ def calculate():
         "houses_engine": _HOUSES_KIND if want_houses else "skipped",
         "houses_requested": bool(want_houses),
     }
-    # Merge adapter/kernel info (lazy; won't force-load)
     meta.update(_snapshot_ephemeris_meta(chart.get("meta")))
 
     # Calculate aspects if requested
@@ -964,7 +969,9 @@ def calculate():
         resp["aspects"] = aspects_result
     return jsonify(resp), 200
 
+
 @api.post("/api/report")
+@rate_limit(RL_REPORT)
 def report():
     try:
         body = request.get_json(force=True) or {}
@@ -1054,6 +1061,7 @@ def report():
 
 # ───────────────────────── predictions ─────────────────────────
 @api.post("/api/predictions")
+@rate_limit(RL_PREDICTIONS)
 def predictions_route():
     if predict_engine is None:
         return _json_error("predictions_unavailable", "predict engine not wired", 501)
@@ -1198,19 +1206,20 @@ def predictions_route():
     resp = {"ok": True, "predictions": preds, "meta": meta}
     return jsonify(resp), 200
 
-# ───────────────────────── aspects ─────────────────────────
 
+# ───────────────────────── aspects ─────────────────────────
 @api.post("/api/aspects")
+@rate_limit(RL_ASPECTS)
 def aspects():
     try:
         body = request.get_json(force=True) or {}
         payload = parse_chart_payload(body)
-        
+
         # Allow additional aspects-specific parameters
         for k in ("orbs", "aspects", "bodies", "points", "mode", "houses"):
             if k in body:
                 payload[k] = body[k]
-                
+
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
     except Exception as e:
@@ -1264,6 +1273,7 @@ def aspects():
 
 # ───────────────────────── predictive (transits • validation • dasha • varga • yogas) ─────────────────────────
 @api.post("/api/predictive/transits")
+@rate_limit(RL_PREDICTIVE)
 def predictive_transits():
     """
     Scan transits (moving bodies vs target longitudes) with bisection refinement.
@@ -1286,7 +1296,7 @@ def predictive_transits():
             time1 = body.get("time_end") or "23:59:59"
             tz = body.get("place_tz") or body.get("timezone") or "UTC"
             if not (isinstance(date0, str) and isinstance(time0, str)):
-                return _json_error("validation_error", [{"loc":["date_start/time_start"],"msg":"required"}], 400)
+                return _json_error("validation_error", [{"loc": ["date_start/time_start"], "msg": "required"}], 400)
             ts0 = _compute_timescales_from_local(date0, time0, tz, payload=body)
             if not isinstance(date1, str):
                 # default: 24h window from start
@@ -1295,16 +1305,16 @@ def predictive_transits():
                 ts1 = _compute_timescales_from_local(date1, time1, tz, payload=body)
                 jd0 = float(ts0["jd_tt"]); jd1 = float(ts1["jd_tt"])
         if not (math.isfinite(jd0) and math.isfinite(jd1)) or jd1 <= jd0:
-            return _json_error("validation_error", [{"loc":["jd_start_tt","jd_end_tt"],"msg":"invalid range"}], 400)
+            return _json_error("validation_error", [{"loc": ["jd_start_tt", "jd_end_tt"], "msg": "invalid range"}], 400)
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
     except Exception as e:
         return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
 
     # -------- movers / targets --------
-    movers = body.get("movers") or ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn"]
+    movers = body.get("movers") or ["Sun", "Moon", "Mercury", "Venus", "Mars", "Jupiter", "Saturn"]
     if not (isinstance(movers, list) and all(isinstance(x, str) and x for x in movers)):
-        return _json_error("validation_error", [{"loc":["movers"],"msg":"must be a list of names"}], 400)
+        return _json_error("validation_error", [{"loc": ["movers"], "msg": "must be a list of names"}], 400)
 
     # targets_longitudes: direct map (preferred, fastest path)
     targets: Dict[str, float] = {}
@@ -1323,7 +1333,7 @@ def predictive_transits():
         try:
             ts_nat = _compute_timescales_from_local(targ["date"], targ["time"], tz, payload=targ)
         except Exception as e:
-            return _json_error("validation_error", [{"loc":["targets_chart"],"msg":str(e)}], 400)
+            return _json_error("validation_error", [{"loc": ["targets_chart"], "msg": str(e)}], 400)
         try:
             ch = _call_compute_chart(targ, ts_nat)
         except Exception as e:
@@ -1337,14 +1347,14 @@ def predictive_transits():
                 targets[str(row["name"])] = _wrap360(float(row["longitude_deg"]))
 
     if not targets:
-        return _json_error("validation_error", [{"loc":["targets_longitudes|targets_chart"],"msg":"no targets to scan"}], 400)
+        return _json_error("validation_error", [{"loc": ["targets_longitudes|targets_chart"], "msg": "no targets to scan"}], 400)
 
     # -------- engine options --------
     # topocentric honored if lat/lon provided or topocentric:true explicitly
-    topocentric = bool(body.get("topocentric")) or (isinstance(body.get("latitude"), (int,float)) and isinstance(body.get("longitude"), (int,float)))
-    lat = float(body.get("latitude")) if isinstance(body.get("latitude"), (int,float)) else None
-    lon = float(body.get("longitude")) if isinstance(body.get("longitude"), (int,float)) else None
-    elev = float(body.get("elevation_m")) if isinstance(body.get("elevation_m"), (int,float)) else None
+    topocentric = bool(body.get("topocentric")) or (isinstance(body.get("latitude"), (int, float)) and isinstance(body.get("longitude"), (int, float)))
+    lat = float(body.get("latitude")) if isinstance(body.get("latitude"), (int, float)) else None
+    lon = float(body.get("longitude")) if isinstance(body.get("longitude"), (int, float)) else None
+    elev = float(body.get("elevation_m")) if isinstance(body.get("elevation_m"), (int, float)) else None
     frame = body.get("frame") or "ecliptic-of-date"
     step_min = float(body.get("step_minutes") or 30.0)
 
@@ -1403,6 +1413,7 @@ def predictive_transits():
 
 
 @api.post("/api/predictive/ingresses")
+@rate_limit(RL_PREDICTIVE)
 def predictive_ingresses():
     try:
         body = request.get_json(force=True) or {}
@@ -1445,6 +1456,7 @@ def predictive_ingresses():
 
 
 @api.post("/api/predictive/stations")
+@rate_limit(RL_PREDICTIVE)
 def predictive_stations():
     try:
         body = request.get_json(force=True) or {}
@@ -1485,6 +1497,7 @@ def predictive_stations():
 
 
 @api.post("/api/predictive/evaluate")
+@rate_limit(RL_PREDICTIVE)
 def predictive_evaluate():
     """
     Univariate permutation test with optional time-series aware permutations.
@@ -1533,6 +1546,7 @@ def predictive_evaluate():
 
 
 @api.post("/api/predictive/holdout")
+@rate_limit(RL_PREDICTIVE)
 def predictive_holdout():
     """
     Train/holdout replication with the same feature menu as /evaluate.
@@ -1574,6 +1588,7 @@ def predictive_holdout():
 
 
 @api.post("/api/predictive/dasha")
+@rate_limit(RL_PREDICTIVE)
 def predictive_dasha():
     try:
         body = request.get_json(force=True) or {}
@@ -1602,6 +1617,7 @@ def predictive_dasha():
 
 
 @api.post("/api/predictive/vargas")
+@rate_limit(RL_PREDICTIVE)
 def predictive_vargas():
     try:
         body = request.get_json(force=True) or {}
@@ -1625,6 +1641,7 @@ def predictive_vargas():
 
 
 @api.post("/api/predictive/yogas")
+@rate_limit(RL_PREDICTIVE)
 def predictive_yogas():
     try:
         body = request.get_json(force=True) or {}
@@ -1647,7 +1664,6 @@ def predictive_yogas():
         return jsonify({"ok": True, "results": res}), 200
     except Exception as e:
         return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
-
 
 
 # ───────────────────────── ephemeris ─────────────────────────
@@ -1755,6 +1771,7 @@ def _norm_rows_from_lv(raw: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
 
 
 @api.post("/api/ephemeris/longitudes")
+@rate_limit(RL_EPHEM)
 def ephemeris_longitudes_endpoint():
     """
     Fixed endpoint that properly handles topocentric flag:
@@ -1924,8 +1941,8 @@ def ephemeris_longitudes_endpoint():
 
 
 # ───────────────────────── ephemeris diagnostics (for dev tools) ─────────────────────────
-# ───────────────────────── ephemeris diagnostics (for dev tools) ─────────────────────────
 @api.get("/api/ephemeris/diagnostics")
+@rate_limit(RL_DEBUG)
 def ephemeris_diagnostics_route():
     """
     Lightweight adapter diagnostics surface.
@@ -1974,17 +1991,18 @@ def ephemeris_diagnostics_route():
 
 # ───────────────────────── DEBUG: House Engine Detection ─────────────────────────
 @api.get("/api/debug/engine-test")
+@rate_limit(RL_DEBUG)
 def debug_engine_test():
     """Test direct call to advanced engine with diagnostics enabled."""
     try:
         from app.core.houses_advanced import PreciseHouseCalculator
-        
+
         calc = PreciseHouseCalculator(
             require_strict_timescales=True,
             enable_diagnostics=True,
             enable_validation=True
         )
-        
+
         result = calc.calculate_houses(
             latitude=40.7128,
             longitude=-74.0060,
@@ -1993,7 +2011,7 @@ def debug_engine_test():
             jd_tt=2460000.501,
             jd_ut1=2460000.499
         )
-        
+
         return jsonify({
             "ok": True,
             "direct_engine_result": {
@@ -2013,11 +2031,12 @@ def debug_engine_test():
 
 
 @api.get("/api/debug/precision-test")
+@rate_limit(RL_DEBUG)
 def debug_precision_test():
     """Run multiple calculations to check for micro-variations."""
     try:
         results = []
-        
+
         for i in range(5):
             # Tiny time variations to trigger different computational paths
             ts = {
@@ -2025,15 +2044,15 @@ def debug_precision_test():
                 "jd_ut1": 2460000.499 + i * 1e-8,
                 "jd_utc": 2460000.5
             }
-            
+
             payload = {
                 "latitude": 40.7128,
                 "longitude": -74.0060,
                 "house_system": "placidus"
             }
-            
+
             houses = _call_compute_houses(payload, ts)
-            
+
             results.append({
                 "run": i,
                 "asc": getattr(houses, 'asc', getattr(houses, 'asc_deg', 'missing')),
@@ -2042,11 +2061,11 @@ def debug_precision_test():
                 "has_solver_stats": hasattr(houses, 'solver_stats'),
                 "warnings": getattr(houses, 'warnings', [])
             })
-        
+
         # Check for variations
         asc_values = [r["asc"] for r in results if isinstance(r["asc"], (int, float))]
         variation = max(asc_values) - min(asc_values) if len(asc_values) > 1 else 0.0
-        
+
         return jsonify({
             "ok": True,
             "results": results,
@@ -2059,11 +2078,12 @@ def debug_precision_test():
 
 
 @api.get("/api/debug/function-signatures")
+@rate_limit(RL_DEBUG)
 def debug_function_signatures():
     """Examine what functions are actually being called."""
     try:
         import inspect
-        
+
         info = {
             "houses_function": str(_houses_fn),
             "houses_function_name": getattr(_houses_fn, '__name__', 'unknown'),
@@ -2071,14 +2091,14 @@ def debug_function_signatures():
             "houses_kind": _HOUSES_KIND,
             "chart_engine": _CHART_ENGINE_NAME
         }
-        
+
         if _houses_fn:
             try:
                 info["houses_function_signature"] = str(inspect.signature(_houses_fn))
                 info["houses_function_file"] = getattr(inspect.getmodule(_houses_fn), '__file__', 'unknown')
             except Exception as e:
                 info["signature_error"] = str(e)
-        
+
         # Test advanced engine import
         try:
             from app.core.houses_advanced import PreciseHouseCalculator
@@ -2087,13 +2107,15 @@ def debug_function_signatures():
         except Exception as e:
             info["advanced_engine_importable"] = False
             info["advanced_engine_error"] = str(e)
-        
+
         return jsonify({"ok": True, "debug_info": info}), 200
     except Exception as e:
         return _json_error("function_signatures_error", str(e), 500)
 
+
 # ───────────────────────── system-validation (optional) ─────────────────────────
 @api.get("/system-validation")
+@rate_limit(RL_DEBUG)
 def system_validation():
     cfg = load_config(os.environ.get("ASTRO_CONFIG", "config/defaults.yaml"))
     leap_status: Optional[Dict[str, Any]] = None
