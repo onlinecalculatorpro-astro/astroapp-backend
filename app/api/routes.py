@@ -10,6 +10,7 @@ AstroApp — Canonical API Routes
 Notes:
 - Topocentric ephemeris honored via either center:"topocentric" or topocentric:true
 - Ephemeris responses include adapter meta (with meta.topocentric)
+- Adapter/kernel meta is bubbled up to API responses so dev tools can verify DE420/DE421 quickly.
 """
 
 from __future__ import annotations
@@ -422,6 +423,56 @@ def _sig_accepts(fn, *names: str) -> Dict[str, bool]:
     return {n: (n in params) for n in names}
 
 
+# ---------- NEW: adapter/kernel meta snapshot (for dev tools visibility) ----------
+def _snapshot_ephemeris_meta(chart_meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Return a small dict with adapter/kernel information WITHOUT forcing a kernel
+    load. Values populate lazily once a kernel is actually loaded.
+    """
+    info: Dict[str, Any] = {}
+    try:
+        from app.core import ephemeris_adapter as ea  # late import by design
+
+        # Prefer diagnostics if available (it will also reflect SPICE status)
+        try:
+            diag = ea.ephemeris_diagnostics()
+        except Exception:
+            diag = None
+
+        # Kernel short name
+        try:
+            info["kernel"] = ea.current_kernel_name()
+        except Exception:
+            pass
+
+        # Kernels list (basenames) if diagnostics provided
+        if isinstance(diag, dict) and isinstance(diag.get("kernels"), list):
+            info["kernels"] = list(diag["kernels"])
+
+        # Path + coverage (may be None until the kernel is loaded)
+        try:
+            info["ephemeris_path"] = ea.current_kernel_path()
+        except Exception:
+            pass
+        try:
+            info["ephemeris_coverage_jd"] = getattr(ea, "KERNEL_COVERAGE_JD", None)
+        except Exception:
+            pass
+
+        # Tag the source engine that produced the chart data
+        if isinstance(chart_meta, dict):
+            src = chart_meta.get("source") or chart_meta.get("engine")
+            if src:
+                info["source"] = src
+        if "source" not in info and _CHART_ENGINE_NAME:
+            info["source"] = _CHART_ENGINE_NAME
+    except Exception:
+        # If adapter import fails, we still return what we can
+        if _CHART_ENGINE_NAME:
+            info["source"] = _CHART_ENGINE_NAME
+    return info
+
+
 def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str, Any]:
     if _compute_chart is None:
         raise RuntimeError("chart_engine_unavailable")
@@ -465,29 +516,28 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
             }
     else:
         kwargs: Dict[str, Any] = {}
-        if "date" in payload and pick("date", "date_str", "date_s"):
-            kwargs[pick("date", "date_str", "date_s")] = payload.get("date")
-        if "time" in payload and pick("time", "time_str", "time_s"):
-            kwargs[pick("time", "time_str", "time_s")] = payload.get("time")
-        if "latitude" in payload and pick("latitude", "lat"):
-            kwargs[pick("latitude", "lat")] = payload["latitude"]
-        if "longitude" in payload and pick("longitude", "lon"):
-            kwargs[pick("longitude", "lon")] = payload["longitude"]
+        if "date" in payload and (k := {"date","date_str","date_s"}.intersection(param_names)):
+            kwargs[list(k)[0]] = payload.get("date")
+        if "time" in payload and (k := {"time","time_str","time_s"}.intersection(param_names)):
+            kwargs[list(k)[0]] = payload.get("time")
+        if "latitude" in payload and (k := {"latitude","lat"}.intersection(param_names)):
+            kwargs[list(k)[0]] = payload["latitude"]
+        if "longitude" in payload and (k := {"longitude","lon"}.intersection(param_names)):
+            kwargs[list(k)[0]] = payload["longitude"]
         tz_name = payload.get("place_tz") or payload.get("timezone")
-        if tz_name and pick("place_tz", "timezone", "tz_name"):
-            kwargs[pick("place_tz", "timezone", "tz_name")] = tz_name
-        if pick("mode", "system") and "mode" in payload:
-            kwargs[pick("mode", "system")] = payload["mode"]
-        if "ayanamsa" in payload and pick("ayanamsa", "ayanamsha", "aya"):
-            kwargs[pick("ayanamsa", "ayanamsha", "aya")] = payload["ayanamsa"]
-        if "topocentric" in payload and pick("topocentric", "observer_topocentric"):
-            kwargs[pick("topocentric", "observer_topocentric")] = bool(payload["topocentric"])
-        # allow both elevation_m and elev_m
-        if ("elevation_m" in payload or "elev_m" in payload) and pick("elevation_m", "elevation"):
-            kwargs[pick("elevation_m", "elevation")] = payload.get("elevation_m", payload.get("elev_m"))
-        if "bodies" in payload and pick("bodies", "names", "planets"):
-            kwargs[pick("bodies", "names", "planets")] = payload["bodies"]
-        if "frame" in payload and pick("frame"):
+        if tz_name and (k := {"place_tz","timezone","tz_name"}.intersection(param_names)):
+            kwargs[list(k)[0]] = tz_name
+        if "mode" in payload and (k := {"mode","system"}.intersection(param_names)):
+            kwargs[list(k)[0]] = payload["mode"]
+        if "ayanamsa" in payload and (k := {"ayanamsa","ayanamsha","aya"}.intersection(param_names)):
+            kwargs[list(k)[0]] = payload["ayanamsa"]
+        if "topocentric" in payload and (k := {"topocentric","observer_topocentric"}.intersection(param_names)):
+            kwargs[list(k)[0]] = bool(payload["topocentric"])
+        if ("elevation_m" in payload or "elev_m" in payload) and (k := {"elevation_m","elevation"}.intersection(param_names)):
+            kwargs[list(k)[0]] = payload.get("elevation_m", payload.get("elev_m"))
+        if "bodies" in payload and (k := {"bodies","names","planets"}.intersection(param_names)):
+            kwargs[list(k)[0]] = payload["bodies"]
+        if "frame" in payload and "frame" in param_names:
             kwargs["frame"] = payload["frame"]
         if "timescales" in param_names:
             kwargs["timescales"] = ts
@@ -787,6 +837,7 @@ def calculate():
 
         houses = _recompute_houses_angles_if_needed(houses, ts, payload, chart)
 
+    # ---- meta (now includes ephemeris/adapter snapshot for dev tools) ----
     meta = {
         "timescales": ts,
         "timescales_locked": True,
@@ -794,6 +845,9 @@ def calculate():
         "houses_engine": _HOUSES_KIND if want_houses else "skipped",
         "houses_requested": bool(want_houses),
     }
+    # Merge adapter/kernel info (lazy; won't force-load)
+    meta.update(_snapshot_ephemeris_meta(chart.get("meta")))
+
     resp = {"ok": True, "timescales": ts, "chart": chart, "meta": meta}
     if want_houses:
         resp["houses"] = houses
@@ -880,6 +934,8 @@ def report():
         "houses_engine": _HOUSES_KIND if want_houses else "skipped",
         "houses_requested": bool(want_houses),
     }
+    meta.update(_snapshot_ephemeris_meta(chart.get("meta")))
+
     resp = {"ok": True, "chart": chart, "narrative": narrative, "meta": meta}
     if want_houses:
         resp["houses"] = houses
@@ -1028,6 +1084,7 @@ def predictions_route():
         "houses_engine": _HOUSES_KIND if want_houses else "skipped",
         "houses_requested": bool(want_houses),
     }
+    meta.update(_snapshot_ephemeris_meta(chart.get("meta")))
     resp = {"ok": True, "predictions": preds, "meta": meta}
     return jsonify(resp), 200
 
@@ -1291,6 +1348,9 @@ def ephemeris_longitudes_endpoint():
     center = "topocentric" if (final_meta.get("topocentric") is True or str(final_meta.get("topocentric")).lower() == "true") else "geocentric"
     final_meta.setdefault("frame", frame)
 
+    # Augment with adapter snapshot so dev tools can see path/coverage
+    final_meta.update(_snapshot_ephemeris_meta(final_meta))
+
     return jsonify({
         "ok": True,
         "jd_tt": float(jd_tt),
@@ -1300,6 +1360,31 @@ def ephemeris_longitudes_endpoint():
         "meta": final_meta,
         "results": ordered_results,
     }), 200
+
+
+# ───────────────────────── ephemeris diagnostics (for dev tools) ─────────────────────────
+@api.get("/api/ephemeris/diagnostics")
+def ephemeris_diagnostics_route():
+    """
+    Lightweight adapter diagnostics surface. Does not force a kernel load, but
+    if a kernel has been loaded by a prior call, path/coverage will show up.
+    """
+    try:
+        from app.core import ephemeris_adapter as ea
+        out = ea.ephemeris_diagnostics()
+        # Augment with path + lazy coverage
+        out = dict(out or {})
+        try:
+            out["ephemeris_path"] = ea.current_kernel_path()
+        except Exception:
+            pass
+        try:
+            out["ephemeris_coverage_jd"] = getattr(ea, "KERNEL_COVERAGE_JD", None)
+        except Exception:
+            pass
+        return jsonify({"ok": True, **out}), 200
+    except Exception as e:
+        return _json_error("adapter_error", str(e) if DEBUG_VERBOSE else "adapter_error", 500)
 
 
 # ───────────────────────── system-validation (optional) ─────────────────────────
