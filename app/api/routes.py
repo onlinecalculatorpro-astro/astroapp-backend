@@ -584,7 +584,15 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
     if _houses_fn is None:
         raise RuntimeError("houses_engine_unavailable")
 
+    # DEBUG: Add comprehensive logging
+    log.info(f"=== HOUSE CALC START ===")
+    log.info(f"Function: {_houses_fn.__name__} from {_houses_fn.__module__}")
+    log.info(f"Houses kind: {_HOUSES_KIND}")
+    log.info(f"Payload keys: {list(payload.keys())}")
+    log.info(f"Timescales: jd_tt={ts.get('jd_tt')}, jd_ut1={ts.get('jd_ut1')}")
+
     acc = _sig_accepts_houses()
+    log.info(f"Function signature accepts: {acc}")
 
     lat_raw = payload.get("latitude")
     lon_raw = payload.get("longitude")
@@ -600,7 +608,16 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
         else (requested_system_raw.lower() or None)
     )
 
+    log.info(f"System: {requested_system_raw} -> {requested_system}")
+
+    # Force diagnostic parameters
+    payload_with_diagnostics = dict(payload)
+    payload_with_diagnostics["diagnostics"] = True
+    payload_with_diagnostics["validation"] = True
+    
     kwargs: Dict[str, Any] = {}
+    
+    # Coordinate parameters
     if acc.get("lat"):
         kwargs["lat"] = lat
     elif acc.get("latitude"):
@@ -615,6 +632,7 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
     else:
         kwargs["lon"] = lon
 
+    # System parameter
     if requested_system:
         if acc.get("system"):
             kwargs["system"] = requested_system
@@ -623,6 +641,7 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
         elif acc.get("house_system"):
             kwargs["house_system"] = requested_system
 
+    # Time parameters
     if acc.get("jd_tt"):
         kwargs["jd_tt"] = ts["jd_tt"]
     if acc.get("jd_ut1"):
@@ -630,13 +649,30 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
     if acc.get("jd_ut") and "jd_tt" not in kwargs and "jd_ut1" not in kwargs:
         kwargs["jd_ut"] = ts["jd_utc"]
 
-    if acc.get("diagnostics") and "diagnostics" in payload:
-        kwargs["diagnostics"] = bool(payload["diagnostics"])
-    if acc.get("validation") and "validation" in payload:
-        kwargs["validation"] = bool(payload["validation"])
+    # Force diagnostics and validation
+    if acc.get("diagnostics"):
+        kwargs["diagnostics"] = True
+    if acc.get("validation"):
+        kwargs["validation"] = True
 
-    return _houses_fn(**kwargs)
+    log.info(f"Calling {_houses_fn.__name__} with kwargs: {list(kwargs.keys())}")
+    log.info(f"Kwargs values: {kwargs}")
 
+    try:
+        result = _houses_fn(**kwargs)
+        log.info(f"Result type: {type(result)}")
+        log.info(f"Result keys: {list(result.keys()) if hasattr(result, 'keys') else 'not_dict'}")
+        
+        # Check for advanced engine indicators
+        has_solver = hasattr(result, 'solver_stats') or (hasattr(result, 'get') and result.get('solver_stats'))
+        has_budget = hasattr(result, 'error_budget') or (hasattr(result, 'get') and result.get('error_budget'))
+        log.info(f"Advanced indicators: solver_stats={has_solver}, error_budget={has_budget}")
+        
+        return result
+        
+    except Exception as e:
+        log.error(f"House calculation failed: {type(e).__name__}: {e}")
+        raise
 
 def _extract_ayanamsa_from_chart(chart: Dict[str, Any]) -> Optional[float]:
     if not isinstance(chart, dict):
