@@ -1366,23 +1366,46 @@ def ephemeris_longitudes_endpoint():
 @api.get("/api/ephemeris/diagnostics")
 def ephemeris_diagnostics_route():
     """
-    Lightweight adapter diagnostics surface. Does not force a kernel load, but
-    if a kernel has been loaded by a prior call, path/coverage will show up.
+    Lightweight adapter diagnostics surface.
+    Does not force a Skyfield kernel load; if a kernel has been loaded earlier,
+    path/coverage will show up. If only a BSP path is known, we lazily read
+    coverage from it (via jplephem) without loading Skyfield.
     """
     try:
         from app.core import ephemeris_adapter as ea
-        out = ea.ephemeris_diagnostics()
-        # Augment with path + lazy coverage
-        out = dict(out or {})
+
+        out = dict(ea.ephemeris_diagnostics() or {})
+
+        # Always expose a single short kernel tag
+        out["kernel"] = out.get("ephemeris_name") or ea.current_kernel_name()
+
+        # Path (if known)
         try:
             out["ephemeris_path"] = ea.current_kernel_path()
         except Exception:
             pass
-        try:
-            out["ephemeris_coverage_jd"] = getattr(ea, "KERNEL_COVERAGE_JD", None)
-        except Exception:
-            pass
+
+        # De-dupe kernels if adapter returned duplicates
+        ks = out.get("kernels")
+        if isinstance(ks, list):
+            out["kernels"] = list(dict.fromkeys(ks))
+
+        # Lazy coverage: if missing but a BSP path exists, compute via jplephem
+        if not out.get("ephemeris_coverage_jd"):
+            p = out.get("ephemeris_path")
+            if p and os.path.isfile(p):
+                try:
+                    from jplephem.spk import SPK  # local import to keep it optional
+                    with SPK.open(p) as spk:
+                        cov_min = min(seg.start_jd for seg in spk.segments)
+                        cov_max = max(seg.end_jd for seg in spk.segments)
+                    out["ephemeris_coverage_jd"] = [cov_min, cov_max]
+                except Exception:
+                    # silently ignore if jplephem isn't available or file can't be read
+                    pass
+
         return jsonify({"ok": True, **out}), 200
+
     except Exception as e:
         return _json_error("adapter_error", str(e) if DEBUG_VERBOSE else "adapter_error", 500)
 
