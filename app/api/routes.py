@@ -1708,55 +1708,48 @@ def progressions_route():
     except Exception as e:
         return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
 
-    # ---- normalize any TimeScales → dict BEFORE seeding kwargs ----------------
-    try:
-        from app.core.timescales import TimeScales  # type: ignore
-
-        def _ts_to_dict(ts: "TimeScales") -> Dict[str, Any]:
-            # minimal shape the engines & API expect
+    # ---- deep-normalize: convert any TimeScales objects to plain dicts --------
+    def _ts_to_dict(ts: Any) -> Optional[Dict[str, Any]]:
+        # Accepts app.core.timescales.TimeScales (or duck-typed equivalent)
+        try:
+            # Access via attributes; don't subscript
             return {
                 "jd_utc": float(ts.jd_utc),
                 "jd_tt": float(ts.jd_tt),
                 "jd_ut1": float(ts.jd_ut1),
                 "delta_t": float(ts.delta_t),
-                "delta_at": float(getattr(ts, "dat", 0.0)),
+                "delta_at": float(ts.dat),
                 "dut1": float(ts.dut1),
                 "timezone": getattr(ts, "timezone", None),
                 "tz_offset_seconds": int(getattr(ts, "tz_offset_seconds", 0)),
                 "warnings": list(getattr(ts, "warnings", []) or []),
             }
+        except Exception:
+            return None
 
-        def _maybe_ts_to_dict(x: Any) -> Any:
-            # shallow converter that safely handles missing import/attr
-            try:
-                if isinstance(x, TimeScales):
-                    return _ts_to_dict(x)
-            except Exception:
-                pass
-            return x
+    def _normalize(obj: Any) -> Any:
+        # Recursively walk lists/dicts and replace TimeScales with dicts
+        if obj is None:
+            return None
+        # direct TimeScales instance?
+        tsd = _ts_to_dict(obj)
+        if tsd is not None:
+            return tsd
+        if isinstance(obj, dict):
+            out = {}
+            for k, v in obj.items():
+                # If key literally named 'timescales' and value looks like TimeScales, coerce
+                if k in {"timescales", "ts", "time_scales"}:
+                    tv = _ts_to_dict(v)
+                    out[k] = tv if tv is not None else _normalize(v)
+                else:
+                    out[k] = _normalize(v)
+            return out
+        if isinstance(obj, (list, tuple)):
+            return [ _normalize(x) for x in obj ]
+        return obj
 
-        # Top-level aliases that may carry a TimeScales object
-        for k in ("timescales", "natal_timescales", "target_timescales"):
-            if k in payload:
-                payload[k] = _maybe_ts_to_dict(payload[k])
-
-        # Nested common shapes
-        if isinstance(payload.get("natal"), dict):
-            n = payload["natal"]
-            if "timescales" in n:
-                n["timescales"] = _maybe_ts_to_dict(n["timescales"])
-        if isinstance(payload.get("target"), dict):
-            t = payload["target"]
-            if "timescales" in t:
-                t["timescales"] = _maybe_ts_to_dict(t["timescales"])
-        if isinstance(payload.get("place"), dict):
-            p = payload["place"]
-            if "timescales" in p:
-                p["timescales"] = _maybe_ts_to_dict(p["timescales"])
-
-    except Exception:
-        # If anything odd happens here, keep going; downstream code will still work with plain payload fields.
-        pass
+    payload = _normalize(payload) or {}
 
     # ---- seed kwargs from payload --------------------------------------------
     kwargs = {
@@ -1784,11 +1777,15 @@ def progressions_route():
     # ---- merge nested flags (if client sent payload.flags) --------------------
     f = payload.get("flags")
     if isinstance(f, dict):
+        # top-level wins; flags only fill gaps or opt-in extras
         if "aspects_to_natal" in f:
-            kwargs["aspects_to_natal"] = bool(kwargs.get("aspects_to_natal") or f.get("aspects_to_natal", False))
+            kwargs["aspects_to_natal"] = bool(
+                kwargs.get("aspects_to_natal") or f.get("aspects_to_natal", False)
+            )
         for k in ("parallels", "antiscia", "profile"):
             if k in f:
                 kwargs[k] = bool(kwargs.get(k) or f.get(k, False))
+        # orbs from flags only if not already provided at top-level
         if "orbs" in f and kwargs.get("orbs") is None and isinstance(f["orbs"], dict):
             kwargs["orbs"] = f["orbs"]
 
@@ -1814,14 +1811,15 @@ def progressions_route():
         engine_params = set(inspect.signature(compute_progressions).parameters.keys())
         safe_kwargs = {k: v for k, v in kwargs.items() if k in engine_params}
 
-        # If engine expects 'mode', map from 'zodiac_mode'
+        # Map common alias if engine expects 'mode' instead of 'zodiac_mode'
         if "mode" in engine_params and "mode" not in safe_kwargs and "zodiac_mode" in kwargs:
             safe_kwargs["mode"] = kwargs["zodiac_mode"]
 
-        # Drop Nones the engine may dislike (keep years_after/target for XOR logic)
+        # Be lenient with none/empties the engine might not like
         for k in list(safe_kwargs.keys()):
-            if safe_kwargs[k] is None and k not in ("years_after", "target"):
-                safe_kwargs.pop(k, None)
+            if safe_kwargs[k] is None:
+                if k not in ("years_after", "target"):
+                    safe_kwargs.pop(k, None)
     except Exception as e:
         det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
         return _json_error("progressions_internal", det or "internal_error", 500)
