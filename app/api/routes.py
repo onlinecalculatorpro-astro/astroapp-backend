@@ -1783,7 +1783,7 @@ def _truthy(val: Any) -> Optional[bool]:
 def _norm_rows_from_longitudes(raw: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Normalize longitude results to consistent format."""
     rows: List[Dict[str, Any]] = []
-    meta: Dict[str, Any]] = {}
+    meta: Dict[str, Any] = {}
 
     if isinstance(raw, tuple) and len(raw) == 2:
         raw, meta = raw
