@@ -138,11 +138,9 @@ def parse_frame(val: Any | None) -> Literal["ecliptic-of-date", "ecliptic-j2000"
         "ecliptic-j2000": "ecliptic-j2000",
         "j2000": "ecliptic-j2000",
         "ecliptic_j2000": "ecliptic-j2000",
-        "ecl-j2000": "eclipctic-j2000",  # typo-safe; corrected below
+        "ecl-j2000": "ecliptic-j2000",  # accept typo-safe alias
     }
     out = aliases.get(s) or s
-    if out == "eclipctic-j2000":  # fix typo alias
-        out = "ecliptic-j2000"
     if out not in ("ecliptic-of-date", "ecliptic-j2000"):
         raise ValidationError(_err("frame", "frame must be 'ecliptic-of-date' or 'ecliptic-j2000'"))
     return out  # type: ignore
@@ -513,7 +511,6 @@ def parse_progressions_payload(body: Dict[str, Any]) -> ProgressionsPayload:
     if orbs_obj is not None:
         if not isinstance(orbs_obj, dict):
             raise ValidationError(_err("orbs", "must be object", "type_error.dict"))
-        # coerce to float where possible, drop invalid keys silently
         new_orbs: Dict[str, float] = {}
         for k, v in orbs_obj.items():
             f = _as_float(v)
