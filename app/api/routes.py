@@ -44,6 +44,7 @@ from app.core.validators import (
     parse_frame,
     parse_latlon,
     parse_progressions_payload,
+    parse_returns_payload,
 )
 
 # Timescales core
@@ -1923,89 +1924,45 @@ def _coerce_int(v: Any) -> Optional[int]:
 
 def _build_returns_kwargs(body: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[List[Dict[str, Any]]]]:
     """
-    Prepare kwargs for returns engine; also collect validation errors list if any.
+    Strict, route-friendly builder for app/core/returns.compute_return.
+    Delegates validation/normalization to parse_returns_payload().
     """
-    errs: List[Dict[str, Any]] = []
-
-    natal = body.get("natal") or {}
-    if not isinstance(natal, dict):
-        errs.append({"loc": ["natal"], "msg": "required object", "type": "value_error"})
-        natal = {}
-
-    # natal requirements: date/time/tz (for timescales) — keep loose: lat/lon optional
-    date = natal.get("date"); time_s = natal.get("time"); tz = natal.get("place_tz") or natal.get("tz") or natal.get("timezone")
-    if not (isinstance(date, str) and isinstance(time_s, str) and isinstance(tz, str)):
-        errs.append({"loc": ["natal.date|time|place_tz"], "msg": "required strings", "type": "value_error"})
-
-    # Normalize frame / zodiac / house system
-    frame = parse_frame(body.get("frame"))
-    zodiac_mode = (body.get("zodiac_mode") or body.get("mode") or "tropical")
-    house_system = (body.get("house_system") or "placidus").strip().lower()
-    ay = body.get("ayanamsa_deg")
-
-    # Return kind
-    kind = _parse_return_kind(body.get("kind") or body.get("type") or body.get("planet"))
-
-    # Target year or approx date (optional)
-    target_year = _coerce_int(body.get("year") or body.get("target_year"))
-    approx_date = body.get("date") or body.get("approx_date")
-
-    # Compute natal JD if possible (helps engines that accept jd_tt_natal)
-    jd_tt_natal = body.get("jd_tt_natal")
-    jd_ut1_natal = body.get("jd_ut1_natal")
     try:
-        if isinstance(date, str) and isinstance(time_s, str) and isinstance(tz, str):
-            ts_nat = _compute_timescales_from_local(date, time_s, tz, payload=natal)
-            if not isinstance(jd_tt_natal, (int, float)):
-                jd_tt_natal = float(ts_nat["jd_tt"])
-            if not isinstance(jd_ut1_natal, (int, float)):
-                jd_ut1_natal = float(ts_nat["jd_ut1"])
+        payload = parse_returns_payload(body)
     except ValidationError as e:
-        errs.extend(e.errors())
+        return {}, e.errors()
 
-    # Infer topocentric if coords present or flag given
-    topocentric = bool(body.get("topocentric")) or (isinstance(natal.get("latitude"), (int, float)) and isinstance(natal.get("longitude"), (int, float)))
+    natal = dict(payload.get("natal") or {})
+    place = dict(payload.get("place") or {}) or None
 
-    # Aspects flags
-    flags = {
-        "aspects_to_natal": bool(body.get("aspects_to_natal", True)),
-        "parallels": bool(body.get("parallels", False)),
-        "antiscia": bool(body.get("antiscia", False)),
-    }
-    orbs = body.get("orbs") if isinstance(body.get("orbs"), dict) else None
-
-    # Scan window (optional)
-    jd0, jd1 = _normalize_window(body)
-
-    kwargs: Dict[str, Any] = {
+    kwargs = {
         "natal": natal,
-        "kind": kind,
-        "year": target_year,
-        "approx_date": approx_date,
-        "jd_tt_natal": jd_tt_natal,
-        "jd_ut1_natal": jd_ut1_natal,
-        "frame": frame,
-        "zodiac_mode": zodiac_mode,
-        "ayanamsa_deg": float(ay) if isinstance(ay, (int, float)) else None,
-        "house_system": house_system,
-        "topocentric": topocentric,
-        "aspects_to_natal": flags["aspects_to_natal"],
-        "parallels": flags["parallels"],
-        "antiscia": flags["antiscia"],
-        "orbs": orbs,
-        # optional scan params (engines may ignore for single compute)
-        "jd_start_tt": jd0,
-        "jd_end_tt": jd1,
-        "validation": body.get("validation", "basic"),
-        "profile": bool(body.get("profile", False)),
+        "kind": payload.get("kind", "solar"),
+        "jd_tt_natal": payload.get("jd_tt_natal"),
+        "jd_ut1_natal": payload.get("jd_ut1_natal"),
+        "place": place,
+        "frame": payload.get("frame", "ecliptic-of-date"),
+        "house_system": payload.get("house_system", "placidus"),
+        "zodiac_mode": payload.get("zodiac_mode", "tropical"),
+        "ayanamsa_deg": payload.get("ayanamsa_deg", 0.0),
+        "lunar_month": payload.get("lunar_month", "sidereal"),
+        "guess_years_offset": payload.get("guess_years_offset"),
+        "around_jd_tt": payload.get("around_jd_tt"),
+        "tol_arcmin": payload.get("tol_arcmin", 1.0),
+        "max_iters": payload.get("max_iters", 12),
+        "estimate_uncertainty": payload.get("estimate_uncertainty", True),
+        "fd_step_minutes": payload.get("fd_step_minutes", 2.0),
+        "profile": payload.get("profile", False),
+        "validation": payload.get("validation", "basic"),
+        "validation_residual_arcmin": payload.get("validation_residual_arcmin", 1.0),
     }
 
-    # prune None values except those that some engines might accept (keep jd_* window Nones harmless)
+    # prune explicit None to avoid TypeErrors on engines with strict signatures
     for k in list(kwargs.keys()):
-        if kwargs[k] is None and k not in ("jd_start_tt", "jd_end_tt", "year", "approx_date", "ayanamsa_deg"):
+        if kwargs[k] is None:
             kwargs.pop(k, None)
 
-    return kwargs, (errs if errs else None)
+    return kwargs, None
 
 def _returns_enrich_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
     m = dict(meta or {})
@@ -2019,25 +1976,18 @@ def _returns_enrich_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
 @rate_limit(RL_RETURNS)
 def returns_compute_route():
     """
-    Compute a single return (solar/lunar/planetary) closest to a target year/date.
+    Compute a single return (solar or lunar) using app/core/returns.compute_return.
 
-    Body (tolerant):
-      natal: { date, time, place_tz, latitude?, longitude? }
-      kind|type|planet: "solar"|"lunar"|"venus"|... (default "solar")
-      year|target_year: int (optional) OR approx date via `date` or `approx_date`
-      frame: "ecliptic-of-date"|"ecliptic-j2000"
-      zodiac_mode: "tropical"|"sidereal"
-      house_system: "placidus"|...
-      topocentric: bool (implied true if natal has lat/lon)
-      aspects_to_natal, parallels, antiscia, orbs (dict)
-      validation: "basic"|...
+    Body (validated by parse_returns_payload):
+      natal: { date|time|place_tz OR strict jd_tt_natal/jd_ut1_natal, latitude?, longitude?, elev_m? }
+      kind: "solar"|"lunar" (default "solar")
+      place: optional override { latitude, longitude, elev_m? }
+      frame: "ecliptic-of-date"|"ecliptic-j2000" (default ecliptic-of-date)
+      house_system, zodiac_mode, ayanamsa_deg, lunar_month
+      guess_years_offset | around_jd_tt
+      tol_arcmin, max_iters, estimate_uncertainty, fd_step_minutes
+      validation ("none"|"basic"|"extended"), validation_residual_arcmin
       profile: bool
-
-    Returns:
-      200 { ok, epoch, positions, houses?, aspects_to_natal?, meta{ kernel,... } }
-      400 on validation / value errors
-      501 if engine unavailable
-      500 on internal exceptions
     """
     if not _returns_available():
         det = {"import_error": repr(_RETURNS_IMPORT_ERROR)} if DEBUG_VERBOSE and _RETURNS_IMPORT_ERROR else None
@@ -2057,7 +2007,7 @@ def returns_compute_route():
         return _json_error("returns_unavailable", "no compute function exported by return(s) module", 501)
 
     try:
-        result = compute_fn(**kwargs)  # type: ignore[misc]
+        result = compute_fn(**kwargs)  # expects returns.compute_return
     except ValueError as e:
         return _json_error("returns_value_error", str(e), 400)
     except TypeError as e:
@@ -2070,14 +2020,22 @@ def returns_compute_route():
         det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
         return _json_error("returns_internal", det or "internal_error", 500)
 
-    meta = _returns_enrich_meta(result.get("meta") or {})
+    # Shape response consistently with the rest of the API
+    meta = dict(result.get("meta") or {})
+    meta = _returns_enrich_meta(meta)
+
+    event = result.get("event") or {}
+    epoch = None
+    if isinstance(event, dict) and ("jd_tt" in event or "jd_ut1" in event):
+        epoch = {"jd_tt": float(event.get("jd_tt")), "jd_ut1": float(event.get("jd_ut1"))}
+
     resp = {
         "ok": True,
-        "kind": result.get("kind") or kwargs.get("kind"),
-        "epoch": result.get("epoch"),
+        "kind": (event.get("kind") or kwargs.get("kind") or "solar"),
+        "event": event,                          # converged?, delta_deg, iterations, uncertainty...
+        "epoch": epoch,                          # convenience for frontend
         "positions": result.get("positions"),
         "houses": result.get("houses"),
-        "aspects_to_natal": result.get("aspects_to_natal") or [],
         "meta": meta,
         "warnings": list(meta.get("warnings") or []),
     }
