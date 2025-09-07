@@ -6,6 +6,7 @@ AstroApp — Canonical API Routes
 - Predictions
 - Ephemeris
 - Predictive toolkit
+- Progressions (secondary • minor • tertiary)   <-- NEW
 - Ops: /api/health, /api/config, /api/openapi, /__debug/routes
 
 Notes:
@@ -41,6 +42,7 @@ from app.core.validators import (
     parse_ephemeris_payload,
     parse_frame,
     parse_latlon,
+    parse_progressions_payload,   # <-- NEW
 )
 
 # Timescales core
@@ -51,6 +53,12 @@ try:
     from app.core.predict import predict as predict_engine
 except Exception:
     predict_engine = None  # type: ignore
+
+# Progressions core (optional import guard)
+try:
+    from app.core.progressions import compute_progressions
+except Exception:
+    compute_progressions = None  # type: ignore
 
 log = logging.getLogger(__name__)
 api = Blueprint("api", __name__)
@@ -68,6 +76,7 @@ RL_EPHEM        = _RL("ASTRO_RL_EPHEM_PER_MIN",        30)
 RL_PREDICTIONS  = _RL("ASTRO_RL_PREDICTIONS_PER_MIN",   6)
 RL_PREDICTIVE   = _RL("ASTRO_RL_PREDICTIVE_PER_MIN",   12)
 RL_DEBUG        = _RL("ASTRO_RL_DEBUG_PER_MIN",         6)
+RL_PROGRESSIONS = _RL("ASTRO_RL_PROGRESSIONS_PER_MIN", 12)  # <-- NEW
 
 
 # ───────────────────────── helpers ─────────────────────────
@@ -1678,6 +1687,75 @@ def predictive_yogas():
         return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
 
+# ───────────────────────── PROGRESSIONS (NEW) ─────────────────────────
+@api.post("/api/progressions")
+@rate_limit(RL_PROGRESSIONS)
+def progressions_route():
+    """
+    Progressions: secondary / minor / tertiary
+    Body is validated by parse_progressions_payload to match compute_progressions signature.
+    """
+    if compute_progressions is None:
+        return _json_error("progressions_unavailable", "progressions engine not wired", 501)
+
+    try:
+        body = request.get_json(force=True) or {}
+        payload = parse_progressions_payload(body)
+    except ValidationError as e:
+        return _json_error("validation_error", e.errors(), 400)
+    except Exception as e:
+        return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
+
+    # Map normalized payload → compute_progressions kwargs
+    kwargs = {
+        "natal": payload["natal"],
+        "method": payload.get("method", "secondary"),
+        "target": (payload["target"] or None) if isinstance(payload.get("target"), dict) and payload["target"] else None,
+        "years_after": payload.get("years_after"),
+        "jd_tt_natal": payload.get("jd_tt_natal"),
+        "jd_ut1_natal": payload.get("jd_ut1_natal"),
+        "place": (payload["place"] or None) if isinstance(payload.get("place"), dict) and payload["place"] else None,
+        "frame": payload.get("frame", "ecliptic-of-date"),
+        "house_system": payload.get("house_system", "placidus"),
+        "zodiac_mode": payload.get("zodiac_mode", "tropical"),
+        "ayanamsa_deg": payload.get("ayanamsa_deg", 0.0),
+        "lunar_month": payload.get("lunar_month", "synodic"),
+        "tertiary_mode": payload.get("tertiary_mode", "day-for-month"),
+        "aspects_to_natal": bool(payload.get("aspects_to_natal", True)),
+        "orbs": (payload.get("orbs") or None),
+        "parallels": bool(payload.get("parallels", False)),
+        "antiscia": bool(payload.get("antiscia", False)),
+        "profile": bool(payload.get("profile", False)),
+        "validation": payload.get("validation", "basic"),
+    }
+
+    try:
+        result = compute_progressions(**kwargs)
+    except ValueError as e:
+        return _json_error("progressions_value_error", str(e), 400)
+    except RuntimeError as e:
+        return _json_error("progressions_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+    except Exception as e:
+        return _json_error("progressions_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+
+    # Meta enrichment (adapter snapshot)
+    meta = dict(result.get("meta") or {})
+    try:
+        meta.update(_snapshot_ephemeris_meta(meta))
+    except Exception:
+        pass
+
+    resp = {
+        "ok": True,
+        "meta": meta,
+        "epoch": result.get("epoch"),
+        "positions": result.get("positions"),
+        "houses": result.get("houses"),
+        "aspects_to_natal": result.get("aspects_to_natal") or [],
+    }
+    return jsonify(resp), 200
+
+
 # ───────────────────────── ephemeris ─────────────────────────
 def _coerce_float(v: Any) -> Optional[float]:
     try:
@@ -1704,7 +1782,7 @@ def _truthy(val: Any) -> Optional[bool]:
 def _norm_rows_from_longitudes(raw: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Normalize longitude results to consistent format."""
     rows: List[Dict[str, Any]] = []
-    meta: Dict[str, Any] = {}
+    meta: Dict[str, Any]] = {}
 
     if isinstance(raw, tuple) and len(raw) == 2:
         raw, meta = raw
