@@ -44,6 +44,19 @@ def _as_float(v: Any) -> Optional[float]:
     except Exception:
         return None
 
+def _as_int(v: Any) -> Optional[int]:
+    try:
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            return int(v)
+        if isinstance(v, (int, )):
+            return int(v)
+        s = str(v).strip()
+        return int(float(s))
+    except Exception:
+        return None
+
 def _truthy(val: Any) -> Optional[bool]:
     if isinstance(val, bool):
         return val
@@ -52,7 +65,7 @@ def _truthy(val: Any) -> Optional[bool]:
     s = str(val).strip().lower()
     if s in {"1", "true", "t", "yes", "y", "on"}:
         return True
-    if s in {"0", "false", "f", "no", "n", "off"}:
+    if s in {"0", "false", "t", "no", "n", "off"}:
         return False
     return None
 
@@ -544,6 +557,182 @@ def parse_progressions_payload(body: Dict[str, Any]) -> ProgressionsPayload:
     return out
 
 
+# ───────────────────────── returns (NEW) ─────────────────────────
+
+ReturnKind = Literal["solar", "lunar"]
+
+class NatalReturns(TypedDict, total=False):
+    date: str
+    time: str
+    place_tz: str
+    latitude: float
+    longitude: float
+    elev_m: float
+
+class ReturnsPayload(TypedDict, total=False):
+    natal: NatalReturns
+    kind: ReturnKind
+    jd_tt_natal: float
+    jd_ut1_natal: float
+    place: PlaceOverride
+    frame: Literal["ecliptic-of-date", "ecliptic-j2000"]
+    house_system: str
+    zodiac_mode: ZodiacMode
+    ayanamsa_deg: float
+    lunar_month: LunarMonthKind           # used for lunar seed length (sidereal|synodic); default "sidereal"
+    guess_years_offset: int | None
+    around_jd_tt: float | None
+    tol_arcmin: float
+    max_iters: int
+    estimate_uncertainty: bool
+    fd_step_minutes: float
+    profile: bool
+    validation: Literal["none", "basic", "extended"]
+    validation_residual_arcmin: float
+
+def _parse_returns_natal(natal: Any) -> NatalReturns:
+    if not isinstance(natal, dict):
+        raise ValidationError(_err("natal", "required object", "type_error.dict"))
+    out: NatalReturns = {}
+    # Same rule as progressions: only require date/time/tz if strict timescales are absent
+    if "date" in natal:
+        out["date"] = parse_date(str(natal["date"])).strftime("%Y-%m-%d")
+    if "time" in natal:
+        out["time"] = parse_time_str(str(natal["time"]))
+    if "place_tz" in natal:
+        out["place_tz"] = _validate_iana_tz(str(natal["place_tz"]).strip(), ["natal","place_tz"])
+    # optional coords for houses/topo default
+    if ("latitude" in natal) or ("longitude" in natal):
+        la, lo = parse_latlon(natal.get("latitude"), natal.get("longitude"), "natal.latitude", "natal.longitude")
+        out["latitude"] = la
+        out["longitude"] = lo
+    if "elev_m" in natal:
+        elev = _as_float(natal.get("elev_m"))
+        if elev is None:
+            raise ValidationError(_err(["natal","elev_m"], "must be number", "type_error.float"))
+        out["elev_m"] = float(elev)
+    return out
+
+def parse_returns_payload(body: Dict[str, Any]) -> ReturnsPayload:
+    """
+    Validate + normalize payload for /api/returns (solar/lunar).
+    Mirrors app/core/returns.compute_return signature.
+
+    Requirements:
+      • Provide strict natal timescales (jd_tt_natal & jd_ut1_natal) OR natal.{date,time,place_tz}
+      • kind ∈ {"solar","lunar"} (default "solar")
+      • Optional place override {latitude, longitude, elev_m?}
+      • frame ∈ {"ecliptic-of-date","ecliptic-j2000"} (default ecliptic-of-date)
+      • house_system normalized (default "placidus")
+      • zodiac_mode normalized; ayanamsa_deg numeric (default 0.0)
+      • lunar_month ∈ {"sidereal","synodic"} (default "sidereal")
+      • guess_years_offset:int or around_jd_tt:float (both optional; function defaults to +1 year/month)
+      • tol_arcmin>0; max_iters>=1; fd_step_minutes>0
+      • validation ∈ {"none","basic","extended"}; validation_residual_arcmin>0
+    """
+    if not isinstance(body, dict):
+        raise ValidationError("payload must be an object")
+
+    # natal
+    natal_raw = body.get("natal")
+    if natal_raw is None:
+        raise ValidationError(_err("natal", "required object", "value_error"))
+    natal = _parse_returns_natal(natal_raw)
+
+    # strict timescales (both or none)
+    jd_tt_natal = _as_float(body.get("jd_tt_natal"))
+    jd_ut1_natal = _as_float(body.get("jd_ut1_natal"))
+    if (jd_tt_natal is None) ^ (jd_ut1_natal is None):
+        raise ValidationError(_err(["jd_tt_natal","jd_ut1_natal"], "supply both or neither", "value_error"))
+    if jd_tt_natal is None or jd_ut1_natal is None:
+        # need natal date/time/tz
+        for key in ("date", "time", "place_tz"):
+            if key not in natal:
+                raise ValidationError(_err(["natal", key], "required when strict timescales are not supplied", "value_error"))
+
+    # kind (accept 'kind' or legacy 'type')
+    raw_kind = (body.get("kind") or body.get("type") or "solar").strip().lower()
+    if raw_kind not in ("solar", "lunar"):
+        raise ValidationError(_err("kind", "must be 'solar' or 'lunar'", "value_error"))
+    kind: ReturnKind = raw_kind  # type: ignore
+
+    # optional place override
+    place_override: Optional[PlaceOverride] = None
+    if body.get("place") is not None:
+        place_override = _parse_place_override(body["place"])
+
+    # frame / house / zodiac
+    frame = parse_frame(body.get("frame"))
+    house_system = parse_house_system(body.get("house_system")) or "placidus"
+    zodiac_mode = parse_mode(body.get("zodiac_mode") or body.get("mode"))
+
+    # ayanamsa_deg
+    aya = _as_float(body.get("ayanamsa_deg", 0.0))
+    if aya is None:
+        raise ValidationError(_err("ayanamsa_deg", "must be a number", "type_error.float"))
+    ayanamsa_deg = float(aya)
+
+    # lunar_month (used to choose sidereal/synodic month for lunar returns seed)
+    lm = (body.get("lunar_month") or "sidereal").strip().lower()
+    if lm not in ("sidereal", "synodic"):
+        raise ValidationError(_err("lunar_month", "must be 'sidereal' or 'synodic'", "value_error"))
+    lunar_month: LunarMonthKind = lm  # type: ignore
+
+    # seeds
+    guess_years_offset = _as_int(body.get("guess_years_offset"))
+    around_jd_tt = _as_float(body.get("around_jd_tt"))
+
+    # tuning
+    tol_arcmin = _as_float(body.get("tol_arcmin", 1.0))
+    if tol_arcmin is None or tol_arcmin <= 0:
+        raise ValidationError(_err("tol_arcmin", "must be > 0", "value_error"))
+
+    max_iters = _as_int(body.get("max_iters", 12))
+    if max_iters is None or max_iters < 1:
+        raise ValidationError(_err("max_iters", "must be >= 1", "value_error"))
+
+    fd_step_minutes = _as_float(body.get("fd_step_minutes", 2.0))
+    if fd_step_minutes is None or fd_step_minutes <= 0:
+        raise ValidationError(_err("fd_step_minutes", "must be > 0", "value_error"))
+
+    # booleans
+    est_unc = _truthy(body.get("estimate_uncertainty"))
+    estimate_uncertainty = True if est_unc is None else bool(est_unc)
+    profile = bool(_truthy(body.get("profile")) or False)
+
+    # validation level
+    validation = str(body.get("validation") or "basic").strip().lower()
+    if validation not in ("none", "basic", "extended"):
+        raise ValidationError(_err("validation", "must be 'none', 'basic', or 'extended'", "value_error"))
+
+    v_resid = _as_float(body.get("validation_residual_arcmin", 1.0))
+    if v_resid is None or v_resid <= 0:
+        raise ValidationError(_err("validation_residual_arcmin", "must be > 0", "value_error"))
+
+    out: ReturnsPayload = {
+        "natal": natal,
+        "kind": kind,
+        "jd_tt_natal": float(jd_tt_natal) if jd_tt_natal is not None else None,  # type: ignore
+        "jd_ut1_natal": float(jd_ut1_natal) if jd_ut1_natal is not None else None,  # type: ignore
+        "place": place_override or {},  # empty when not provided
+        "frame": frame,
+        "house_system": house_system,
+        "zodiac_mode": zodiac_mode,
+        "ayanamsa_deg": ayanamsa_deg,
+        "lunar_month": lunar_month,
+        "guess_years_offset": guess_years_offset,
+        "around_jd_tt": float(around_jd_tt) if around_jd_tt is not None else None,  # type: ignore
+        "tol_arcmin": float(tol_arcmin),
+        "max_iters": int(max_iters),
+        "estimate_uncertainty": bool(estimate_uncertainty),
+        "fd_step_minutes": float(fd_step_minutes),
+        "profile": bool(profile),
+        "validation": validation,  # "none" | "basic" | "extended"
+        "validation_residual_arcmin": float(v_resid),
+    }
+    return out
+
+
 # ───────────────────────── timescale resolver (for predictive.py) ─────────────
 def resolve_timescales_from_civil_erfa(
     d: date,
@@ -619,6 +808,7 @@ __all__ = [
     "parse_rectification_payload",
     "parse_ephemeris_payload",
     "parse_frame",
-    "parse_progressions_payload",          # NEW
+    "parse_progressions_payload",    # NEW
+    "parse_returns_payload",         # NEW
     "resolve_timescales_from_civil_erfa",
 ]
