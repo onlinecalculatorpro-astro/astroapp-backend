@@ -273,6 +273,18 @@ def compute_return(
     profile: bool = False,
     validation: str = "basic",
     validation_residual_arcmin: float = 1.0,
+    # ── route-compat extras (accepted but currently unused) ────────────────────
+    year: Optional[int] = None,
+    approx_date: Optional[str] = None,
+    jd_start_tt: Optional[float] = None,
+    jd_end_tt: Optional[float] = None,
+    topocentric: Optional[bool] = None,
+    aspects_to_natal: Optional[bool] = None,
+    parallels: Optional[bool] = None,
+    antiscia: Optional[bool] = None,
+    orbs: Optional[Dict[str, float]] = None,
+    # Catch-all for any future fields from routes
+    **_unused: Any,
 ) -> Dict[str, Any]:
     """
     Compute a solar or lunar return with optional uncertainty, profiling, and validation.
