@@ -322,6 +322,231 @@ def parse_ephemeris_payload(body: Dict[str, Any], require_bodies: bool = False) 
     return {"jd_tt": float(jd_tt), "frame": frame, "bodies": bodies, "names": canon}
 
 
+# ───────────────────────── progressions payload (NEW) ─────────────────────────
+
+ProgressionsMethod = Literal["secondary", "minor", "tertiary"]
+TertiaryMode = Literal["day-for-month", "lunar-day-for-year"]
+ZodiacMode = Literal["tropical", "sidereal"]
+LunarMonthKind = Literal["synodic", "sidereal"]
+
+class NatalProgressions(TypedDict, total=False):
+    date: str
+    time: str
+    place_tz: str
+    latitude: float
+    longitude: float
+    elev_m: float
+
+class TargetProgressions(TypedDict, total=False):
+    date: str
+    time: str
+    place_tz: str
+
+class PlaceOverride(TypedDict, total=False):
+    latitude: float
+    longitude: float
+    elev_m: float
+
+class ProgressionsPayload(TypedDict, total=False):
+    natal: NatalProgressions
+    method: ProgressionsMethod
+    target: TargetProgressions
+    years_after: float
+    jd_tt_natal: float
+    jd_ut1_natal: float
+    place: PlaceOverride
+    frame: Literal["ecliptic-of-date", "ecliptic-j2000"]
+    house_system: str
+    zodiac_mode: ZodiacMode
+    ayanamsa_deg: float
+    lunar_month: LunarMonthKind
+    tertiary_mode: TertiaryMode
+    aspects_to_natal: bool
+    orbs: Dict[str, float]
+    parallels: bool
+    antiscia: bool
+    profile: bool
+    validation: Literal["none", "basic"]
+
+def _parse_progressions_natal(natal: Any) -> NatalProgressions:
+    if not isinstance(natal, dict):
+        raise ValidationError(_err("natal", "required object", "type_error.dict"))
+
+    out: NatalProgressions = {}
+    # natal date/time/tz are required IF strict timescales are not supplied at top-level
+    if "date" in natal:
+        out["date"] = parse_date(str(natal["date"])).strftime("%Y-%m-%d")
+    if "time" in natal:
+        out["time"] = parse_time_str(str(natal["time"]))
+    if "place_tz" in natal:
+        out["place_tz"] = _validate_iana_tz(str(natal["place_tz"]).strip(), ["natal", "place_tz"])
+
+    # optional coords
+    lat = natal.get("latitude")
+    lon = natal.get("longitude")
+    elev = natal.get("elev_m")
+    if lat is not None or lon is not None:
+        la, lo = parse_latlon(lat, lon, "natal.latitude", "natal.longitude")
+        out["latitude"] = la
+        out["longitude"] = lo
+    if elev is not None and _as_float(elev) is None:
+        raise ValidationError(_err(["natal", "elev_m"], "must be number", "type_error.float"))
+    if elev is not None:
+        out["elev_m"] = float(elev)
+
+    return out
+
+def _parse_progressions_target(target: Any) -> TargetProgressions:
+    if not isinstance(target, dict):
+        raise ValidationError(_err("target", "must be object", "type_error.dict"))
+    if "date" not in target or "time" not in target or ("place_tz" not in target and "timezone" not in target):
+        raise ValidationError(_err("target", "requires date, time, place_tz", "value_error"))
+    tz_val = target.get("place_tz") or target.get("timezone")
+    return {
+        "date": parse_date(str(target["date"])).strftime("%Y-%m-%d"),
+        "time": parse_time_str(str(target["time"])),
+        "place_tz": _validate_iana_tz(str(tz_val).strip(), ["target", "place_tz"]),
+    }
+
+def _parse_place_override(place: Any) -> PlaceOverride:
+    if not isinstance(place, dict):
+        raise ValidationError(_err("place", "must be object", "type_error.dict"))
+    la, lo = parse_latlon(place.get("latitude"), place.get("longitude"), "place.latitude", "place.longitude")
+    out: PlaceOverride = {"latitude": la, "longitude": lo}
+    if place.get("elev_m") is not None:
+        elev = _as_float(place.get("elev_m"))
+        if elev is None:
+            raise ValidationError(_err(["place","elev_m"], "must be number", "type_error.float"))
+        out["elev_m"] = float(elev)
+    return out
+
+def parse_progressions_payload(body: Dict[str, Any]) -> ProgressionsPayload:
+    """
+    Validate + normalize payload for /api/progressions.
+    Supports:
+      - method: secondary|minor|tertiary (default secondary)
+      - target {date,time,place_tz} OR years_after (one required)
+      - optional strict natal timescales: jd_tt_natal + jd_ut1_natal (both or none)
+      - frame (default ecliptic-of-date), house_system (default placidus in core), zodiac_mode
+      - lunar_month (synodic|sidereal), tertiary_mode, aspects_to_natal, orbs, parallels/antiscia, profile, validation
+    """
+    if not isinstance(body, dict):
+        raise ValidationError("payload must be an object")
+
+    # natal (always present, but date/time/tz are optional if strict timescales provided)
+    natal_raw = body.get("natal")
+    if natal_raw is None:
+        raise ValidationError(_err("natal", "required object", "value_error"))
+    natal = _parse_progressions_natal(natal_raw)
+
+    # strict natal timescales (optional, must be both if provided)
+    jd_tt_natal = _as_float(body.get("jd_tt_natal"))
+    jd_ut1_natal = _as_float(body.get("jd_ut1_natal"))
+    if (jd_tt_natal is None) ^ (jd_ut1_natal is None):
+        raise ValidationError(_err(["jd_tt_natal","jd_ut1_natal"], "supply both or neither", "value_error"))
+    have_strict_ts = (jd_tt_natal is not None and jd_ut1_natal is not None)
+
+    # if no strict timescales, ensure we have natal date/time/place_tz
+    if not have_strict_ts:
+        for key in ("date", "time", "place_tz"):
+            if key not in natal:
+                raise ValidationError(_err(["natal", key], "required when strict timescales are not supplied", "value_error"))
+
+    # method
+    method_raw = (body.get("method") or "secondary").strip().lower()
+    if method_raw not in ("secondary", "minor", "tertiary"):
+        raise ValidationError(_err("method", "must be 'secondary', 'minor', or 'tertiary'", "value_error"))
+    method: ProgressionsMethod = method_raw  # type: ignore
+
+    # target vs years_after (one required)
+    target_raw = body.get("target")
+    years_after = _as_float(body.get("years_after"))
+    target: Optional[TargetProgressions] = None
+    if target_raw is not None:
+        target = _parse_progressions_target(target_raw)
+    if target is None and years_after is None:
+        raise ValidationError(_err(["target","years_after"], "provide either target or years_after", "value_error"))
+
+    # place override (optional)
+    place_override: Optional[PlaceOverride] = None
+    if body.get("place") is not None:
+        place_override = _parse_place_override(body["place"])
+
+    # frame / house system / zodiac mode
+    frame = parse_frame(body.get("frame"))
+    house_system = parse_house_system(body.get("house_system")) or "placidus"
+    zodiac_mode = parse_mode(body.get("zodiac_mode") or body.get("mode"))
+
+    # ayanamsa_deg (float, default 0.0)
+    aya = body.get("ayanamsa_deg", 0.0)
+    aya_f = _as_float(aya)
+    if aya_f is None:
+        raise ValidationError(_err("ayanamsa_deg", "must be a number", "type_error.float"))
+    ayanamsa_deg = float(aya_f)
+
+    # lunar_month (for minor)
+    lunar_month_raw = (body.get("lunar_month") or "synodic").strip().lower()
+    if lunar_month_raw not in ("synodic", "sidereal"):
+        raise ValidationError(_err("lunar_month", "must be 'synodic' or 'sidereal'", "value_error"))
+    lunar_month: LunarMonthKind = lunar_month_raw  # type: ignore
+
+    # tertiary_mode
+    tertiary_mode_raw = (body.get("tertiary_mode") or "day-for-month").strip().lower()
+    if tertiary_mode_raw not in ("day-for-month", "lunar-day-for-year"):
+        raise ValidationError(_err("tertiary_mode", "must be 'day-for-month' or 'lunar-day-for-year'", "value_error"))
+    tertiary_mode: TertiaryMode = tertiary_mode_raw  # type: ignore
+
+    # booleans
+    aspects_to_natal = _truthy(body.get("aspects_to_natal"))
+    aspects_to_natal = True if aspects_to_natal is None else aspects_to_natal
+    parallels = bool(_truthy(body.get("parallels")) or False)
+    antiscia = bool(_truthy(body.get("antiscia")) or False)
+    profile = bool(_truthy(body.get("profile")) or False)
+
+    # validation
+    validation = str(body.get("validation") or "basic").strip().lower()
+    if validation not in ("none", "basic"):
+        raise ValidationError(_err("validation", "must be 'none' or 'basic'", "value_error"))
+
+    # orbs (optional dict[str,float])
+    orbs_obj = body.get("orbs")
+    if orbs_obj is not None:
+        if not isinstance(orbs_obj, dict):
+            raise ValidationError(_err("orbs", "must be object", "type_error.dict"))
+        # coerce to float where possible, drop invalid keys silently
+        new_orbs: Dict[str, float] = {}
+        for k, v in orbs_obj.items():
+            f = _as_float(v)
+            if f is not None:
+                new_orbs[str(k)] = float(f)
+        orbs = new_orbs
+    else:
+        orbs = None
+
+    out: ProgressionsPayload = {
+        "natal": natal,
+        "method": method,
+        "target": target if target is not None else {},  # keep key presence predictable
+        "years_after": float(years_after) if years_after is not None else None,  # type: ignore
+        "jd_tt_natal": float(jd_tt_natal) if jd_tt_natal is not None else None,  # type: ignore
+        "jd_ut1_natal": float(jd_ut1_natal) if jd_ut1_natal is not None else None,  # type: ignore
+        "place": place_override or {},  # empty if absent
+        "frame": frame,
+        "house_system": house_system,
+        "zodiac_mode": zodiac_mode,  # "tropical" | "sidereal"
+        "ayanamsa_deg": ayanamsa_deg,
+        "lunar_month": lunar_month,
+        "tertiary_mode": tertiary_mode,
+        "aspects_to_natal": bool(aspects_to_natal),
+        "orbs": orbs or {},  # empty if absent
+        "parallels": bool(parallels),
+        "antiscia": bool(antiscia),
+        "profile": bool(profile),
+        "validation": validation,  # "none" | "basic"
+    }
+    return out
+
+
 # ───────────────────────── timescale resolver (for predictive.py) ─────────────
 def resolve_timescales_from_civil_erfa(
     d: date,
@@ -397,5 +622,6 @@ __all__ = [
     "parse_rectification_payload",
     "parse_ephemeris_payload",
     "parse_frame",
+    "parse_progressions_payload",          # NEW
     "resolve_timescales_from_civil_erfa",
 ]
