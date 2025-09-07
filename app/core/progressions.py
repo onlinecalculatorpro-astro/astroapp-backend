@@ -223,7 +223,7 @@ def _to_place(natal: Dict[str, Any], override: Optional[Dict[str, Any]]) -> Opti
         }
     return None
 
-# ── ephemeris integration (class or module fallback) ──────────────────────────
+# ── ephemeris integration (FIXED) ──────────────────────────────────────────────
 def _normalize_ephem_result(res: Any) -> List[Dict[str, Any]]:
     """
     Normalize common adapter shapes into:
@@ -233,32 +233,44 @@ def _normalize_ephem_result(res: Any) -> List[Dict[str, Any]]:
     if res is None:
         return rows
 
-    # Combined dict {'longitudes': {...}, 'velocities': {...}}
-    if isinstance(res, dict) and ("longitudes" in res or "velocities" in res):
-        lonmap = res.get("longitudes") or {}
-        velmap = res.get("velocities") or {}
-        for k, v in lonmap.items():
-            try:
-                row = {"name": str(k), "lon": float(v)}
-                if k in velmap and isinstance(velmap[k], (int, float)):
-                    row["speed"] = float(velmap[k])
+    # Handle the actual adapter response format
+    if isinstance(res, dict):
+        # Extract results from the response structure
+        results = res.get("results", [])
+        if isinstance(results, list):
+            for r in results:
+                if isinstance(r, dict):
+                    name = r.get("name") or r.get("body")
+                    lon = r.get("longitude") or r.get("lon")
+                    lat = r.get("latitude") or r.get("lat")
+                    speed = r.get("velocity") or r.get("speed")
+                    
+                    if name and isinstance(lon, (int, float)):
+                        row = {"name": str(name), "lon": float(lon)}
+                        if isinstance(lat, (int, float)):
+                            row["lat"] = float(lat)
+                        if isinstance(speed, (int, float)):
+                            row["speed"] = float(speed)
+                        rows.append(row)
+            return rows
+        
+        # Fallback: try to extract from root level
+        longitudes = res.get("longitudes", {})
+        velocities = res.get("velocities", {})
+        for name, lon in longitudes.items():
+            if isinstance(lon, (int, float)):
+                row = {"name": str(name), "lon": float(lon)}
+                if name in velocities and isinstance(velocities[name], (int, float)):
+                    row["speed"] = float(velocities[name])
                 rows.append(row)
-            except Exception:
-                continue
         return rows
 
-    # Flat dict {'Sun': 123.4, ...}
-    if isinstance(res, dict) and all(isinstance(v, (int, float)) for v in res.values()):
-        for k, v in res.items():
-            rows.append({"name": str(k), "lon": float(v)})
-        return rows
-
-    # List of dict rows
+    # Handle list format
     if isinstance(res, list):
         for r in res:
             if not isinstance(r, dict):
                 continue
-            name = str(r.get("name") or r.get("body") or r.get("planet") or r.get("id") or r.get("label") or "?")
+            name = str(r.get("name") or r.get("body") or r.get("planet") or "?")
             lon = r.get("lon") or r.get("longitude") or r.get("lambda") or r.get("ecliptic_longitude")
             try:
                 lonf = float(lon)
@@ -289,83 +301,62 @@ def _planet_rows(
     warnings: List[str],
 ) -> List[Dict[str, Any]]:
     """
-    Prefer class-based adapter; fall back to module-level functions.
-    Tolerate signature drift & missing topo fields; never raise here.
+    FIXED: Use the working ephemeris adapter properly.
     """
     topo = bool(place)
     lat = place.get("latitude") if place else None
     lon = place.get("longitude") if place else None
     elev = place.get("elev_m") if place else None
 
-    # 1) Class adapter branch
+    # Use the adapter that we know works for /api/ephemeris
     if EphemerisAdapter is not None:
         try:
-            adapter = EphemerisAdapter()  # type: ignore[call-arg]
-            for m in ("ecliptic_longitudes_and_velocities", "ecliptic_longitudes"):
-                if hasattr(adapter, m):
-                    fn = getattr(adapter, m)
-                    sig = inspect.signature(fn)
-                    kwargs = {
-                        "jd_tt": jd_tt,
-                        "bodies": list(bodies),
-                        "center": ("topocentric" if topo else "geocentric"),
-                        "latitude": lat, "longitude": lon, "elevation_m": elev,
-                        "observer": {"lat": lat, "lon": lon, "elevation_m": elev} if topo else None,
-                        "frame": frame,
-                        "topocentric": topo,
-                    }
-                    call_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters and v is not None}
-                    res = fn(**call_kwargs)
-                    rows = _normalize_ephem_result(res)
-                    if rows:
-                        return rows
+            adapter = EphemerisAdapter()
+            
+            # Call the method that works for /api/ephemeris
+            result = adapter.ecliptic_longitudes(
+                jd_tt=jd_tt,
+                names=list(bodies),  # Use 'names' parameter like /api/ephemeris
+                frame=frame,
+                topocentric=topo,
+                latitude=lat,
+                longitude=lon,
+                elevation_m=elev
+            )
+            
+            # Normalize the result
+            rows = _normalize_ephem_result(result)
+            if rows:
+                return rows
+            else:
+                _warn(warnings, "ephemeris_adapter_returned_empty_results")
+                
         except Exception as e:
-            _warn(warnings, f"ephemeris_class_failed:{type(e).__name__}")
+            _warn(warnings, f"ephemeris_adapter_failed:{type(e).__name__}:{str(e)}")
 
-    # 2) Module-level fallback
+    # Fallback: try module-level functions (simplified)
     try:
-        from app.core import ephemeris_adapter as ea  # type: ignore
-        if hasattr(ea, "ecliptic_longitudes_and_velocities"):
-            try:
-                res = ea.ecliptic_longitudes_and_velocities(
-                    jd_tt=jd_tt, bodies=list(bodies), frame=frame,
-                    topocentric=topo,
-                    observer={"lat": lat, "lon": lon, "elevation_m": elev} if topo else None,
-                    latitude=lat, longitude=lon, elevation_m=elev
-                )
-                rows = _normalize_ephem_result(res)
-                if rows: return rows
-            except TypeError:
-                res = ea.ecliptic_longitudes_and_velocities(
-                    jd_tt=jd_tt, bodies=list(bodies), frame=frame, topocentric=topo
-                )
-                rows = _normalize_ephem_result(res)
-                if rows: return rows
-
-        if hasattr(ea, "ecliptic_longitudes"):
-            try:
-                res = ea.ecliptic_longitudes(
-                    jd_tt=jd_tt, bodies=list(bodies), frame=frame,
-                    topocentric=topo,
-                    observer={"lat": lat, "lon": lon, "elevation_m": elev} if topo else None,
-                    latitude=lat, longitude=lon, elevation_m=elev
-                )
-            except TypeError:
-                try:
-                    res = ea.ecliptic_longitudes(
-                        jd_tt, names=list(bodies), frame=frame, topocentric=topo,
-                        latitude=lat, longitude=lon, elevation_m=elev
-                    )
-                except TypeError:
-                    res = ea.ecliptic_longitudes(
-                        jd_tt=jd_tt, names=list(bodies), frame=frame, topocentric=topo
-                    )
-            rows = _normalize_ephem_result(res)
-            if rows: return rows
+        from app.core import ephemeris_adapter as ea
+        
+        # Try the same method that works for /api/ephemeris
+        result = ea.ecliptic_longitudes(
+            jd_tt=jd_tt,
+            names=list(bodies),
+            frame=frame,
+            topocentric=topo,
+            latitude=lat,
+            longitude=lon,
+            elevation_m=elev
+        )
+        
+        rows = _normalize_ephem_result(result)
+        if rows:
+            return rows
+            
     except Exception as e:
         _warn(warnings, f"ephemeris_module_failed:{type(e).__name__}")
 
-    # Nothing worked: return empty (caller handles gracefully)
+    # Last resort: return empty with clear warning
     _warn(warnings, "ephemeris_unavailable_for_longitudes")
     return []
 
