@@ -176,13 +176,13 @@ def _resolve_ts_from_natal(
         raise ValueError("Missing natal {date,time,place_tz} for timescale resolution.")
 
     ts = build_timescales(date_str=str(date), time_str=str(time), tz_name=str(tz), dut1_seconds=0.0)
-_warn(warnings, "strict_missing→computed_timescales_with_dut1=0.0s")
-return float(ts.jd_tt), float(ts.jd_ut1), {
-    "jd_tt": float(ts.jd_tt),
-    "jd_ut1": float(ts.jd_ut1),
-    "delta_t": float(getattr(ts, "delta_t", 0.0)),
-    "dut1": float(getattr(ts, "dut1", 0.0)),
-}
+    _warn(warnings, "strict_missing→computed_timescales_with_dut1=0.0s")
+    return float(ts.jd_tt), float(ts.jd_ut1), {
+        "jd_tt": float(ts.jd_tt),
+        "jd_ut1": float(ts.jd_ut1),
+        "delta_t": float(getattr(ts, "delta_t", 0.0)),
+        "dut1": float(getattr(ts, "dut1", 0.0)),
+    }
 
 def _resolve_years_since_birth(
     natal: Dict[str, Any],
@@ -199,12 +199,12 @@ def _resolve_years_since_birth(
         if not (d and t and tz):
             raise ValueError("Target requires {date,time,place_tz}.")
         ts = build_timescales(date_str=str(d), time_str=str(t), tz_name=str(tz), dut1_seconds=0.0)
-        jd_ut1_target = float(ts["jd_ut1"])
+        jd_ut1_target = float(ts.jd_ut1)
         yrs = (jd_ut1_target - jd_ut1_natal) / TROPICAL_YEAR_D
         return float(yrs), {
-            "jd_tt": float(ts["jd_tt"]),
+            "jd_tt": float(ts.jd_tt),
             "jd_ut1": jd_ut1_target,
-            "delta_t": float(ts.get("delta_t", 0.0)),
+            "delta_t": float(getattr(ts, "delta_t", 0.0)),
         }
 
     if years_after is None:
