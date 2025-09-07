@@ -1731,6 +1731,21 @@ def progressions_route():
         "validation": payload.get("validation", "basic"),
     }
 
+    # ---- merge nested flags (if client sent payload.flags) --------------------
+    f = payload.get("flags")
+    if isinstance(f, dict):
+        # top-level wins; flags only fill gaps or opt-in extras
+        if "aspects_to_natal" in f:
+            kwargs["aspects_to_natal"] = bool(
+                kwargs.get("aspects_to_natal") or f.get("aspects_to_natal", False)
+            )
+        for k in ("parallels", "antiscia", "profile"):
+            if k in f:
+                kwargs[k] = bool(kwargs.get(k) or f.get(k, False))
+        # orbs from flags only if not already provided at top-level
+        if "orbs" in f and kwargs.get("orbs") is None and isinstance(f["orbs"], dict):
+            kwargs["orbs"] = f["orbs"]
+
     # ---- fill natal timescales if not provided --------------------------------
     try:
         if (kwargs.get("jd_tt_natal") is None or kwargs.get("jd_ut1_natal") is None) and isinstance(kwargs["natal"], dict):
