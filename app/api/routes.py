@@ -1699,6 +1699,56 @@ def progressions_route():
     if compute_progressions is None:
         return _json_error("progressions_unavailable", "progressions engine not wired", 501)
 
+    # ---------- helpers: normalize any TimeScales objects to plain dicts ----------
+    def _timescales_to_dict(ts_obj: Any) -> Optional[Dict[str, Any]]:
+        # Already dict-like?
+        if isinstance(ts_obj, dict):
+            return ts_obj
+        # Our canonical type
+        try:
+            from app.core.timescales import TimeScales as _TS  # local import
+            if isinstance(ts_obj, _TS):
+                return {
+                    "jd_utc": float(ts_obj.jd_utc),
+                    "jd_tt": float(ts_obj.jd_tt),
+                    "jd_ut1": float(ts_obj.jd_ut1),
+                    "delta_t": float(ts_obj.delta_t),
+                    "delta_at": float(ts_obj.dat),
+                    "dut1": float(ts_obj.dut1),
+                    "tz_offset_seconds": int(ts_obj.tz_offset_seconds),
+                    "timezone": getattr(ts_obj, "tz_name", None) or getattr(ts_obj, "timezone", None),
+                    "warnings": list(getattr(ts_obj, "warnings", []) or []),
+                }
+        except Exception:
+            pass
+        # Dataclass fallback
+        try:
+            if is_dataclass(ts_obj):
+                return asdict(ts_obj)  # type: ignore[arg-type]
+        except Exception:
+            pass
+        # __dict__ fallback
+        try:
+            if hasattr(ts_obj, "__dict__"):
+                return dict(ts_obj.__dict__)
+        except Exception:
+            pass
+        return None  # unknown shape
+
+    def _strip_or_fix_timescales(container: Any) -> Any:
+        """Return a shallow-copied dict with any *.timescales normalized or removed."""
+        if not isinstance(container, dict):
+            return container
+        out = dict(container)
+        for key in ("timescales", "ts", "TimeScales"):
+            if key in out:
+                fixed = _timescales_to_dict(out[key])
+                if fixed is None:
+                    out.pop(key, None)     # drop unrecognized object to avoid engine errors
+                else:
+                    out[key] = fixed
+        return out
+
     # ---- parse & validate body ------------------------------------------------
     try:
         body = request.get_json(force=True) or {}
@@ -1708,58 +1758,20 @@ def progressions_route():
     except Exception as e:
         return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
 
-    # ---- deep-normalize: convert any TimeScales objects to plain dicts --------
-    def _ts_to_dict(ts: Any) -> Optional[Dict[str, Any]]:
-        # Accepts app.core.timescales.TimeScales (or duck-typed equivalent)
-        try:
-            # Access via attributes; don't subscript
-            return {
-                "jd_utc": float(ts.jd_utc),
-                "jd_tt": float(ts.jd_tt),
-                "jd_ut1": float(ts.jd_ut1),
-                "delta_t": float(ts.delta_t),
-                "delta_at": float(ts.dat),
-                "dut1": float(ts.dut1),
-                "timezone": getattr(ts, "timezone", None),
-                "tz_offset_seconds": int(getattr(ts, "tz_offset_seconds", 0)),
-                "warnings": list(getattr(ts, "warnings", []) or []),
-            }
-        except Exception:
-            return None
-
-    def _normalize(obj: Any) -> Any:
-        # Recursively walk lists/dicts and replace TimeScales with dicts
-        if obj is None:
-            return None
-        # direct TimeScales instance?
-        tsd = _ts_to_dict(obj)
-        if tsd is not None:
-            return tsd
-        if isinstance(obj, dict):
-            out = {}
-            for k, v in obj.items():
-                # If key literally named 'timescales' and value looks like TimeScales, coerce
-                if k in {"timescales", "ts", "time_scales"}:
-                    tv = _ts_to_dict(v)
-                    out[k] = tv if tv is not None else _normalize(v)
-                else:
-                    out[k] = _normalize(v)
-            return out
-        if isinstance(obj, (list, tuple)):
-            return [ _normalize(x) for x in obj ]
-        return obj
-
-    payload = _normalize(payload) or {}
+    # ---- sanitize nested dicts that may carry TimeScales -----------------------
+    natal_clean  = _strip_or_fix_timescales(payload.get("natal")  or {})
+    target_clean = _strip_or_fix_timescales(payload.get("target") or {})
+    place_clean  = _strip_or_fix_timescales(payload.get("place")  or {})
 
     # ---- seed kwargs from payload --------------------------------------------
     kwargs = {
-        "natal": payload["natal"],
+        "natal": natal_clean,
         "method": payload.get("method", "secondary"),
-        "target": (payload["target"] or None) if isinstance(payload.get("target"), dict) and payload["target"] else None,
+        "target": (target_clean or None) if isinstance(payload.get("target"), dict) and target_clean else None,
         "years_after": payload.get("years_after"),
         "jd_tt_natal": payload.get("jd_tt_natal"),
         "jd_ut1_natal": payload.get("jd_ut1_natal"),
-        "place": (payload["place"] or None) if isinstance(payload.get("place"), dict) and payload["place"] else None,
+        "place": (place_clean or None) if isinstance(payload.get("place"), dict) and place_clean else None,
         "frame": payload.get("frame", "ecliptic-of-date"),
         "house_system": payload.get("house_system", "placidus"),
         "zodiac_mode": payload.get("zodiac_mode", "tropical"),
@@ -1777,15 +1789,11 @@ def progressions_route():
     # ---- merge nested flags (if client sent payload.flags) --------------------
     f = payload.get("flags")
     if isinstance(f, dict):
-        # top-level wins; flags only fill gaps or opt-in extras
         if "aspects_to_natal" in f:
-            kwargs["aspects_to_natal"] = bool(
-                kwargs.get("aspects_to_natal") or f.get("aspects_to_natal", False)
-            )
+            kwargs["aspects_to_natal"] = bool(kwargs.get("aspects_to_natal") or f.get("aspects_to_natal", False))
         for k in ("parallels", "antiscia", "profile"):
             if k in f:
                 kwargs[k] = bool(kwargs.get(k) or f.get(k, False))
-        # orbs from flags only if not already provided at top-level
         if "orbs" in f and kwargs.get("orbs") is None and isinstance(f["orbs"], dict):
             kwargs["orbs"] = f["orbs"]
 
@@ -1809,17 +1817,23 @@ def progressions_route():
     try:
         import inspect
         engine_params = set(inspect.signature(compute_progressions).parameters.keys())
-        safe_kwargs = {k: v for k, v in kwargs.items() if k in engine_params}
 
-        # Map common alias if engine expects 'mode' instead of 'zodiac_mode'
-        if "mode" in engine_params and "mode" not in safe_kwargs and "zodiac_mode" in kwargs:
-            safe_kwargs["mode"] = kwargs["zodiac_mode"]
+        # drop any accidental TimeScales again if user nested them deeper
+        def _deep_clean(obj: Any) -> Any:
+            if isinstance(obj, dict):
+                return {k: _deep_clean(v) if k not in ("timescales", "ts", "TimeScales") else _timescales_to_dict(v) or None
+                        for k, v in obj.items() if (k not in ("timescales", "ts", "TimeScales")) or (_timescales_to_dict(v) is not None)}
+            return obj
 
-        # Be lenient with none/empties the engine might not like
+        cleaned_kwargs = {k: _deep_clean(v) for k, v in kwargs.items()}
+        safe_kwargs = {k: v for k, v in cleaned_kwargs.items() if k in engine_params}
+
+        if "mode" in engine_params and "mode" not in safe_kwargs and "zodiac_mode" in cleaned_kwargs:
+            safe_kwargs["mode"] = cleaned_kwargs["zodiac_mode"]
+
         for k in list(safe_kwargs.keys()):
-            if safe_kwargs[k] is None:
-                if k not in ("years_after", "target"):
-                    safe_kwargs.pop(k, None)
+            if safe_kwargs[k] is None and k not in ("years_after", "target"):
+                safe_kwargs.pop(k, None)
     except Exception as e:
         det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
         return _json_error("progressions_internal", det or "internal_error", 500)
