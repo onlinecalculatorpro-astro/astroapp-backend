@@ -1283,6 +1283,177 @@ def get_node_longitude(name: str, jd_tt: float) -> float:
     lon, _model, _fb = _node_longitude(canon, jd_tt, cfg=cfg, warnings=warnings, model_override=override)
     return lon
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ADDITIONS FOR PROGRESSIONS (APPENDED — NO EXISTING LINES MODIFIED)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Month/day constants typically used in progression conventions
+_SYNODIC_MONTH_D = 29.530588853      # mean synodic month (days)
+_SIDEREAL_MONTH_D = 27.321661547     # mean sidereal month (days)
+_LUNAR_DAY_D = 1.0351905             # lunar day (~24h50m) used in some tertiary (Type II) traditions
+
+def progression_epoch(
+    jd_natal: float,
+    *,
+    years_after: Optional[float] = None,
+    target_jd: Optional[float] = None,
+    kind: str = "secondary",
+    month_model: str = "synodic",      # for minor
+    tertiary_model: str = "typeI",     # for tertiary: {"typeI","typeII"}
+) -> float:
+    """
+    Compute a *progressed* Julian Day (TT) from a natal JD.
+
+    Conventions implemented:
+      - secondary      : 1 day per year
+      - minor:synodic  : 1 synodic month per year
+      - minor:sidereal : 1 sidereal month per year
+      - tertiary:typeI : 1 day per *month* of life  => shift = years_after * 12 days
+      - tertiary:typeII: 1 lunar day (~1.03519 d) per year
+
+    If 'target_jd' is supplied, it's returned (explicit epoch wins) and 'kind' is ignored.
+    """
+    if target_jd is not None:
+        return float(target_jd)
+
+    if years_after is None:
+        raise EphemerisError("progression", "either 'years_after' or 'target_jd' must be provided")
+
+    k = (kind or "secondary").strip().lower()
+
+    if k == "secondary":
+        return float(jd_natal) + float(years_after)
+
+    if k == "minor":
+        m = (month_model or "synodic").strip().lower()
+        month_len = _SYNODIC_MONTH_D if m in ("synodic", "syn") else _SIDEREAL_MONTH_D
+        return float(jd_natal) + float(years_after) * month_len
+
+    if k == "tertiary":
+        t = (tertiary_model or "typeI").strip().lower()
+        if t in ("typei", "i", "day-for-month", "day_for_month", "day4month"):
+            # 1 day per month of life
+            return float(jd_natal) + float(years_after) * 12.0
+        # type II: 1 lunar day per year
+        return float(jd_natal) + float(years_after) * _LUNAR_DAY_D
+
+    raise EphemerisError("progression", f"unsupported progression kind: {kind}")
+
+def resolve_progression_target(
+    jd_natal: float,
+    years_after: Optional[float],
+    target: Optional[float],
+    *,
+    kind: str = "secondary",
+    month_model: str = "synodic",
+    tertiary_model: str = "typeI",
+) -> Tuple[float, Dict[str, Any]]:
+    """
+    Returns (jd_target, meta_dict) given typical /api/progressions inputs.
+    """
+    jd_target = progression_epoch(
+        jd_natal,
+        years_after=years_after,
+        target_jd=target,
+        kind=kind,
+        month_model=month_model,
+        tertiary_model=tertiary_model,
+    )
+    meta = {
+        "progression": {
+            "kind": kind,
+            "years_after": years_after,
+            "target_jd": jd_target,
+            "month_model": month_model if kind.lower() == "minor" else None,
+            "tertiary_model": tertiary_model if kind.lower() == "tertiary" else None,
+        }
+    }
+    return jd_target, meta
+
+def apply_ayanamsa_to_rows(rows: List[Dict[str, Any]], ayanamsa_deg: float) -> List[Dict[str, Any]]:
+    """
+    Return new rows with tropical longitudes shifted by explicit ayanamsa.
+    Does not mutate the input.
+    """
+    try:
+        a = float(ayanamsa_deg)
+    except Exception:
+        a = 0.0
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        rr = dict(r)
+        lon = rr.get("longitude", rr.get("lon"))
+        try:
+            lonf = float(lon)
+        except Exception:
+            lonf = None  # type: ignore[assignment]
+        if lonf is not None and math.isfinite(lonf):
+            shifted = (lonf - a) % 360.0
+            rr["longitude"] = shifted
+            rr["lon"] = shifted
+            rr["ayanamsa_applied_deg"] = a
+        out.append(rr)
+    return out
+
+def progressed_positions(
+    jd_natal: float,
+    *,
+    years_after: Optional[float] = None,
+    target_jd: Optional[float] = None,
+    kind: str = "secondary",
+    month_model: str = "synodic",
+    tertiary_model: str = "typeI",
+    names: Optional[List[str]] = None,
+    bodies: Optional[List[str]] = None,
+    frame: Optional[str] = None,
+    topocentric: bool = False,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    elevation_m: Optional[float] = None,
+    observer: Optional[Dict[str, float]] = None,
+    ayanamsa_deg: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    Convenience wrapper:
+      1) Resolve progressed epoch from natal JD + (years_after | target_jd)
+      2) Fetch ecliptic longitudes (and speeds)
+      3) Optionally apply explicit ayanamsa to get sidereal positions.
+
+    This uses the existing adapter without altering any of its semantics.
+    """
+    jd_target, meta_prog = resolve_progression_target(
+        jd_natal, years_after, target_jd, kind=kind, month_model=month_model, tertiary_model=tertiary_model
+    )
+
+    payload = ecliptic_longitudes_and_velocities(
+        jd_target,
+        names=names,
+        bodies=bodies,
+        frame=frame,
+        topocentric=topocentric,
+        latitude=latitude,
+        longitude=longitude,
+        elevation_m=elevation_m,
+        observer=observer,
+    )
+
+    # Merge meta
+    payload = dict(payload)
+    payload_meta = dict(payload.get("meta", {}))
+    # Keep original meta; add/overlay progression meta
+    payload_meta.update(meta_prog)
+    payload["meta"] = payload_meta
+
+    # Optional explicit ayanamsa application
+    if ayanamsa_deg is not None:
+        payload["results"] = apply_ayanamsa_to_rows(payload.get("results", []), ayanamsa_deg)
+        # annotate that we applied a sidereal offset explicitly
+        payload["meta"]["sidereal"] = {"ayanamsa_deg": float(ayanamsa_deg)}
+
+    return payload
+
+
 __all__ = [
     "Config",
     "EphemerisAdapter",
@@ -1300,4 +1471,9 @@ __all__ = [
     "get_ecliptic_longitudes",
     "get_node_longitude",
     "EphemerisError",
+    # new exports for progressions:
+    "progression_epoch",
+    "resolve_progression_target",
+    "apply_ayanamsa_to_rows",
+    "progressed_positions",
 ]
