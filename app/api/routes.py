@@ -6,7 +6,8 @@ AstroApp — Canonical API Routes
 - Predictions
 - Ephemeris
 - Predictive toolkit
-- Progressions (secondary • minor • tertiary)   <-- NEW
+- Progressions (secondary • minor • tertiary)
+- Returns (solar • lunar • planetary)              <-- NEW
 - Ops: /api/health, /api/config, /api/openapi, /__debug/routes
 
 Notes:
@@ -42,7 +43,7 @@ from app.core.validators import (
     parse_ephemeris_payload,
     parse_frame,
     parse_latlon,
-    parse_progressions_payload,   # <-- NEW
+    parse_progressions_payload,
 )
 
 # Timescales core
@@ -60,6 +61,26 @@ try:
 except Exception:
     compute_progressions = None  # type: ignore
 
+# Returns core (prefer 'returns.py', fallback to 'return.py' via importlib)
+_returns_mod = None  # module object when available
+_RETURNS_IMPORT_ERROR: Optional[Exception] = None
+try:
+    from app.core import returns as _returns_mod  # app/core/returns.py (recommended)
+except Exception as _e1:
+    _RETURNS_IMPORT_ERROR = _e1
+    try:
+        import importlib.util as _importlib_util
+        _base_dir = os.path.dirname(os.path.dirname(__file__))  # app/
+        _path_return = os.path.join(_base_dir, "core", "return.py")
+        if os.path.exists(_path_return):
+            _spec = _importlib_util.spec_from_file_location("app.core._return_mod", _path_return)
+            if _spec and _spec.loader:
+                _mod = _importlib_util.module_from_spec(_spec)
+                _spec.loader.exec_module(_mod)  # type: ignore[attr-defined]
+                _returns_mod = _mod
+    except Exception as _e2:
+        _RETURNS_IMPORT_ERROR = _e2  # keep last error for diagnostics
+
 log = logging.getLogger(__name__)
 api = Blueprint("api", __name__)
 
@@ -76,8 +97,8 @@ RL_EPHEM        = _RL("ASTRO_RL_EPHEM_PER_MIN",        30)
 RL_PREDICTIONS  = _RL("ASTRO_RL_PREDICTIONS_PER_MIN",   6)
 RL_PREDICTIVE   = _RL("ASTRO_RL_PREDICTIVE_PER_MIN",   12)
 RL_DEBUG        = _RL("ASTRO_RL_DEBUG_PER_MIN",         6)
-RL_PROGRESSIONS = _RL("ASTRO_RL_PROGRESSIONS_PER_MIN", 12)  # <-- NEW
-
+RL_PROGRESSIONS = _RL("ASTRO_RL_PROGRESSIONS_PER_MIN", 12)
+RL_RETURNS      = _RL("ASTRO_RL_RETURNS_PER_MIN",      12)  # <-- NEW
 
 # ───────────────────────── helpers ─────────────────────────
 def _wrap360(x: float) -> float:
@@ -87,15 +108,12 @@ def _wrap360(x: float) -> float:
     except Exception:
         return x
 
-
 def _shortest_delta_deg(a2: float, a1: float) -> float:
     d = (float(a2) - float(a1) + 540.0) % 360.0 - 180.0
     return -180.0 if d == 180.0 else d
 
-
 def _delta_arcsec(a: float, b: float) -> float:
     return abs(_shortest_delta_deg(a, b)) * 3600.0
-
 
 def _json_error(code: str, details: Any = None, http: int = 400):
     out: Dict[str, Any] = {"ok": False, "error": code}
@@ -103,28 +121,23 @@ def _json_error(code: str, details: Any = None, http: int = 400):
         out["details"] = details
     return jsonify(out), http
 
-
 def _split_jd(jd: float) -> tuple[float, float]:
     d = int(jd // 1)
     return float(d), float(jd - d)
-
 
 def _sind(a: float) -> float:
     import math as _m
     return _m.sin(_m.radians(a))
 
-
 def _cosd(a: float) -> float:
     import math as _m
     return _m.cos(_m.radians(a))
-
 
 def _atan2d(y: float, x: float) -> float:
     import math as _m
     if abs(x) < 1e-18 and abs(y) < 1e-18:
         raise ValueError("atan2(0,0) undefined")
     return _wrap360(_m.degrees(_m.atan2(y, x)))
-
 
 def _gast_deg(jd_ut1: float, jd_tt: float) -> float:
     try:
@@ -145,7 +158,6 @@ def _gast_deg(jd_ut1: float, jd_tt: float) -> float:
         )
         return _wrap360(theta)
 
-
 def _true_obliquity_deg(jd_tt: float) -> float:
     try:
         import erfa  # type: ignore
@@ -160,26 +172,20 @@ def _true_obliquity_deg(jd_tt: float) -> float:
         eps_arcsec = 84381.448 - 46.8150 * T - 0.00059 * (T**2) + 0.001813 * (T**3)
         return eps_arcsec / 3600.0
 
-
 def _ramc_deg(jd_ut1: float, jd_tt: float, lon_east_deg: float) -> float:
     return _wrap360(_gast_deg(jd_ut1, jd_tt) + float(lon_east_deg))
-
 
 def _mc_from_ramc(ramc: float, eps: float) -> float:
     return _atan2d(_sind(ramc) * _cosd(eps), _cosd(ramc))
 
-
 def _asc_from_phi_ramc(phi: float, ramc: float, eps: float) -> float:
     import math as _m
-
     def _acotd(x: float) -> float:
         return _wrap360(_m.degrees(_m.atan2(1.0, x)))
-
     num = -((_m.tan(_m.radians(phi)) * _sind(eps)) + (_sind(ramc) * _cosd(eps)))
     den = _cosd(ramc)
     den = den if abs(den) > 1e-15 else _m.copysign(1e-15, den if den != 0 else 1.0)
     return _acotd(num / den)
-
 
 def _recompute_angles_exact(
     *,
@@ -200,7 +206,6 @@ def _recompute_angles_exact(
         asc = _wrap360(asc - float(ayanamsa_deg))
         mc = _wrap360(mc - float(ayanamsa_deg))
     return {"asc_deg": asc, "mc_deg": mc}
-
 
 # ───────────────────────── timescales adapter ─────────────────────────
 def _compute_timescales_from_local(
@@ -283,12 +288,10 @@ def _compute_timescales_from_local(
         "warnings": list(ts.warnings),
     }
 
-
 # ───────────────────────── health / ops ─────────────────────────
 @api.get("/api/health")
 def health():
     return jsonify({"ok": True, "status": "up", "version": VERSION}), 200
-
 
 @api.get("/api/config")
 @rate_limit(1)
@@ -346,7 +349,6 @@ def config_info():
         }
     ), 200
 
-
 @api.get("/api/openapi")
 @rate_limit(RL_DEBUG)
 def openapi_spec():
@@ -360,7 +362,6 @@ def openapi_spec():
             continue
     return _json_error("openapi_not_found", None, 404)
 
-
 @api.get("/__debug/routes")
 @rate_limit(RL_DEBUG)
 def debug_routes():
@@ -373,7 +374,6 @@ def debug_routes():
         rules.append({"rule": str(r), "methods": methods, "endpoint": r.endpoint})
     rules.sort(key=lambda x: x["rule"])
     return jsonify({"ok": True, "routes": rules}), 200
-
 
 # ───────────────────────── timescales ─────────────────────────
 @api.post("/api/timescales")
@@ -401,7 +401,6 @@ def timescales_endpoint():
         return _json_error("validation_error", e.errors(), 400)
     except Exception as e:
         return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
-
 
 # ───────────────────────── chart / houses ─────────────────────────
 _compute_chart = None  # type: ignore
@@ -447,7 +446,6 @@ def _sig_accepts(fn, *names: str) -> Dict[str, bool]:
     except Exception:
         params = inspect.signature(fn).parameters
     return {n: (n in params) for n in names}
-
 
 # ---------- adapter/kernel meta snapshot (for dev tools visibility) ----------
 def _snapshot_ephemeris_meta(chart_meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -497,7 +495,6 @@ def _snapshot_ephemeris_meta(chart_meta: Optional[Dict[str, Any]] = None) -> Dic
         if _CHART_ENGINE_NAME:
             info["source"] = _CHART_ENGINE_NAME
     return info
-
 
 def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str, Any]:
     if _compute_chart is None:
@@ -590,7 +587,6 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
         chart["mode"] = payload["mode"]
     return chart
 
-
 def _sig_accepts_houses() -> Dict[str, bool]:
     if _houses_fn is None:
         return {}
@@ -599,7 +595,6 @@ def _sig_accepts_houses() -> Dict[str, bool]:
         "system", "requested_house_system", "house_system",
         "mode", "jd_ut", "jd_tt", "jd_ut1", "diagnostics", "validation",
     )
-
 
 def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
     if _houses_fn is None:
@@ -691,7 +686,6 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
         log.error("House calculation failed: %s: %s", type(e).__name__, e)
         raise
 
-
 def _call_compute_aspects(payload: Dict[str, Any], chart: Dict[str, Any], houses: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Build a positions dict from chart (and optional houses) and delegate to the
@@ -753,7 +747,6 @@ def _call_compute_aspects(payload: Dict[str, Any], chart: Dict[str, Any], houses
     # --- Run aspects engine (adapter handles empty positions gracefully) ---
     return run_aspects_api(**aspects_config)
 
-
 def _extract_ayanamsa_from_chart(chart: Dict[str, Any]) -> Optional[float]:
     if not isinstance(chart, dict):
         return None
@@ -763,7 +756,6 @@ def _extract_ayanamsa_from_chart(chart: Dict[str, Any]) -> Optional[float]:
         return float(ay)
     ay2 = chart.get("ayanamsa_deg")
     return float(ay2) if isinstance(ay2, (int, float)) else None
-
 
 def _normalize_houses_payload(h: Any) -> Any:
     if not isinstance(h, dict):
@@ -787,7 +779,6 @@ def _normalize_houses_payload(h: Any) -> Any:
         if isinstance(h.get(key), list):
             h[key] = [_wrap360(c) if isinstance(c, (int, float)) else c for c in h[key]]
     return h
-
 
 def _recompute_houses_angles_if_needed(
     h: Any, ts: Dict[str, Any], payload: Dict[str, Any], chart: Dict[str, Any]
@@ -832,7 +823,6 @@ def _recompute_houses_angles_if_needed(
         h["warnings"] = warn_list
     return _normalize_houses_payload(h)
 
-
 def _prepare_chart_for_predict(chart: Dict[str, Any]) -> Dict[str, Any]:
     ch = dict(chart)
     bodies = ch.get("bodies")
@@ -849,7 +839,6 @@ def _prepare_chart_for_predict(chart: Dict[str, Any]) -> Dict[str, Any]:
         ch["bodies_map"] = bodies
     return ch
 
-
 def _require_coords_for_houses(payload: Dict[str, Any]):
     lat = payload.get("latitude")
     lon = payload.get("longitude")
@@ -860,7 +849,6 @@ def _require_coords_for_houses(payload: Dict[str, Any]):
         lat_ok = lon_ok = False
     if not (lat_ok and lon_ok):
         raise ValueError("latitude and longitude are required (finite numbers) to compute houses")
-
 
 def _want_houses(body: Dict[str, Any]) -> bool:
     """
@@ -878,7 +866,6 @@ def _want_houses(body: Dict[str, Any]) -> bool:
         if "compute" in h and h.get("compute") is False:
             return False
     return True
-
 
 # ───────────────────────── endpoints ─────────────────────────
 @api.post("/api/calculate")
@@ -980,7 +967,6 @@ def calculate():
         resp["aspects"] = aspects_result
     return jsonify(resp), 200
 
-
 @api.post("/api/report")
 @rate_limit(RL_REPORT)
 def report():
@@ -1068,7 +1054,6 @@ def report():
     if want_houses:
         resp["houses"] = houses
     return jsonify(resp), 200
-
 
 # ───────────────────────── predictions ─────────────────────────
 @api.post("/api/predictions")
@@ -1217,7 +1202,6 @@ def predictions_route():
     resp = {"ok": True, "predictions": preds, "meta": meta}
     return jsonify(resp), 200
 
-
 # ───────────────────────── aspects ─────────────────────────
 @api.post("/api/aspects")
 @rate_limit(RL_ASPECTS)
@@ -1280,7 +1264,6 @@ def aspects():
         "aspects": aspects_result,
         "meta": meta
     }), 200
-
 
 # ───────────────────────── predictive (transits • validation • dasha • varga • yogas) ─────────────────────────
 @api.post("/api/predictive/transits")
@@ -1432,7 +1415,6 @@ def predictive_transits():
         "results": out
     }), 200
 
-
 @api.post("/api/predictive/ingresses")
 @rate_limit(RL_PREDICTIVE)
 def predictive_ingresses():
@@ -1475,7 +1457,6 @@ def predictive_ingresses():
     except Exception as e:
         return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
-
 @api.post("/api/predictive/stations")
 @rate_limit(RL_PREDICTIVE)
 def predictive_stations():
@@ -1515,7 +1496,6 @@ def predictive_stations():
         return _json_error("validation_error", e.errors(), 400)
     except Exception as e:
         return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
-
 
 @api.post("/api/predictive/evaluate")
 @rate_limit(RL_PREDICTIVE)
@@ -1565,7 +1545,6 @@ def predictive_evaluate():
     except Exception as e:
         return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
-
 @api.post("/api/predictive/holdout")
 @rate_limit(RL_PREDICTIVE)
 def predictive_holdout():
@@ -1607,7 +1586,6 @@ def predictive_holdout():
     except Exception as e:
         return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
-
 @api.post("/api/predictive/dasha")
 @rate_limit(RL_PREDICTIVE)
 def predictive_dasha():
@@ -1636,7 +1614,6 @@ def predictive_dasha():
     except Exception as e:
         return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
-
 @api.post("/api/predictive/vargas")
 @rate_limit(RL_PREDICTIVE)
 def predictive_vargas():
@@ -1659,7 +1636,6 @@ def predictive_vargas():
         return jsonify({"ok": True, "results": res}), 200
     except Exception as e:
         return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
-
 
 @api.post("/api/predictive/yogas")
 @rate_limit(RL_PREDICTIVE)
@@ -1686,8 +1662,7 @@ def predictive_yogas():
     except Exception as e:
         return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
-
-# ───────────────────────── PROGRESSIONS (NEW) ─────────────────────────
+# ───────────────────────── PROGRESSIONS ─────────────────────────
 @api.post("/api/progressions")
 @rate_limit(RL_PROGRESSIONS)
 def progressions_route():
@@ -1873,6 +1848,312 @@ def progressions_route():
     }
     return jsonify(resp), 200
 
+# ───────────────────────── RETURNS (NEW) ─────────────────────────
+def _returns_available() -> bool:
+    return _returns_mod is not None
+
+def _returns_pick_fn(kind: str) -> Optional[Any]:
+    """
+    Choose a function from the returns module based on intent.
+    For 'compute': prefer one-shot compute fn; for 'scan': prefer window scanner.
+    """
+    if not _returns_available():
+        return None
+    candidates = []
+    if kind == "compute":
+        candidates = [
+            "compute_return", "run_return_api", "calculate_return",
+            "compute_returns", "solar_return", "lunar_return",
+        ]
+    elif kind == "scan":
+        candidates = ["scan_returns", "find_returns", "scan", "search_returns"]
+    for name in candidates:
+        fn = getattr(_returns_mod, name, None)
+        if callable(fn):
+            return fn
+    return None
+
+def _parse_return_kind(raw: Any) -> str:
+    s = str(raw or "").strip().lower()
+    if not s:
+        return "solar"
+    # accept aliases
+    alias = {
+        "sun": "solar", "sol": "solar",
+        "moon": "lunar", "lun": "lunar",
+    }
+    return alias.get(s, s)
+
+def _normalize_window(body: Dict[str, Any], default_days: float = 30.0) -> Tuple[Optional[float], Optional[float]]:
+    """Return (jd_start_tt, jd_end_tt) if resolvable from body; else (None,None)."""
+    jd0 = body.get("jd_start_tt")
+    jd1 = body.get("jd_end_tt")
+    if isinstance(jd0, (int, float)) and isinstance(jd1, (int, float)):
+        try:
+            jd0 = float(jd0); jd1 = float(jd1)
+            if jd1 > jd0:
+                return jd0, jd1
+        except Exception:
+            pass
+    # Try civil dates
+    date0 = body.get("date_start") or body.get("start_date")
+    time0 = body.get("time_start") or "00:00:00"
+    date1 = body.get("date_end") or body.get("end_date")
+    time1 = body.get("time_end") or "23:59:59"
+    tz = body.get("tz") or body.get("place_tz") or body.get("timezone")
+    if isinstance(date0, str) and isinstance(time0, str) and isinstance(tz, str):
+        ts0 = _compute_timescales_from_local(date0, time0, tz, payload=body)
+        jd0f = float(ts0["jd_tt"])
+        if isinstance(date1, str) and isinstance(time1, str):
+            ts1 = _compute_timescales_from_local(date1, time1, tz, payload=body)
+            jd1f = float(ts1["jd_tt"])
+            if jd1f > jd0f:
+                return jd0f, jd1f
+        else:
+            return jd0f, jd0f + default_days
+    return None, None
+
+def _coerce_int(v: Any) -> Optional[int]:
+    try:
+        if v is None:
+            return None
+        return int(v)
+    except Exception:
+        return None
+
+def _build_returns_kwargs(body: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[List[Dict[str, Any]]]]:
+    """
+    Prepare kwargs for returns engine; also collect validation errors list if any.
+    """
+    errs: List[Dict[str, Any]] = []
+
+    natal = body.get("natal") or {}
+    if not isinstance(natal, dict):
+        errs.append({"loc": ["natal"], "msg": "required object", "type": "value_error"})
+        natal = {}
+
+    # natal requirements: date/time/tz (for timescales) — keep loose: lat/lon optional
+    date = natal.get("date"); time_s = natal.get("time"); tz = natal.get("place_tz") or natal.get("tz") or natal.get("timezone")
+    if not (isinstance(date, str) and isinstance(time_s, str) and isinstance(tz, str)):
+        errs.append({"loc": ["natal.date|time|place_tz"], "msg": "required strings", "type": "value_error"})
+
+    # Normalize frame / zodiac / house system
+    frame = parse_frame(body.get("frame"))
+    zodiac_mode = (body.get("zodiac_mode") or body.get("mode") or "tropical")
+    house_system = (body.get("house_system") or "placidus").strip().lower()
+    ay = body.get("ayanamsa_deg")
+
+    # Return kind
+    kind = _parse_return_kind(body.get("kind") or body.get("type") or body.get("planet"))
+
+    # Target year or approx date (optional)
+    target_year = _coerce_int(body.get("year") or body.get("target_year"))
+    approx_date = body.get("date") or body.get("approx_date")
+
+    # Compute natal JD if possible (helps engines that accept jd_tt_natal)
+    jd_tt_natal = body.get("jd_tt_natal")
+    jd_ut1_natal = body.get("jd_ut1_natal")
+    try:
+        if isinstance(date, str) and isinstance(time_s, str) and isinstance(tz, str):
+            ts_nat = _compute_timescales_from_local(date, time_s, tz, payload=natal)
+            if not isinstance(jd_tt_natal, (int, float)):
+                jd_tt_natal = float(ts_nat["jd_tt"])
+            if not isinstance(jd_ut1_natal, (int, float)):
+                jd_ut1_natal = float(ts_nat["jd_ut1"])
+    except ValidationError as e:
+        errs.extend(e.errors())
+
+    # Infer topocentric if coords present or flag given
+    topocentric = bool(body.get("topocentric")) or (isinstance(natal.get("latitude"), (int, float)) and isinstance(natal.get("longitude"), (int, float)))
+
+    # Aspects flags
+    flags = {
+        "aspects_to_natal": bool(body.get("aspects_to_natal", True)),
+        "parallels": bool(body.get("parallels", False)),
+        "antiscia": bool(body.get("antiscia", False)),
+    }
+    orbs = body.get("orbs") if isinstance(body.get("orbs"), dict) else None
+
+    # Scan window (optional)
+    jd0, jd1 = _normalize_window(body)
+
+    kwargs: Dict[str, Any] = {
+        "natal": natal,
+        "kind": kind,
+        "year": target_year,
+        "approx_date": approx_date,
+        "jd_tt_natal": jd_tt_natal,
+        "jd_ut1_natal": jd_ut1_natal,
+        "frame": frame,
+        "zodiac_mode": zodiac_mode,
+        "ayanamsa_deg": float(ay) if isinstance(ay, (int, float)) else None,
+        "house_system": house_system,
+        "topocentric": topocentric,
+        "aspects_to_natal": flags["aspects_to_natal"],
+        "parallels": flags["parallels"],
+        "antiscia": flags["antiscia"],
+        "orbs": orbs,
+        # optional scan params (engines may ignore for single compute)
+        "jd_start_tt": jd0,
+        "jd_end_tt": jd1,
+        "validation": body.get("validation", "basic"),
+        "profile": bool(body.get("profile", False)),
+    }
+
+    # prune None values except those that some engines might accept (keep jd_* window Nones harmless)
+    for k in list(kwargs.keys()):
+        if kwargs[k] is None and k not in ("jd_start_tt", "jd_end_tt", "year", "approx_date", "ayanamsa_deg"):
+            kwargs.pop(k, None)
+
+    return kwargs, (errs if errs else None)
+
+def _returns_enrich_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
+    m = dict(meta or {})
+    try:
+        m.update(_snapshot_ephemeris_meta(m))
+    except Exception:
+        pass
+    return m
+
+@api.post("/api/return")
+@rate_limit(RL_RETURNS)
+def returns_compute_route():
+    """
+    Compute a single return (solar/lunar/planetary) closest to a target year/date.
+
+    Body (tolerant):
+      natal: { date, time, place_tz, latitude?, longitude? }
+      kind|type|planet: "solar"|"lunar"|"venus"|... (default "solar")
+      year|target_year: int (optional) OR approx date via `date` or `approx_date`
+      frame: "ecliptic-of-date"|"ecliptic-j2000"
+      zodiac_mode: "tropical"|"sidereal"
+      house_system: "placidus"|...
+      topocentric: bool (implied true if natal has lat/lon)
+      aspects_to_natal, parallels, antiscia, orbs (dict)
+      validation: "basic"|...
+      profile: bool
+
+    Returns:
+      200 { ok, epoch, positions, houses?, aspects_to_natal?, meta{ kernel,... } }
+      400 on validation / value errors
+      501 if engine unavailable
+      500 on internal exceptions
+    """
+    if not _returns_available():
+        det = {"import_error": repr(_RETURNS_IMPORT_ERROR)} if DEBUG_VERBOSE and _RETURNS_IMPORT_ERROR else None
+        return _json_error("returns_unavailable", det or "returns engine not wired", 501)
+
+    try:
+        body = request.get_json(force=True) or {}
+    except Exception as e:
+        return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
+
+    kwargs, errs = _build_returns_kwargs(body)
+    if errs:
+        return _json_error("validation_error", errs, 400)
+
+    compute_fn = _returns_pick_fn("compute")
+    if not callable(compute_fn):
+        return _json_error("returns_unavailable", "no compute function exported by return(s) module", 501)
+
+    try:
+        result = compute_fn(**kwargs)  # type: ignore[misc]
+    except ValueError as e:
+        return _json_error("returns_value_error", str(e), 400)
+    except TypeError as e:
+        det = {"type": "TypeError", "message": str(e)} if DEBUG_VERBOSE else None
+        return _json_error("returns_internal", det or "internal_error", 500)
+    except RuntimeError as e:
+        det = {"type": "RuntimeError", "message": str(e)} if DEBUG_VERBOSE else None
+        return _json_error("returns_internal", det or "internal_error", 500)
+    except Exception as e:
+        det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
+        return _json_error("returns_internal", det or "internal_error", 500)
+
+    meta = _returns_enrich_meta(result.get("meta") or {})
+    resp = {
+        "ok": True,
+        "kind": result.get("kind") or kwargs.get("kind"),
+        "epoch": result.get("epoch"),
+        "positions": result.get("positions"),
+        "houses": result.get("houses"),
+        "aspects_to_natal": result.get("aspects_to_natal") or [],
+        "meta": meta,
+        "warnings": list(meta.get("warnings") or []),
+    }
+    return jsonify(resp), 200
+
+@api.post("/api/return/scan")
+@rate_limit(RL_RETURNS)
+def returns_scan_route():
+    """
+    Scan a time window for return events (e.g., all lunar returns in a month).
+
+    Body:
+      natal: { date, time, place_tz, latitude?, longitude? }
+      kind|type|planet: "solar"|"lunar"|...
+      jd_start_tt & jd_end_tt (preferred) OR date_start/ time_start / date_end / time_end (+ tz)
+      frame, zodiac_mode, house_system, topocentric, orbs, flags same as /api/return
+
+    Returns:
+      200 { ok, window, kind, results:[{ jd_tt, epoch?, positions?, houses?, meta? }], meta }
+      400 on validation errors
+      501 if engine unavailable / missing scan function
+    """
+    if not _returns_available():
+        det = {"import_error": repr(_RETURNS_IMPORT_ERROR)} if DEBUG_VERBOSE and _RETURNS_IMPORT_ERROR else None
+        return _json_error("returns_unavailable", det or "returns engine not wired", 501)
+
+    try:
+        body = request.get_json(force=True) or {}
+    except Exception as e:
+        return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
+
+    kwargs, errs = _build_returns_kwargs(body)
+    if errs:
+        return _json_error("validation_error", errs, 400)
+
+    # ensure we have a real window
+    jd0 = kwargs.get("jd_start_tt"); jd1 = kwargs.get("jd_end_tt")
+    if not (isinstance(jd0, (int, float)) and isinstance(jd1, (int, float)) and jd1 > jd0):
+        return _json_error("validation_error", [{"loc": ["jd_start_tt|date_start"], "msg": "window required"}], 400)
+
+    scan_fn = _returns_pick_fn("scan")
+    if not callable(scan_fn):
+        return _json_error("returns_unavailable", "no scan function exported by return(s) module", 501)
+
+    try:
+        results = scan_fn(**kwargs)  # type: ignore[misc]
+    except ValueError as e:
+        return _json_error("returns_value_error", str(e), 400)
+    except TypeError as e:
+        det = {"type": "TypeError", "message": str(e)} if DEBUG_VERBOSE else None
+        return _json_error("returns_internal", det or "internal_error", 500)
+    except RuntimeError as e:
+        det = {"type": "RuntimeError", "message": str(e)} if DEBUG_VERBOSE else None
+        return _json_error("returns_internal", det or "internal_error", 500)
+    except Exception as e:
+        det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
+        return _json_error("returns_internal", det or "internal_error", 500)
+
+    meta = {}
+    if isinstance(results, dict):
+        # engines might return {"results":[...], "meta":{...}}
+        meta = _returns_enrich_meta(results.get("meta") or {})
+        res_list = results.get("results") if isinstance(results.get("results"), list) else []
+    elif isinstance(results, list):
+        meta = {}
+        res_list = results
+    else:
+        res_list = []
+
+    return jsonify({
+        "ok": True,
+        "kind": kwargs.get("kind"),
+        "window": {"jd_start_tt": float(jd0), "jd_end_tt": float(jd1)},
+        "results": res_list,
+        "meta": meta,
+    }), 200
 
 # ───────────────────────── ephemeris ─────────────────────────
 def _coerce_float(v: Any) -> Optional[float]:
@@ -1882,7 +2163,6 @@ def _coerce_float(v: Any) -> Optional[float]:
         return float(v)
     except Exception:
         return None
-
 
 def _truthy(val: Any) -> Optional[bool]:
     if isinstance(val, bool):
@@ -1895,7 +2175,6 @@ def _truthy(val: Any) -> Optional[bool]:
     if s in {"0", "false", "f", "no", "n", "off"}:
         return False
     return None
-
 
 def _norm_rows_from_longitudes(raw: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Normalize longitude results to consistent format."""
@@ -1942,7 +2221,6 @@ def _norm_rows_from_longitudes(raw: Any) -> Tuple[List[Dict[str, Any]], Dict[str
 
     return rows, meta
 
-
 def _norm_rows_from_lv(raw: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Normalize longitude+velocity results to consistent format."""
     rows_map: Dict[str, Dict[str, Any]] = {}
@@ -1976,7 +2254,6 @@ def _norm_rows_from_lv(raw: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
                 rec["velocity"] = float(V)
 
     return list(rows_map.values()), meta
-
 
 @api.post("/api/ephemeris/longitudes")
 @rate_limit(RL_EPHEM)
@@ -2147,7 +2424,6 @@ def ephemeris_longitudes_endpoint():
         "results": ordered_results,
     }), 200
 
-
 # ───────────────────────── ephemeris diagnostics (for dev tools) ─────────────────────────
 @api.get("/api/ephemeris/diagnostics")
 @rate_limit(RL_DEBUG)
@@ -2196,7 +2472,6 @@ def ephemeris_diagnostics_route():
     except Exception as e:
         return _json_error("adapter_error", str(e) if DEBUG_VERBOSE else "adapter_error", 500)
 
-
 # ───────────────────────── DEBUG: House Engine Detection ─────────────────────────
 @api.get("/api/debug/engine-test")
 @rate_limit(RL_DEBUG)
@@ -2236,7 +2511,6 @@ def debug_engine_test():
         }), 200
     except Exception as e:
         return _json_error("engine_test_error", str(e), 500)
-
 
 @api.get("/api/debug/precision-test")
 @rate_limit(RL_DEBUG)
@@ -2284,7 +2558,6 @@ def debug_precision_test():
     except Exception as e:
         return _json_error("precision_test_error", str(e), 500)
 
-
 @api.get("/api/debug/function-signatures")
 @rate_limit(RL_DEBUG)
 def debug_function_signatures():
@@ -2319,7 +2592,6 @@ def debug_function_signatures():
         return jsonify({"ok": True, "debug_info": info}), 200
     except Exception as e:
         return _json_error("function_signatures_error", str(e), 500)
-
 
 # ───────────────────────── system-validation (optional) ─────────────────────────
 @api.get("/system-validation")
