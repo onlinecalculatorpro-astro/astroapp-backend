@@ -2,6 +2,8 @@
 # -----------------------------------------------------------------------------
 # Research-grade Ephemeris Adapter (Skyfield + optional SPICE)
 #
+# FIXED VERSION - Supports frame parameter for return calculations
+#
 # Guarantees
 # • ALWAYS returns {"results": [ {name, longitude, ...} ], "meta": {...}, "center": "..."}.
 # • Accepts both argument names: names=[] or bodies=[] (case-insensitive).
@@ -11,6 +13,7 @@
 # • Robust lunar nodes (true via angular-momentum; mean as policy/fallback), with speed via central diff.
 # • Clean error taxonomy in warnings; JD guard aligned to DE421 span by default (override via env).
 # • Optional SPICE for selected small bodies (Ceres, Pallas, Juno, Vesta, Chiron) when enabled.
+# • FIXED: Constructor accepts frame parameter directly for compatibility with return calculations
 # -----------------------------------------------------------------------------
 from __future__ import annotations
 
@@ -588,7 +591,7 @@ def _frame_latlon(geo, ecliptic_frame, *, abs_zero_tol_deg: float) -> Tuple[floa
         x, y, z = (float(xyz.au[0]), float(xyz.au[1]), float(xyz.au[2]))
         rho = math.hypot(x, y)
         if math.isfinite(x) and math.isfinite(y) and math.isfinite(z) and (rho > 0.0 or z != 0.0):
-            lon = _atan2deg(y, x, abs_zero_tol_deg=self.cfg.abs_zero_tol_deg)  # type: ignore[attr-defined]
+            lon = _atan2deg(y, x, abs_zero_tol_deg=abs_zero_tol_deg)
             lat = math.degrees(math.atan2(z, rho)) if rho > 0.0 else (90.0 if z > 0.0 else -90.0)
             return lon % 360.0, float(lat)
     except Exception:
@@ -675,7 +678,7 @@ def _mean_node(jd_tt: float) -> float:
     return Omega % 360.0
 
 def _node_tick(jd_tt: float, res_s: float) -> int:
-    # Quantize JD to integer “ticks” to avoid float-key precision loss in caching.
+    # Quantize JD to integer "ticks" to avoid float-key precision loss in caching.
     # res_s=0 → 1 ns ticks.
     day_s = 86400.0
     q = max(res_s, 1e-9)
@@ -712,7 +715,7 @@ def _true_node_geocentric_tick(cache_key: Tuple[int, float, float]) -> float:
             return (ay*bz - az*by, az*bx - ax*bz, ax*by - ay*bz)
 
         h = _cross(r0, v)
-        n = _cross((0.0, 0.0, 1.0), h)  # ecliptic Ẑ
+        n = _cross((0.0, 0.0, 1.0), h)  # ecliptic Ẑ
         nx, ny = n[0], n[1]
         norm_xy = math.hypot(nx, ny)
         if not math.isfinite(norm_xy) or norm_xy < 1e-18:
@@ -802,11 +805,61 @@ def _ang_speed_via_xy(
     return math.degrees(lamdot_rad)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Adapter class
+# FIXED Adapter class with improved constructor
 # ─────────────────────────────────────────────────────────────────────────────
 class EphemerisAdapter:
-    def __init__(self, cfg: Optional[Config] = None):
-        self.cfg = cfg or Config()
+    def __init__(self, cfg: Optional[Config] = None, frame: Optional[str] = None, **kwargs):
+        """
+        FIXED: Initialize EphemerisAdapter with optional frame parameter for compatibility.
+        
+        This constructor now accepts frame parameter directly, which was causing the error:
+        "EphemerisAdapter.__init__() got an unexpected keyword argument 'frame'"
+        
+        Args:
+            cfg: Configuration object (preferred method)
+            frame: Frame parameter for backward compatibility with return calculations
+            **kwargs: Additional parameters (ignored for compatibility)
+        """
+        if cfg is not None:
+            # Use provided config, but allow frame override
+            if frame is not None:
+                # Override frame in existing config
+                self.cfg = Config(
+                    frame=frame,
+                    allow_degraded=cfg.allow_degraded,
+                    node_model=cfg.node_model,
+                    node_on_fail=cfg.node_on_fail,
+                    node_cache_res_s=cfg.node_cache_res_s,
+                    speed_tol_arcsec=cfg.speed_tol_arcsec,
+                    speed_min_step_d=cfg.speed_min_step_d,
+                    abs_zero_tol_deg=cfg.abs_zero_tol_deg,
+                    enable_smalls=cfg.enable_smalls,
+                    enforce_jd_range=cfg.enforce_jd_range,
+                    jd_min=cfg.jd_min,
+                    jd_max=cfg.jd_max,
+                )
+            else:
+                self.cfg = cfg
+        else:
+            # Create new config with frame override if provided
+            base_config = Config()
+            if frame is not None:
+                self.cfg = Config(
+                    frame=frame,
+                    allow_degraded=base_config.allow_degraded,
+                    node_model=base_config.node_model,
+                    node_on_fail=base_config.node_on_fail,
+                    node_cache_res_s=base_config.node_cache_res_s,
+                    speed_tol_arcsec=base_config.speed_tol_arcsec,
+                    speed_min_step_d=base_config.speed_min_step_d,
+                    abs_zero_tol_deg=base_config.abs_zero_tol_deg,
+                    enable_smalls=base_config.enable_smalls,
+                    enforce_jd_range=base_config.enforce_jd_range,
+                    jd_min=base_config.jd_min,
+                    jd_max=base_config.jd_max,
+                )
+            else:
+                self.cfg = base_config
 
     # ---- body resolution -----------------------------------------------------
     @lru_cache(maxsize=2048)
