@@ -1708,6 +1708,49 @@ def progressions_route():
     except Exception as e:
         return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
 
+    # ---- deep-normalize: convert any TimeScales objects to plain dicts --------
+    def _ts_to_dict(ts: Any) -> Optional[Dict[str, Any]]:
+        # Accepts app.core.timescales.TimeScales (or duck-typed equivalent)
+        try:
+            # Access via attributes; don't subscript
+            return {
+                "jd_utc": float(ts.jd_utc),
+                "jd_tt": float(ts.jd_tt),
+                "jd_ut1": float(ts.jd_ut1),
+                "delta_t": float(ts.delta_t),
+                "delta_at": float(ts.dat),
+                "dut1": float(ts.dut1),
+                "timezone": getattr(ts, "timezone", None),
+                "tz_offset_seconds": int(getattr(ts, "tz_offset_seconds", 0)),
+                "warnings": list(getattr(ts, "warnings", []) or []),
+            }
+        except Exception:
+            return None
+
+    def _normalize(obj: Any) -> Any:
+        # Recursively walk lists/dicts and replace TimeScales with dicts
+        if obj is None:
+            return None
+        # direct TimeScales instance?
+        tsd = _ts_to_dict(obj)
+        if tsd is not None:
+            return tsd
+        if isinstance(obj, dict):
+            out = {}
+            for k, v in obj.items():
+                # If key literally named 'timescales' and value looks like TimeScales, coerce
+                if k in {"timescales", "ts", "time_scales"}:
+                    tv = _ts_to_dict(v)
+                    out[k] = tv if tv is not None else _normalize(v)
+                else:
+                    out[k] = _normalize(v)
+            return out
+        if isinstance(obj, (list, tuple)):
+            return [ _normalize(x) for x in obj ]
+        return obj
+
+    payload = _normalize(payload) or {}
+
     # ---- seed kwargs from payload --------------------------------------------
     kwargs = {
         "natal": payload["natal"],
@@ -1756,12 +1799,10 @@ def progressions_route():
                 kwargs.setdefault("jd_tt_natal", float(ts_nat["jd_tt"]))
                 kwargs.setdefault("jd_ut1_natal", float(ts_nat["jd_ut1"]))
     except ValidationError as e:
-        # If natal timescales derivation fails, surface as validation error
         return _json_error("validation_error", e.errors(), 400)
     except Exception as e:
         if DEBUG_VERBOSE:
             return _json_error("timescales_error", {"type": type(e).__name__, "message": str(e)}, 400)
-        # non-fatal; engine may not require these explicitly
         pass
 
     # ---- filter to engine signature & map aliases -----------------------------
@@ -1777,8 +1818,7 @@ def progressions_route():
         # Be lenient with none/empties the engine might not like
         for k in list(safe_kwargs.keys()):
             if safe_kwargs[k] is None:
-                # Drop empty optionals rather than sending None
-                if k not in ("years_after", "target"):  # keep these; engine may want the exclusive-or check
+                if k not in ("years_after", "target"):
                     safe_kwargs.pop(k, None)
     except Exception as e:
         det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
@@ -1793,7 +1833,6 @@ def progressions_route():
         det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
         return _json_error("progressions_internal", det or "internal_error", 500)
     except TypeError as e:
-        # Most common cause: unexpected kwarg – include details in debug
         det = {"type": "TypeError", "message": str(e), "accepted": sorted(engine_params)} if DEBUG_VERBOSE else None
         return _json_error("progressions_internal", det or "internal_error", 500)
     except Exception as e:
