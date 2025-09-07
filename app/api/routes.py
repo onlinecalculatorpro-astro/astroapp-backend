@@ -1929,139 +1929,148 @@ def _coerce_int(v: Any) -> Optional[int]:
 
 def _build_returns_kwargs(body: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[List[Dict[str, Any]]]]:
     """
-    Build kwargs for the returns engine.
-
-    Behavior:
-    - If validators.parse_returns_payload exists, use it and map 1:1.
-    - Otherwise, perform a tolerant normalization here.
+    Route-friendly builder for returns engines.
+    - Validates minimal natal fields
+    - Fills jd_tt_natal / jd_ut1_natal if missing
+    - Normalizes frame/zodiac/house
+    - Derives topocentric from coords
+    - Computes optional scan window (jd_start_tt / jd_end_tt)
     """
-    # ---- path A: strict parser if present ------------------------------------
-    try:
-        from app.core.validators import parse_returns_payload  # type: ignore
-        try:
-            payload = parse_returns_payload(body)  # returns normalized dict
-            natal = dict(payload.get("natal") or {})
-            place = dict(payload.get("place") or {}) or None
-
-            kwargs = {
-                "natal": natal,
-                "kind": payload.get("kind", "solar"),
-                "jd_tt_natal": payload.get("jd_tt_natal"),
-                "jd_ut1_natal": payload.get("jd_ut1_natal"),
-                "place": place,
-                "frame": payload.get("frame", "ecliptic-of-date"),
-                "house_system": payload.get("house_system", "placidus"),
-                "zodiac_mode": payload.get("zodiac_mode", "tropical"),
-                "ayanamsa_deg": payload.get("ayanamsa_deg", 0.0),
-                "lunar_month": payload.get("lunar_month", "sidereal"),
-                "guess_years_offset": payload.get("guess_years_offset"),
-                "around_jd_tt": payload.get("around_jd_tt"),
-                "tol_arcmin": payload.get("tol_arcmin", 1.0),
-                "max_iters": payload.get("max_iters", 12),
-                "estimate_uncertainty": payload.get("estimate_uncertainty", True),
-                "fd_step_minutes": payload.get("fd_step_minutes", 2.0),
-                "profile": payload.get("profile", False),
-                "validation": payload.get("validation", "basic"),
-                "validation_residual_arcmin": payload.get("validation_residual_arcmin", 1.0),
-                # scanner hints (harmless for single compute)
-                "jd_start_tt": payload.get("jd_start_tt"),
-                "jd_end_tt": payload.get("jd_end_tt"),
-            }
-            for k in list(kwargs.keys()):
-                if kwargs[k] is None and k not in ("jd_start_tt", "jd_end_tt"):
-                    kwargs.pop(k, None)
-            return kwargs, None
-        except ValidationError as e:
-            return {}, e.errors()
-    except Exception:
-        # No strict parser available → fall back below
-        pass
-
-    # ---- path B: tolerant builder (no strict parser) --------------------------
     errs: List[Dict[str, Any]] = []
 
+    # natal (required)
     natal = body.get("natal") or {}
     if not isinstance(natal, dict):
         errs.append({"loc": ["natal"], "msg": "required object", "type": "value_error"})
         natal = {}
 
-    # minimal natal inputs (for timescales if strict JDs not provided)
+    # natal essentials (only enforced here to be helpful; engine can still handle strict JDs)
     date = natal.get("date"); time_s = natal.get("time")
     tz = natal.get("place_tz") or natal.get("tz") or natal.get("timezone")
+    if not (isinstance(date, str) and isinstance(time_s, str) and isinstance(tz, str)):
+        errs.append({"loc": ["natal.date|time|place_tz"], "msg": "required strings", "type": "value_error"})
 
+    # frame / zodiac / house / ayanamsa
+    try:
+        frame = parse_frame(body.get("frame"))
+    except ValidationError as e:
+        return {}, e.errors()
+    zodiac_mode = (body.get("zodiac_mode") or body.get("mode") or "tropical").strip().lower()
+    house_system = (body.get("house_system") or "placidus").strip().lower()
+    ay = body.get("ayanamsa_deg")
+    ay_f = None
+    try:
+        if isinstance(ay, (int, float)):
+            ay_f = float(ay)
+        elif ay is not None:
+            ay_f = float(str(ay))
+    except Exception:
+        errs.append({"loc": ["ayanamsa_deg"], "msg": "must be a number", "type": "type_error.float"})
+
+    # return kind
+    kind = _parse_return_kind(body.get("kind") or body.get("type") or body.get("planet"))
+
+    # natal strict timescales (fill if missing)
     jd_tt_natal = body.get("jd_tt_natal")
     jd_ut1_natal = body.get("jd_ut1_natal")
-    if not (isinstance(jd_tt_natal, (int, float)) and isinstance(jd_ut1_natal, (int, float))):
-        if not (isinstance(date, str) and isinstance(time_s, str) and isinstance(tz, str)):
-            errs.append({"loc": ["natal.date|time|place_tz"], "msg": "required strings", "type": "value_error"})
-        else:
-            try:
-                ts_nat = _compute_timescales_from_local(str(date), str(time_s), str(tz), payload=natal)
+    try:
+        if isinstance(date, str) and isinstance(time_s, str) and isinstance(tz, str):
+            ts_nat = _compute_timescales_from_local(date, time_s, tz, payload=natal)
+            if not isinstance(jd_tt_natal, (int, float)):
                 jd_tt_natal = float(ts_nat["jd_tt"])
+            if not isinstance(jd_ut1_natal, (int, float)):
                 jd_ut1_natal = float(ts_nat["jd_ut1"])
-            except ValidationError as e:
-                errs.extend(e.errors())
+    except ValidationError as e:
+        errs.extend(e.errors())
 
-    # optional place override
+    # place override (optional)
     place = body.get("place")
-    if place is not None and not isinstance(place, dict):
-        errs.append({"loc": ["place"], "msg": "must be object", "type": "type_error.dict"})
-        place = None
     if isinstance(place, dict):
-        la = place.get("latitude"); lo = place.get("longitude")
-        if la is None and lo is None:
+        # only keep valid numbers
+        try:
+            la = float(place["latitude"]); lo = float(place["longitude"])
+            place = {"latitude": la, "longitude": lo, "elev_m": float(place.get("elev_m", 0.0))}
+        except Exception:
+            # ignore malformed place override
             place = None
-        else:
-            try:
-                la_f, lo_f = parse_latlon(la, lo, "place.latitude", "place.longitude")
-                elev = place.get("elev_m") if ("elev_m" in place) else place.get("elevation_m")
-                elev_f = float(elev) if isinstance(elev, (int, float)) else None
-                place = {"latitude": la_f, "longitude": lo_f}
-                if elev_f is not None:
-                    place["elev_m"] = elev_f
-            except ValidationError as e:
-                errs.extend(e.errors())
+    else:
+        place = None
+
+    # topocentric if coords exist (either override or natal) or flag explicitly true
+    def _has_coords(d: Dict[str, Any]) -> bool:
+        try:
+            return isinstance(d.get("latitude"), (int, float)) and isinstance(d.get("longitude"), (int, float))
+        except Exception:
+            return False
+
+    topocentric = bool(body.get("topocentric")) or _has_coords(natal) or _has_coords(place or {})
+
+    # scan window (used by /api/return/scan; harmless on single compute)
+    try:
+        jd0, jd1 = _normalize_window(body)
+    except ValidationError as e:
+        errs.extend(e.errors())
+        jd0 = jd1 = None
+
+    # solver & validation knobs
+    tol_arcmin = float(body.get("tol_arcmin", 1.0))
+    max_iters = int(body.get("max_iters", 12))
+    estimate_uncertainty = bool(body.get("estimate_uncertainty", True))
+    fd_step_minutes = float(body.get("fd_step_minutes", 2.0))
+    profile = bool(body.get("profile", False))
+    validation = (body.get("validation") or "basic").strip().lower()
+    validation_residual_arcmin = float(body.get("validation_residual_arcmin", 1.0))
+
+    # targeting options
+    guess_years_offset = body.get("guess_years_offset")
+    around_jd_tt = body.get("around_jd_tt")
+
+    # orbs & aspect flags (pass-through)
+    orbs = body.get("orbs") if isinstance(body.get("orbs"), dict) else None
+    aspects_to_natal = bool(body.get("aspects_to_natal", True))
+    parallels = bool(body.get("parallels", False))
+    antiscia = bool(body.get("antiscia", False))
+
+    # lunar month (for lunar returns)
+    lunar_month = (body.get("lunar_month") or "sidereal").strip().lower()
 
     if errs:
         return {}, errs
 
-    # map basic knobs
-    kind = _parse_return_kind(body.get("kind") or body.get("type") or body.get("planet"))
-    frame = parse_frame(body.get("frame"))
-    house_system = str(body.get("house_system") or "placidus").strip().lower()
-    zodiac_mode = str(body.get("zodiac_mode") or body.get("mode") or "tropical").strip().lower()
-    ay = body.get("ayanamsa_deg")
-    ay_f = float(ay) if isinstance(ay, (int, float)) else 0.0
-
     kwargs: Dict[str, Any] = {
-        "natal": dict(natal),
+        "natal": natal,
         "kind": kind,
-        "jd_tt_natal": float(jd_tt_natal) if isinstance(jd_tt_natal, (int, float)) else None,
-        "jd_ut1_natal": float(jd_ut1_natal) if isinstance(jd_ut1_natal, (int, float)) else None,
-        "place": place or None,
+        "jd_tt_natal": jd_tt_natal,
+        "jd_ut1_natal": jd_ut1_natal,
+        "place": place,
         "frame": frame,
         "house_system": house_system,
         "zodiac_mode": zodiac_mode,
-        "ayanamsa_deg": ay_f,
-        "lunar_month": str(body.get("lunar_month") or "sidereal").strip().lower(),
-        "guess_years_offset": _coerce_int(body.get("guess_years_offset")),
-        "around_jd_tt": (float(body["around_jd_tt"]) if isinstance(body.get("around_jd_tt"), (int, float)) else None),
-        "tol_arcmin": float(body.get("tol_arcmin", 1.0)),
-        "max_iters": int(body.get("max_iters", 12)),
-        "estimate_uncertainty": bool(body.get("estimate_uncertainty", True)),
-        "fd_step_minutes": float(body.get("fd_step_minutes", 2.0)),
-        "profile": bool(body.get("profile", False)),
-        "validation": str(body.get("validation", "basic")).strip().lower(),
-        "validation_residual_arcmin": float(body.get("validation_residual_arcmin", 1.0)),
+        "ayanamsa_deg": ay_f if ay_f is not None else None,
+        "lunar_month": lunar_month,
+        "guess_years_offset": guess_years_offset,
+        "around_jd_tt": around_jd_tt,
+        "tol_arcmin": tol_arcmin,
+        "max_iters": max_iters,
+        "estimate_uncertainty": estimate_uncertainty,
+        "fd_step_minutes": fd_step_minutes,
+        "profile": profile,
+        "validation": validation,
+        "validation_residual_arcmin": validation_residual_arcmin,
+        "aspects_to_natal": aspects_to_natal,
+        "parallels": parallels,
+        "antiscia": antiscia,
+        "orbs": orbs,
+        # window (for /scan)
+        "jd_start_tt": jd0,
+        "jd_end_tt": jd1,
+        # hint (some engines may read it)
+        "topocentric": topocentric,
     }
 
-    # optional scan window hints (harmless for single compute)
-    jd0, jd1 = _normalize_window(body)
-    kwargs["jd_start_tt"] = jd0
-    kwargs["jd_end_tt"] = jd1
-
+    # prune explicit None (except window and ayanamsa which can be None safely)
     for k in list(kwargs.keys()):
-        if kwargs[k] is None and k not in ("jd_start_tt", "jd_end_tt"):
+        if kwargs[k] is None and k not in ("jd_start_tt", "jd_end_tt", "ayanamsa_deg"):
             kwargs.pop(k, None)
 
     return kwargs, None
