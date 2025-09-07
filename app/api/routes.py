@@ -1693,11 +1693,13 @@ def predictive_yogas():
 def progressions_route():
     """
     Progressions: secondary / minor / tertiary.
-    Body is validated by parse_progressions_payload to match compute_progressions signature.
+    Validates payload, normalizes aliases, fills natal JDs if missing,
+    filters kwargs to the engine's signature, and returns enriched meta.
     """
     if compute_progressions is None:
         return _json_error("progressions_unavailable", "progressions engine not wired", 501)
 
+    # ---- parse & validate body ------------------------------------------------
     try:
         body = request.get_json(force=True) or {}
         payload = parse_progressions_payload(body)
@@ -1706,6 +1708,7 @@ def progressions_route():
     except Exception as e:
         return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
 
+    # ---- seed kwargs from payload --------------------------------------------
     kwargs = {
         "natal": payload["natal"],
         "method": payload.get("method", "secondary"),
@@ -1728,22 +1731,68 @@ def progressions_route():
         "validation": payload.get("validation", "basic"),
     }
 
+    # ---- fill natal timescales if not provided --------------------------------
     try:
-        result = compute_progressions(**kwargs)
+        if (kwargs.get("jd_tt_natal") is None or kwargs.get("jd_ut1_natal") is None) and isinstance(kwargs["natal"], dict):
+            nat = kwargs["natal"]
+            d, t, tz = nat.get("date"), nat.get("time"), (nat.get("place_tz") or nat.get("timezone"))
+            if isinstance(d, str) and isinstance(t, str) and isinstance(tz, str):
+                ts_nat = _compute_timescales_from_local(d, t, tz, payload=nat)
+                kwargs.setdefault("jd_tt_natal", float(ts_nat["jd_tt"]))
+                kwargs.setdefault("jd_ut1_natal", float(ts_nat["jd_ut1"]))
+    except ValidationError as e:
+        # If natal timescales derivation fails, surface as validation error
+        return _json_error("validation_error", e.errors(), 400)
+    except Exception as e:
+        if DEBUG_VERBOSE:
+            return _json_error("timescales_error", {"type": type(e).__name__, "message": str(e)}, 400)
+        # non-fatal; engine may not require these explicitly
+        pass
+
+    # ---- filter to engine signature & map aliases -----------------------------
+    try:
+        import inspect
+        engine_params = set(inspect.signature(compute_progressions).parameters.keys())
+        safe_kwargs = {k: v for k, v in kwargs.items() if k in engine_params}
+
+        # Map common alias if engine expects 'mode' instead of 'zodiac_mode'
+        if "mode" in engine_params and "mode" not in safe_kwargs and "zodiac_mode" in kwargs:
+            safe_kwargs["mode"] = kwargs["zodiac_mode"]
+
+        # Be lenient with none/empties the engine might not like
+        for k in list(safe_kwargs.keys()):
+            if safe_kwargs[k] is None:
+                # Drop empty optionals rather than sending None
+                if k not in ("years_after", "target"):  # keep these; engine may want the exclusive-or check
+                    safe_kwargs.pop(k, None)
+    except Exception as e:
+        det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
+        return _json_error("progressions_internal", det or "internal_error", 500)
+
+    # ---- call engine ----------------------------------------------------------
+    try:
+        result = compute_progressions(**safe_kwargs)
     except ValueError as e:
         return _json_error("progressions_value_error", str(e), 400)
     except RuntimeError as e:
-        return _json_error("progressions_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+        det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
+        return _json_error("progressions_internal", det or "internal_error", 500)
+    except TypeError as e:
+        # Most common cause: unexpected kwarg – include details in debug
+        det = {"type": "TypeError", "message": str(e), "accepted": sorted(engine_params)} if DEBUG_VERBOSE else None
+        return _json_error("progressions_internal", det or "internal_error", 500)
     except Exception as e:
-        return _json_error("progressions_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+        det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
+        return _json_error("progressions_internal", det or "internal_error", 500)
 
-    # Meta enrichment (adapter snapshot)
+    # ---- meta enrichment (adapter snapshot) -----------------------------------
     meta = dict(result.get("meta") or {})
     try:
         meta.update(_snapshot_ephemeris_meta(meta))
     except Exception:
         pass
 
+    # ---- response -------------------------------------------------------------
     resp = {
         "ok": True,
         "mapping": (meta.get("mapping") if isinstance(meta.get("mapping"), dict) else None),
