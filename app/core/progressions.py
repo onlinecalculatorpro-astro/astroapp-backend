@@ -300,7 +300,7 @@ def _planet_rows(
     # 1) Class adapter branch
     if EphemerisAdapter is not None:
         try:
-            adapter = EphemerisAdapter(frame=frame)  # type: ignore[call-arg]
+            adapter = EphemerisAdapter()  # type: ignore[call-arg]
             for m in ("ecliptic_longitudes_and_velocities", "ecliptic_longitudes"):
                 if hasattr(adapter, m):
                     fn = getattr(adapter, m)
