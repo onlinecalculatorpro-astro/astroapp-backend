@@ -1692,7 +1692,7 @@ def predictive_yogas():
 @rate_limit(RL_PROGRESSIONS)
 def progressions_route():
     """
-    Progressions: secondary / minor / tertiary
+    Progressions: secondary / minor / tertiary.
     Body is validated by parse_progressions_payload to match compute_progressions signature.
     """
     if compute_progressions is None:
@@ -1706,7 +1706,6 @@ def progressions_route():
     except Exception as e:
         return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
 
-    # Map normalized payload → compute_progressions kwargs
     kwargs = {
         "natal": payload["natal"],
         "method": payload.get("method", "secondary"),
@@ -1722,7 +1721,7 @@ def progressions_route():
         "lunar_month": payload.get("lunar_month", "synodic"),
         "tertiary_mode": payload.get("tertiary_mode", "day-for-month"),
         "aspects_to_natal": bool(payload.get("aspects_to_natal", True)),
-        "orbs": (payload.get("orbs") or None),
+        "orbs": payload.get("orbs") or None,
         "parallels": bool(payload.get("parallels", False)),
         "antiscia": bool(payload.get("antiscia", False)),
         "profile": bool(payload.get("profile", False)),
@@ -1747,7 +1746,9 @@ def progressions_route():
 
     resp = {
         "ok": True,
+        "mapping": (meta.get("mapping") if isinstance(meta.get("mapping"), dict) else None),
         "meta": meta,
+        "warnings": list((meta.get("warnings") or [])),
         "epoch": result.get("epoch"),
         "positions": result.get("positions"),
         "houses": result.get("houses"),
