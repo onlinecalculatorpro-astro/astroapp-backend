@@ -1944,10 +1944,9 @@ def resolve_timescales_from_civil_erfa(
         frac = (m.group("f") or "0")
 
     # Leap second 60 → build 59 and add one second later
-    add_one_sec = False
-    if ss == 60:
+    add_one_sec = (ss == 60)
+    if add_one_sec:
         ss = 59
-        add_one_sec = True
 
     # Microseconds from fractional seconds
     us = int((frac + "000000")[:6])
@@ -1965,17 +1964,23 @@ def resolve_timescales_from_civil_erfa(
         raise RuntimeError(f"Skyfield not installed: {e}") from e
 
     ts = load.timescale()
-    t = ts.utc(dt_utc.year, dt_utc.month, dt_utc.day, dt_utc.hour, dt_utc.minute, dt_utc.second + dt_utc.microsecond/1e6)
+    t = ts.utc(
+        dt_utc.year, dt_utc.month, dt_utc.day,
+        dt_utc.hour, dt_utc.minute, dt_utc.second + dt_utc.microsecond / 1e6
+    )
 
     jd_tt = float(t.tt)
-    jd_utc = float(t.utc_jd)
 
+    # ΔT = TT − UT1 (seconds) → convert to days to get JD(UT1)
     try:
-        delta_t_sec = float(t.delta_t)  # TT − UT1 (seconds)
+        delta_t_sec = float(t.delta_t)
     except Exception:
         delta_t_sec = 0.0  # fallback: UT1≈UTC if ΔT unavailable
-
     jd_ut1 = jd_tt - (delta_t_sec / 86400.0)
+
+    # Compute JD(UTC) from the UTC datetime (Skyfield has no `utc_jd`)
+    J2000_UTC = datetime(2000, 1, 1, 12, 0, 0, tzinfo=ZoneInfo("UTC"))
+    jd_utc = 2451545.0 + (dt_utc - J2000_UTC).total_seconds() / 86400.0
 
     return {"jd_tt": jd_tt, "jd_ut1": jd_ut1, "jd_utc": jd_utc, "tz": tz}
 
