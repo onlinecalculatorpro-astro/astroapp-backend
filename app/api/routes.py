@@ -2226,7 +2226,7 @@ def parans_route():
     Compute local parans (co-risings/culminations/settings/anti-culminations).
     
     Body:
-      subject: { date, time, place_tz }  # for timescale resolution
+      subject?: { date, time, place_tz }  # for timescale resolution (optional if jd_tt_ref/jd_ut1_ref provided)
       place: { latitude, longitude, elev_m? }  # observation location (required)
       jd_tt_ref?: float  # reference epoch (TT); optional if subject provided
       jd_ut1_ref?: float  # reference epoch (UT1); optional if subject provided
@@ -2257,7 +2257,7 @@ def parans_route():
     except Exception as e:
         return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
 
-    # Extract and validate required components
+    # Extract components
     subject = payload.get("subject", {})
     place = payload.get("place", {})
     
@@ -2265,13 +2265,9 @@ def parans_route():
     jd_tt_ref = payload.get("jd_tt_ref")
     jd_ut1_ref = payload.get("jd_ut1_ref")
     
-    # If no strict timescales provided, resolve from subject
+    # Resolve timescales if not provided directly
     if jd_tt_ref is None or jd_ut1_ref is None:
-        if not all(k in subject for k in ["date", "time", "place_tz"]):
-            return _json_error("validation_error", [
-                {"loc": ["subject"], "msg": "date, time, place_tz required when strict timescales not provided", "type": "value_error"}
-            ], 400)
-        
+        # At this point, validator has ensured subject has required fields
         try:
             ts = _compute_timescales_from_local(
                 subject["date"], 
@@ -2361,7 +2357,6 @@ def parans_route():
     }
 
     return jsonify(resp), 200
-
 
 # ───────────────────────── ephemeris ─────────────────────────
 def _coerce_float(v: Any) -> Optional[float]:
