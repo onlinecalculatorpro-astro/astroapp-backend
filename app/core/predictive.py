@@ -22,25 +22,55 @@ import math
 import random
 import logging
 
-# ───────────────────── precise backends ─────────────────────
+# ───────────────────── precise backends (soft imports) ─────────────────────
+# Ephemeris adapter
 try:
     from app.core.ephemeris_adapter import (
         EphemerisAdapter, Config as EphemConfig, rows_to_maps, get_node_longitude
     )
+    _EPH_OK = True
+    _EPH_ERR = None
 except Exception as e:
-    raise RuntimeError(f"predictive: ephemeris backend unavailable: {e}") from e
+    # Do NOT raise at import time; defer error until a function needs it
+    _EPH_OK = False
+    _EPH_ERR = e
+    EphemerisAdapter = None          # type: ignore
+    EphemConfig = None               # type: ignore
 
+    def rows_to_maps(_rows):         # minimal harmless fallback
+        return {"longitudes": {}}
+
+    def get_node_longitude(*_args, **_kwargs):
+        return None
+
+# Houses
+_HAS_POLICY = False
+_HOUSES_OK = True
 try:
     from app.core.house import compute_houses_with_policy as _compute_houses_policy
     _HAS_POLICY = True
 except Exception:
-    _HAS_POLICY = False
-    from app.core.houses import asc_mc_houses as _asc_mc_houses
+    try:
+        from app.core.houses import asc_mc_houses as _asc_mc_houses  # fallback implementation
+    except Exception as _houses_err:
+        _HOUSES_OK = False
+        _compute_houses_policy = None   # type: ignore
+        _asc_mc_houses = None           # type: ignore
+        _HOUSES_ERR = _houses_err
+    else:
+        _HOUSES_ERR = None
+else:
+    _HOUSES_ERR = None
 
+# Timescale resolver (optional)
 try:
     from app.core.validators import resolve_timescales_from_civil_erfa as _ts_resolve
-except Exception:
-    _ts_resolve = None
+    _TS_OK = True
+    _TS_ERR = None
+except Exception as e:
+    _TS_OK = False
+    _TS_ERR = e
+    _ts_resolve = None  # type: ignore
 
 log = logging.getLogger(__name__)
 
