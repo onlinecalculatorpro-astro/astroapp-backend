@@ -965,7 +965,7 @@ def holdout_replicate(
     for name in selected:
         x: List[float] = []; yy: List[int] = []; ss: List[Any] = []; tt: List[float] = []
         for i, r in enumerate(rows):
-            if name in r and math.isfinite(r[name])):
+            if name in r and math.isfinite(r[name]):
                 x.append(float(r[name])); yy.append(y_test[i]); ss.append(strata[i]); tt.append(times[i])
         if len(x) < 8 or len(set(yy)) < 2:
             detailed.append({"feature": name, "n": len(x), "p_perm": 1.0, "effect_r": 0.0, "replicated": False})
