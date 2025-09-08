@@ -911,7 +911,7 @@ def parse_parans_payload(body: Dict[str, Any]) -> ParansPayload:
     Validate and normalize payload for /api/parans endpoint.
     
     Handles:
-    - subject: minimal natal-like dict for timescale resolution
+    - subject: optional natal-like dict for timescale resolution
     - place: required latitude/longitude for horizon calculations
     - optional strict timescales: jd_tt_ref + jd_ut1_ref
     - bodies: list of celestial bodies (defaults to major planets)
@@ -921,12 +921,6 @@ def parse_parans_payload(body: Dict[str, Any]) -> ParansPayload:
     """
     if not isinstance(body, dict):
         raise ValidationError("payload must be an object")
-    
-    # Parse subject data
-    subject_raw = body.get("subject")
-    if subject_raw is None:
-        raise ValidationError(_err("subject", "required object", "value_error"))
-    subject = _parse_parans_subject(subject_raw)
     
     # Parse place data - required for horizon calculations
     place_raw = body.get("place")
@@ -943,8 +937,22 @@ def parse_parans_payload(body: Dict[str, Any]) -> ParansPayload:
     
     have_strict_timescales = (jd_tt_ref is not None and jd_ut1_ref is not None)
     
-    # If no strict timescales, we need subject date/time/place_tz
-    if not have_strict_timescales:
+    # Subject data - only required if strict timescales not provided
+    subject_raw = body.get("subject")
+    subject = {}
+    
+    if have_strict_timescales:
+        # If strict timescales provided, subject is optional
+        if subject_raw is not None:
+            subject = _parse_parans_subject(subject_raw)
+    else:
+        # No strict timescales, subject with date/time/place_tz is required
+        if subject_raw is None:
+            raise ValidationError(_err("subject", "required when strict timescales not provided", "value_error"))
+        
+        subject = _parse_parans_subject(subject_raw)
+        
+        # Validate required fields for timescale resolution
         missing_fields = []
         for required_field in ["date", "time", "place_tz"]:
             if required_field not in subject:
@@ -1031,7 +1039,6 @@ def parse_parans_payload(body: Dict[str, Any]) -> ParansPayload:
     }
     
     return out
-
 
 # ───────────────────────── timescale resolver (for predictive.py) ─────────────
 def resolve_timescales_from_civil_erfa(
