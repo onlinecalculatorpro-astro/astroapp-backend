@@ -1382,6 +1382,282 @@ def parse_synastry_report_payload(body: Dict[str, Any]) -> SynastryReportPayload
     
     return out
 
+# Relocation Module Validators for validators.py
+# Add these TypedDict definitions and validator functions to your existing validators.py
+
+# ═══════════════════════════════ TYPE DEFINITIONS ═══════════════════════════════
+
+class RelocationPayload(TypedDict, total=False):
+    """Payload for /api/relocation endpoint."""
+    natal: Dict[str, Any]
+    place_new: Dict[str, Any]
+    jd_tt_natal: float
+    jd_ut1_natal: float
+    frame: str
+    house_system: str
+    zodiac_mode: str
+    ayanamsa_deg: float
+    topocentric_positions: bool
+
+class AstrocartographyPayload(TypedDict, total=False):
+    """Payload for /api/astrocartography endpoint."""
+    natal: Dict[str, Any]
+    jd_tt: float
+    jd_ut1: float
+    frame: str
+    zodiac_mode: str
+    ayanamsa_deg: float
+    bodies: List[str]
+    lon_step_deg: float
+    lat_clip_deg: float
+    earth_model: str
+    apply_refraction: bool
+    pressure_hPa: float
+    temperature_C: float
+    default_elev_m: float
+
+# ═══════════════════════════════ HELPER FUNCTIONS ═══════════════════════════════
+
+def _parse_relocation_place(place_raw: Any) -> Dict[str, Any]:
+    """Parse and validate place data for relocation."""
+    if not isinstance(place_raw, dict):
+        raise ValidationError(_err("place", "must be an object", "value_error"))
+    
+    place = {}
+    
+    # Required coordinates
+    lat = _as_float(place_raw.get("latitude"))
+    if lat is None:
+        raise ValidationError(_err("place.latitude", "required number", "value_error"))
+    if not (-90.0 <= lat <= 90.0):
+        raise ValidationError(_err("place.latitude", "must be between -90 and 90 degrees", "value_error"))
+    place["latitude"] = lat
+    
+    lon = _as_float(place_raw.get("longitude"))
+    if lon is None:
+        raise ValidationError(_err("place.longitude", "required number", "value_error"))
+    if not (-180.0 <= lon <= 180.0):
+        raise ValidationError(_err("place.longitude", "must be between -180 and 180 degrees", "value_error"))
+    place["longitude"] = lon
+    
+    # Optional elevation
+    if "elev_m" in place_raw:
+        elev = _as_float(place_raw["elev_m"])
+        if elev is None:
+            raise ValidationError(_err("place.elev_m", "must be a number", "type_error.float"))
+        place["elev_m"] = elev
+    
+    return place
+
+def _parse_relocation_natal(natal_raw: Any) -> Dict[str, Any]:
+    """Parse and validate natal data for relocation."""
+    if not isinstance(natal_raw, dict):
+        raise ValidationError(_err("natal", "must be an object", "value_error"))
+    
+    natal = {}
+    
+    # Required fields for timescale resolution
+    required_fields = ["date", "time", "place_tz"]
+    for field in required_fields:
+        if field not in natal_raw:
+            raise ValidationError(_err(f"natal.{field}", "required string", "value_error"))
+        
+        value = str(natal_raw[field]).strip()
+        if not value:
+            raise ValidationError(_err(f"natal.{field}", "cannot be empty", "value_error"))
+        natal[field] = value
+    
+    # Optional coordinates (for original chart reference)
+    for coord_field in ["latitude", "longitude", "elev_m"]:
+        if coord_field in natal_raw:
+            coord_val = _as_float(natal_raw[coord_field])
+            if coord_val is not None:
+                if coord_field == "latitude" and not (-90.0 <= coord_val <= 90.0):
+                    raise ValidationError(_err(f"natal.{coord_field}", "must be between -90 and 90 degrees", "value_error"))
+                elif coord_field == "longitude" and not (-180.0 <= coord_val <= 180.0):
+                    raise ValidationError(_err(f"natal.{coord_field}", "must be between -180 and 180 degrees", "value_error"))
+                natal[coord_field] = coord_val
+    
+    # Optional mode
+    if "mode" in natal_raw:
+        mode = str(natal_raw["mode"]).strip().lower()
+        if mode not in ("tropical", "sidereal"):
+            raise ValidationError(_err("natal.mode", "must be 'tropical' or 'sidereal'", "value_error"))
+        natal["mode"] = mode
+    
+    return natal
+
+def _parse_bodies_list_relocation(bodies_raw: Any) -> List[str]:
+    """Parse and validate bodies list for astrocartography."""
+    if bodies_raw is None:
+        # Default major bodies
+        return ["Sun", "Moon", "Mercury", "Venus", "Mars", "Jupiter", "Saturn", "Uranus", "Neptune", "Pluto"]
+    
+    if not isinstance(bodies_raw, list):
+        raise ValidationError(_err("bodies", "must be a list", "type_error.list"))
+    
+    if not bodies_raw:
+        raise ValidationError(_err("bodies", "cannot be empty", "value_error"))
+    
+    bodies = []
+    valid_bodies = {
+        "sun", "moon", "mercury", "venus", "mars", "jupiter", "saturn", 
+        "uranus", "neptune", "pluto", "chiron", "ceres", "pallas", "juno", "vesta"
+    }
+    
+    for i, body in enumerate(bodies_raw):
+        if not isinstance(body, str):
+            raise ValidationError(_err(f"bodies[{i}]", "must be a string", "type_error.str"))
+        
+        body_clean = body.strip()
+        if not body_clean:
+            raise ValidationError(_err(f"bodies[{i}]", "cannot be empty", "value_error"))
+        
+        body_lower = body_clean.lower()
+        if body_lower not in valid_bodies:
+            raise ValidationError(_err(f"bodies[{i}]", f"unknown body '{body_clean}'", "value_error"))
+        
+        # Convert to standard capitalization
+        bodies.append(body_clean.capitalize())
+    
+    return bodies
+
+# ═══════════════════════════════ MAIN VALIDATORS ═══════════════════════════════
+
+def parse_relocation_payload(body: Dict[str, Any]) -> RelocationPayload:
+    """Validate and normalize payload for /api/relocation endpoint."""
+    if not isinstance(body, dict):
+        raise ValidationError("payload must be an object")
+    
+    # Parse natal chart (required)
+    natal_raw = body.get("natal")
+    if natal_raw is None:
+        raise ValidationError(_err("natal", "required object", "value_error"))
+    natal = _parse_relocation_natal(natal_raw)
+    
+    # Parse new place (required)
+    place_new_raw = body.get("place_new")
+    if place_new_raw is None:
+        raise ValidationError(_err("place_new", "required object", "value_error"))
+    place_new = _parse_relocation_place(place_new_raw)
+    
+    # Optional strict timescales
+    jd_tt_natal = _as_float(body.get("jd_tt_natal"))
+    jd_ut1_natal = _as_float(body.get("jd_ut1_natal"))
+    
+    # Frame and coordinate system
+    frame = parse_frame(body.get("frame"))
+    house_system = str(body.get("house_system", "placidus")).strip().lower()
+    zodiac_mode = parse_mode(body.get("zodiac_mode") or body.get("mode"))
+    
+    # Ayanamsa
+    ayanamsa_deg = _as_float(body.get("ayanamsa_deg", 0.0))
+    if ayanamsa_deg is None:
+        raise ValidationError(_err("ayanamsa_deg", "must be a number", "type_error.float"))
+    
+    # Topocentric flag
+    topocentric_positions = bool(_truthy(body.get("topocentric_positions", False)))
+    
+    # Build output
+    out: RelocationPayload = {
+        "natal": natal,
+        "place_new": place_new,
+        "frame": frame,
+        "house_system": house_system,
+        "zodiac_mode": zodiac_mode,
+        "ayanamsa_deg": float(ayanamsa_deg),
+        "topocentric_positions": topocentric_positions,
+    }
+    
+    # Add optional strict timescales
+    if jd_tt_natal is not None:
+        out["jd_tt_natal"] = float(jd_tt_natal)
+    if jd_ut1_natal is not None:
+        out["jd_ut1_natal"] = float(jd_ut1_natal)
+    
+    return out
+
+def parse_astrocartography_payload(body: Dict[str, Any]) -> AstrocartographyPayload:
+    """Validate and normalize payload for /api/astrocartography endpoint."""
+    if not isinstance(body, dict):
+        raise ValidationError("payload must be an object")
+    
+    # Parse natal chart (required)
+    natal_raw = body.get("natal")
+    if natal_raw is None:
+        raise ValidationError(_err("natal", "required object", "value_error"))
+    natal = _parse_relocation_natal(natal_raw)
+    
+    # Optional strict timescales
+    jd_tt = _as_float(body.get("jd_tt"))
+    jd_ut1 = _as_float(body.get("jd_ut1"))
+    
+    # Frame and coordinate system
+    frame = parse_frame(body.get("frame"))
+    zodiac_mode = parse_mode(body.get("zodiac_mode") or body.get("mode"))
+    
+    # Ayanamsa
+    ayanamsa_deg = _as_float(body.get("ayanamsa_deg", 0.0))
+    if ayanamsa_deg is None:
+        raise ValidationError(_err("ayanamsa_deg", "must be a number", "type_error.float"))
+    
+    # Bodies list
+    bodies = _parse_bodies_list_relocation(body.get("bodies"))
+    
+    # Sampling parameters
+    lon_step_deg = _as_float(body.get("lon_step_deg", 1.0))
+    if lon_step_deg is None or lon_step_deg <= 0 or lon_step_deg > 10.0:
+        raise ValidationError(_err("lon_step_deg", "must be between 0 and 10 degrees", "value_error"))
+    
+    lat_clip_deg = _as_float(body.get("lat_clip_deg", 89.5))
+    if lat_clip_deg is None or lat_clip_deg <= 0 or lat_clip_deg > 90.0:
+        raise ValidationError(_err("lat_clip_deg", "must be between 0 and 90 degrees", "value_error"))
+    
+    # Earth model
+    earth_model = str(body.get("earth_model", "spherical")).strip().lower()
+    if earth_model not in ("spherical", "wgs84"):
+        raise ValidationError(_err("earth_model", "must be 'spherical' or 'wgs84'", "value_error"))
+    
+    # Atmospheric refraction
+    apply_refraction = bool(_truthy(body.get("apply_refraction", False)))
+    
+    pressure_hPa = _as_float(body.get("pressure_hPa", 1010.0))
+    if pressure_hPa is None or pressure_hPa <= 0:
+        raise ValidationError(_err("pressure_hPa", "must be positive", "value_error"))
+    
+    temperature_C = _as_float(body.get("temperature_C", 10.0))
+    if temperature_C is None:
+        raise ValidationError(_err("temperature_C", "must be a number", "type_error.float"))
+    
+    # Default elevation
+    default_elev_m = _as_float(body.get("default_elev_m", 0.0))
+    if default_elev_m is None:
+        raise ValidationError(_err("default_elev_m", "must be a number", "type_error.float"))
+    
+    # Build output
+    out: AstrocartographyPayload = {
+        "natal": natal,
+        "frame": frame,
+        "zodiac_mode": zodiac_mode,
+        "ayanamsa_deg": float(ayanamsa_deg),
+        "bodies": bodies,
+        "lon_step_deg": float(lon_step_deg),
+        "lat_clip_deg": float(lat_clip_deg),
+        "earth_model": earth_model,
+        "apply_refraction": apply_refraction,
+        "pressure_hPa": float(pressure_hPa),
+        "temperature_C": float(temperature_C),
+        "default_elev_m": float(default_elev_m),
+    }
+    
+    # Add optional strict timescales
+    if jd_tt is not None:
+        out["jd_tt"] = float(jd_tt)
+    if jd_ut1 is not None:
+        out["jd_ut1"] = float(jd_ut1)
+    
+    return out
+
 # ───────────────────────── timescale resolver (for predictive.py) ─────────────
 def resolve_timescales_from_civil_erfa(
     d: date,
