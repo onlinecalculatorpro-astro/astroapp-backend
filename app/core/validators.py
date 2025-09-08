@@ -1658,35 +1658,6 @@ def parse_astrocartography_payload(body: Dict[str, Any]) -> AstrocartographyPayl
     
     return out
 
-# Directions Module Route Handlers for routes.py
-# Add these integration blocks to your existing routes.py file
-
-# ═══════════════════════════════ INTEGRATION BLOCK 1: IMPORTS ═══════════════════════════════
-# Add to validator imports section (around line 31), after the relocation imports:
-    parse_directions_payload,
-
-# ═══════════════════════════════ INTEGRATION BLOCK 2: MODULE IMPORTS ═══════════════════════════
-# Add after your relocation import section (around line 105):
-
-# Directions core (NEW - optional import guard)
-_compute_directions = None
-_DIRECTIONS_IMPORT_ERROR: Optional[Exception] = None
-try:
-    from app.core.directions import compute_directions as _compute_directions
-except Exception as _e:
-    _DIRECTIONS_IMPORT_ERROR = _e
-    _compute_directions = None
-
-# ═══════════════════════════════ INTEGRATION BLOCK 3: RATE LIMITS ═══════════════════════════
-# Add to your rate limiting section (around line 125):
-
-RL_DIRECTIONS = _RL("ASTRO_RL_DIRECTIONS_PER_MIN", 8)  # NEW - Rate limit for directions endpoint
-
-# ═══════════════════════════════ INTEGRATION BLOCK 4: ROUTE HANDLERS ═══════════════════════════
-# Add after your relocation route handlers (around line 3000):
-
-
-
 # ═══════════════════════════════ DIRECTIONS VALIDATORS ═══════════════════════════════
 
 class DirectionsPayload(TypedDict, total=False):
