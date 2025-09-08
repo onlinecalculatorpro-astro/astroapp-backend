@@ -1685,124 +1685,259 @@ RL_DIRECTIONS = _RL("ASTRO_RL_DIRECTIONS_PER_MIN", 8)  # NEW - Rate limit for di
 # ═══════════════════════════════ INTEGRATION BLOCK 4: ROUTE HANDLERS ═══════════════════════════
 # Add after your relocation route handlers (around line 3000):
 
-# ───────────────────────── DIRECTIONS (NEW) ─────────────────────────
-@api.post("/api/directions")
-@rate_limit(RL_DIRECTIONS)
-def directions_route():
-    """
-    Compute Solar-Arc directions (direct/converse) and detect hits to natal targets.
+
+
+# ═══════════════════════════════ DIRECTIONS VALIDATORS ═══════════════════════════════
+
+class DirectionsPayload(TypedDict, total=False):
+    """Payload for /api/directions endpoint."""
+    natal: Dict[str, Any]
+    method: str
+    rate: str
+    target: Dict[str, Any]
+    years_after: float
+    jd_tt_natal: float
+    jd_ut1_natal: float
+    place: Dict[str, Any]
+    frame: str
+    house_system: str
+    zodiac_mode: str
+    ayanamsa_deg: float
+    arcs: str
+    orbs: Dict[str, float]
+    include_hits_to: List[str]
+    parallels: bool
+    antiscia: bool
+    profile: bool
+    validation: str
+
+def _parse_directions_natal(natal_raw: Any) -> Dict[str, Any]:
+    """Parse and validate natal data for directions."""
+    if not isinstance(natal_raw, dict):
+        raise ValidationError(_err("natal", "must be an object", "value_error"))
     
-    Body:
-      natal: { date, time, place_tz, latitude?, longitude?, elev_m?, mode? }
-      method?: "solar_arc" (only supported method currently)
-      rate?: "naibod" | "true_sun" (default: "naibod")
-      target?: { date, time, place_tz } # alternative to years_after
-      years_after?: float # alternative to target
-      jd_tt_natal?, jd_ut1_natal?: strict timescales (optional)
-      place?: { latitude, longitude, elev_m? } # place override for directions
-      frame?: "ecliptic-of-date" | "ecliptic-j2000"
-      house_system?: string (default: "placidus")
-      zodiac_mode?: "tropical" | "sidereal"
-      ayanamsa_deg?: float
-      arcs?: "direct" | "converse" | "both" (default: "direct")
-      orbs?: { conjunction: float, opposition: float, ... }
-      include_hits_to?: ["planets", "angles", "cusps"] # targets for hit detection
-      parallels?: bool (default: false)
-      antiscia?: bool (default: false)
-      profile?: bool (default: false)
-      validation?: "none" | "basic" (default: "basic")
-    """
-    if _compute_directions is None:
-        det = {"import_error": repr(_DIRECTIONS_IMPORT_ERROR)} if DEBUG_VERBOSE and _DIRECTIONS_IMPORT_ERROR else None
-        return _json_error("directions_unavailable", det or "directions engine not wired", 501)
+    natal = {}
+    
+    # Required fields for timescale resolution (if strict JD not provided)
+    required_fields = ["date", "time", "place_tz"]
+    for field in required_fields:
+        if field in natal_raw:
+            value = str(natal_raw[field]).strip()
+            if not value:
+                raise ValidationError(_err(f"natal.{field}", "cannot be empty", "value_error"))
+            natal[field] = value
+    
+    # Optional coordinates
+    for coord_field in ["latitude", "longitude", "elev_m"]:
+        if coord_field in natal_raw:
+            coord_val = _as_float(natal_raw[coord_field])
+            if coord_val is not None:
+                if coord_field == "latitude" and not (-90.0 <= coord_val <= 90.0):
+                    raise ValidationError(_err(f"natal.{coord_field}", "must be between -90 and 90 degrees", "value_error"))
+                elif coord_field == "longitude" and not (-180.0 <= coord_val <= 180.0):
+                    raise ValidationError(_err(f"natal.{coord_field}", "must be between -180 and 180 degrees", "value_error"))
+                natal[coord_field] = coord_val
+    
+    # Optional mode
+    if "mode" in natal_raw:
+        mode = str(natal_raw["mode"]).strip().lower()
+        if mode not in ("tropical", "sidereal"):
+            raise ValidationError(_err("natal.mode", "must be 'tropical' or 'sidereal'", "value_error"))
+        natal["mode"] = mode
+    
+    return natal
 
-    try:
-        body = request.get_json(force=True) or {}
-        payload = parse_directions_payload(body)
-    except ValidationError as e:
-        return _json_error("validation_error", e.errors(), 400)
-    except Exception as e:
-        return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
+def _parse_directions_target(target_raw: Any) -> Dict[str, Any]:
+    """Parse and validate target data for directions."""
+    if not isinstance(target_raw, dict):
+        raise ValidationError(_err("target", "must be an object", "value_error"))
+    
+    target = {}
+    required_fields = ["date", "time", "place_tz"]
+    for field in required_fields:
+        if field not in target_raw:
+            raise ValidationError(_err(f"target.{field}", "required string", "value_error"))
+        
+        value = str(target_raw[field]).strip()
+        if not value:
+            raise ValidationError(_err(f"target.{field}", "cannot be empty", "value_error"))
+        target[field] = value
+    
+    return target
 
-    # Build arguments for directions computation
-    directions_kwargs = {
-        "natal": payload["natal"],
-        "method": payload.get("method", "solar_arc"),
-        "rate": payload.get("rate", "naibod"),
-        "frame": payload.get("frame", "ecliptic-of-date"),
-        "house_system": payload.get("house_system", "placidus"),
-        "zodiac_mode": payload.get("zodiac_mode", "tropical"),
-        "ayanamsa_deg": payload.get("ayanamsa_deg", 0.0),
-        "arcs": payload.get("arcs", "direct"),
-        "include_hits_to": tuple(payload.get("include_hits_to", ["planets", "angles", "cusps"])),
-        "parallels": payload.get("parallels", False),
-        "antiscia": payload.get("antiscia", False),
-        "profile": payload.get("profile", False),
-        "validation": payload.get("validation", "basic"),
+def _parse_directions_place(place_raw: Any) -> Dict[str, Any]:
+    """Parse and validate place override for directions."""
+    if not isinstance(place_raw, dict):
+        raise ValidationError(_err("place", "must be an object", "value_error"))
+    
+    place = {}
+    
+    # Required coordinates for place override
+    lat = _as_float(place_raw.get("latitude"))
+    if lat is None:
+        raise ValidationError(_err("place.latitude", "required number", "value_error"))
+    if not (-90.0 <= lat <= 90.0):
+        raise ValidationError(_err("place.latitude", "must be between -90 and 90 degrees", "value_error"))
+    place["latitude"] = lat
+    
+    lon = _as_float(place_raw.get("longitude"))
+    if lon is None:
+        raise ValidationError(_err("place.longitude", "required number", "value_error"))
+    if not (-180.0 <= lon <= 180.0):
+        raise ValidationError(_err("place.longitude", "must be between -180 and 180 degrees", "value_error"))
+    place["longitude"] = lon
+    
+    # Optional elevation
+    if "elev_m" in place_raw:
+        elev = _as_float(place_raw["elev_m"])
+        if elev is None:
+            raise ValidationError(_err("place.elev_m", "must be a number", "type_error.float"))
+        place["elev_m"] = elev
+    
+    return place
+
+def _parse_directions_orbs(orbs_raw: Any) -> Dict[str, float]:
+    """Parse and validate orbs for directions."""
+    if not isinstance(orbs_raw, dict):
+        raise ValidationError(_err("orbs", "must be an object", "value_error"))
+    
+    orbs = {}
+    valid_aspects = {"conjunction", "opposition", "trine", "square", "sextile", "quincunx"}
+    
+    for aspect, orb_val in orbs_raw.items():
+        if not isinstance(aspect, str):
+            continue
+        
+        aspect_clean = aspect.strip().lower()
+        if aspect_clean not in valid_aspects:
+            raise ValidationError(_err(f"orbs.{aspect}", "unknown aspect type", "value_error"))
+        
+        orb = _as_float(orb_val)
+        if orb is None:
+            raise ValidationError(_err(f"orbs.{aspect}", "must be a number", "type_error.float"))
+        if orb < 0:
+            raise ValidationError(_err(f"orbs.{aspect}", "must be non-negative", "value_error"))
+        
+        orbs[aspect_clean] = orb
+    
+    return orbs
+
+def parse_directions_payload(body: Dict[str, Any]) -> DirectionsPayload:
+    """Validate and normalize payload for /api/directions endpoint."""
+    if not isinstance(body, dict):
+        raise ValidationError("payload must be an object")
+    
+    # Parse natal chart (required)
+    natal_raw = body.get("natal")
+    if natal_raw is None:
+        raise ValidationError(_err("natal", "required object", "value_error"))
+    natal = _parse_directions_natal(natal_raw)
+    
+    # Method validation
+    method = str(body.get("method", "solar_arc")).strip().lower()
+    if method not in ("solar_arc",):
+        raise ValidationError(_err("method", "must be 'solar_arc'", "value_error"))
+    
+    # Rate validation
+    rate = str(body.get("rate", "naibod")).strip().lower()
+    if rate not in ("naibod", "true_sun"):
+        raise ValidationError(_err("rate", "must be 'naibod' or 'true_sun'", "value_error"))
+    
+    # Target vs years_after (one required)
+    target_raw = body.get("target")
+    years_after = _as_float(body.get("years_after"))
+    
+    target = None
+    if target_raw is not None:
+        target = _parse_directions_target(target_raw)
+    
+    if target is None and years_after is None:
+        raise ValidationError(_err(["target", "years_after"], "provide either target or years_after", "value_error"))
+    
+    if target is not None and years_after is not None:
+        raise ValidationError(_err(["target", "years_after"], "provide only one of target or years_after", "value_error"))
+    
+    # Optional strict timescales
+    jd_tt_natal = _as_float(body.get("jd_tt_natal"))
+    jd_ut1_natal = _as_float(body.get("jd_ut1_natal"))
+    
+    # Optional place override
+    place = None
+    if body.get("place") is not None:
+        place = _parse_directions_place(body["place"])
+    
+    # Frame and coordinate system
+    frame = parse_frame(body.get("frame"))
+    house_system = str(body.get("house_system", "placidus")).strip().lower()
+    zodiac_mode = parse_mode(body.get("zodiac_mode") or body.get("mode"))
+    
+    # Ayanamsa
+    ayanamsa_deg = _as_float(body.get("ayanamsa_deg", 0.0))
+    if ayanamsa_deg is None:
+        raise ValidationError(_err("ayanamsa_deg", "must be a number", "type_error.float"))
+    
+    # Arcs type
+    arcs = str(body.get("arcs", "direct")).strip().lower()
+    if arcs not in ("direct", "converse", "both"):
+        raise ValidationError(_err("arcs", "must be 'direct', 'converse', or 'both'", "value_error"))
+    
+    # Hit targets
+    include_hits_to = body.get("include_hits_to", ["planets", "angles", "cusps"])
+    if not isinstance(include_hits_to, list):
+        raise ValidationError(_err("include_hits_to", "must be a list", "type_error.list"))
+    
+    valid_targets = {"planets", "angles", "cusps"}
+    for i, target_type in enumerate(include_hits_to):
+        if target_type not in valid_targets:
+            raise ValidationError(_err(f"include_hits_to[{i}]", f"must be one of {valid_targets}", "value_error"))
+    
+    # Optional orbs
+    orbs = None
+    if body.get("orbs") is not None:
+        orbs = _parse_directions_orbs(body["orbs"])
+    
+    # Boolean flags
+    parallels = bool(_truthy(body.get("parallels", False)))
+    antiscia = bool(_truthy(body.get("antiscia", False)))
+    profile = bool(_truthy(body.get("profile", False)))
+    
+    # Validation level
+    validation = str(body.get("validation", "basic")).strip().lower()
+    if validation not in ("none", "basic"):
+        raise ValidationError(_err("validation", "must be 'none' or 'basic'", "value_error"))
+    
+    # Build output
+    out: DirectionsPayload = {
+        "natal": natal,
+        "method": method,
+        "rate": rate,
+        "frame": frame,
+        "house_system": house_system,
+        "zodiac_mode": zodiac_mode,
+        "ayanamsa_deg": float(ayanamsa_deg),
+        "arcs": arcs,
+        "include_hits_to": include_hits_to,
+        "parallels": parallels,
+        "antiscia": antiscia,
+        "profile": profile,
+        "validation": validation,
     }
-
-    # Add optional target or years_after
-    if "target" in payload:
-        directions_kwargs["target"] = payload["target"]
-    elif "years_after" in payload:
-        directions_kwargs["years_after"] = payload["years_after"]
-
-    # Add optional strict timescales
-    for field in ("jd_tt_natal", "jd_ut1_natal"):
-        if field in payload:
-            directions_kwargs[field] = payload[field]
-
-    # Add optional place override
-    if "place" in payload:
-        directions_kwargs["place"] = payload["place"]
-
-    # Add optional orbs
-    if "orbs" in payload:
-        directions_kwargs["orbs"] = payload["orbs"]
-
-    # Filter arguments to match function signature
-    try:
-        import inspect
-        directions_params = set(inspect.signature(_compute_directions).parameters.keys())
-        filtered_kwargs = {k: v for k, v in directions_kwargs.items() if k in directions_params}
-    except Exception:
-        filtered_kwargs = directions_kwargs
-
-    # Call directions computation
-    try:
-        result = _compute_directions(**filtered_kwargs)
-    except ValueError as e:
-        return _json_error("directions_value_error", str(e), 400)
-    except TypeError as e:
-        det = {"type": "TypeError", "message": str(e)} if DEBUG_VERBOSE else None
-        return _json_error("directions_internal", det or "internal_error", 500)
-    except RuntimeError as e:
-        det = {"type": "RuntimeError", "message": str(e)} if DEBUG_VERBOSE else None
-        return _json_error("directions_internal", det or "internal_error", 500)
-    except Exception as e:
-        det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
-        return _json_error("directions_internal", det or "internal_error", 500)
-
-    # Enrich metadata with ephemeris adapter info
-    meta = dict(result.get("meta", {}))
-    try:
-        meta.update(_snapshot_ephemeris_meta(meta))
-    except Exception:
-        pass
-
-    # Structure response
-    resp = {
-        "ok": True,
-        "meta": meta,
-        "epoch": result.get("epoch", {}),
-        "arc_deg": result.get("arc_deg", {}),
-        "positions": result.get("positions", {}),
-        "hits": result.get("hits", {}),
-        "warnings": list(meta.get("warnings", [])),
-    }
-
-    return jsonify(resp), 200
-
+    
+    # Add optional fields
+    if target is not None:
+        out["target"] = target
+    if years_after is not None:
+        out["years_after"] = float(years_after)
+    if jd_tt_natal is not None:
+        out["jd_tt_natal"] = float(jd_tt_natal)
+    if jd_ut1_natal is not None:
+        out["jd_ut1_natal"] = float(jd_ut1_natal)
+    if place is not None:
+        out["place"] = place
+    if orbs is not None:
+        out["orbs"] = orbs
+    
+    return out
 # ───────────────────────── timescale resolver (for predictive.py) ─────────────
 def resolve_timescales_from_civil_erfa(
     d: date,
@@ -1880,6 +2015,7 @@ __all__ = [
     "parse_frame",
     "parse_progressions_payload",    # NEW
     "parse_returns_payload",         # NEW
-    "parse_parans_payload",          # NEW - Added for paran integration
+    "parse_parans_payload",          # NEW
+    "parse_directions_payload",      # NEW
     "resolve_timescales_from_civil_erfa",
 ]
