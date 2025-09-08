@@ -49,6 +49,8 @@ from app.core.validators import (
     parse_synastry_payload,
     parse_composite_payload,
     parse_synastry_report_payload,
+    parse_relocation_payload,
+    parse_astrocartography_payload,
 )
 
 # Timescales core
@@ -111,6 +113,20 @@ except Exception as _e:
     _synastry_compute = None
     _composite_compute = None
     _synastry_report_compute = None
+
+# Relocation core (NEW - optional import guard)
+_compute_relocated = None
+_compute_astrocartography = None
+_RELOCATION_IMPORT_ERROR: Optional[Exception] = None
+try:
+    from app.core.relocation import (
+        compute_relocated as _compute_relocated,
+        compute_astrocartography as _compute_astrocartography
+    )
+except Exception as _e:
+    _RELOCATION_IMPORT_ERROR = _e
+    _compute_relocated = None
+    _compute_astrocartography = None
     
 log = logging.getLogger(__name__)
 api = Blueprint("api", __name__)
@@ -133,6 +149,8 @@ RL_RETURNS      = _RL("ASTRO_RL_RETURNS_PER_MIN",      12)  # <-- NEW
 RL_PARANS       = _RL("ASTRO_RL_PARANS_PER_MIN",       12)  # NEW - Rate limit for parans endpoint
 RL_SYNASTRY     = _RL("ASTRO_RL_SYNASTRY_PER_MIN",     6)   # NEW - Rate limit for synastry endpoints
 RL_COMPOSITE    = _RL("ASTRO_RL_COMPOSITE_PER_MIN",    8)   # NEW - Rate limit for composite endpoint
+RL_RELOCATION      = _RL("ASTRO_RL_RELOCATION_PER_MIN",      10)  # NEW - Rate limit for relocation endpoint
+RL_ASTROCARTOGRAPHY = _RL("ASTRO_RL_ASTROCARTOGRAPHY_PER_MIN", 4)   # NEW - Rate limit for astrocartography endpoint
 
 # ───────────────────────── helpers ─────────────────────────
 def _wrap360(x: float) -> float:
@@ -2631,6 +2649,187 @@ def synastry_report_route():
         "composite": result.get("composite", {}),
         "scores": result.get("scores", {}),
         "metrics": result.get("metrics", {}),
+        "warnings": list(meta.get("warnings", [])),
+    }
+
+    return jsonify(resp), 200
+
+# ───────────────────────── RELOCATION & ASTROCARTOGRAPHY (NEW) ─────────────────────────
+@api.post("/api/relocation")
+@rate_limit(RL_RELOCATION)
+def relocation_route():
+    """
+    Compute relocated chart for new location while preserving natal time.
+    
+    Body:
+      natal: { date, time, place_tz, latitude?, longitude?, elev_m? }
+      place_new: { latitude, longitude, elev_m? } # required new location
+      jd_tt_natal?, jd_ut1_natal?: strict timescales (optional)
+      frame?: "ecliptic-of-date" | "ecliptic-j2000"
+      house_system?: string
+      zodiac_mode?: "tropical" | "sidereal"
+      ayanamsa_deg?: float
+      topocentric_positions?: bool (default false - use geocentric positions)
+    """
+    if _compute_relocated is None:
+        det = {"import_error": repr(_RELOCATION_IMPORT_ERROR)} if DEBUG_VERBOSE and _RELOCATION_IMPORT_ERROR else None
+        return _json_error("relocation_unavailable", det or "relocation engine not wired", 501)
+
+    try:
+        body = request.get_json(force=True) or {}
+        payload = parse_relocation_payload(body)
+    except ValidationError as e:
+        return _json_error("validation_error", e.errors(), 400)
+    except Exception as e:
+        return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
+
+    # Build arguments for relocation computation
+    relocation_kwargs = {
+        "natal": payload["natal"],
+        "place_new": payload["place_new"],
+        "frame": payload.get("frame", "ecliptic-of-date"),
+        "house_system": payload.get("house_system", "placidus"),
+        "zodiac_mode": payload.get("zodiac_mode", "tropical"),
+        "ayanamsa_deg": payload.get("ayanamsa_deg", 0.0),
+        "topocentric_positions": payload.get("topocentric_positions", False),
+    }
+
+    # Add optional strict timescales
+    for field in ("jd_tt_natal", "jd_ut1_natal"):
+        if field in payload:
+            relocation_kwargs[field] = payload[field]
+
+    # Filter arguments to match function signature
+    try:
+        import inspect
+        relocation_params = set(inspect.signature(_compute_relocated).parameters.keys())
+        filtered_kwargs = {k: v for k, v in relocation_kwargs.items() if k in relocation_params}
+    except Exception:
+        filtered_kwargs = relocation_kwargs
+
+    # Call relocation computation
+    try:
+        result = _compute_relocated(**filtered_kwargs)
+    except ValueError as e:
+        return _json_error("relocation_value_error", str(e), 400)
+    except TypeError as e:
+        det = {"type": "TypeError", "message": str(e)} if DEBUG_VERBOSE else None
+        return _json_error("relocation_internal", det or "internal_error", 500)
+    except RuntimeError as e:
+        det = {"type": "RuntimeError", "message": str(e)} if DEBUG_VERBOSE else None
+        return _json_error("relocation_internal", det or "internal_error", 500)
+    except Exception as e:
+        det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
+        return _json_error("relocation_internal", det or "internal_error", 500)
+
+    # Enrich metadata with ephemeris adapter info
+    meta = dict(result.get("meta", {}))
+    try:
+        meta.update(_snapshot_ephemeris_meta(meta))
+    except Exception:
+        pass
+
+    # Structure response
+    resp = {
+        "ok": True,
+        "meta": meta,
+        "positions": result.get("positions", {}),
+        "houses": result.get("houses"),
+        "axes": result.get("axes", {}),
+        "warnings": list(meta.get("warnings", [])),
+    }
+
+    return jsonify(resp), 200
+
+@api.post("/api/astrocartography")
+@rate_limit(RL_ASTROCARTOGRAPHY)
+def astrocartography_route():
+    """
+    Compute astrocartography lines (MC/IC/ASC/DC) for selected bodies.
+    
+    Body:
+      natal: { date, time, place_tz, latitude?, longitude?, elev_m? }
+      jd_tt?, jd_ut1?: epoch timescales (optional, defaults to natal time)
+      frame?: "ecliptic-of-date" | "ecliptic-j2000"
+      zodiac_mode?: "tropical" | "sidereal"
+      ayanamsa_deg?: float
+      bodies?: ["Sun", "Moon", ...] # default: major planets
+      lon_step_deg?: float # longitude sampling step (default 1.0)
+      lat_clip_deg?: float # latitude clipping limit (default 89.5)
+      earth_model?: "spherical" | "wgs84" # Earth model for dip calculation
+      apply_refraction?: bool # Saemundsson atmospheric refraction
+      pressure_hPa?: float # atmospheric pressure for refraction
+      temperature_C?: float # temperature for refraction
+      default_elev_m?: float # default elevation when no DEM available
+    """
+    if _compute_astrocartography is None:
+        det = {"import_error": repr(_RELOCATION_IMPORT_ERROR)} if DEBUG_VERBOSE and _RELOCATION_IMPORT_ERROR else None
+        return _json_error("astrocartography_unavailable", det or "astrocartography engine not wired", 501)
+
+    try:
+        body = request.get_json(force=True) or {}
+        payload = parse_astrocartography_payload(body)
+    except ValidationError as e:
+        return _json_error("validation_error", e.errors(), 400)
+    except Exception as e:
+        return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
+
+    # Build arguments for astrocartography computation
+    astro_kwargs = {
+        "natal": payload["natal"],
+        "frame": payload.get("frame", "ecliptic-of-date"),
+        "zodiac_mode": payload.get("zodiac_mode", "tropical"),
+        "ayanamsa_deg": payload.get("ayanamsa_deg", 0.0),
+        "bodies": tuple(payload.get("bodies", ["Sun", "Moon", "Mercury", "Venus", "Mars", "Jupiter", "Saturn", "Uranus", "Neptune", "Pluto"])),
+        "lon_step_deg": payload.get("lon_step_deg", 1.0),
+        "lat_clip_deg": payload.get("lat_clip_deg", 89.5),
+        "earth_model": payload.get("earth_model", "spherical"),
+        "apply_refraction": payload.get("apply_refraction", False),
+        "pressure_hPa": payload.get("pressure_hPa", 1010.0),
+        "temperature_C": payload.get("temperature_C", 10.0),
+        "default_elev_m": payload.get("default_elev_m", 0.0),
+    }
+
+    # Add optional epoch timescales
+    for field in ("jd_tt", "jd_ut1"):
+        if field in payload:
+            astro_kwargs[field] = payload[field]
+
+    # Filter arguments to match function signature
+    try:
+        import inspect
+        astro_params = set(inspect.signature(_compute_astrocartography).parameters.keys())
+        filtered_kwargs = {k: v for k, v in astro_kwargs.items() if k in astro_params}
+    except Exception:
+        filtered_kwargs = astro_kwargs
+
+    # Call astrocartography computation
+    try:
+        result = _compute_astrocartography(**filtered_kwargs)
+    except ValueError as e:
+        return _json_error("astrocartography_value_error", str(e), 400)
+    except TypeError as e:
+        det = {"type": "TypeError", "message": str(e)} if DEBUG_VERBOSE else None
+        return _json_error("astrocartography_internal", det or "internal_error", 500)
+    except RuntimeError as e:
+        det = {"type": "RuntimeError", "message": str(e)} if DEBUG_VERBOSE else None
+        return _json_error("astrocartography_internal", det or "internal_error", 500)
+    except Exception as e:
+        det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
+        return _json_error("astrocartography_internal", det or "internal_error", 500)
+
+    # Enrich metadata with ephemeris adapter info
+    meta = dict(result.get("meta", {}))
+    try:
+        meta.update(_snapshot_ephemeris_meta(meta))
+    except Exception:
+        pass
+
+    # Structure response
+    resp = {
+        "ok": True,
+        "meta": meta,
+        "lines": result.get("lines", []),
         "warnings": list(meta.get("warnings", [])),
     }
 
