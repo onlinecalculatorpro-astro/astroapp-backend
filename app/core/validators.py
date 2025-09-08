@@ -1040,6 +1040,348 @@ def parse_parans_payload(body: Dict[str, Any]) -> ParansPayload:
     
     return out
 
+# ───────────────────────── synastry ─────────────
+
+# Add these TypedDict definitions to your existing validators.py
+
+class NatalSynastry(TypedDict, total=False):
+    """Minimal natal data for synastry calculations."""
+    date: str
+    time: str
+    place_tz: str
+    latitude: float
+    longitude: float
+    elev_m: float
+    mode: str
+
+class PlaceSynastry(TypedDict, total=False):
+    """Place override for synastry calculations."""
+    latitude: float
+    longitude: float
+    elev_m: float
+
+class SynastryPayload(TypedDict, total=False):
+    """Payload for /api/synastry endpoint."""
+    natal_a: NatalSynastry
+    natal_b: NatalSynastry
+    jd_tt_a: float
+    jd_ut1_a: float
+    jd_tt_b: float
+    jd_ut1_b: float
+    place_a: PlaceSynastry
+    place_b: PlaceSynastry
+    frame: str
+    ayanamsa_deg: float
+    zodiac_mode: str
+    house_system: str
+    orbs: Dict[str, float]
+    parallels: bool
+    antiscia: bool
+
+class CompositePayload(TypedDict, total=False):
+    """Payload for /api/composite endpoint."""
+    natal_a: NatalSynastry
+    natal_b: NatalSynastry
+    method: str
+    jd_tt_ref: float
+    jd_ut1_ref: float
+    place_ref: PlaceSynastry
+    frame: str
+    house_system: str
+    ayanamsa_deg: float
+    zodiac_mode: str
+
+class SynastryReportPayload(TypedDict, total=False):
+    """Payload for /api/synastry/report endpoint."""
+    natal_a: NatalSynastry
+    natal_b: NatalSynastry
+    jd_tt_a: float
+    jd_ut1_a: float
+    jd_tt_b: float
+    jd_ut1_b: float
+    place_a: PlaceSynastry
+    place_b: PlaceSynastry
+    frame: str
+    ayanamsa_deg: float
+    zodiac_mode: str
+    house_system: str
+    orbs: Dict[str, float]
+    parallels: bool
+    antiscia: bool
+    composite_method: str
+    composite_place_ref: PlaceSynastry
+
+# Add these helper functions
+
+def _parse_natal_synastry(natal_raw: Any) -> NatalSynastry:
+    """Parse and validate natal data for synastry."""
+    if not isinstance(natal_raw, dict):
+        raise ValidationError(_err("natal", "must be an object", "value_error"))
+    
+    natal: NatalSynastry = {}
+    
+    # Required fields for timescale resolution (if strict JD not provided)
+    if "date" in natal_raw:
+        natal["date"] = str(natal_raw["date"]).strip()
+        if not natal["date"]:
+            raise ValidationError(_err("natal.date", "cannot be empty", "value_error"))
+    
+    if "time" in natal_raw:
+        natal["time"] = str(natal_raw["time"]).strip()
+        if not natal["time"]:
+            raise ValidationError(_err("natal.time", "cannot be empty", "value_error"))
+    
+    if "place_tz" in natal_raw:
+        natal["place_tz"] = str(natal_raw["place_tz"]).strip()
+        if not natal["place_tz"]:
+            raise ValidationError(_err("natal.place_tz", "cannot be empty", "value_error"))
+    
+    # Optional coordinates for topocentric calculations
+    if "latitude" in natal_raw:
+        lat = _as_float(natal_raw["latitude"])
+        if lat is None:
+            raise ValidationError(_err("natal.latitude", "must be a number", "type_error.float"))
+        if not (-90.0 <= lat <= 90.0):
+            raise ValidationError(_err("natal.latitude", "must be between -90 and 90 degrees", "value_error"))
+        natal["latitude"] = lat
+    
+    if "longitude" in natal_raw:
+        lon = _as_float(natal_raw["longitude"])
+        if lon is None:
+            raise ValidationError(_err("natal.longitude", "must be a number", "type_error.float"))
+        if not (-180.0 <= lon <= 180.0):
+            raise ValidationError(_err("natal.longitude", "must be between -180 and 180 degrees", "value_error"))
+        natal["longitude"] = lon
+    
+    if "elev_m" in natal_raw:
+        elev = _as_float(natal_raw["elev_m"])
+        if elev is None:
+            raise ValidationError(_err("natal.elev_m", "must be a number", "type_error.float"))
+        natal["elev_m"] = elev
+    
+    if "mode" in natal_raw:
+        mode = str(natal_raw["mode"]).strip().lower()
+        if mode not in ("tropical", "sidereal"):
+            raise ValidationError(_err("natal.mode", "must be 'tropical' or 'sidereal'", "value_error"))
+        natal["mode"] = mode
+    
+    return natal
+
+def _parse_place_synastry(place_raw: Any) -> PlaceSynastry:
+    """Parse and validate place override for synastry."""
+    if not isinstance(place_raw, dict):
+        raise ValidationError(_err("place", "must be an object", "value_error"))
+    
+    place: PlaceSynastry = {}
+    
+    if "latitude" in place_raw:
+        lat = _as_float(place_raw["latitude"])
+        if lat is None:
+            raise ValidationError(_err("place.latitude", "must be a number", "type_error.float"))
+        if not (-90.0 <= lat <= 90.0):
+            raise ValidationError(_err("place.latitude", "must be between -90 and 90 degrees", "value_error"))
+        place["latitude"] = lat
+    
+    if "longitude" in place_raw:
+        lon = _as_float(place_raw["longitude"])
+        if lon is None:
+            raise ValidationError(_err("place.longitude", "must be a number", "type_error.float"))
+        if not (-180.0 <= lon <= 180.0):
+            raise ValidationError(_err("place.longitude", "must be between -180 and 180 degrees", "value_error"))
+        place["longitude"] = lon
+    
+    if "elev_m" in place_raw:
+        elev = _as_float(place_raw["elev_m"])
+        if elev is None:
+            raise ValidationError(_err("place.elev_m", "must be a number", "type_error.float"))
+        place["elev_m"] = elev
+    
+    return place
+
+def _parse_orbs_dict(orbs_raw: Any) -> Dict[str, float]:
+    """Parse and validate orbs dictionary."""
+    if not isinstance(orbs_raw, dict):
+        raise ValidationError(_err("orbs", "must be an object", "value_error"))
+    
+    orbs: Dict[str, float] = {}
+    valid_aspects = {
+        "conjunction", "opposition", "trine", "square", "sextile", "quincunx",
+        "parallel_arcmin", "antiscia"
+    }
+    
+    for aspect, orb_raw in orbs_raw.items():
+        if not isinstance(aspect, str):
+            continue
+        
+        aspect_clean = aspect.strip().lower()
+        if aspect_clean not in valid_aspects:
+            raise ValidationError(_err(f"orbs.{aspect}", f"unknown aspect type", "value_error"))
+        
+        orb = _as_float(orb_raw)
+        if orb is None:
+            raise ValidationError(_err(f"orbs.{aspect}", "must be a number", "type_error.float"))
+        if orb < 0:
+            raise ValidationError(_err(f"orbs.{aspect}", "must be non-negative", "value_error"))
+        
+        orbs[aspect_clean] = orb
+    
+    return orbs
+
+# Main parser functions
+
+def parse_synastry_payload(body: Dict[str, Any]) -> SynastryPayload:
+    """Validate and normalize payload for /api/synastry endpoint."""
+    if not isinstance(body, dict):
+        raise ValidationError("payload must be an object")
+    
+    # Parse natal charts (required)
+    natal_a_raw = body.get("natal_a")
+    if natal_a_raw is None:
+        raise ValidationError(_err("natal_a", "required object", "value_error"))
+    natal_a = _parse_natal_synastry(natal_a_raw)
+    
+    natal_b_raw = body.get("natal_b")
+    if natal_b_raw is None:
+        raise ValidationError(_err("natal_b", "required object", "value_error"))
+    natal_b = _parse_natal_synastry(natal_b_raw)
+    
+    # Strict timescales (optional)
+    jd_tt_a = _as_float(body.get("jd_tt_a"))
+    jd_ut1_a = _as_float(body.get("jd_ut1_a"))
+    jd_tt_b = _as_float(body.get("jd_tt_b"))
+    jd_ut1_b = _as_float(body.get("jd_ut1_b"))
+    
+    # Place overrides (optional)
+    place_a = None
+    if body.get("place_a") is not None:
+        place_a = _parse_place_synastry(body["place_a"])
+    
+    place_b = None
+    if body.get("place_b") is not None:
+        place_b = _parse_place_synastry(body["place_b"])
+    
+    # Frame and coordinate system
+    frame = parse_frame(body.get("frame"))
+    ayanamsa_deg = _as_float(body.get("ayanamsa_deg", 0.0)) or 0.0
+    zodiac_mode = parse_mode(body.get("zodiac_mode") or body.get("mode"))
+    house_system = str(body.get("house_system", "placidus")).strip().lower()
+    
+    # Orbs (optional)
+    orbs = None
+    if body.get("orbs") is not None:
+        orbs = _parse_orbs_dict(body["orbs"])
+    
+    # Flags
+    parallels = bool(_truthy(body.get("parallels", True)))
+    antiscia = bool(_truthy(body.get("antiscia", True)))
+    
+    # Build output
+    out: SynastryPayload = {
+        "natal_a": natal_a,
+        "natal_b": natal_b,
+        "frame": frame,
+        "ayanamsa_deg": ayanamsa_deg,
+        "zodiac_mode": zodiac_mode,
+        "house_system": house_system,
+        "parallels": parallels,
+        "antiscia": antiscia,
+    }
+    
+    # Add optional fields
+    if jd_tt_a is not None:
+        out["jd_tt_a"] = jd_tt_a
+    if jd_ut1_a is not None:
+        out["jd_ut1_a"] = jd_ut1_a
+    if jd_tt_b is not None:
+        out["jd_tt_b"] = jd_tt_b
+    if jd_ut1_b is not None:
+        out["jd_ut1_b"] = jd_ut1_b
+    if place_a is not None:
+        out["place_a"] = place_a
+    if place_b is not None:
+        out["place_b"] = place_b
+    if orbs is not None:
+        out["orbs"] = orbs
+    
+    return out
+
+def parse_composite_payload(body: Dict[str, Any]) -> CompositePayload:
+    """Validate and normalize payload for /api/composite endpoint."""
+    if not isinstance(body, dict):
+        raise ValidationError("payload must be an object")
+    
+    # Parse natal charts (required)
+    natal_a = _parse_natal_synastry(body.get("natal_a"))
+    natal_b = _parse_natal_synastry(body.get("natal_b"))
+    
+    # Composite method
+    method = str(body.get("method", "midpoint")).strip().lower()
+    if method not in ("midpoint", "davison"):
+        raise ValidationError(_err("method", "must be 'midpoint' or 'davison'", "value_error"))
+    
+    # Reference timescales and place (optional)
+    jd_tt_ref = _as_float(body.get("jd_tt_ref"))
+    jd_ut1_ref = _as_float(body.get("jd_ut1_ref"))
+    
+    place_ref = None
+    if body.get("place_ref") is not None:
+        place_ref = _parse_place_synastry(body["place_ref"])
+    
+    # Coordinate system parameters
+    frame = parse_frame(body.get("frame"))
+    house_system = str(body.get("house_system", "placidus")).strip().lower()
+    ayanamsa_deg = _as_float(body.get("ayanamsa_deg", 0.0)) or 0.0
+    zodiac_mode = parse_mode(body.get("zodiac_mode") or body.get("mode"))
+    
+    # Build output
+    out: CompositePayload = {
+        "natal_a": natal_a,
+        "natal_b": natal_b,
+        "method": method,
+        "frame": frame,
+        "house_system": house_system,
+        "ayanamsa_deg": ayanamsa_deg,
+        "zodiac_mode": zodiac_mode,
+    }
+    
+    # Add optional fields
+    if jd_tt_ref is not None:
+        out["jd_tt_ref"] = jd_tt_ref
+    if jd_ut1_ref is not None:
+        out["jd_ut1_ref"] = jd_ut1_ref
+    if place_ref is not None:
+        out["place_ref"] = place_ref
+    
+    return out
+
+def parse_synastry_report_payload(body: Dict[str, Any]) -> SynastryReportPayload:
+    """Validate and normalize payload for /api/synastry/report endpoint."""
+    if not isinstance(body, dict):
+        raise ValidationError("payload must be an object")
+    
+    # Start with synastry validation
+    synastry_payload = parse_synastry_payload(body)
+    
+    # Add composite-specific fields
+    composite_method = str(body.get("composite_method", "midpoint")).strip().lower()
+    if composite_method not in ("midpoint", "davison"):
+        raise ValidationError(_err("composite_method", "must be 'midpoint' or 'davison'", "value_error"))
+    
+    composite_place_ref = None
+    if body.get("composite_place_ref") is not None:
+        composite_place_ref = _parse_place_synastry(body["composite_place_ref"])
+    
+    # Build output by extending synastry payload
+    out: SynastryReportPayload = {
+        **synastry_payload,  # type: ignore
+        "composite_method": composite_method,
+    }
+    
+    if composite_place_ref is not None:
+        out["composite_place_ref"] = composite_place_ref
+    
+    return out
+
 # ───────────────────────── timescale resolver (for predictive.py) ─────────────
 def resolve_timescales_from_civil_erfa(
     d: date,
