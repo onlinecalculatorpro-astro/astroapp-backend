@@ -1225,35 +1225,39 @@ def _returns_available() -> bool:
 
 # ───────────────────────── PREDICTION ENGINE ─────────────────────────
 def parse_prediction_payload(body: Dict[str, Any]) -> Dict[str, Any]:
-    """Parse and validate prediction engine request payload."""
+    """Parse and validate prediction engine request payload (V2 shape, tolerant)."""
     errors = []
-    
-    # Validate natal_chart
-    natal_chart = body.get("natal_chart")
-    if not isinstance(natal_chart, dict):
+
+    if not isinstance(body, dict):
+        raise ValidationError([{"loc": [], "msg": "payload must be an object", "type": "type_error.dict"}])
+
+    # natal_chart is required for all endpoints in this block (except relationship/validate handle their own)
+    if "natal_chart" in body and not isinstance(body.get("natal_chart"), dict):
         errors.append({"loc": ["natal_chart"], "msg": "required object", "type": "value_error"})
-    
-    # Validate time_range for applicable endpoints
-    time_range = body.get("time_range")
-    if "time_range" in body and not (isinstance(time_range, (list, tuple)) and len(time_range) == 2):
-        errors.append({"loc": ["time_range"], "msg": "must be [start_date, end_date] array", "type": "value_error"})
-    
-    # Validate target_date for applicable endpoints  
-    target_date = body.get("target_date")
-    if "target_date" in body and not isinstance(target_date, (str, int, float)):
-        errors.append({"loc": ["target_date"], "msg": "must be ISO string, JD float, or datetime", "type": "value_error"})
-    
+
+    # time_range: when present, must be [start, end]
+    if "time_range" in body:
+        tr = body.get("time_range")
+        if not (isinstance(tr, (list, tuple)) and len(tr) == 2):
+            errors.append({"loc": ["time_range"], "msg": "must be [start_date, end_date] array", "type": "value_error"})
+
+    # target_date: when present, must be str|int|float
+    if "target_date" in body:
+        td = body.get("target_date")
+        if not isinstance(td, (str, int, float)):
+            errors.append({"loc": ["target_date"], "msg": "must be ISO string, JD float, or datetime", "type": "value_error"})
+
     if errors:
         raise ValidationError(errors)
-    
     return body
+
 
 @api.post("/api/prediction/forecast")
 @rate_limit(RL_PREDICTION_FORECAST)
 def prediction_comprehensive_forecast_route():
     """
     Comprehensive astrological forecast using the prediction engine.
-    
+
     Body:
       natal_chart: { date, time, place_tz, bodies?, ... }
       time_range: [start_date, end_date]
@@ -1263,7 +1267,7 @@ def prediction_comprehensive_forecast_route():
       statistical_validation?: bool (default false)
       include_vedic?: bool (default false)
       peak_window_days?: int (default 14)
-      ... technique-specific parameters with prefixes (transit_*, progression_*, etc.)
+      ... technique-specific parameters with prefixes (transit_*, progression_*, return_*, vedic_*)
     """
     if not _PREDICTION_ENGINE_OK:
         det = {"import_error": repr(_PREDICTION_ENGINE_ERR)} if DEBUG_VERBOSE and _PREDICTION_ENGINE_ERR else None
@@ -1278,28 +1282,22 @@ def prediction_comprehensive_forecast_route():
         return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
 
     try:
-        # Extract parameters
         natal_chart = payload["natal_chart"]
         time_range = tuple(payload["time_range"]) if "time_range" in payload else None
-        
         if not time_range:
             return _json_error("validation_error", [{"loc": ["time_range"], "msg": "required"}], 400)
-        
-        # Optional parameters
+
         techniques = payload.get("techniques")
         confidence_threshold = float(payload.get("confidence_threshold", 0.2))
         synthesis_method = payload.get("synthesis_method", "weighted_consensus")
         statistical_validation = bool(payload.get("statistical_validation", False))
         include_vedic = bool(payload.get("include_vedic", False))
         peak_window_days = int(payload.get("peak_window_days", 14))
-        
-        # Extract technique-specific kwargs
-        tk_kwargs = {}
-        for key, value in payload.items():
-            if any(key.startswith(prefix) for prefix in ("transit_", "progression_", "return_", "vedic_")):
-                tk_kwargs[key] = value
-        
-        # Generate forecast
+
+        # Technique-specific kwargs passthrough
+        tk_kwargs = {k: v for k, v in payload.items()
+                     if any(k.startswith(prefix) for prefix in ("transit_", "progression_", "return_", "vedic_"))}
+
         forecast = comprehensive_forecast(
             natal_chart=natal_chart,
             time_range=time_range,
@@ -1311,49 +1309,30 @@ def prediction_comprehensive_forecast_route():
             peak_window_days=peak_window_days,
             **tk_kwargs
         )
-        
-        # Serialize forecast
-        forecast_data = _serialize_comprehensive_forecast(forecast)
-        
-        # Enrich metadata
+
         meta = {
-            "prediction_engine": "app.core.prediction",
+            "prediction_engine": "app.core.prediction v2",
             "natal_chart_engine": _CHART_ENGINE_NAME,
             "houses_engine": _HOUSES_KIND,
-            "computation_time_ms": forecast.computation_time_ms,
+            "computation_time_ms": getattr(forecast, "computation_time_ms", None),
         }
         meta.update(_snapshot_ephemeris_meta())
-        
+
         return jsonify({
             "ok": True,
-            "forecast": forecast_data,
+            "forecast": _serialize_comprehensive_forecast(forecast),
             "meta": meta
         }), 200
-        
+
     except Exception as e:
         return _json_error("prediction_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+
 
 @api.post("/api/prediction/transits")
 @rate_limit(RL_PREDICTION_TRANSITS)
 def prediction_transits_route():
     """
     Calculate transit events using the prediction engine.
-    
-    Body:
-      natal_chart: { date, time, place_tz, bodies?, ... }
-      time_range: [start_date, end_date]
-      transiting_bodies?: ["Sun", "Moon", ...]
-      natal_bodies?: ["Sun", "Moon", ...]
-      orbs?: {aspect: orb_deg, ...}
-      aspects?: ["conjunction", "opposition", ...]
-      include_aspects_to?: ["planets", "angles"]
-      include_house_cusps?: bool
-      frame?: string
-      zodiac_mode?: "tropical" | "sidereal"
-      ayanamsa_deg?: float
-      exact_timing?: bool
-      statistical_validation?: bool
-      confidence_threshold?: float
     """
     if not _PREDICTION_ENGINE_OK:
         det = {"import_error": repr(_PREDICTION_ENGINE_ERR)} if DEBUG_VERBOSE and _PREDICTION_ENGINE_ERR else None
@@ -1362,65 +1341,41 @@ def prediction_transits_route():
     try:
         body = request.get_json(force=True) or {}
         payload = parse_prediction_payload(body)
-        
+
         natal_chart = payload["natal_chart"]
         time_range = tuple(payload["time_range"]) if "time_range" in payload else None
-        
         if not time_range:
             return _json_error("validation_error", [{"loc": ["time_range"], "msg": "required"}], 400)
-        
-        # Extract transit-specific parameters
-        kwargs = {}
-        transit_params = [
+
+        # Transit-specific accepted parameters
+        accept = {
             "transiting_bodies", "natal_bodies", "orbs", "aspects", "include_aspects_to",
             "include_house_cusps", "frame", "zodiac_mode", "ayanamsa_deg", "exact_timing",
             "statistical_validation", "confidence_threshold"
-        ]
-        for param in transit_params:
-            if param in payload:
-                kwargs[param] = payload[param]
-        
-        # Calculate transits
-        result = predict_transits(
-            natal_chart=natal_chart,
-            time_range=time_range,
-            **kwargs
-        )
-        
+        }
+        kwargs = {k: payload[k] for k in payload.keys() & accept}
+
+        result = predict_transits(natal_chart=natal_chart, time_range=time_range, **kwargs)
+
         return jsonify({
-            "ok": result.ok,
+            "ok": getattr(result, "ok", False),
             "result": _serialize_prediction_result(result),
             "meta": {
-                "prediction_engine": "app.core.prediction",
-                "technique": result.technique,
-                "computation_time_ms": result.computation_time_ms
+                "prediction_engine": "app.core.prediction v2",
+                "technique": getattr(result, "technique", "transits"),
+                "computation_time_ms": getattr(result, "computation_time_ms", None)
             }
         }), 200
-        
+
     except Exception as e:
         return _json_error("transits_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+
 
 @api.post("/api/prediction/progressions")
 @rate_limit(RL_PREDICTION_PROGRESSIONS)
 def prediction_progressions_route():
     """
-    Calculate secondary progression events using the prediction engine.
-    
-    Body:
-      natal_chart: { date, time, place_tz, bodies?, ... }
-      target_date: ISO string | JD float
-      method?: "secondary" | "minor" | "tertiary"
-      lunar_month?: "synodic" | "sidereal"
-      tertiary_mode?: "day-for-month" | ...
-      frame?: string
-      house_system?: string
-      zodiac_mode?: "tropical" | "sidereal"
-      ayanamsa_deg?: float
-      aspects_to_natal?: bool
-      orbs?: {aspect: orb_deg, ...}
-      parallels?: bool
-      antiscia?: bool
-      statistical_validation?: bool
+    Calculate progression events using the prediction engine.
     """
     if not _PREDICTION_ENGINE_OK:
         det = {"import_error": repr(_PREDICTION_ENGINE_ERR)} if DEBUG_VERBOSE and _PREDICTION_ENGINE_ERR else None
@@ -1429,63 +1384,40 @@ def prediction_progressions_route():
     try:
         body = request.get_json(force=True) or {}
         payload = parse_prediction_payload(body)
-        
+
         natal_chart = payload["natal_chart"]
         target_date = payload.get("target_date")
-        
         if not target_date:
             return _json_error("validation_error", [{"loc": ["target_date"], "msg": "required"}], 400)
-        
-        # Extract progression-specific parameters
-        kwargs = {}
-        progression_params = [
+
+        accept = {
             "method", "lunar_month", "tertiary_mode", "frame", "house_system",
             "zodiac_mode", "ayanamsa_deg", "aspects_to_natal", "orbs",
             "parallels", "antiscia", "statistical_validation"
-        ]
-        for param in progression_params:
-            if param in payload:
-                kwargs[param] = payload[param]
-        
-        result = predict_progressions(
-            natal_chart=natal_chart,
-            target_date=target_date,
-            **kwargs
-        )
-        
+        }
+        kwargs = {k: payload[k] for k in payload.keys() & accept}
+
+        result = predict_progressions(natal_chart=natal_chart, target_date=target_date, **kwargs)
+
         return jsonify({
-            "ok": result.ok,
+            "ok": getattr(result, "ok", False),
             "result": _serialize_prediction_result(result),
             "meta": {
-                "prediction_engine": "app.core.prediction",
-                "technique": result.technique,
-                "computation_time_ms": result.computation_time_ms
+                "prediction_engine": "app.core.prediction v2",
+                "technique": getattr(result, "technique", "progressions"),
+                "computation_time_ms": getattr(result, "computation_time_ms", None)
             }
         }), 200
-        
+
     except Exception as e:
         return _json_error("progressions_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+
 
 @api.post("/api/prediction/returns")
 @rate_limit(RL_PREDICTION_RETURNS)
 def prediction_returns_route():
     """
     Calculate solar/lunar return events using the prediction engine.
-    
-    Body:
-      natal_chart: { date, time, place_tz, bodies?, ... }
-      return_type: "solar" | "lunar"
-      year: int
-      lunar_month?: "sidereal" | "synodic"
-      place?: { latitude, longitude, ... } # override location
-      frame?: string
-      house_system?: string
-      zodiac_mode?: "tropical" | "sidereal"
-      ayanamsa_deg?: float
-      estimate_uncertainty?: bool
-      aspects_to_natal?: bool
-      orbs?: {aspect: orb_deg, ...}
-      statistical_validation?: bool
     """
     if not _PREDICTION_ENGINE_OK:
         det = {"import_error": repr(_PREDICTION_ENGINE_ERR)} if DEBUG_VERBOSE and _PREDICTION_ENGINE_ERR else None
@@ -1494,69 +1426,48 @@ def prediction_returns_route():
     try:
         body = request.get_json(force=True) or {}
         payload = parse_prediction_payload(body)
-        
+
         natal_chart = payload["natal_chart"]
         return_type = payload.get("return_type")
         year = payload.get("year")
-        
+
         if not return_type or not year:
             return _json_error("validation_error", [
                 {"loc": ["return_type"], "msg": "required"},
-                {"loc": ["year"], "msg": "required"}
+                {"loc": ["year"], "msg": "required"},
             ], 400)
-        
+
         if return_type not in ("solar", "lunar"):
-            return _json_error("validation_error", [
-                {"loc": ["return_type"], "msg": "must be 'solar' or 'lunar'"}
-            ], 400)
-        
-        # Extract return-specific parameters
-        kwargs = {}
-        return_params = [
+            return _json_error("validation_error", [{"loc": ["return_type"], "msg": "must be 'solar' or 'lunar'"}], 400)
+
+        accept = {
             "lunar_month", "place", "frame", "house_system", "zodiac_mode",
             "ayanamsa_deg", "estimate_uncertainty", "aspects_to_natal", "orbs",
             "statistical_validation"
-        ]
-        for param in return_params:
-            if param in payload:
-                kwargs[param] = payload[param]
-        
-        result = predict_returns(
-            natal_chart=natal_chart,
-            return_type=return_type,
-            year=int(year),
-            **kwargs
-        )
-        
+        }
+        kwargs = {k: payload[k] for k in payload.keys() & accept}
+
+        result = predict_returns(natal_chart=natal_chart, return_type=return_type, year=int(year), **kwargs)
+
         return jsonify({
-            "ok": result.ok,
+            "ok": getattr(result, "ok", False),
             "result": _serialize_prediction_result(result),
             "meta": {
-                "prediction_engine": "app.core.prediction",
-                "technique": result.technique,
-                "computation_time_ms": result.computation_time_ms
+                "prediction_engine": "app.core.prediction v2",
+                "technique": getattr(result, "technique", "returns"),
+                "computation_time_ms": getattr(result, "computation_time_ms", None)
             }
         }), 200
-        
+
     except Exception as e:
         return _json_error("returns_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+
 
 @api.post("/api/prediction/directions")
 @rate_limit(RL_PREDICTION_DIRECTIONS)
 def prediction_directions_route():
     """
     Calculate direction events using the prediction engine.
-    
-    Body:
-      natal_chart: { date, time, place_tz, bodies?, ... }
-      target_date: ISO string | JD float
-      method?: "solar_arc" | ...
-      frame?: string
-      zodiac_mode?: "tropical" | "sidereal"
-      ayanamsa_deg?: float
-      house_system?: string
-      orbs?: {aspect: orb_deg, ...}
-      statistical_validation?: bool
     """
     if not _PREDICTION_ENGINE_OK:
         det = {"import_error": repr(_PREDICTION_ENGINE_ERR)} if DEBUG_VERBOSE and _PREDICTION_ENGINE_ERR else None
@@ -1565,58 +1476,40 @@ def prediction_directions_route():
     try:
         body = request.get_json(force=True) or {}
         payload = parse_prediction_payload(body)
-        
+
         natal_chart = payload["natal_chart"]
         target_date = payload.get("target_date")
-        
         if not target_date:
             return _json_error("validation_error", [{"loc": ["target_date"], "msg": "required"}], 400)
-        
-        # Extract direction-specific parameters (removed aspects_to_natal)
-        kwargs = {}
-        direction_params = [
+
+        # IMPORTANT: do NOT pass 'aspects_to_natal' — legacy backends choke on it
+        accept = {
             "method", "frame", "zodiac_mode", "ayanamsa_deg", "house_system",
             "orbs", "statistical_validation"
-        ]
-        for param in direction_params:
-            if param in payload:
-                kwargs[param] = payload[param]
-        
-        result = predict_directions(
-            natal_chart=natal_chart,
-            target_date=target_date,
-            **kwargs
-        )
-        
+        }
+        kwargs = {k: payload[k] for k in payload.keys() & accept}
+
+        result = predict_directions(natal_chart=natal_chart, target_date=target_date, **kwargs)
+
         return jsonify({
-            "ok": result.ok,
+            "ok": getattr(result, "ok", False),
             "result": _serialize_prediction_result(result),
             "meta": {
-                "prediction_engine": "app.core.prediction",
-                "technique": result.technique,
-                "computation_time_ms": result.computation_time_ms
+                "prediction_engine": "app.core.prediction v2",
+                "technique": getattr(result, "technique", "directions"),
+                "computation_time_ms": getattr(result, "computation_time_ms", None)
             }
         }), 200
-        
+
     except Exception as e:
         return _json_error("directions_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+
 
 @api.post("/api/prediction/relationship")
 @rate_limit(RL_PREDICTION_RELATIONSHIP)
 def prediction_relationship_route():
     """
     Relationship forecast between two natal charts.
-    
-    Body:
-      natal_a: { date, time, place_tz, bodies?, ... }
-      natal_b: { date, time, place_tz, bodies?, ... }
-      time_range: [start_date, end_date]
-      synastry_orbs?: {aspect: orb_deg, ...}
-      composite_method?: "midpoint" | "davison"
-      include_transits_to_composite?: bool
-      include_progressions?: bool
-      confidence_threshold?: float
-      ... other parameters
     """
     if not _PREDICTION_ENGINE_OK:
         det = {"import_error": repr(_PREDICTION_ENGINE_ERR)} if DEBUG_VERBOSE and _PREDICTION_ENGINE_ERR else None
@@ -1624,70 +1517,58 @@ def prediction_relationship_route():
 
     try:
         body = request.get_json(force=True) or {}
-        
+
         natal_a = body.get("natal_a")
         natal_b = body.get("natal_b")
         time_range = body.get("time_range")
-        
+
         if not natal_a or not natal_b or not time_range:
             return _json_error("validation_error", [
                 {"loc": ["natal_a"], "msg": "required"},
                 {"loc": ["natal_b"], "msg": "required"},
-                {"loc": ["time_range"], "msg": "required"}
+                {"loc": ["time_range"], "msg": "required"},
             ], 400)
-        
+
         if not (isinstance(time_range, (list, tuple)) and len(time_range) == 2):
-            return _json_error("validation_error", [
-                {"loc": ["time_range"], "msg": "must be [start_date, end_date] array"}
-            ], 400)
-        
-        # Extract relationship-specific parameters
-        kwargs = {}
-        relationship_params = [
+            return _json_error("validation_error", [{"loc": ["time_range"], "msg": "must be [start_date, end_date] array"}], 400)
+
+        accept = {
             "synastry_orbs", "composite_method", "include_transits_to_composite",
             "include_progressions", "confidence_threshold", "parallels", "antiscia",
             "frame", "zodiac_mode", "ayanamsa_deg", "house_system"
-        ]
-        for param in relationship_params:
-            if param in body:
-                kwargs[param] = body[param]
-        
-        # Add technique-specific kwargs
-        for key, value in body.items():
-            if any(key.startswith(prefix) for prefix in ("transit_", "progression_")):
-                kwargs[key] = value
-        
+        }
+        kwargs = {k: body[k] for k in body.keys() & accept}
+
+        # technique-specific passthroughs
+        for k, v in body.items():
+            if any(k.startswith(prefix) for prefix in ("transit_", "progression_")):
+                kwargs[k] = v
+
         result = relationship_forecast(
             natal_a=natal_a,
             natal_b=natal_b,
             time_range=tuple(time_range),
             **kwargs
         )
-        
+
         return jsonify({
             "ok": True,
             "result": _serialize_relationship_forecast(result),
             "meta": {
-                "prediction_engine": "app.core.prediction",
-                "technique": "relationship_forecast"
+                "prediction_engine": "app.core.prediction v2",
+                "technique": "relationship_forecast",
             }
         }), 200
-        
+
     except Exception as e:
         return _json_error("relationship_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+
 
 @api.post("/api/prediction/validate")
 @rate_limit(RL_PREDICTION_VALIDATION)
 def prediction_validation_route():
     """
     Validate prediction model using test cases.
-    
-    Body:
-      test_cases: [{ natal_chart, time_range?, target_date?, prediction_type, expected_events, ... }, ...]
-      validation_method?: "cross_validation" | "bootstrap" | "holdout"
-      n_folds?: int (for cross_validation)
-      metrics?: ["precision", "recall", "f1", "timing_accuracy", "confidence_calibration"]
-      confidence_threshold?: float
     """
     if not _PREDICTION_ENGINE_OK:
         det = {"import_error": repr(_PREDICTION_ENGINE_ERR)} if DEBUG_VERBOSE and _PREDICTION_ENGINE_ERR else None
@@ -1695,76 +1576,66 @@ def prediction_validation_route():
 
     try:
         body = request.get_json(force=True) or {}
-        
+
         test_cases = body.get("test_cases")
         if not isinstance(test_cases, list) or not test_cases:
-            return _json_error("validation_error", [
-                {"loc": ["test_cases"], "msg": "required non-empty array"}
-            ], 400)
-        
-        # Extract validation parameters
-        kwargs = {}
-        validation_params = [
-            "validation_method", "n_folds", "metrics", "confidence_threshold"
-        ]
-        for param in validation_params:
-            if param in body:
-                kwargs[param] = body[param]
-        
-        result = validate_prediction_model(
-            test_cases=test_cases,
-            **kwargs
-        )
-        
+            return _json_error("validation_error", [{"loc": ["test_cases"], "msg": "required non-empty array"}], 400)
+
+        accept = {"validation_method", "n_folds", "metrics", "confidence_threshold"}
+        kwargs = {k: body[k] for k in body.keys() & accept}
+
+        result = validate_prediction_model(test_cases=test_cases, **kwargs)
+
         return jsonify({
             "ok": result.get("ok", True),
             "result": result,
             "meta": {
-                "prediction_engine": "app.core.prediction",
-                "technique": "model_validation"
+                "prediction_engine": "app.core.prediction v2",
+                "technique": "model_validation",
             }
         }), 200
-        
+
     except Exception as e:
         return _json_error("validation_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+
 
 # ─────────────── Serialization helpers for prediction engine ───────────────
 def _serialize_prediction_event(event: Any) -> Dict[str, Any]:
     """Convert PredictionEvent to JSON-serializable dict."""
     if event is None:
         return {}
-    
     return {
         "event_type": getattr(event, "event_type", None),
         "technique": getattr(event, "technique", None),
         "description": getattr(event, "description", None),
-        "datetime_utc": getattr(event, "datetime_utc", None).isoformat() if hasattr(event, "datetime_utc") and getattr(event, "datetime_utc") else None,
+        "datetime_utc": getattr(event, "datetime_utc", None).isoformat()
+            if hasattr(event, "datetime_utc") and getattr(event, "datetime_utc") else None,
         "jd_tt": getattr(event, "jd_tt", None),
         "jd_ut1": getattr(event, "jd_ut1", None),
         "precision_seconds": getattr(event, "precision_seconds", None),
         "confidence": getattr(event, "confidence", None),
         "significance": getattr(event, "significance", None),
-        "metadata": getattr(event, "metadata", {})
+        "metadata": getattr(event, "metadata", {}),
     }
+
 
 def _serialize_timing_window(window: Any) -> Dict[str, Any]:
     """Convert TimingWindow to JSON-serializable dict."""
     if window is None:
         return {}
-        
     return {
         "start_jd_tt": getattr(window, "start_jd_tt", None),
         "end_jd_tt": getattr(window, "end_jd_tt", None),
         "peak_jd_tt": getattr(window, "peak_jd_tt", None),
         "uncertainty_days": getattr(window, "uncertainty_days", None),
-        "confidence_interval": getattr(window, "confidence_interval", None)
+        "confidence_interval": getattr(window, "confidence_interval", None),
     }
+
 
 def _serialize_prediction_result(result: Any) -> Dict[str, Any]:
     """Convert PredictionResult to JSON-serializable dict."""
     if result is None:
         return {}
-        
     return {
         "ok": getattr(result, "ok", True),
         "technique": getattr(result, "technique", None),
@@ -1775,24 +1646,24 @@ def _serialize_prediction_result(result: Any) -> Dict[str, Any]:
         "statistical_metrics": getattr(result, "statistical_metrics", {}),
         "warnings": getattr(result, "warnings", []),
         "metadata": getattr(result, "metadata", {}),
-        "computation_time_ms": getattr(result, "computation_time_ms", None)
+        "computation_time_ms": getattr(result, "computation_time_ms", None),
     }
+
 
 def _serialize_comprehensive_forecast(forecast: Any) -> Dict[str, Any]:
     """Convert ComprehensiveForecast to JSON-serializable dict."""
     if forecast is None:
         return {}
-        
     predictions = {}
     if hasattr(forecast, "predictions") and forecast.predictions:
         predictions = {k: _serialize_prediction_result(v) for k, v in forecast.predictions.items()}
-    
+
     time_range = getattr(forecast, "time_range", [])
     if time_range and len(time_range) >= 2:
         time_range_iso = [dt.isoformat() if hasattr(dt, "isoformat") else str(dt) for dt in time_range[:2]]
     else:
         time_range_iso = []
-        
+
     return {
         "natal_chart": getattr(forecast, "natal_chart", {}),
         "time_range": time_range_iso,
@@ -1802,23 +1673,23 @@ def _serialize_comprehensive_forecast(forecast: Any) -> Dict[str, Any]:
         "risk_assessment": getattr(forecast, "risk_assessment", {}),
         "confidence_metrics": getattr(forecast, "confidence_metrics", {}),
         "validation_results": getattr(forecast, "validation_results", {}),
-        "computation_time_ms": getattr(forecast, "computation_time_ms", None)
+        "computation_time_ms": getattr(forecast, "computation_time_ms", None),
     }
+
 
 def _serialize_relationship_forecast(forecast: Any) -> Dict[str, Any]:
     """Convert RelationshipForecast to JSON-serializable dict."""
     if forecast is None:
         return {}
-        
     return {
-        "synastry_analysis": getattr(forecast, "synastry_analysis", {}),
+        "synastry_analysis": getattr(forecast, "synasry_analysis", getattr(forecast, "synastry_analysis", {})),
         "composite_analysis": getattr(forecast, "composite_analysis", {}),
         "transit_interactions": [_serialize_prediction_event(e) for e in getattr(forecast, "transit_interactions", [])],
         "progression_interactions": [_serialize_prediction_event(e) for e in getattr(forecast, "progression_interactions", [])],
         "compatibility_trends": getattr(forecast, "compatibility_trends", {}),
         "critical_periods": [_serialize_timing_window(w) for w in getattr(forecast, "critical_periods", [])],
         "relationship_score": getattr(forecast, "relationship_score", None),
-        "confidence_metrics": getattr(forecast, "confidence_metrics", {})
+        "confidence_metrics": getattr(forecast, "confidence_metrics", {}),
     }
 
 
