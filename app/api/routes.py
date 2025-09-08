@@ -46,6 +46,9 @@ from app.core.validators import (
     parse_progressions_payload,
     parse_returns_payload,
     parse_parans_payload,  # NEW - Added for paran integration
+    parse_synastry_payload,
+    parse_composite_payload,
+    parse_synastry_report_payload,
 )
 
 # Timescales core
@@ -91,6 +94,23 @@ try:
 except Exception as _e:
     _PARANS_IMPORT_ERROR = _e
     _parans_compute = None  # type: ignore
+
+# Synastry core (NEW - optional import guard)
+_synastry_compute = None
+_composite_compute = None
+_synastry_report_compute = None
+_SYNASTRY_IMPORT_ERROR: Optional[Exception] = None
+try:
+    from app.core.synastry import (
+        compute_synastry as _synastry_compute,
+        compute_composite as _composite_compute,
+        synastry_report as _synastry_report_compute
+    )
+except Exception as _e:
+    _SYNASTRY_IMPORT_ERROR = _e
+    _synastry_compute = None
+    _composite_compute = None
+    _synastry_report_compute = None
     
 log = logging.getLogger(__name__)
 api = Blueprint("api", __name__)
@@ -111,6 +131,8 @@ RL_DEBUG        = _RL("ASTRO_RL_DEBUG_PER_MIN",         6)
 RL_PROGRESSIONS = _RL("ASTRO_RL_PROGRESSIONS_PER_MIN", 12)
 RL_RETURNS      = _RL("ASTRO_RL_RETURNS_PER_MIN",      12)  # <-- NEW
 RL_PARANS       = _RL("ASTRO_RL_PARANS_PER_MIN",       12)  # NEW - Rate limit for parans endpoint
+RL_SYNASTRY     = _RL("ASTRO_RL_SYNASTRY_PER_MIN",     6)   # NEW - Rate limit for synastry endpoints
+RL_COMPOSITE    = _RL("ASTRO_RL_COMPOSITE_PER_MIN",    8)   # NEW - Rate limit for composite endpoint
 
 # ───────────────────────── helpers ─────────────────────────
 def _wrap360(x: float) -> float:
@@ -2353,6 +2375,262 @@ def parans_route():
         "meta": meta,
         "events_by_body": result.get("events_by_body", {}),
         "parans": result.get("parans", []),
+        "warnings": list(meta.get("warnings", [])),
+    }
+
+    return jsonify(resp), 200
+
+# ───────────────────────── SYNASTRY & COMPOSITE (NEW) ─────────────────────────
+@api.post("/api/synastry")
+@rate_limit(RL_SYNASTRY)
+def synastry_route():
+    """
+    Compute synastry between two natal charts.
+    
+    Body:
+      natal_a: { date, time, place_tz, latitude?, longitude?, elev_m? }
+      natal_b: { date, time, place_tz, latitude?, longitude?, elev_m? }
+      jd_tt_a?, jd_ut1_a?, jd_tt_b?, jd_ut1_b?: strict timescales (optional)
+      place_a?, place_b?: coordinate overrides (optional)
+      frame?: "ecliptic-of-date" | "ecliptic-j2000"
+      zodiac_mode?: "tropical" | "sidereal"
+      ayanamsa_deg?: float
+      house_system?: string
+      orbs?: {aspect: orb_deg, ...}
+      parallels?: bool (default true)
+      antiscia?: bool (default true)
+    """
+    if _synastry_compute is None:
+        det = {"import_error": repr(_SYNASTRY_IMPORT_ERROR)} if DEBUG_VERBOSE and _SYNASTRY_IMPORT_ERROR else None
+        return _json_error("synastry_unavailable", det or "synastry engine not wired", 501)
+
+    try:
+        body = request.get_json(force=True) or {}
+        payload = parse_synastry_payload(body)
+    except ValidationError as e:
+        return _json_error("validation_error", e.errors(), 400)
+    except Exception as e:
+        return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
+
+    # Build arguments for synastry computation
+    synastry_kwargs = {
+        "natal_a": payload["natal_a"],
+        "natal_b": payload["natal_b"],
+        "frame": payload.get("frame", "ecliptic-of-date"),
+        "ayanamsa_deg": payload.get("ayanamsa_deg", 0.0),
+        "zodiac_mode": payload.get("zodiac_mode", "tropical"),
+        "house_system": payload.get("house_system", "placidus"),
+        "parallels": payload.get("parallels", True),
+        "antiscia": payload.get("antiscia", True),
+    }
+
+    # Add optional fields
+    for field in ("jd_tt_a", "jd_ut1_a", "jd_tt_b", "jd_ut1_b", "place_a", "place_b", "orbs"):
+        if field in payload:
+            synastry_kwargs[field] = payload[field]
+
+    # Filter arguments to match function signature
+    try:
+        import inspect
+        synastry_params = set(inspect.signature(_synastry_compute).parameters.keys())
+        filtered_kwargs = {k: v for k, v in synastry_kwargs.items() if k in synastry_params}
+    except Exception:
+        filtered_kwargs = synastry_kwargs
+
+    # Call synastry computation
+    try:
+        result = _synastry_compute(**filtered_kwargs)
+    except ValueError as e:
+        return _json_error("synastry_value_error", str(e), 400)
+    except TypeError as e:
+        det = {"type": "TypeError", "message": str(e)} if DEBUG_VERBOSE else None
+        return _json_error("synastry_internal", det or "internal_error", 500)
+    except Exception as e:
+        det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
+        return _json_error("synastry_internal", det or "internal_error", 500)
+
+    # Enrich metadata
+    meta = dict(result.get("meta", {}))
+    try:
+        meta.update(_snapshot_ephemeris_meta(meta))
+    except Exception:
+        pass
+
+    # Structure response
+    resp = {
+        "ok": True,
+        "meta": meta,
+        "aspects": result.get("aspects", {}),
+        "overlays": result.get("overlays", {}),
+        "midpoints": result.get("midpoints", {}),
+        "scores": result.get("scores", {}),
+        "warnings": list(meta.get("warnings", [])),
+    }
+
+    return jsonify(resp), 200
+
+@api.post("/api/composite")
+@rate_limit(RL_COMPOSITE)
+def composite_route():
+    """
+    Compute composite chart between two natal charts.
+    
+    Body:
+      natal_a: { date, time, place_tz, latitude?, longitude?, elev_m? }
+      natal_b: { date, time, place_tz, latitude?, longitude?, elev_m? }
+      method?: "midpoint" | "davison" (default midpoint)
+      jd_tt_ref?, jd_ut1_ref?: reference timescales (optional)
+      place_ref?: reference place for davison method (optional)
+      frame?: "ecliptic-of-date" | "ecliptic-j2000"
+      house_system?: string
+      ayanamsa_deg?: float
+      zodiac_mode?: "tropical" | "sidereal"
+    """
+    if _composite_compute is None:
+        det = {"import_error": repr(_SYNASTRY_IMPORT_ERROR)} if DEBUG_VERBOSE and _SYNASTRY_IMPORT_ERROR else None
+        return _json_error("composite_unavailable", det or "composite engine not wired", 501)
+
+    try:
+        body = request.get_json(force=True) or {}
+        payload = parse_composite_payload(body)
+    except ValidationError as e:
+        return _json_error("validation_error", e.errors(), 400)
+    except Exception as e:
+        return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
+
+    # Build arguments
+    composite_kwargs = {
+        "natal_a": payload["natal_a"],
+        "natal_b": payload["natal_b"],
+        "method": payload.get("method", "midpoint"),
+        "frame": payload.get("frame", "ecliptic-of-date"),
+        "house_system": payload.get("house_system", "placidus"),
+        "ayanamsa_deg": payload.get("ayanamsa_deg", 0.0),
+        "zodiac_mode": payload.get("zodiac_mode", "tropical"),
+    }
+
+    # Add optional fields
+    for field in ("jd_tt_ref", "jd_ut1_ref", "place_ref"):
+        if field in payload:
+            composite_kwargs[field] = payload[field]
+
+    # Filter arguments
+    try:
+        import inspect
+        composite_params = set(inspect.signature(_composite_compute).parameters.keys())
+        filtered_kwargs = {k: v for k, v in composite_kwargs.items() if k in composite_params}
+    except Exception:
+        filtered_kwargs = composite_kwargs
+
+    # Call composite computation
+    try:
+        result = _composite_compute(**filtered_kwargs)
+    except ValueError as e:
+        return _json_error("composite_value_error", str(e), 400)
+    except Exception as e:
+        det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
+        return _json_error("composite_internal", det or "internal_error", 500)
+
+    # Enrich metadata
+    meta = dict(result.get("meta", {}))
+    try:
+        meta.update(_snapshot_ephemeris_meta(meta))
+    except Exception:
+        pass
+
+    # Structure response
+    resp = {
+        "ok": True,
+        "meta": meta,
+        "method": result.get("method"),
+        "positions": result.get("positions", {}),
+        "asc": result.get("asc"),
+        "mc": result.get("mc"),
+        "cusps": result.get("cusps"),
+    }
+
+    return jsonify(resp), 200
+
+@api.post("/api/synastry/report")
+@rate_limit(RL_SYNASTRY)
+def synastry_report_route():
+    """
+    Comprehensive synastry report (synastry + composite + metrics).
+    
+    Body: combines synastry and composite parameters
+      natal_a, natal_b: natal chart data
+      composite_method?: "midpoint" | "davison"
+      composite_place_ref?: reference place
+      ... all synastry parameters ...
+    """
+    if _synastry_report_compute is None:
+        det = {"import_error": repr(_SYNASTRY_IMPORT_ERROR)} if DEBUG_VERBOSE and _SYNASTRY_IMPORT_ERROR else None
+        return _json_error("synastry_report_unavailable", det or "synastry report engine not wired", 501)
+
+    try:
+        body = request.get_json(force=True) or {}
+        payload = parse_synastry_report_payload(body)
+    except ValidationError as e:
+        return _json_error("validation_error", e.errors(), 400)
+    except Exception as e:
+        return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
+
+    # Build arguments
+    report_kwargs = {
+        "natal_a": payload["natal_a"],
+        "natal_b": payload["natal_b"],
+        "frame": payload.get("frame", "ecliptic-of-date"),
+        "ayanamsa_deg": payload.get("ayanamsa_deg", 0.0),
+        "zodiac_mode": payload.get("zodiac_mode", "tropical"),
+        "house_system": payload.get("house_system", "placidus"),
+        "parallels": payload.get("parallels", True),
+        "antiscia": payload.get("antiscia", True),
+        "composite_method": payload.get("composite_method", "midpoint"),
+    }
+
+    # Add optional fields
+    optional_fields = (
+        "jd_tt_a", "jd_ut1_a", "jd_tt_b", "jd_ut1_b", 
+        "place_a", "place_b", "orbs", "composite_place_ref"
+    )
+    for field in optional_fields:
+        if field in payload:
+            report_kwargs[field] = payload[field]
+
+    # Filter arguments
+    try:
+        import inspect
+        report_params = set(inspect.signature(_synastry_report_compute).parameters.keys())
+        filtered_kwargs = {k: v for k, v in report_kwargs.items() if k in report_params}
+    except Exception:
+        filtered_kwargs = report_kwargs
+
+    # Call report computation
+    try:
+        result = _synastry_report_compute(**filtered_kwargs)
+    except ValueError as e:
+        return _json_error("synastry_report_value_error", str(e), 400)
+    except Exception as e:
+        det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
+        return _json_error("synastry_report_internal", det or "internal_error", 500)
+
+    # Enrich metadata
+    meta = dict(result.get("meta", {}))
+    try:
+        meta.update(_snapshot_ephemeris_meta(meta))
+    except Exception:
+        pass
+
+    # Structure response
+    resp = {
+        "ok": True,
+        "meta": meta,
+        "aspects": result.get("aspects", {}),
+        "overlays": result.get("overlays", {}),
+        "midpoints": result.get("midpoints", {}),
+        "composite": result.get("composite", {}),
+        "scores": result.get("scores", {}),
+        "metrics": result.get("metrics", {}),
         "warnings": list(meta.get("warnings", [])),
     }
 
