@@ -269,35 +269,75 @@ def _normalize_aspect_config(orbs: Optional[Dict[str, float]], technique: str) -
         enable_fdr_correction=True,
         q_level=0.05,
     )
+def _body_specific_orbs(base_orbs: Dict[str, float], body_a: str, body_b: str) -> Dict[str, float]:
+    """Apply body-specific orb scaling (luminaries get wider orbs)."""
+    luminaries = {"sun", "moon"}
+    outer_planets = {"uranus", "neptune", "pluto"}
+    
+    # Determine scaling factor
+    scale = 1.0
+    if any(b.lower() in luminaries for b in [body_a, body_b]):
+        scale = 1.2  # 20% wider for luminaries
+    elif any(b.lower() in outer_planets for b in [body_a, body_b]):
+        scale = 0.9  # 10% tighter for outer planets
+    
+    return {k: v * scale for k, v in base_orbs.items()}
 
 def _compute_confidence(events: List[PredictionEvent], stats: Dict[str, float]) -> float:
+    """Compute calibrated confidence score with technique-specific adjustments."""
     if not events:
         return 0.0
-    avg = sum(e.confidence for e in events) / len(events)
-    p = stats.get("p_value", 1.0)
-    boost = 0.2 * (1.0 - p / 0.05) if p < 0.05 else 0.0
-    size = min(0.1, 0.02 * len(events))
-    return min(1.0, avg + boost + size)
-
+    
+    # Base confidence from events
+    confidences = [e.confidence for e in events if e.confidence > 0]
+    if not confidences:
+        return 0.0
+    
+    # Weighted average (higher confidence events get more weight)
+    weights = [c ** 1.5 for c in confidences]  # Exponential weighting
+    weighted_avg = sum(c * w for c, w in zip(confidences, weights)) / sum(weights)
+    
+    # Statistical significance boost
+    p_value = stats.get("p_value", 1.0)
+    significance_boost = 0.3 * max(0, 1.0 - p_value / 0.01) if p_value < 0.05 else 0.0
+    
+    # Event count factor (diminishing returns)
+    count_factor = min(0.15, 0.03 * math.log(1 + len(events)))
+    
+    # Technique diversity bonus
+    techniques = set(e.technique for e in events)
+    diversity_bonus = min(0.1, 0.03 * len(techniques))
+    
+    return min(1.0, weighted_avg + significance_boost + count_factor + diversity_bonus)
+    
 def _create_timing_windows(events: List[PredictionEvent], *, cluster_days: float = 7.0) -> List[TimingWindow]:
+    """Create timing windows with adaptive clustering based on confidence density."""
     ev = [e for e in events if e.datetime_utc is not None]
     if len(ev) < 2:
         return []
-    ev.sort(key=lambda e: e.datetime_utc)  # type: ignore
+    ev.sort(key=lambda e: e.datetime_utc)
+    
+    # Adaptive clustering: adjust window size based on confidence density
     wins: List[TimingWindow] = []
     group: List[PredictionEvent] = [ev[0]]
+    
     for e in ev[1:]:
-        dt_days = (e.datetime_utc - group[-1].datetime_utc).total_seconds() / 86400.0  # type: ignore
-        if dt_days <= cluster_days:
+        dt_days = (e.datetime_utc - group[-1].datetime_utc).total_seconds() / 86400.0
+        
+        # Adaptive threshold based on confidence
+        avg_confidence = sum(g.confidence for g in group) / len(group)
+        adaptive_threshold = cluster_days * (0.5 + 0.5 * avg_confidence)  # 3.5-10.5 days
+        
+        if dt_days <= adaptive_threshold:
             group.append(e)
         else:
             if len(group) > 1:
-                s = group[0].datetime_utc  # type: ignore
-                q = group[-1].datetime_utc  # type: ignore
+                s = group[0].datetime_utc
+                q = group[-1].datetime_utc
                 peak = max(group, key=lambda x: x.confidence)
-                s_jd_tt, _ = _jd_pair_from_dt(s)  # ERFA
+                s_jd_tt, _ = _jd_pair_from_dt(s)
                 q_jd_tt, _ = _jd_pair_from_dt(q)
-                pk_jd_tt, _ = _jd_pair_from_dt(peak.datetime_utc)  # type: ignore
+                pk_jd_tt, _ = _jd_pair_from_dt(peak.datetime_utc)
                 wins.append(TimingWindow(
                     start_jd_tt=s_jd_tt,
                     end_jd_tt=q_jd_tt,
@@ -306,13 +346,15 @@ def _create_timing_windows(events: List[PredictionEvent], *, cluster_days: float
                     confidence_interval=(s_jd_tt, q_jd_tt),
                 ))
             group = [e]
+    
+    # Handle final group
     if len(group) > 1:
-        s = group[0].datetime_utc  # type: ignore
-        q = group[-1].datetime_utc  # type: ignore
+        s = group[0].datetime_utc
+        q = group[-1].datetime_utc
         peak = max(group, key=lambda x: x.confidence)
-        s_jd_tt, _ = _jd_pair_from_dt(s)  # type: ignore
-        q_jd_tt, _ = _jd_pair_from_dt(q)  # type: ignore
-        pk_jd_tt, _ = _jd_pair_from_dt(peak.datetime_utc)  # type: ignore
+        s_jd_tt, _ = _jd_pair_from_dt(s)
+        q_jd_tt, _ = _jd_pair_from_dt(q)
+        pk_jd_tt, _ = _jd_pair_from_dt(peak.datetime_utc)
         wins.append(TimingWindow(
             start_jd_tt=s_jd_tt,
             end_jd_tt=q_jd_tt,
@@ -321,6 +363,7 @@ def _create_timing_windows(events: List[PredictionEvent], *, cluster_days: float
             confidence_interval=(s_jd_tt, q_jd_tt),
         ))
     return wins
+
 
 def _body_activity(events: List[PredictionEvent]) -> Dict[str, Any]:
     counts: Dict[str, int] = {}
@@ -386,8 +429,10 @@ def predict_transits(
         if "angles" in include_aspects_to:
             natal_targets += ["asc", "mc", "ic", "dsc"]
         if include_house_cusps:
-            natal_targets += [f"cusp{i}" for i in range(1, 13)]
-
+            # Add house cusps as targets
+            natal_targets += [f"cusp_{i}" for i in range(1, 13)]
+            # Also add cusp alternate naming
+            natal_targets += [f"house_{i}_cusp" for i in range(1, 13)]
         orbs_to_use = orbs or DEFAULT_ORBS_TRANSITS
 
         tr = find_transits_in_range(
@@ -408,7 +453,12 @@ def predict_transits(
         for hit in tr.get("transits", []):
             asp = _canon_aspect(hit.get("aspect"))
             orb = float(hit.get("orb", 0.0))
-            max_orb = float(hit.get("max_orb", max(orbs_to_use.get(asp, 1.0), 1e-9)))
+            base_max_orb = orbs_to_use.get(asp, 1.0)
+            body_orbs = _body_specific_orbs({asp: base_max_orb}, 
+                           hit.get('transiting_body', ''), 
+                           hit.get('natal_body', ''))
+            # Use the body-specific orb, not the hit's max_orb
+            max_orb = max(body_orbs.get(asp, base_max_orb), 1e-9)
             tight = max(0.0, 1.0 - (orb / max_orb))
             major = 0.2 if asp in {"conjunction", "opposition", "trine", "square"} else 0.0
             conf = min(1.0, tight + major)
@@ -535,13 +585,11 @@ def predict_progressions(
             target_dt = None
             years_after = ((target_date - jd_tt_natal) * 86400.0) / (TROPICAL_YEAR_D * 86400.0)
         else:
-            t_dt = _ensure_utc(target_date)
-            # years since natal using civil-approx days (consistent with earlier design)
-            natal_dt = datetime.fromtimestamp(0, tz=timezone.utc)  # placeholder for consistent math below
-            # Better: derive natal civil from jd_tt_natal via a stored natal civil if present
-            if all(k in natal_chart for k in ("date", "time", "place_tz")):
-                natal_dt = _ensure_utc(f"{natal_chart['date']}T{natal_chart['time']}")
-            years_after = (t_dt - natal_dt).days / TROPICAL_YEAR_D
+            warns.append(f"statistical_validation_failed_but_continuing:{type(e).__name__}:{str(e)[:100]}")
+            # Convert natal JD back to datetime for consistent calculation
+            natal_timestamp = (jd_tt_natal - 2440587.5) * 86400.0
+            natal_dt = datetime.fromtimestamp(natal_timestamp, tz=timezone.utc)
+            years_after = (t_dt - natal_dt).total_seconds() / (TROPICAL_YEAR_D * 86400.0)
             target_dt = t_dt
 
         res = compute_progressions(
@@ -928,7 +976,7 @@ def predict_directions(
         if isinstance(target_date, (int, float)):
             target_dt = None
         else:
-            target_dt = _ensure_utc(target_date)
+            targewarns.append(f"statistical_validation_failed_but_continuing:{type(e).__name__}:{str(e)[:100]}")
 
         dr = compute_directions(
             natal=natal_chart,
@@ -1320,11 +1368,15 @@ def _synthesize(all_events: List[PredictionEvent], preds: Dict[str, PredictionRe
     }
 
 def _consensus_score(preds: Dict[str, PredictionResult], time_range: Tuple[datetime, datetime]) -> float:
+    """Calculate consensus using statistical correlation methods."""
     if sum(1 for v in preds.values() if v.ok) < 2:
         return 1.0
+    
+    # Create time series for each technique
     timings: Dict[str, List[Tuple[int, float]]] = {}
     s = time_range[0]
     e = time_range[1]
+    
     for name, pr in preds.items():
         if pr.ok:
             lst: List[Tuple[int, float]] = []
@@ -1332,27 +1384,46 @@ def _consensus_score(preds: Dict[str, PredictionResult], time_range: Tuple[datet
                 if ev.datetime_utc and s <= ev.datetime_utc <= e:
                     lst.append(((ev.datetime_utc - s).days, ev.confidence))
             timings[name] = lst
+    
     if len(timings) < 2:
         return 1.0
-    scores: List[float] = []
+    
+    # Calculate pairwise correlations
+    correlations: List[float] = []
     names = list(timings.keys())
+    
     for i in range(len(names)):
         for j in range(i + 1, len(names)):
-            a = timings[names[i]]
-            b = timings[names[j]]
-            if not a or not b:
+            a_events = timings[names[i]]
+            b_events = timings[names[j]]
+            
+            if not a_events or not b_events:
                 continue
-            total = 0
-            overlap = 0.0
-            for da, ca in a:
-                for db, cb in b:
-                    total += 1
-                    if abs(da - db) <= 7:
-                        overlap += 0.5 * (ca + cb)
-            if total > 0:
-                scores.append(overlap / total)
-    return (sum(scores) / len(scores)) if scores else 0.0
-
+            
+            # Time-windowed correlation
+            total_score = 0.0
+            comparison_count = 0
+            
+            # Check each event in A against events in B
+            for day_a, conf_a in a_events:
+                best_correlation = 0.0
+                for day_b, conf_b in b_events:
+                    time_diff = abs(day_a - day_b)
+                    if time_diff <= 7:  # Within 7 days
+                        # Exponential decay with distance
+                        time_correlation = math.exp(-time_diff / 3.0)
+                        confidence_correlation = min(conf_a, conf_b)
+                        correlation = time_correlation * confidence_correlation
+                        best_correlation = max(best_correlation, correlation)
+                
+                total_score += best_correlation
+                comparison_count += 1
+            
+            if comparison_count > 0:
+                correlations.append(total_score / comparison_count)
+    
+    return sum(correlations) / len(correlations) if correlations else 0.0
+    
 def _identify_peak_periods(events: List[PredictionEvent], time_range: Tuple[datetime, datetime], *, window_days: int = 14) -> List[TimingWindow]:
     ev = [e for e in events if e.datetime_utc and time_range[0] <= e.datetime_utc <= time_range[1]]
     if not ev:
