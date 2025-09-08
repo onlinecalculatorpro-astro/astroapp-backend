@@ -98,11 +98,24 @@ except Exception as e:
     _RET_OK = False
     _RET_ERR = e
 
+# Unified predictive toolkit (Transit / Dasha / Varga / Yoga)
 try:
     from app.core.predictive import (
-        find_transits_in_range,
-        predict_dasha_periods,
-        validate_predictions,
+        # Transits
+        TransitEngine, TransitEvent, find_transits_in_range,
+        # Dasha
+        DashaPeriod, vimsottari_dasha,
+        # Varga
+        compute_vargas_for_point, compute_vargas,
+        # Yogas
+        detect_yogas, house_index_for_longitude,
+        # Houses & timescales helpers
+        compute_houses, timescales_from_civil,
+        # Validation primitives & feature builders (available if/when needed)
+        EvalResult, evaluate_univariate, permutation_pvalue_corr, bh_fdr, holdout_replicate,
+        feature_transit_proximity, feature_dasha_lords_onehot, feature_yoga_flags,
+        # Predictive result type (aliased so it doesn't shadow ours)
+        PredictionResult as PredictiveResult,
     )
     _PRED_OK = True
     _PRED_ERR: Optional[Exception] = None
@@ -196,7 +209,6 @@ def _check_env() -> None:
 def _ensure_utc(dt_or_str: Union[str, datetime]) -> datetime:
     """Parse ISO or pass-through datetime and return UTC-aware datetime."""
     if isinstance(dt_or_str, str):
-        # Allow plain date, ISO with/without Z, and with offset
         s = dt_or_str.strip()
         if "T" not in s and len(s) <= 10:
             s = s + "T00:00:00+00:00"
@@ -290,13 +302,11 @@ def _scaled_orb(orbs: Dict[str, float], asp: str, body_a: str, body_b: str) -> f
 def _resolve_natal_timescales(natal: Dict[str, Any]) -> Tuple[float, float, List[str]]:
     """Return (jd_tt, jd_ut1, warnings)."""
     warns: List[str] = []
-    # strict path
     if "jd_tt" in natal and "jd_ut1" in natal:
         try:
             return float(natal["jd_tt"]), float(natal["jd_ut1"]), warns
         except Exception:
             warns.append("invalid_strict_timescales_fallback_to_civil")
-    # civil fallback
     missing = [k for k in ("date", "time", "place_tz") if k not in natal]
     if missing:
         raise RuntimeError(f"missing fields for timescales: {missing}")
@@ -393,11 +403,12 @@ def _body_activity(events: List[PredictionEvent]) -> Dict[str, Any]:
 # ───────────────────────────── Predictive caching wrapper ─────────────────────
 
 @lru_cache(maxsize=1024)
-def _memo_predictive(key: str) -> Dict[str, Any]:
+def _memo_predictive(key: str):
     """Memoizes pure predictive calls using a stable string key."""
     args = json.loads(key)
     kind = args["kind"]
     if kind == "transits":
+        # Directly return the PredictionResult coming from predictive.find_transits_in_range
         return find_transits_in_range(**args["payload"])
     raise RuntimeError(f"Unsupported memo kind: {kind}")
 
@@ -421,7 +432,7 @@ def predict_transits(
     zodiac_mode: str = "tropical",
     ayanamsa_deg: float = 0.0,
     exact_timing: bool = True,
-    statistical_validation: bool = False,   # default OFF for latency
+    statistical_validation: bool = False,   # kept for API, currently no-op
     confidence_threshold: float = 0.1,
     **kwargs,
 ) -> PredictionResult:
@@ -437,92 +448,85 @@ def predict_transits(
 
         start_dt = _ensure_utc(time_range[0])
         end_dt = _ensure_utc(time_range[1])
-        s_tt, _ = _jd_pair_from_dt_dt(start_dt)
-        e_tt, _ = _jd_pair_from_dt_dt(end_dt)
 
         transiting_bodies = transiting_bodies or list(MAJOR_BODIES)
         natal_bodies = natal_bodies or list(MAJOR_BODIES)
         aspects_list = [a.lower() for a in (aspects or ["conjunction", "opposition", "trine", "square", "sextile"])]
         include_aspects_to = include_aspects_to or ["planets", "angles"]
 
-        natal_targets = list(natal_bodies)
-        if "angles" in include_aspects_to:
-            natal_targets += ["asc", "mc", "ic", "dsc"]
-        if include_house_cusps:
-            natal_targets += [f"cusp_{i}" for i in range(1, 13)] + [f"house_{i}_cusp" for i in range(1, 13)]
-
+        # NOTE: predictive currently targets planets (Asc/MC optional in future)
         orbs_to_use = orbs or DEFAULT_ORBS_TRANSITS
 
-        # Memoized transit search
+        # Build payload for predictive.find_transits_in_range (uses date strings)
         payload = dict(
             natal_chart=natal_chart,
-            start_jd_tt=s_tt,
-            end_jd_tt=e_tt,
+            time_range=(start_dt.date().isoformat(), end_dt.date().isoformat()),
             transiting_bodies=transiting_bodies,
-            natal_targets=natal_targets,
+            natal_bodies=natal_bodies,
             aspects=aspects_list,
             orbs=orbs_to_use,
             exact_timing=exact_timing,
             frame=frame,
             zodiac_mode=zodiac_mode,
             ayanamsa_deg=ayanamsa_deg,
+            include_aspects_to=include_aspects_to,
+            include_house_cusps=include_house_cusps,
         )
         key = _memo_key_transits(payload)
-        tr = _memo_predictive(key)
+        tr_res: PredictiveResult = _memo_predictive(key)  # returned by predictive.py
 
         events: List[PredictionEvent] = []
-        for hit in tr.get("transits", []):
-            asp = _canon_aspect(hit.get("aspect"))
-            orb = float(hit.get("orb", 0.0))
-            max_orb = _scaled_orb(orbs_to_use, asp, hit.get("transiting_body", ""), hit.get("natal_body", ""))
-            tight = max(0.0, 1.0 - (orb / max_orb))
-            major = 0.2 if asp in {"conjunction", "opposition", "trine", "square"} else 0.0
-            conf = min(1.0, tight + major)
 
-            jd_tt = hit.get("exact_jd_tt")
-            jd_ut1 = hit.get("exact_jd_ut1")
-            dt_utc: Optional[datetime] = None
-            if "exact_datetime_utc" in hit and isinstance(hit["exact_datetime_utc"], str):
-                dt_utc = _ensure_utc(hit["exact_datetime_utc"])
+        if not getattr(tr_res, "ok", False):
+            warns.append("predictive_find_transits_failed")
+        else:
+            for ev in getattr(tr_res, "events", []):
+                meta = getattr(ev, "metadata", {}) or {}
+                body = meta.get("body", "")
+                target = meta.get("target", "")
+                aspect = _canon_aspect(meta.get("aspect"))
 
-            ev = PredictionEvent(
-                event_type="transit",
-                technique="exact_transit",
-                description=f"{hit.get('transiting_body', 'Unknown')} {asp} {hit.get('natal_body', 'Unknown')}",
-                datetime_utc=dt_utc,
-                jd_tt=jd_tt,
-                jd_ut1=jd_ut1,
-                precision_seconds=hit.get("precision_seconds"),
-                confidence=conf,
-                significance=float(hit.get("p_value", 1.0)),
-                metadata={
-                    "transiting_body": hit.get("transiting_body"),
-                    "natal_body": hit.get("natal_body"),
-                    "aspect": asp,
-                    "orb": orb,
-                    "max_orb": max_orb,
-                    "applying": bool(hit.get("applying", False)),
-                    "exact_longitude": hit.get("exact_longitude"),
-                    "house": hit.get("house"),
-                    "finder": "predictive.find_transits_in_range",
-                },
-            )
-            if ev.confidence >= confidence_threshold:
-                events.append(ev)
+                # tightness from |separation| / allowed orb (if provided)
+                sep = abs(float(meta.get("separation_deg", 999.0)))
+                # pull orb if predictive attached it; otherwise fall back to our orbs
+                meta_orb = 0.0
+                mmeta = meta.get("meta") if isinstance(meta.get("meta"), dict) else {}
+                if isinstance(mmeta, dict):
+                    meta_orb = float(mmeta.get("orb_deg", 0.0))
+                orb_cap = float(meta_orb or orbs_to_use.get(aspect, 1.0))
+                orb_cap = max(orb_cap, 1e-9)
 
-        stats: Dict[str, float] = {}
-        if statistical_validation and events:
-            try:
-                vr = validate_predictions(
-                    events=events,
-                    method="permutation",
-                    n_permutations=400,      # lighter by default
-                    fdr_correction=True,
+                tight = max(0.0, 1.0 - (sep / orb_cap))
+                major = 0.2 if aspect in {"conjunction", "opposition", "trine", "square"} else 0.0
+                conf = min(1.0, tight + major)
+
+                pe = PredictionEvent(
+                    event_type="transit",
+                    technique="exact_transit",
+                    description=f"{body} {aspect} {target}",
+                    datetime_utc=None,         # predictive leaves UTC datetime None (we're using jd_tt)
+                    jd_tt=getattr(ev, "jd_tt", None),
+                    jd_ut1=None,
+                    precision_seconds=None,
+                    confidence=conf,
+                    significance=1.0,          # no p-values in fast scan
+                    metadata={
+                        "transiting_body": body,
+                        "natal_body": target,
+                        "aspect": aspect,
+                        "orb": sep,             # here 'orb' == absolute separation from exact
+                        "max_orb": orb_cap,
+                        "applying": bool(meta.get("applying", False)),
+                        "exact": bool(meta.get("exact", False)),
+                        "kind": meta.get("kind", "zodiacal"),
+                        "finder": "predictive.find_transits_in_range",
+                    },
                 )
-                stats = vr.get("metrics", {})
-                warns.extend(vr.get("warnings", []))
-            except Exception as e:
-                warns.append(f"validation_failed:{e}")
+                if pe.confidence >= confidence_threshold:
+                    events.append(pe)
+
+        # Validation step intentionally omitted (no validate_predictions in predictive.py)
+        stats: Dict[str, float] = {}
 
         windows = _create_timing_windows(events)
         conf_score = _compute_confidence(events, stats)
@@ -548,7 +552,7 @@ def predict_transits(
                 "time_range_utc": (start_dt.isoformat(), end_dt.isoformat()),
                 "parameters": {
                     "transiting_bodies": transiting_bodies,
-                    "natal_targets": natal_targets,
+                    "natal_targets": natal_bodies,
                     "aspects": aspects_list,
                     "frame": frame,
                     "zodiac_mode": zodiac_mode,
@@ -581,7 +585,7 @@ def predict_progressions(
     orbs: Optional[Dict[str, float]] = None,
     parallels: bool = False,
     antiscia: bool = False,
-    statistical_validation: bool = False,  # default OFF
+    statistical_validation: bool = False,  # kept for API, no-op
     **kwargs,
 ) -> PredictionResult:
     _check_env()
@@ -663,7 +667,7 @@ def predict_progressions(
                         },
                     ))
 
-        # Positional movements summary (optional)
+        # Positional movements summary
         if isinstance(res.get("positions"), list):
             natal_lookup: Dict[str, float] = {}
             if isinstance(natal_chart.get("bodies"), list):
@@ -697,15 +701,8 @@ def predict_progressions(
                             },
                         ))
 
+        # Validation step omitted
         stats: Dict[str, float] = {}
-        if statistical_validation and events and _PRED_OK:
-            try:
-                vr = validate_predictions(events=events, method="bootstrap", n_bootstrap=400, fdr_correction=True)
-                stats = vr.get("metrics", {})
-                for w in vr.get("warnings", []):
-                    warns.append(f"validation_{w}")
-            except Exception as e:
-                warns.append(f"validation_failed:{e}")
 
         synth = {
             "progression_method": method,
@@ -763,7 +760,7 @@ def predict_returns(
     estimate_uncertainty: bool = True,
     aspects_to_natal: bool = True,
     orbs: Optional[Dict[str, float]] = None,
-    statistical_validation: bool = False,  # default OFF
+    statistical_validation: bool = False,  # kept for API, no-op
     **kwargs,
 ) -> PredictionResult:
     _check_env()
@@ -896,15 +893,8 @@ def predict_returns(
                     },
                 ))
 
+        # Validation step omitted
         stats: Dict[str, float] = {}
-        if statistical_validation and len(events) > 1 and _PRED_OK:
-            try:
-                vr = validate_predictions(events=events[1:], method="bootstrap", n_bootstrap=300, fdr_correction=True)
-                stats = vr.get("metrics", {})
-                for w in vr.get("warnings", []):
-                    warns.append(f"validation_{w}")
-            except Exception as e:
-                warns.append(f"validation_failed:{e}")
 
         windows: List[TimingWindow] = []
         if ret_jd_tt and unc_days:
@@ -1031,13 +1021,8 @@ def predict_directions(
                 },
             ))
 
+        # Validation step omitted
         stats: Dict[str, float] = {}
-        if statistical_validation and events and _PRED_OK:
-            try:
-                vr = validate_predictions(events=events, method="bootstrap", n_bootstrap=300, fdr_correction=True)
-                stats = vr.get("metrics", {})
-            except Exception as e:
-                warns.append(f"validation_failed:{e}")
 
         return PredictionResult(
             ok=True,
@@ -1066,7 +1051,7 @@ def comprehensive_forecast(
     techniques: Optional[List[str]] = None,
     confidence_threshold: float = 0.2,
     synthesis_method: str = "weighted_consensus",
-    statistical_validation: bool = False,  # default OFF
+    statistical_validation: bool = False,  # kept for API, no-op
     include_vedic: bool = False,
     peak_window_days: int = 14,
     **tk_kwargs,
@@ -1138,52 +1123,66 @@ def comprehensive_forecast(
             )
             all_events += revents
 
-        # Optional Vedic
+        # Optional Vedic via predictive.vimsottari_dasha
         validation_results = None
         if include_vedic and _PRED_OK:
             try:
                 ved = {k.replace("vedic_", ""): v for k, v in tk_kwargs.items() if k.startswith("vedic_")}
-                dr = predict_dasha_periods(
-                    natal_chart=natal_chart,
-                    start_date=start_dt,
-                    end_date=end_dt,
-                    dasha_system=ved.get("dasha_system", "vimshottari"),
-                    include_antardasha=ved.get("include_antardasha", True),
-                )
-                if dr.get("ok"):
+                ay = float(natal_chart.get("ayanamsa_deg", ved.get("ayanamsa_deg", 0.0)) or 0.0)
+                # Need natal Moon tropical longitude & birth JD_TT
+                jd_tt_natal, _, _ = _resolve_natal_timescales(natal_chart)
+                moon_lon = None
+                if isinstance(natal_chart.get("natal_longitudes"), dict):
+                    moon_lon = float(natal_chart["natal_longitudes"].get("moon", None))
+                else:
+                    for b in (natal_chart.get("bodies") or []):
+                        if isinstance(b, dict) and str(b.get("name", "")).lower() == "moon":
+                            moon_lon = float(b.get("longitude", b.get("lon", None)))
+                            break
+                if moon_lon is not None:
+                    periods = vimsottari_dasha(
+                        birth_jd_tt=jd_tt_natal,
+                        moon_lon_tropical_deg=moon_lon,
+                        ayanamsa_deg=ay,
+                        levels=int(ved.get("levels", 3)),
+                        span_years=float(ved.get("span_years", 120.0)),
+                    )
+                    s_tt, _ = _jd_pair_from_dt_dt(start_dt)
+                    e_tt, _ = _jd_pair_from_dt_dt(end_dt)
                     des: List[PredictionEvent] = []
-                    for p in dr.get("periods", []):
-                        dt = p.get("start_date")
-                        dt = _ensure_utc(dt) if isinstance(dt, str) else dt
+                    for p in periods:
+                        if p.end_jd_tt < s_tt or p.start_jd_tt > e_tt:
+                            continue
                         des.append(PredictionEvent(
                             event_type="dasha",
-                            technique=f"{ved.get('dasha_system','vimshottari')}_dasha",
-                            description=f"{p.get('mahadasha_lord','?')} Mahadasha",
-                            datetime_utc=dt,
-                            jd_tt=None,
+                            technique="vimshottari_dasha",
+                            description=f"{' / '.join(p.parent_chain)}",
+                            datetime_utc=None,
+                            jd_tt=p.start_jd_tt,
                             jd_ut1=None,
                             precision_seconds=None,
-                            confidence=0.8,
+                            confidence=0.7 if p.level == 1 else 0.6 if p.level == 2 else 0.5,
                             significance=0.05,
-                            metadata=p,
+                            metadata={
+                                "level": p.level,
+                                "lord": p.lord,
+                                "chain": p.parent_chain,
+                                "start_jd_tt": p.start_jd_tt,
+                                "end_jd_tt": p.end_jd_tt,
+                            },
                         ))
-                    predictions["dasha"] = PredictionResult(ok=True, technique="dasha", events=des, synthesis={"total_periods": len(des)}, confidence_score=0.8)
+                    predictions["dasha"] = PredictionResult(
+                        ok=True,
+                        technique="dasha",
+                        events=des,
+                        synthesis={"total_periods": len(des)},
+                        confidence_score=(sum(e.confidence for e in des) / len(des)) if des else 0.0,
+                    )
                     all_events += des
             except Exception as e:
                 warns.append(f"vedic_techniques_failed:{e}")
 
-        # Ensemble validation (optional)
-        if statistical_validation and len(all_events) > 5 and _PRED_OK:
-            try:
-                validation_results = validate_predictions(
-                    events=all_events,
-                    method="ensemble_validation",
-                    fdr_correction=True,
-                    confidence_threshold=confidence_threshold,
-                )
-                warns += [f"ensemble_validation_{w}" for w in (validation_results.get("warnings", []) or [])]
-            except Exception as e:
-                warns.append(f"ensemble_validation_failed:{e}")
+        # (Optional) ensemble validation omitted — no validate_predictions here
 
         # Synthesis
         synthesis = _synthesize(all_events, predictions, method=synthesis_method, time_range=(start_dt, end_dt))
@@ -1193,7 +1192,7 @@ def comprehensive_forecast(
             "overall_confidence": synthesis.get("weighted_confidence", 0.0),
             "technique_agreement": synthesis.get("consensus_score", 0.0),
             "event_density": len(all_events) / max(1, (end_dt - start_dt).days),
-            "validation_passed": bool(validation_results and validation_results.get("validation_passed")),
+            "validation_passed": False,  # placeholder; no global validation step
         }
 
         return ComprehensiveForecast(
@@ -1204,7 +1203,7 @@ def comprehensive_forecast(
             peak_periods=peak_periods,
             risk_assessment=risk,
             confidence_metrics=conf_metrics,
-            validation_results=validation_results,
+            validation_results=None,
             computation_time_ms=(time.time() - t0) * 1000.0,
         )
     except Exception as e:
@@ -1391,7 +1390,6 @@ def _temporal_cluster_strength(events: List[PredictionEvent], time_range: Tuple[
         return 0.0
     mean_gap = sum(gaps) / len(gaps)
     var_gap = sum((g - mean_gap) ** 2 for g in gaps) / len(gaps)
-    # Normalize: lower mean gap + higher variance -> higher clustering
     score = max(0.0, min(1.0, (1.0 / (1.0 + mean_gap)) * (1.0 + min(1.0, var_gap / 30.0))))
     return score
 
