@@ -1658,6 +1658,151 @@ def parse_astrocartography_payload(body: Dict[str, Any]) -> AstrocartographyPayl
     
     return out
 
+# Directions Module Route Handlers for routes.py
+# Add these integration blocks to your existing routes.py file
+
+# ═══════════════════════════════ INTEGRATION BLOCK 1: IMPORTS ═══════════════════════════════
+# Add to validator imports section (around line 31), after the relocation imports:
+    parse_directions_payload,
+
+# ═══════════════════════════════ INTEGRATION BLOCK 2: MODULE IMPORTS ═══════════════════════════
+# Add after your relocation import section (around line 105):
+
+# Directions core (NEW - optional import guard)
+_compute_directions = None
+_DIRECTIONS_IMPORT_ERROR: Optional[Exception] = None
+try:
+    from app.core.directions import compute_directions as _compute_directions
+except Exception as _e:
+    _DIRECTIONS_IMPORT_ERROR = _e
+    _compute_directions = None
+
+# ═══════════════════════════════ INTEGRATION BLOCK 3: RATE LIMITS ═══════════════════════════
+# Add to your rate limiting section (around line 125):
+
+RL_DIRECTIONS = _RL("ASTRO_RL_DIRECTIONS_PER_MIN", 8)  # NEW - Rate limit for directions endpoint
+
+# ═══════════════════════════════ INTEGRATION BLOCK 4: ROUTE HANDLERS ═══════════════════════════
+# Add after your relocation route handlers (around line 3000):
+
+# ───────────────────────── DIRECTIONS (NEW) ─────────────────────────
+@api.post("/api/directions")
+@rate_limit(RL_DIRECTIONS)
+def directions_route():
+    """
+    Compute Solar-Arc directions (direct/converse) and detect hits to natal targets.
+    
+    Body:
+      natal: { date, time, place_tz, latitude?, longitude?, elev_m?, mode? }
+      method?: "solar_arc" (only supported method currently)
+      rate?: "naibod" | "true_sun" (default: "naibod")
+      target?: { date, time, place_tz } # alternative to years_after
+      years_after?: float # alternative to target
+      jd_tt_natal?, jd_ut1_natal?: strict timescales (optional)
+      place?: { latitude, longitude, elev_m? } # place override for directions
+      frame?: "ecliptic-of-date" | "ecliptic-j2000"
+      house_system?: string (default: "placidus")
+      zodiac_mode?: "tropical" | "sidereal"
+      ayanamsa_deg?: float
+      arcs?: "direct" | "converse" | "both" (default: "direct")
+      orbs?: { conjunction: float, opposition: float, ... }
+      include_hits_to?: ["planets", "angles", "cusps"] # targets for hit detection
+      parallels?: bool (default: false)
+      antiscia?: bool (default: false)
+      profile?: bool (default: false)
+      validation?: "none" | "basic" (default: "basic")
+    """
+    if _compute_directions is None:
+        det = {"import_error": repr(_DIRECTIONS_IMPORT_ERROR)} if DEBUG_VERBOSE and _DIRECTIONS_IMPORT_ERROR else None
+        return _json_error("directions_unavailable", det or "directions engine not wired", 501)
+
+    try:
+        body = request.get_json(force=True) or {}
+        payload = parse_directions_payload(body)
+    except ValidationError as e:
+        return _json_error("validation_error", e.errors(), 400)
+    except Exception as e:
+        return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
+
+    # Build arguments for directions computation
+    directions_kwargs = {
+        "natal": payload["natal"],
+        "method": payload.get("method", "solar_arc"),
+        "rate": payload.get("rate", "naibod"),
+        "frame": payload.get("frame", "ecliptic-of-date"),
+        "house_system": payload.get("house_system", "placidus"),
+        "zodiac_mode": payload.get("zodiac_mode", "tropical"),
+        "ayanamsa_deg": payload.get("ayanamsa_deg", 0.0),
+        "arcs": payload.get("arcs", "direct"),
+        "include_hits_to": tuple(payload.get("include_hits_to", ["planets", "angles", "cusps"])),
+        "parallels": payload.get("parallels", False),
+        "antiscia": payload.get("antiscia", False),
+        "profile": payload.get("profile", False),
+        "validation": payload.get("validation", "basic"),
+    }
+
+    # Add optional target or years_after
+    if "target" in payload:
+        directions_kwargs["target"] = payload["target"]
+    elif "years_after" in payload:
+        directions_kwargs["years_after"] = payload["years_after"]
+
+    # Add optional strict timescales
+    for field in ("jd_tt_natal", "jd_ut1_natal"):
+        if field in payload:
+            directions_kwargs[field] = payload[field]
+
+    # Add optional place override
+    if "place" in payload:
+        directions_kwargs["place"] = payload["place"]
+
+    # Add optional orbs
+    if "orbs" in payload:
+        directions_kwargs["orbs"] = payload["orbs"]
+
+    # Filter arguments to match function signature
+    try:
+        import inspect
+        directions_params = set(inspect.signature(_compute_directions).parameters.keys())
+        filtered_kwargs = {k: v for k, v in directions_kwargs.items() if k in directions_params}
+    except Exception:
+        filtered_kwargs = directions_kwargs
+
+    # Call directions computation
+    try:
+        result = _compute_directions(**filtered_kwargs)
+    except ValueError as e:
+        return _json_error("directions_value_error", str(e), 400)
+    except TypeError as e:
+        det = {"type": "TypeError", "message": str(e)} if DEBUG_VERBOSE else None
+        return _json_error("directions_internal", det or "internal_error", 500)
+    except RuntimeError as e:
+        det = {"type": "RuntimeError", "message": str(e)} if DEBUG_VERBOSE else None
+        return _json_error("directions_internal", det or "internal_error", 500)
+    except Exception as e:
+        det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
+        return _json_error("directions_internal", det or "internal_error", 500)
+
+    # Enrich metadata with ephemeris adapter info
+    meta = dict(result.get("meta", {}))
+    try:
+        meta.update(_snapshot_ephemeris_meta(meta))
+    except Exception:
+        pass
+
+    # Structure response
+    resp = {
+        "ok": True,
+        "meta": meta,
+        "epoch": result.get("epoch", {}),
+        "arc_deg": result.get("arc_deg", {}),
+        "positions": result.get("positions", {}),
+        "hits": result.get("hits", {}),
+        "warnings": list(meta.get("warnings", [])),
+    }
+
+    return jsonify(resp), 200
+
 # ───────────────────────── timescale resolver (for predictive.py) ─────────────
 def resolve_timescales_from_civil_erfa(
     d: date,
