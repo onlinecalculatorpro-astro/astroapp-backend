@@ -45,6 +45,7 @@ from app.core.validators import (
     parse_latlon,
     parse_progressions_payload,
     parse_returns_payload,
+    parse_parans_payload,  # NEW - Added for paran integration
 )
 
 # Timescales core
@@ -82,6 +83,15 @@ except Exception as _e1:
     except Exception as _e2:
         _RETURNS_IMPORT_ERROR = _e2  # keep last error for diagnostics
 
+# Parans core (NEW - optional import guard)
+_parans_compute = None  # function when available
+_PARANS_IMPORT_ERROR: Optional[Exception] = None
+try:
+    from app.core.paran import compute_parans as _parans_compute
+except Exception as _e:
+    _PARANS_IMPORT_ERROR = _e
+    _parans_compute = None  # type: ignore
+    
 log = logging.getLogger(__name__)
 api = Blueprint("api", __name__)
 
@@ -100,6 +110,7 @@ RL_PREDICTIVE   = _RL("ASTRO_RL_PREDICTIVE_PER_MIN",   12)
 RL_DEBUG        = _RL("ASTRO_RL_DEBUG_PER_MIN",         6)
 RL_PROGRESSIONS = _RL("ASTRO_RL_PROGRESSIONS_PER_MIN", 12)
 RL_RETURNS      = _RL("ASTRO_RL_RETURNS_PER_MIN",      12)  # <-- NEW
+RL_PARANS       = _RL("ASTRO_RL_PARANS_PER_MIN",       12)  # NEW - Rate limit for parans endpoint
 
 # ───────────────────────── helpers ─────────────────────────
 def _wrap360(x: float) -> float:
@@ -2206,6 +2217,150 @@ def returns_scan_route():
         "results": res_list,
         "meta": meta,
     }), 200
+
+# ───────────────────────── PARANS (NEW) ─────────────────────────
+@api.post("/api/parans")
+@rate_limit(RL_PARANS)
+def parans_route():
+    """
+    Compute local parans (co-risings/culminations/settings/anti-culminations).
+    
+    Body:
+      subject: { date, time, place_tz }  # for timescale resolution
+      place: { latitude, longitude, elev_m? }  # observation location (required)
+      jd_tt_ref?: float  # reference epoch (TT); optional if subject provided
+      jd_ut1_ref?: float  # reference epoch (UT1); optional if subject provided
+      frame?: "ecliptic-of-date" | "ecliptic-j2000"
+      zodiac_mode?: "tropical" | "sidereal"
+      ayanamsa_deg?: float
+      bodies?: ["Sun", "Moon", ...]  # default: major planets
+      tolerance_minutes?: float  # max separation for paran detection (default: 4.0)
+      search_window_days?: float  # search window around reference (default: 1.0)
+      max_iters?: int  # iteration limit for event solving (default: 10)
+      fd_step_minutes?: float  # finite difference step (default: 2.0)
+      earth_model?: "spherical" | "wgs84"
+      apply_refraction?: bool
+      pressure_hPa?: float
+      temperature_C?: float
+      profile?: bool
+      validation?: "none" | "basic"
+    """
+    if _parans_compute is None:
+        det = {"import_error": repr(_PARANS_IMPORT_ERROR)} if DEBUG_VERBOSE and _PARANS_IMPORT_ERROR else None
+        return _json_error("parans_unavailable", det or "parans engine not wired", 501)
+
+    try:
+        body = request.get_json(force=True) or {}
+        payload = parse_parans_payload(body)
+    except ValidationError as e:
+        return _json_error("validation_error", e.errors(), 400)
+    except Exception as e:
+        return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
+
+    # Extract and validate required components
+    subject = payload.get("subject", {})
+    place = payload.get("place", {})
+    
+    # Handle strict timescales vs subject resolution
+    jd_tt_ref = payload.get("jd_tt_ref")
+    jd_ut1_ref = payload.get("jd_ut1_ref")
+    
+    # If no strict timescales provided, resolve from subject
+    if jd_tt_ref is None or jd_ut1_ref is None:
+        if not all(k in subject for k in ["date", "time", "place_tz"]):
+            return _json_error("validation_error", [
+                {"loc": ["subject"], "msg": "date, time, place_tz required when strict timescales not provided", "type": "value_error"}
+            ], 400)
+        
+        try:
+            ts = _compute_timescales_from_local(
+                subject["date"], 
+                subject["time"], 
+                subject["place_tz"], 
+                payload=subject
+            )
+            jd_tt_ref = float(ts["jd_tt"])
+            jd_ut1_ref = float(ts["jd_ut1"])
+        except ValidationError as e:
+            return _json_error("validation_error", e.errors(), 400)
+        except Exception as e:
+            return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
+
+    # Build arguments for compute_parans function
+    paran_kwargs = {
+        "subject": subject,
+        "place": place,
+        "jd_tt_ref": jd_tt_ref,
+        "jd_ut1_ref": jd_ut1_ref,
+        "frame": payload.get("frame", "ecliptic-of-date"),
+        "zodiac_mode": payload.get("zodiac_mode", "tropical"),
+        "ayanamsa_deg": payload.get("ayanamsa_deg", 0.0),
+        "bodies": tuple(payload.get("bodies", ["Sun", "Moon", "Mercury", "Venus", "Mars", "Jupiter", "Saturn", "Uranus", "Neptune", "Pluto"])),
+        "tolerance_minutes": payload.get("tolerance_minutes", 4.0),
+        "search_window_days": payload.get("search_window_days", 1.0),
+        "max_iters": payload.get("max_iters", 10),
+        "fd_step_minutes": payload.get("fd_step_minutes", 2.0),
+        "earth_model": payload.get("earth_model", "spherical"),
+        "apply_refraction": payload.get("apply_refraction", False),
+        "pressure_hPa": payload.get("pressure_hPa", 1010.0),
+        "temperature_C": payload.get("temperature_C", 10.0),
+        "profile": payload.get("profile", False),
+        "validation": payload.get("validation", "basic"),
+    }
+
+    # Filter arguments to match function signature
+    try:
+        import inspect
+        paran_params = set(inspect.signature(_parans_compute).parameters.keys())
+        filtered_kwargs = {k: v for k, v in paran_kwargs.items() if k in paran_params}
+    except Exception:
+        # Fallback: pass all arguments and let the function handle it
+        filtered_kwargs = paran_kwargs
+
+    # Call the parans computation engine
+    try:
+        result = _parans_compute(**filtered_kwargs)
+    except ValueError as e:
+        return _json_error("parans_value_error", str(e), 400)
+    except TypeError as e:
+        det = {"type": "TypeError", "message": str(e)} if DEBUG_VERBOSE else None
+        return _json_error("parans_internal", det or "internal_error", 500)
+    except RuntimeError as e:
+        det = {"type": "RuntimeError", "message": str(e)} if DEBUG_VERBOSE else None
+        return _json_error("parans_internal", det or "internal_error", 500)
+    except Exception as e:
+        det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
+        return _json_error("parans_internal", det or "internal_error", 500)
+
+    # Check if result indicates success
+    if not isinstance(result, dict) or not result.get("ok", False):
+        error_details = result.get("details") if isinstance(result, dict) else None
+        error_type = result.get("error", "parans_failed") if isinstance(result, dict) else "parans_failed"
+        
+        if error_type == "validation_error":
+            return _json_error("validation_error", error_details, 400)
+        elif error_type in ("timescales_error", "parans_calculation_failed"):
+            return _json_error(error_type, error_details, 400)
+        else:
+            return _json_error("parans_internal", error_details if DEBUG_VERBOSE else None, 500)
+
+    # Enrich metadata with ephemeris adapter info
+    meta = dict(result.get("meta", {}))
+    try:
+        meta.update(_snapshot_ephemeris_meta(meta))
+    except Exception:
+        pass
+
+    # Structure the response
+    resp = {
+        "ok": True,
+        "meta": meta,
+        "events_by_body": result.get("events_by_body", {}),
+        "parans": result.get("parans", []),
+        "warnings": list(meta.get("warnings", [])),
+    }
+
+    return jsonify(resp), 200
 
 
 # ───────────────────────── ephemeris ─────────────────────────
