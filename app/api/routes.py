@@ -59,12 +59,20 @@ from app.core.validators import (
     parse_directions_payload,
 )
 
-# Timescales core
-from app.core.timescales import build_timescales, TimeScales
-
-# Optional predictions engine (legacy)
+# Timescales core (guarded)
 try:
-    from app.core.predict import predict as predict_engine
+    from app.core.timescales import build_timescales, TimeScales
+    _TIMESCALES_OK = True
+    _TIMESCALES_ERR: Optional[Exception] = None
+except Exception as e:
+    _TIMESCALES_OK = False
+    _TIMESCALES_ERR = e
+    build_timescales = None  # type: ignore
+    TimeScales = None  # type: ignore
+
+# Optional legacy predictions engine (kept for backwards compatibility)
+try:
+    from app.core.predict import predict as predict_engine  # legacy
 except Exception:
     predict_engine = None  # type: ignore
 
@@ -89,28 +97,28 @@ try:
 except Exception as e:
     _PREDICTION_ENGINE_OK = False
     _PREDICTION_ENGINE_ERR = e
-    # Import placeholders to avoid NameError
-    predict_transits = None
-    predict_progressions = None
-    predict_returns = None
-    predict_directions = None
-    comprehensive_forecast = None
-    relationship_forecast = None
-    validate_prediction_model = None
-    PredictionEvent = None
-    PredictionResult = None
-    ComprehensiveForecast = None
-    RelationshipForecast = None
-    TimingWindow = None
+    # Placeholders to avoid NameError downstream
+    predict_transits = None  # type: ignore
+    predict_progressions = None  # type: ignore
+    predict_returns = None  # type: ignore
+    predict_directions = None  # type: ignore
+    comprehensive_forecast = None  # type: ignore
+    relationship_forecast = None  # type: ignore
+    validate_prediction_model = None  # type: ignore
+    PredictionEvent = None  # type: ignore
+    PredictionResult = None  # type: ignore
+    ComprehensiveForecast = None  # type: ignore
+    RelationshipForecast = None  # type: ignore
+    TimingWindow = None  # type: ignore
 
-# Progressions core (optional import guard)
+# Progressions core (optional low-level helper; not required if v2 engine is used)
 try:
     from app.core.progressions import compute_progressions
 except Exception:
     compute_progressions = None  # type: ignore
 
-# Returns core (prefer 'returns.py', fallback to 'return.py' via importlib)
-_returns_mod = None  # module object when available
+# Returns core (prefer 'returns.py', fallback to single-file 'return.py')
+_returns_mod = None
 _RETURNS_IMPORT_ERROR: Optional[Exception] = None
 try:
     from app.core import returns as _returns_mod  # app/core/returns.py (recommended)
@@ -147,7 +155,7 @@ try:
     from app.core.synastry import (
         compute_synastry as _synastry_compute,
         compute_composite as _composite_compute,
-        synastry_report as _synastry_report_compute
+        synastry_report as _synastry_report_compute,
     )
     _SYN_OK = True
 except Exception as _e:
@@ -164,14 +172,14 @@ _RELOCATION_IMPORT_ERROR: Optional[Exception] = None
 try:
     from app.core.relocation import (
         compute_relocated as _compute_relocated,
-        compute_astrocartography as _compute_astrocartography
+        compute_astrocartography as _compute_astrocartography,
     )
 except Exception as _e:
     _RELOCATION_IMPORT_ERROR = _e
     _compute_relocated = None
     _compute_astrocartography = None
 
-# Directions core (optional import guard)
+# Directions core (optional low-level helper; v2 engine exposes predict_directions)
 _compute_directions = None
 _DIRECTIONS_IMPORT_ERROR: Optional[Exception] = None
 try:
@@ -181,7 +189,7 @@ except Exception as _e:
     _DIRECTIONS_IMPORT_ERROR = _e
     _compute_directions = None
     _DIR_OK = False
-    
+
 log = logging.getLogger(__name__)
 api = Blueprint("api", __name__)
 
@@ -321,6 +329,47 @@ def _recompute_angles_exact(
         asc = _wrap360(asc - float(ayanamsa_deg))
         mc = _wrap360(mc - float(ayanamsa_deg))
     return {"asc_deg": asc, "mc_deg": mc}
+
+# ─────────────────────────── Helpers & engine guard ───────────────────────────
+
+# Timescales imported without a guard above; mark OK since import succeeded.
+_TIMESCALES_OK = True
+
+def _engine_required() -> None:
+    """Ensure the v2 prediction engine is loaded before serving endpoints."""
+    if not _PREDICTION_ENGINE_OK:
+        raise RuntimeError(f"Prediction engine unavailable: {_PREDICTION_ENGINE_ERR}")
+
+def _as_json(obj: Any) -> Any:
+    """
+    JSON-safe serializer that understands our v2 dataclasses
+    (PredictionResult, ComprehensiveForecast, etc.).
+    """
+    if is_dataclass(obj):
+        return asdict(obj)
+    if isinstance(obj, (list, tuple)):
+        return [_as_json(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _as_json(v) for k, v in obj.items()}
+    if isinstance(obj, datetime):
+        return obj.astimezone(timezone.utc).isoformat()
+    return obj
+
+@api.route("/v2/health", methods=["GET"])
+def health_v2():
+    status = {
+        "version": VERSION,
+        "prediction_engine": _PREDICTION_ENGINE_OK,
+        "timescales": _TIMESCALES_OK,
+        "synastry": _SYN_OK,
+        "directions_lowlevel": _DIR_OK,
+        "returns_module": bool(_returns_mod),
+        "parans_available": _parans_compute is not None,
+        "relocation_available": (_compute_relocated is not None) and (_compute_astrocartography is not None),
+        "debug_verbose": DEBUG_VERBOSE,
+    }
+    return jsonify(status), 200
+
 
 # ───────────────────────── timescales adapter ─────────────────────────
 def _compute_timescales_from_local(
@@ -1224,6 +1273,7 @@ def _returns_available() -> bool:
     return _returns_mod is not None
 
 # ───────────────────────── PREDICTION ENGINE ─────────────────────────
+
 def parse_prediction_payload(body: Dict[str, Any]) -> Dict[str, Any]:
     """Parse and validate prediction engine request payload (V2 shape, tolerant)."""
     errors = []
@@ -1295,8 +1345,11 @@ def prediction_comprehensive_forecast_route():
         peak_window_days = int(payload.get("peak_window_days", 14))
 
         # Technique-specific kwargs passthrough
-        tk_kwargs = {k: v for k, v in payload.items()
-                     if any(k.startswith(prefix) for prefix in ("transit_", "progression_", "return_", "vedic_"))}
+        tk_kwargs = {
+            k: v
+            for k, v in payload.items()
+            if any(k.startswith(prefix) for prefix in ("transit_", "progression_", "return_", "vedic_"))
+        }
 
         forecast = comprehensive_forecast(
             natal_chart=natal_chart,
@@ -1307,7 +1360,7 @@ def prediction_comprehensive_forecast_route():
             statistical_validation=statistical_validation,
             include_vedic=include_vedic,
             peak_window_days=peak_window_days,
-            **tk_kwargs
+            **tk_kwargs,
         )
 
         meta = {
@@ -1331,9 +1384,7 @@ def prediction_comprehensive_forecast_route():
 @api.post("/api/prediction/transits")
 @rate_limit(RL_PREDICTION_TRANSITS)
 def prediction_transits_route():
-    """
-    Calculate transit events using the prediction engine.
-    """
+    """Calculate transit events using the prediction engine."""
     if not _PREDICTION_ENGINE_OK:
         det = {"import_error": repr(_PREDICTION_ENGINE_ERR)} if DEBUG_VERBOSE and _PREDICTION_ENGINE_ERR else None
         return _json_error("prediction_engine_unavailable", det or "prediction engine not available", 501)
@@ -1351,7 +1402,7 @@ def prediction_transits_route():
         accept = {
             "transiting_bodies", "natal_bodies", "orbs", "aspects", "include_aspects_to",
             "include_house_cusps", "frame", "zodiac_mode", "ayanamsa_deg", "exact_timing",
-            "statistical_validation", "confidence_threshold"
+            "statistical_validation", "confidence_threshold",
         }
         kwargs = {k: payload[k] for k in payload.keys() & accept}
 
@@ -1363,8 +1414,8 @@ def prediction_transits_route():
             "meta": {
                 "prediction_engine": "app.core.prediction v2",
                 "technique": getattr(result, "technique", "transits"),
-                "computation_time_ms": getattr(result, "computation_time_ms", None)
-            }
+                "computation_time_ms": getattr(result, "computation_time_ms", None),
+            },
         }), 200
 
     except Exception as e:
@@ -1374,9 +1425,7 @@ def prediction_transits_route():
 @api.post("/api/prediction/progressions")
 @rate_limit(RL_PREDICTION_PROGRESSIONS)
 def prediction_progressions_route():
-    """
-    Calculate progression events using the prediction engine.
-    """
+    """Calculate progression events using the prediction engine."""
     if not _PREDICTION_ENGINE_OK:
         det = {"import_error": repr(_PREDICTION_ENGINE_ERR)} if DEBUG_VERBOSE and _PREDICTION_ENGINE_ERR else None
         return _json_error("prediction_engine_unavailable", det or "prediction engine not available", 501)
@@ -1393,7 +1442,7 @@ def prediction_progressions_route():
         accept = {
             "method", "lunar_month", "tertiary_mode", "frame", "house_system",
             "zodiac_mode", "ayanamsa_deg", "aspects_to_natal", "orbs",
-            "parallels", "antiscia", "statistical_validation"
+            "parallels", "antiscia", "statistical_validation",
         }
         kwargs = {k: payload[k] for k in payload.keys() & accept}
 
@@ -1405,8 +1454,8 @@ def prediction_progressions_route():
             "meta": {
                 "prediction_engine": "app.core.prediction v2",
                 "technique": getattr(result, "technique", "progressions"),
-                "computation_time_ms": getattr(result, "computation_time_ms", None)
-            }
+                "computation_time_ms": getattr(result, "computation_time_ms", None),
+            },
         }), 200
 
     except Exception as e:
@@ -1416,9 +1465,7 @@ def prediction_progressions_route():
 @api.post("/api/prediction/returns")
 @rate_limit(RL_PREDICTION_RETURNS)
 def prediction_returns_route():
-    """
-    Calculate solar/lunar return events using the prediction engine.
-    """
+    """Calculate solar/lunar return events using the prediction engine."""
     if not _PREDICTION_ENGINE_OK:
         det = {"import_error": repr(_PREDICTION_ENGINE_ERR)} if DEBUG_VERBOSE and _PREDICTION_ENGINE_ERR else None
         return _json_error("prediction_engine_unavailable", det or "prediction engine not available", 501)
@@ -1443,7 +1490,7 @@ def prediction_returns_route():
         accept = {
             "lunar_month", "place", "frame", "house_system", "zodiac_mode",
             "ayanamsa_deg", "estimate_uncertainty", "aspects_to_natal", "orbs",
-            "statistical_validation"
+            "statistical_validation",
         }
         kwargs = {k: payload[k] for k in payload.keys() & accept}
 
@@ -1455,8 +1502,8 @@ def prediction_returns_route():
             "meta": {
                 "prediction_engine": "app.core.prediction v2",
                 "technique": getattr(result, "technique", "returns"),
-                "computation_time_ms": getattr(result, "computation_time_ms", None)
-            }
+                "computation_time_ms": getattr(result, "computation_time_ms", None),
+            },
         }), 200
 
     except Exception as e:
@@ -1466,9 +1513,7 @@ def prediction_returns_route():
 @api.post("/api/prediction/directions")
 @rate_limit(RL_PREDICTION_DIRECTIONS)
 def prediction_directions_route():
-    """
-    Calculate direction events using the prediction engine.
-    """
+    """Calculate direction events using the prediction engine."""
     if not _PREDICTION_ENGINE_OK:
         det = {"import_error": repr(_PREDICTION_ENGINE_ERR)} if DEBUG_VERBOSE and _PREDICTION_ENGINE_ERR else None
         return _json_error("prediction_engine_unavailable", det or "prediction engine not available", 501)
@@ -1485,7 +1530,7 @@ def prediction_directions_route():
         # IMPORTANT: do NOT pass 'aspects_to_natal' — legacy backends choke on it
         accept = {
             "method", "frame", "zodiac_mode", "ayanamsa_deg", "house_system",
-            "orbs", "statistical_validation"
+            "orbs", "statistical_validation",
         }
         kwargs = {k: payload[k] for k in payload.keys() & accept}
 
@@ -1497,8 +1542,8 @@ def prediction_directions_route():
             "meta": {
                 "prediction_engine": "app.core.prediction v2",
                 "technique": getattr(result, "technique", "directions"),
-                "computation_time_ms": getattr(result, "computation_time_ms", None)
-            }
+                "computation_time_ms": getattr(result, "computation_time_ms", None),
+            },
         }), 200
 
     except Exception as e:
@@ -1508,9 +1553,7 @@ def prediction_directions_route():
 @api.post("/api/prediction/relationship")
 @rate_limit(RL_PREDICTION_RELATIONSHIP)
 def prediction_relationship_route():
-    """
-    Relationship forecast between two natal charts.
-    """
+    """Relationship forecast between two natal charts."""
     if not _PREDICTION_ENGINE_OK:
         det = {"import_error": repr(_PREDICTION_ENGINE_ERR)} if DEBUG_VERBOSE and _PREDICTION_ENGINE_ERR else None
         return _json_error("prediction_engine_unavailable", det or "prediction engine not available", 501)
@@ -1535,7 +1578,7 @@ def prediction_relationship_route():
         accept = {
             "synastry_orbs", "composite_method", "include_transits_to_composite",
             "include_progressions", "confidence_threshold", "parallels", "antiscia",
-            "frame", "zodiac_mode", "ayanamsa_deg", "house_system"
+            "frame", "zodiac_mode", "ayanamsa_deg", "house_system",
         }
         kwargs = {k: body[k] for k in body.keys() & accept}
 
@@ -1548,7 +1591,7 @@ def prediction_relationship_route():
             natal_a=natal_a,
             natal_b=natal_b,
             time_range=tuple(time_range),
-            **kwargs
+            **kwargs,
         )
 
         return jsonify({
@@ -1557,7 +1600,7 @@ def prediction_relationship_route():
             "meta": {
                 "prediction_engine": "app.core.prediction v2",
                 "technique": "relationship_forecast",
-            }
+            },
         }), 200
 
     except Exception as e:
@@ -1567,9 +1610,7 @@ def prediction_relationship_route():
 @api.post("/api/prediction/validate")
 @rate_limit(RL_PREDICTION_VALIDATION)
 def prediction_validation_route():
-    """
-    Validate prediction model using test cases.
-    """
+    """Validate prediction model using test cases."""
     if not _PREDICTION_ENGINE_OK:
         det = {"import_error": repr(_PREDICTION_ENGINE_ERR)} if DEBUG_VERBOSE and _PREDICTION_ENGINE_ERR else None
         return _json_error("prediction_engine_unavailable", det or "prediction engine not available", 501)
@@ -1592,7 +1633,7 @@ def prediction_validation_route():
             "meta": {
                 "prediction_engine": "app.core.prediction v2",
                 "technique": "model_validation",
-            }
+            },
         }), 200
 
     except Exception as e:
@@ -1600,6 +1641,7 @@ def prediction_validation_route():
 
 
 # ─────────────── Serialization helpers for prediction engine ───────────────
+
 def _serialize_prediction_event(event: Any) -> Dict[str, Any]:
     """Convert PredictionEvent to JSON-serializable dict."""
     if event is None:
@@ -1682,7 +1724,7 @@ def _serialize_relationship_forecast(forecast: Any) -> Dict[str, Any]:
     if forecast is None:
         return {}
     return {
-        "synastry_analysis": getattr(forecast, "synasry_analysis", getattr(forecast, "synastry_analysis", {})),
+        "synastry_analysis": getattr(forecast, "synastry_analysis", {}),
         "composite_analysis": getattr(forecast, "composite_analysis", {}),
         "transit_interactions": [_serialize_prediction_event(e) for e in getattr(forecast, "transit_interactions", [])],
         "progression_interactions": [_serialize_prediction_event(e) for e in getattr(forecast, "progression_interactions", [])],
