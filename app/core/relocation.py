@@ -1,12 +1,13 @@
 # app/core/relocation.py
 # -*- coding: utf-8 -*-
 """
-Relocated charts & Astrocartography (v11)
+Relocated charts & Astrocartography (v12)
 
 Enhancements:
 - Optional WGS-84 geodetic model for local Earth radius.
 - Horizon dip from elevation (DEM callback supported).
 - Saemundsson refraction (scaled by P/T) for more realistic ASC/DC curves.
+- Fixed time format validation to accept both HH:MM and HH:MM:SS formats.
 Defaults preserve the original spherical/no-refraction behavior.
 """
 
@@ -14,6 +15,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Iterable, Tuple, Callable
 import math
 import inspect
+import re
 
 # ── resilient imports ─────────────────────────────────────────────────────────
 try:
@@ -62,6 +64,24 @@ def _warn(ws: List[str], msg: str) -> None:
     if msg not in ws:
         ws.append(msg)
 
+def _normalize_time_format(time_str: str) -> str:
+    """
+    Normalize time string to HH:MM:SS format.
+    Accepts both HH:MM and HH:MM:SS formats for consistency with other modules.
+    """
+    time_str = str(time_str).strip()
+    
+    # Match HH:MM:SS format (already correct)
+    if re.match(r'^\d{1,2}:\d{2}:\d{2}(?:\.\d+)?$', time_str):
+        return time_str
+    
+    # Match HH:MM format (needs seconds)
+    if re.match(r'^\d{1,2}:\d{2}$', time_str):
+        return f"{time_str}:00"
+    
+    # Invalid format
+    raise ValueError(f"Invalid time_str '{time_str}': expected HH:MM or HH:MM:SS[.frac]")
+
 def _mean_obliquity_iau2006(jd_tt: float) -> float:
     T = (jd_tt - 2451545.0) / 36525.0
     eps0 = 84381.406 \
@@ -104,7 +124,14 @@ def _resolve_ts_from_natal(
     date, time, tz = natal.get("date"), natal.get("time"), natal.get("place_tz")
     if not (date and time and tz):
         raise ValueError("Missing date/time/place_tz for timescale resolution.")
-    ts = build_timescales(date_str=str(date), time_str=str(time), tz_name=str(tz), dut1_seconds=0.0)
+    
+    # Normalize time format to handle both HH:MM and HH:MM:SS
+    try:
+        normalized_time = _normalize_time_format(str(time))
+    except ValueError as e:
+        raise ValueError(str(e))  # Re-raise with same message for consistency
+    
+    ts = build_timescales(date_str=str(date), time_str=normalized_time, tz_name=str(tz), dut1_seconds=0.0)
     _warn(warnings, "strict_missing→computed_timescales_with_dut1=0.0s")
     return float(ts["jd_tt"]), float(ts["jd_ut1"]), {"jd_tt": float(ts["jd_tt"]), "jd_ut1": float(ts["jd_ut1"]), "dut1_assumed": 0.0}
 
@@ -171,7 +198,7 @@ def _apply_ayanamsa(rows: List[Dict[str, Any]], ayanamsa_deg: float) -> None:
         r["lon"] = _wrap_deg(float(r["lon"]) - ayanamsa_deg)
 
 
-# ── Relocated charts (unchanged) ─────────────────────────────────────────────
+# ── Relocated charts ─────────────────────────────────────────────
 def compute_relocated(
     natal: Dict[str, Any],
     *,
