@@ -188,7 +188,7 @@ api = Blueprint("api", __name__)
 DEBUG_VERBOSE = os.getenv("ASTRO_DEBUG_VERBOSE", "0").lower() in ("1", "true", "yes", "on")
 ARCSEC_TOL = float(os.getenv("ASTRO_ASC_TOL_ARCSEC", "3.6"))  # 0.001°
 
-# ── per-endpoint rate-limit caps (calls per minute, env-overridable) ───────────
+# per-endpoint rate-limit caps (calls per minute, env-overridable)
 _RL = lambda k, d: int(os.getenv(k, str(d)))
 RL_TIMESCALES   = _RL("ASTRO_RL_TIMESCALES_PER_MIN",   60)
 RL_CALCULATE    = _RL("ASTRO_RL_CALCULATE_PER_MIN",    24)
