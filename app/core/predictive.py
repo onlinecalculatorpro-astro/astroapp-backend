@@ -165,13 +165,13 @@ class TransitEvent:
 
 class TransitEngine:
     """
-    Performance-aware transit finder:
-    - Batch ephemeris calls per boundary (t0, t1) for all movers
-    - Carry forward lons(t1) → next-step lons(t0)
-    - In-scan cache for lon(body, t) during refinement; no duplicate lookups
+    Faster transit finder:
+    - Batch ephemeris calls per boundary (t0, t1)
+    - Carry forward lons(t1) → next step
+    - In-scan cache for lon(body, t) during refinement
     - Two-phase search: coarse bracket → refine (bisection)
-    - Guard band around orb to avoid unnecessary refinements
-    - De-duplicate near-identical roots across adjacent brackets
+    - Guard band around orbs to catch slow zero-crossings
+    - De-duplicate near-identical roots at step boundaries
     """
 
     def __init__(
@@ -192,18 +192,18 @@ class TransitEngine:
             longitude=longitude,
             elevation_m=elevation_m,
         )
-        # Sidereal toggle filled by caller (find_transits_in_range) without changing API
+        # will be set by the public wrapper; keeps API unchanged
         self.sidereal_mode: bool = False
         self.ayanamsa_deg: float = 0.0
 
     # ---------- ephemeris wrappers ----------
     def _lon_map(self, jd_tt: float, names: List[str]) -> Dict[str, float]:
         r = self.ephem.ecliptic_longitudes(jd_tt, names, **self.obs)
-        lm = rows_to_maps(r.get("results", []))["longitudes"]
+        lmap = rows_to_maps(r.get("results", []))["longitudes"]
         if self.sidereal_mode:
             ay = self.ayanamsa_deg
-            return {k: norm360(float(v) - ay) for k, v in lm.items()}
-        return {k: float(v) for k, v in lm.items()}
+            return {k: norm360(float(v) - ay) for k, v in lmap.items()}
+        return {k: float(v) for k, v in lmap.items()}
 
     # ---------- root finding ----------
     @staticmethod
@@ -213,18 +213,12 @@ class TransitEngine:
             return (t0 + t1) / 2.0
         if f0 == 0.0: return t0
         if f1 == 0.0: return t1
-        if f0 * f1 > 0.0:
-            # Not a sign change; still allow refinement if caller bracketed via guard band
-            a, b = (t0, t1)
-        else:
-            a, b = (t0, t1)
-        fa, fb = (f0, f1)
+        a, b = (t0, t1); fa, fb = (f0, f1)
         for _ in range(max_iter):
             m = 0.5 * (a + b)
             fm = f(m)
             if fm == 0.0 or (b - a) <= tol_days:
                 return m
-            # Keep interval with sign change or smaller absolute value
             if fa * fm <= 0.0:
                 b, fb = m, fm
             else:
@@ -240,34 +234,45 @@ class TransitEngine:
         movers: List[str],
         targets: Dict[str, float],
         aspects: Iterable[AspectSpec] = MAJOR_ASPECTS,
-        step_minutes: float = 30.0,
+        step_minutes: float = 30.0,   # <=0 or "auto" → auto
         include_antiscia: bool = False,
         antiscia_orb_deg: float = 2.0,
     ) -> List[TransitEvent]:
         if jd_end_tt <= jd_start_tt:
             return []
 
-        # Build aspect list and precompute target images (antiscia/contra)
+        # Aspect set
         asp_list: List[AspectSpec] = list(aspects)
         if include_antiscia:
             asp_list.append(AspectSpec("Antiscia", 0.0, antiscia_orb_deg, kind="antiscia"))
             asp_list.append(AspectSpec("Contra-Antiscia", 0.0, antiscia_orb_deg, kind="contra-antiscia"))
 
-        # Precompute image longitudes for targets once
-        tgt_img_anti: Dict[str, float] = {name: antiscia_longitude(lon) for name, lon in targets.items()}
-        tgt_img_contra: Dict[str, float] = {name: contra_antiscia_longitude(lon) for name, lon in targets.items()}
+        # Precompute antiscia images once per target
+        tgt_img_anti = {k: antiscia_longitude(v) for k, v in targets.items()}
+        tgt_img_contra = {k: contra_antiscia_longitude(v) for k, v in targets.items()}
 
-        # Small guard around orb to avoid missing slow zero-crossings near stations
+        # Guard band around orb (0.25°..0.75°; capped by half the orb)
         def guard_for(spec: AspectSpec) -> float:
-            # 0.25°–0.75°, capped by the spec orb (prevents over-eager refinement)
             return max(0.25, min(0.75, spec.orb_deg * 0.5))
 
-        dt = max(1.0, float(step_minutes)) / (60.0 * 24.0)  # days; enforce ≥1 minute
+        # step size (days). Support "auto" without changing signature.
+        auto = (isinstance(step_minutes, str) and step_minutes.lower() == "auto") or (float(step_minutes) <= 0.0)
+        if auto:
+            # conservative auto step; refinement gives exact time
+            # Moon 10m, personal 30m, Sun/Jupiter/Saturn 60–120m, outers 180m
+            # Use the tightest among requested movers.
+            caps_min = []
+            for m in movers:
+                n = m.lower()
+                if n in ("moon",): caps_min.append(10)
+                elif n in ("mercury","venus","mars"): caps_min.append(30)
+                elif n in ("sun","jupiter","saturn"): caps_min.append(90)
+                else: caps_min.append(180)
+            step_minutes = max(5, min(caps_min) if caps_min else 30)
+        dt = float(step_minutes) / (60.0 * 24.0)
 
         events: List[TransitEvent] = []
-        dedupe: set[Tuple[str, str, str, int]] = set()  # (body,target,aspect,round(jd*1e7))
-
-        # In-scan cache: {(name, t): lon_deg}
+        dedupe: set[Tuple[str, str, str, int]] = set()
         lon_cache: Dict[Tuple[str, float], float] = {}
 
         def _lon_cached(name: str, t: float) -> float:
@@ -275,12 +280,12 @@ class TransitEngine:
             v = lon_cache.get(key)
             if v is not None:
                 return v
-            vmap = self._lon_map(t, [name])
-            if name not in vmap:
+            got = self._lon_map(t, [name])
+            if name not in got:
                 raise RuntimeError(f"no ephemeris for {name}@{t}")
-            val = float(vmap[name])
-            lon_cache[key] = val
-            return val
+            lon = float(got[name])
+            lon_cache[key] = lon
+            return lon
 
         def make_sep(body: str, tgt_name: str, tgt_lon: float, spec: AspectSpec):
             if spec.kind == "zodiacal":
@@ -300,18 +305,14 @@ class TransitEngine:
 
         while t0 < jd_end_tt - 1e-12:
             t1 = float(min(t0 + dt, jd_end_tt))
-
-            # Batch compute longitudes at t1, cache them
             l1 = self._lon_map(t1, movers)
             for m, v in l1.items():
                 lon_cache[(m, t1)] = float(v)
 
-            # Coarse pass: evaluate separations at t0 and t1; refine only when needed
             for body in movers:
                 lon0 = l0.get(body); lon1 = l1.get(body)
                 if lon0 is None or lon1 is None:
                     continue
-
                 for tgt_name, tgt_lon in targets.items():
                     for spec in asp_list:
                         if spec.kind == "zodiacal":
@@ -326,24 +327,18 @@ class TransitEngine:
 
                         if not (math.isfinite(s0) and math.isfinite(s1)):
                             continue
-
-                        # Quick large-gap reject (angle wrap safe threshold)
                         if abs(s0) > 120.0 and abs(s1) > 120.0:
                             continue
 
                         sign_change = (s0 == 0.0) or (s1 == 0.0) or ((s0 * s1) < 0.0)
-                        # Guard band around orb to catch near-station "grazing" cases
-                        gb = guard_for(spec)
-                        near_enough = (min(abs(s0), abs(s1)) <= (spec.orb_deg + gb))
-
-                        if not (sign_change or near_enough):
+                        near = (min(abs(s0), abs(s1)) <= (spec.orb_deg + guard_for(spec)))
+                        if not (sign_change or near):
                             continue
 
-                        # Refine inside [t0, t1]
+                        # refine root
                         f = make_sep(body, tgt_name, tgt_lon, spec)
                         t_exact = self._refine_zero(f, t0, t1, tol_days=1e-6)
 
-                        # Evaluate at refined time
                         lon_now = _lon_cached(body, t_exact)
                         if spec.kind == "zodiacal":
                             sep = _zodiacal_separation(lon_now, tgt_lon, spec.angle)
@@ -351,12 +346,12 @@ class TransitEngine:
                             img_now = tgt_img_anti[tgt_name] if spec.kind == "antiscia" else tgt_img_contra[tgt_name]
                             sep = wrap180(lon_now - img_now)
 
-                        # Determine applying/separating by checking just before the root
+                        # applying/separating
                         epsd = 5.0 / (24.0 * 60.0)
                         before = f(t_exact - epsd)
                         applying = (abs(before) > abs(sep))
 
-                        # De-duplicate identical roots bracketed by adjacent steps
+                        # de-dup
                         key = (body, tgt_name, spec.name, int(round(t_exact * 1e7)))
                         if key in dedupe:
                             continue
@@ -376,7 +371,6 @@ class TransitEngine:
                             )
                         )
 
-            # Advance
             t0 = t1
             l0 = l1
 
@@ -472,7 +466,7 @@ def find_transits_in_range(
             return {"ok": False, "error": "time_range_required", "transits": [], "meta": {}}
         d0 = _to_date(time_range[0]); d1 = _to_date(time_range[1])
         start_jd_tt = _jd_from_date(d0, tz)
-        # end of day (inclusive feel)
+        # end-of-day inclusive feel (~1 minute before next day)
         end_jd_tt = _jd_from_date(d1, tz) + (24*60-1) / (24*60)
 
     movers = list(transiting_bodies or ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn","Uranus","Neptune","Pluto"])
@@ -480,11 +474,11 @@ def find_transits_in_range(
 
     ep = EphemerisAdapter(EphemConfig(frame=frame))
     eng = TransitEngine(ephem=ep, frame=frame)
-    # Thread sidereal setting into engine without changing the API
+    # thread sidereal mode into the engine (no API change)
     eng.sidereal_mode = zodiac_mode.startswith("sidereal")
     eng.ayanamsa_deg = ay
 
-    # natal longitudes for targets at start (consistent frame)
+    # natal target longitudes at start (apply sidereal if needed)
     nat_rows = ep.ecliptic_longitudes(float(start_jd_tt), tgts).get("results", [])
     nat_map = rows_to_maps(nat_rows)["longitudes"]
     targets: dict[str, float] = {}
@@ -498,7 +492,9 @@ def find_transits_in_range(
     specs = _aspects_from_kwargs({"aspects": aspects, "orbs": (orbs or {})})
     include_antiscia = bool(kwargs.get("include_antiscia", False))
     antiscia_orb = float(kwargs.get("antiscia_orb_deg", 2.0))
-    step_min = float(kwargs.get("step_minutes", 30.0))
+    # allow auto without changing signature
+    step_arg = kwargs.get("step_minutes", 30.0)
+    step_min = step_arg if isinstance(step_arg, (int, float)) else 30.0
 
     try:
         evs = eng.scan_aspects(
