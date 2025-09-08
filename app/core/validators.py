@@ -1606,8 +1606,8 @@ def parse_astrocartography_payload(body: Dict[str, Any]) -> AstrocartographyPayl
     
     # Sampling parameters
     lon_step_deg = _as_float(body.get("lon_step_deg", 1.0))
-    if lon_step_deg is None or lon_step_deg <= 0 or lon_step_deg > 10.0:
-        raise ValidationError(_err("lon_step_deg", "must be between 0 and 10 degrees", "value_error"))
+    if lon_step_deg is None or lon_step_deg <= 0 or lon_step_deg > 45.0:
+        raise ValidationError(_err("lon_step_deg", "must be between 0 and 45 degrees", "value_error"))
     
     lat_clip_deg = _as_float(body.get("lat_clip_deg", 89.5))
     if lat_clip_deg is None or lat_clip_deg <= 0 or lat_clip_deg > 90.0:
