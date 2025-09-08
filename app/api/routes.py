@@ -161,7 +161,8 @@ RL_SYNASTRY     = _RL("ASTRO_RL_SYNASTRY_PER_MIN",     6)   # NEW - Rate limit f
 RL_COMPOSITE    = _RL("ASTRO_RL_COMPOSITE_PER_MIN",    8)   # NEW - Rate limit for composite endpoint
 RL_RELOCATION      = _RL("ASTRO_RL_RELOCATION_PER_MIN",      10)  # NEW - Rate limit for relocation endpoint
 RL_ASTROCARTOGRAPHY = _RL("ASTRO_RL_ASTROCARTOGRAPHY_PER_MIN", 4)   # NEW - Rate limit for astrocartography endpoint
-RL_DIRECTIONS = _RL("ASTRO_RL_DIRECTIONS_PER_MIN", 8)  # NEW - Rate limit for directions endpoint
+RL_DIRECTIONS   = _RL("ASTRO_RL_DIRECTIONS_PER_MIN",    8)  # NEW - Rate limit for directions endpoint
+
 
 # ───────────────────────── helpers ─────────────────────────
 def _wrap360(x: float) -> float:
