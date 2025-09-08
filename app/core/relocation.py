@@ -133,7 +133,26 @@ def _resolve_ts_from_natal(
     
     ts = build_timescales(date_str=str(date), time_str=normalized_time, tz_name=str(tz), dut1_seconds=0.0)
     _warn(warnings, "strict_missing→computed_timescales_with_dut1=0.0s")
-    return float(ts["jd_tt"]), float(ts["jd_ut1"]), {"jd_tt": float(ts["jd_tt"]), "jd_ut1": float(ts["jd_ut1"]), "dut1_assumed": 0.0}
+    
+    # Handle both dict and object return types from build_timescales
+    if hasattr(ts, 'jd_tt') and hasattr(ts, 'jd_ut1'):
+        # Object with attributes
+        jd_tt = float(ts.jd_tt)
+        jd_ut1 = float(ts.jd_ut1)
+    elif isinstance(ts, dict):
+        # Dictionary
+        jd_tt = float(ts["jd_tt"])
+        jd_ut1 = float(ts["jd_ut1"])
+    else:
+        # Try both approaches for safety
+        try:
+            jd_tt = float(ts.jd_tt)
+            jd_ut1 = float(ts.jd_ut1)
+        except AttributeError:
+            jd_tt = float(ts["jd_tt"])
+            jd_ut1 = float(ts["jd_ut1"])
+    
+    return jd_tt, jd_ut1, {"jd_tt": jd_tt, "jd_ut1": jd_ut1, "dut1_assumed": 0.0}
 
 def _to_place(src: Optional[Dict[str, Any]]) -> Optional[Dict[str, float]]:
     if src and all(k in src for k in ("latitude","longitude")):
