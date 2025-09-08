@@ -18,7 +18,7 @@ Features
 
 Notes
 - Storage is in-memory and per-process. If you run multiple workers, rate limiting is enforced per worker.
-- “Reset” header indicates seconds until the next token (not until the bucket is full).
+- "Reset" header indicates seconds until the next token (not until the bucket is full).
 """
 
 import math
@@ -51,6 +51,24 @@ try:
     _JITTER_429_MS = max(0, int(os.getenv("ASTRO_RL_JITTER_429_MS", "0")))
 except Exception:
     _JITTER_429_MS = 0
+
+# ───────────────────────── rate limit helper function ─────────────────────────
+
+def _RL(env_key: str, default_value: int) -> int:
+    """
+    Rate limit helper function to read from environment with fallback.
+    
+    Args:
+        env_key: Environment variable key (e.g., "ASTRO_RL_DIRECTIONS_PER_MIN")
+        default_value: Default rate limit value if env var not set
+        
+    Returns:
+        Integer rate limit value
+    """
+    try:
+        return int(os.getenv(env_key, str(default_value)))
+    except (ValueError, TypeError):
+        return default_value
 
 # ───────────────────────── storage / globals ─────────────────────────
 
@@ -205,7 +223,7 @@ def rate_limit(
             if _DISABLE_ALL:
                 return view_fn(*args, **kwargs)
 
-            # Don’t rate limit preflight/lightweight methods
+            # Don't rate limit preflight/lightweight methods
             if request.method in {"HEAD", "OPTIONS"}:
                 return view_fn(*args, **kwargs)
 
