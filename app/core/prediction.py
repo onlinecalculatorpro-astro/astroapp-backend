@@ -197,27 +197,65 @@ def _hash_obj(obj: Any) -> str:
 
 @lru_cache(maxsize=4096)
 def _jd_pair_from_dt(dt_utc_iso: str) -> Tuple[float, float]:
+    """
+    Convert datetime ISO string to Julian Date pair (JD_TT, JD_UT1).
+    Fixed version that avoids .utc_jd errors by using correct Skyfield API.
+    
+    Args:
+        dt_utc_iso: ISO format datetime string in UTC
+        
+    Returns:
+        Tuple of (jd_tt, jd_ut1) as floats
+    """
     dt_utc = _ensure_utc(dt_utc_iso)
-    ts: TimeScales = build_timescales(
-        date_str=dt_utc.date().isoformat(),
-        time_str=dt_utc.time().isoformat(timespec="seconds"),
-        tz_name="UTC",
-        dut1_seconds=0.0,
-    )
-    return float(ts.jd_tt), float(ts.jd_ut1)
+    
+    try:
+        from skyfield.api import load
+        ts = load.timescale()
+        t = ts.from_datetime(dt_utc)
+        
+        # Use correct Skyfield Time attributes (not .utc_jd)
+        return float(t.tt), float(t.ut1)
+        
+    except ImportError:
+        # Fallback calculation without Skyfield
+        import calendar
+        timestamp = calendar.timegm(dt_utc.timetuple())
+        jd_ut1 = 2440587.5 + timestamp / 86400.0  # Unix epoch to JD conversion
+        jd_tt = jd_ut1 + 69.184 / 86400.0  # Approximate TT-UT1 difference
+        return jd_tt, jd_ut1
+        
+    except Exception:
+        # Emergency fallback for any other errors
+        import calendar
+        timestamp = calendar.timegm(dt_utc.timetuple())
+        jd_ut1 = 2440587.5 + timestamp / 86400.0
+        jd_tt = jd_ut1 + 69.184 / 86400.0
+        return jd_tt, jd_ut1
 
 def _jd_pair_from_dt_dt(dt_utc: datetime) -> Tuple[float, float]:
+    """
+    Convert datetime object to Julian Date pair.
+    Wrapper that converts datetime to ISO string then calls cached function.
+    
+    Args:
+        dt_utc: datetime object (preferably in UTC)
+        
+    Returns:
+        Tuple of (jd_tt, jd_ut1) as floats
+    """
     return _jd_pair_from_dt(dt_utc.isoformat())
 
 def _jd_pair_from_dt_fixed(dt: Union[datetime, str]) -> Tuple[float, float]:
     """
-    Fixed version that converts datetime to (jd_tt, jd_ut1) without .utc_jd errors.
+    Unified fixed version for both datetime objects and ISO strings.
+    Handles timezone conversion and uses correct Skyfield API.
     
     Args:
         dt: datetime object or ISO string
         
     Returns:
-        Tuple of (jd_tt, jd_ut1)
+        Tuple of (jd_tt, jd_ut1) as floats
     """
     if isinstance(dt, str):
         dt = datetime.fromisoformat(dt.replace("Z", "")).replace(tzinfo=timezone.utc)
@@ -227,29 +265,8 @@ def _jd_pair_from_dt_fixed(dt: Union[datetime, str]) -> Tuple[float, float]:
     elif dt.tzinfo != timezone.utc:
         dt = dt.astimezone(timezone.utc)
     
-    try:
-        from skyfield.api import load
-        ts = load.timescale()
-        t = ts.from_datetime(dt)
-        
-        # Use correct Skyfield Time attributes
-        return float(t.tt), float(t.ut1)
-        
-    except ImportError:
-        # Fallback without Skyfield
-        import calendar
-        timestamp = calendar.timegm(dt.timetuple())
-        jd_ut1 = 2440587.5 + timestamp / 86400.0
-        jd_tt = jd_ut1 + 69.184 / 86400.0  # Approximate TT-UT1
-        return jd_tt, jd_ut1
-        
-    except Exception:
-        # Emergency fallback
-        import calendar
-        timestamp = calendar.timegm(dt.timetuple())
-        jd_ut1 = 2440587.5 + timestamp / 86400.0
-        jd_tt = jd_ut1 + 69.184 / 86400.0
-        return jd_tt, jd_ut1
+    # Use the cached function for consistency
+    return _jd_pair_from_dt(dt.isoformat())
 
 def _canon_aspect(name: Optional[str]) -> str:
     return (name or "").strip().lower()
@@ -322,34 +339,9 @@ def _resolve_natal_timescales_fixed(natal_chart: Dict[str, Any]) -> Tuple[float,
             dt_utc = natal_date if hasattr(natal_date, 'astimezone') else datetime.now(timezone.utc)
             warnings.append("assumed_datetime_object")
         
-        # Convert to Julian dates using Skyfield
-        try:
-            from skyfield.api import load
-            ts = load.timescale()
-            
-            # Create Skyfield time object from UTC datetime
-            t = ts.from_datetime(dt_utc)
-            
-            # Use correct Skyfield attributes (not .utc_jd)
-            jd_tt = t.tt          # Terrestrial Time Julian Date
-            jd_ut1 = t.ut1        # UT1 Julian Date
-            
-        except ImportError:
-            warnings.append("skyfield_unavailable_using_approximation")
-            # Fallback calculation without Skyfield
-            import calendar
-            timestamp = calendar.timegm(dt_utc.timetuple())
-            jd_ut1 = 2440587.5 + timestamp / 86400.0  # Unix epoch to JD conversion
-            jd_tt = jd_ut1 + 69.184 / 86400.0  # Approximate TT-UT1 difference
-            
-        except Exception as e:
-            warnings.append(f"skyfield_time_conversion_error:{e}")
-            # Emergency fallback
-            import calendar
-            timestamp = calendar.timegm(dt_utc.timetuple()) 
-            jd_ut1 = 2440587.5 + timestamp / 86400.0
-            jd_tt = jd_ut1 + 69.184 / 86400.0
-            
+        # Convert to Julian dates using fixed function
+        jd_tt, jd_ut1 = _jd_pair_from_dt_fixed(dt_utc)
+        
         return float(jd_tt), float(jd_ut1), warnings
         
     except Exception as e:
@@ -386,17 +378,17 @@ def _create_timing_windows(events: List[PredictionEvent], *, cluster_days: float
             if len(grp) > 1:
                 s = grp[0].datetime_utc; q = grp[-1].datetime_utc  # type: ignore
                 pk = max(grp, key=lambda x: x.confidence)
-                s_tt, _ = _jd_pair_from_dt_dt(s)   # type: ignore
-                q_tt, _ = _jd_pair_from_dt_dt(q)   # type: ignore
-                p_tt, _ = _jd_pair_from_dt_dt(pk.datetime_utc)  # type: ignore
+                s_tt, _ = _jd_pair_from_dt_fixed(s)   # type: ignore
+                q_tt, _ = _jd_pair_from_dt_fixed(q)   # type: ignore
+                p_tt, _ = _jd_pair_from_dt_fixed(pk.datetime_utc)  # type: ignore
                 out.append(TimingWindow(s_tt, q_tt, p_tt, (q_tt - s_tt), (s_tt, q_tt)))
             grp = [e]
     if len(grp) > 1:
         s = grp[0].datetime_utc; q = grp[-1].datetime_utc  # type: ignore
         pk = max(grp, key=lambda x: x.confidence)
-        s_tt, _ = _jd_pair_from_dt_dt(s)   # type: ignore
-        q_tt, _ = _jd_pair_from_dt_dt(q)   # type: ignore
-        p_tt, _ = _jd_pair_from_dt_dt(pk.datetime_utc)  # type: ignore
+        s_tt, _ = _jd_pair_from_dt_fixed(s)   # type: ignore
+        q_tt, _ = _jd_pair_from_dt_fixed(q)   # type: ignore
+        p_tt, _ = _jd_pair_from_dt_fixed(pk.datetime_utc)  # type: ignore
         out.append(TimingWindow(s_tt, q_tt, p_tt, (q_tt - s_tt), (s_tt, q_tt)))
     return out
 
@@ -970,11 +962,9 @@ def _compute_solar_return_fallback(
         else:
             estimated_return_date = f"{target_year}-01-01"
         
-        # Convert to JD
+        # Convert to JD using fixed function
         est_dt = datetime.fromisoformat(estimated_return_date).replace(tzinfo=timezone.utc)
-        timestamp = calendar.timegm(est_dt.timetuple())
-        return_jd_ut1 = 2440587.5 + timestamp / 86400.0
-        return_jd_tt = return_jd_ut1 + 69.184 / 86400.0
+        return_jd_tt, return_jd_ut1 = _jd_pair_from_dt_fixed(est_dt)
         
         return {
             "ok": True,
@@ -1034,9 +1024,7 @@ def _compute_lunar_return_fallback(
         # Approximate lunar return (monthly cycles)
         # Use January 1st of target year as rough estimate
         est_dt = datetime(target_year, 1, 1, tzinfo=timezone.utc)
-        timestamp = calendar.timegm(est_dt.timetuple())
-        return_jd_ut1 = 2440587.5 + timestamp / 86400.0
-        return_jd_tt = return_jd_ut1 + 69.184 / 86400.0
+        return_jd_tt, return_jd_ut1 = _jd_pair_from_dt_fixed(est_dt)
         
         return {
             "ok": True,
@@ -1955,7 +1943,7 @@ def _identify_peak_periods(events: List[PredictionEvent], time_range: Tuple[date
         if len(win) >= 2:
             total_conf = sum(e.confidence for e in win)
             peak = max(win, key=lambda x: x.confidence)
-            s_tt, _ = _jd_pair_from_dt_dt(ws); e_tt, _ = _jd_pair_from_dt_dt(we); p_tt, _ = _jd_pair_from_dt_dt(peak.datetime_utc)  # type: ignore
+            s_tt, _ = _jd_pair_from_dt_fixed(ws); e_tt, _ = _jd_pair_from_dt_fixed(we); p_tt, _ = _jd_pair_from_dt_fixed(peak.datetime_utc)  # type: ignore
             score = len(win) * (total_conf / len(win))
             windows.append((score, TimingWindow(s_tt, e_tt, p_tt, window_days/2, (s_tt, e_tt))))
     windows.sort(key=lambda x: x[0], reverse=True)
@@ -2024,9 +2012,9 @@ def _relationship_critical(events: List[PredictionEvent], time_range: Tuple[date
         avgc = sum(e.confidence for e in wv) / len(wv)
         score = 2.0 * ccount + len(wv) * avgc
         if score >= 3.0:
-            s_tt, _ = _jd_pair_from_dt_dt(ws); e_tt, _ = _jd_pair_from_dt_dt(we)
+            s_tt, _ = _jd_pair_from_dt_fixed(ws); e_tt, _ = _jd_pair_from_dt_fixed(we)
             peak = max(wv, key=lambda x: x.confidence)
-            p_tt, _ = _jd_pair_from_dt_dt(peak.datetime_utc)  # type: ignore
+            p_tt, _ = _jd_pair_from_dt_fixed(peak.datetime_utc)  # type: ignore
             outs.append((score, TimingWindow(s_tt, e_tt, p_tt, win_days/3, (s_tt, e_tt))))
     outs.sort(key=lambda x: x[1].peak_jd_tt or 0.0)
     return [w for _, w in outs[:5]]
