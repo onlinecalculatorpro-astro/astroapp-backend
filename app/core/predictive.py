@@ -942,25 +942,241 @@ def feature_yoga_flags(yoga_names: Iterable[str] = ("panch_mahapurusha","gajakes
         return active
     return _fn
 
+# ───────────────────────── Minimal adapter expected by prediction.py ─────────────────────────
+from dataclasses import dataclass, field
+from types import SimpleNamespace
+from datetime import datetime, date as _date
+from typing import TypedDict
+
+@dataclass
+class PredictionResult:
+    ok: bool = True
+    technique: str = "transits"
+    events: list = field(default_factory=list)
+    synthesis: dict | None = None
+    timing_windows: list = field(default_factory=list)
+    confidence_score: float | None = 0.0
+    statistical_metrics: dict = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
+    metadata: dict = field(default_factory=dict)
+    computation_time_ms: float | None = None
+
+# Small helpers
+def _to_date(s) -> _date:
+    if isinstance(s, _date):
+        return s
+    if isinstance(s, str):
+        # accept 'YYYY-MM-DD' or ISO datetime; take date part
+        try:
+            if "T" in s or " " in s:
+                return datetime.fromisoformat(s).date()
+            return datetime.strptime(s, "%Y-%m-%d").date()
+        except Exception:
+            pass
+    # Fallback: today
+    return datetime.utcnow().date()
+
+def _jd_from_date(d: _date, tz: str) -> float:
+    # use local midnight as start of day
+    if _ts_resolve is None:
+        raise RuntimeError("Timescale resolver unavailable; pass jd_tt/jd_ut1 directly.")
+    ts = _ts_resolve(d, "00:00:00", tz)
+    return float(ts["jd_tt"])
+
+def _aspects_from_kwargs(kwargs: dict) -> list[AspectSpec]:
+    # Build aspect set from names/angles/orbs if provided; default to MAJOR_ASPECTS
+    custom = kwargs.get("aspects")
+    orbs = kwargs.get("orbs", {})
+    specs: list[AspectSpec] = []
+    if isinstance(custom, (list, tuple)) and custom:
+        # Accept strings of major/minor names (case-insensitive) or dicts {name, angle, orb_deg}
+        known = {a.name.lower(): a for a in (list(MAJOR_ASPECTS) + list(MINOR_ASPECTS))}
+        for item in custom:
+            if isinstance(item, str):
+                a = known.get(item.strip().lower())
+                if a:
+                    # allow orb override via orbs dict
+                    orb = float(orbs.get(item.strip().lower(), a.orb_deg)) if isinstance(orbs, dict) else a.orb_deg
+                    specs.append(AspectSpec(a.name, a.angle, orb, a.kind, a.weight))
+            elif isinstance(item, dict):
+                try:
+                    nm = str(item.get("name") or "Aspect")
+                    ang = float(item["angle"])
+                    orb = float(item.get("orb_deg", 1.0))
+                    specs.append(AspectSpec(nm, ang, orb))
+                except Exception:
+                    continue
+    if not specs:
+        # default majors, allow orb overrides
+        for a in MAJOR_ASPECTS:
+            nm = a.name.lower()
+            orb = float(orbs.get(nm, a.orb_deg)) if isinstance(orbs, dict) else a.orb_deg
+            specs.append(AspectSpec(a.name, a.angle, orb, a.kind, a.weight))
+    return specs
+
+def find_transits_in_range(
+    *,
+    natal_chart: dict,
+    time_range: tuple | list,
+    transiting_bodies: list[str] | None = None,
+    natal_bodies: list[str] | None = None,
+    frame: str | None = None,
+    zodiac_mode: str | None = None,
+    ayanamsa_deg: float | None = None,
+    include_aspects_to: list[str] | None = None,
+    include_house_cusps: bool | None = None,
+    exact_timing: bool | None = None,
+    **kwargs,
+) -> PredictionResult:
+    """
+    Compatibility wrapper expected by prediction.py.
+    Produces a PredictionResult with 'events' list understood by _serialize_prediction_result().
+    """
+    import time
+    t0_wall = time.perf_counter()
+    warnings: list[str] = []
+
+    # Defaults
+    movers = list(transiting_bodies or ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn"])
+    tgts   = list(natal_bodies or ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn","Asc","MC"])
+    frame = frame or "ecliptic-of-date"
+    zodiac_mode = (zodiac_mode or "tropical").lower()
+    ay = float(ayanamsa_deg or 0.0)
+
+    # Resolve natal timescales (for natal longitudes)
+    tz = str(natal_chart.get("place_tz") or natal_chart.get("timezone") or "UTC")
+    if "jd_tt" in natal_chart and isinstance(natal_chart.get("jd_tt"), (int, float)):
+        natal_jd_tt = float(natal_chart["jd_tt"])
+    else:
+        d = str(natal_chart.get("date") or "")
+        t = str(natal_chart.get("time") or "00:00:00")
+        if not d:
+            return PredictionResult(ok=False, warnings=["natal_chart.date required"], technique="transits")
+        if _ts_resolve is None:
+            return PredictionResult(ok=False, warnings=["timescale resolver unavailable"], technique="transits")
+        ts = _ts_resolve(datetime.strptime(d, "%Y-%m-%d").date(), t, tz)
+        natal_jd_tt = float(ts["jd_tt"])
+
+    # Build ephemeris + TransitEngine
+    ep = EphemerisAdapter(EphemConfig(frame=frame))
+    eng = TransitEngine(ephem=ep, frame=frame)
+
+    # Compute natal longitudes for requested natal bodies (targets)
+    # For Asc/MC we skip here (needs houses); you can extend to compute them if desired.
+    target_planets = [b for b in tgts if b not in ("Asc","ASC","asc","MC","mc")]
+    nat_rows = ep.ecliptic_longitudes(natal_jd_tt, target_planets).get("results", [])
+    nat_map = rows_to_maps(nat_rows)["longitudes"]
+    targets: dict[str, float] = {k: float(v) for k, v in nat_map.items() if math.isfinite(float(v))}
+
+    # Time window (JD TT)
+    if isinstance(time_range, (list, tuple)) and len(time_range) == 2:
+        d0 = _to_date(time_range[0]); d1 = _to_date(time_range[1])
+        jd0 = _jd_from_date(d0, tz)
+        # Use end of the day for inclusive feel
+        jd1 = _jd_from_date(d1, tz) + (24.0*60.0-1) / (24.0*60.0)
+        if jd1 < jd0:
+            jd0, jd1 = jd1, jd0
+    else:
+        return PredictionResult(ok=False, warnings=["time_range must be [start_date, end_date]"], technique="transits")
+
+    # Aspect set
+    aspects = _aspects_from_kwargs(kwargs)
+    include_antiscia = bool(kwargs.get("include_antiscia", False))
+    antiscia_orb = float(kwargs.get("antiscia_orb_deg", 2.0))
+    step_min = float(kwargs.get("step_minutes", 30.0))
+
+    # Scan
+    try:
+        events_raw = eng.scan_aspects(
+            jd_start_tt=jd0, jd_end_tt=jd1,
+            movers=movers, targets=targets,
+            aspects=aspects,
+            step_minutes=step_min,
+            include_antiscia=include_antiscia,
+            antiscia_orb_deg=antiscia_orb,
+        )
+    except Exception as e:
+        return PredictionResult(
+            ok=False,
+            warnings=[f"transit_scan_failed:{e}"],
+            technique="transits",
+            metadata={"frame": frame, "zodiac_mode": zodiac_mode, "ayanamsa_deg": ay},
+            computation_time_ms=(time.perf_counter()-t0_wall)*1000.0,
+        )
+
+    # Convert TransitEvent → serializer-friendly objects
+    events = []
+    for ev in events_raw:
+        # Your serializer looks for fields like event_type/technique/datetime_utc/jd_tt etc.
+        events.append(SimpleNamespace(
+            event_type="aspect",
+            technique="transits",
+            description=f"{ev.body} {ev.aspect} {ev.target}",
+            datetime_utc=None,             # leave None (you can enrich if you want)
+            jd_tt=ev.jd_tt,
+            jd_ut1=None,
+            precision_seconds=None,
+            confidence=None,
+            significance=None,
+            metadata={
+                "body": ev.body,
+                "target": ev.target,
+                "aspect": ev.aspect,
+                "kind": ev.kind,
+                "separation_deg": ev.separation_deg,
+                "applying": ev.applying,
+                "exact": ev.exact,
+            },
+        ))
+
+    dt_ms = (time.perf_counter() - t0_wall) * 1000.0
+    return PredictionResult(
+        ok=True,
+        technique="transits",
+        events=events,
+        warnings=warnings,
+        metadata={
+            "frame": frame,
+            "zodiac_mode": zodiac_mode,
+            "ayanamsa_deg": ay,
+            "natal_targets": list(targets.keys()),
+            "movers": movers,
+            "window_jd_tt": [jd0, jd1],
+        },
+        computation_time_ms=dt_ms,
+    )
+
+
 # =============================================================================
 # Exports
 # =============================================================================
 
 __all__ = [
     # Aspects
-    "AspectSpec", "AspectKind", "MAJOR_ASPECTS", "MINOR_ASPECTS",
+    "AspectSpec", "AspectKind",
+    "MAJOR_ASPECTS", "MINOR_ASPECTS",
     "antiscia_longitude", "contra_antiscia_longitude",
+
     # Transits
     "TransitEngine", "TransitEvent",
+    "PredictionResult", "find_transits_in_range",
+
     # Dasha
     "DashaPeriod", "vimsottari_dasha",
+
     # Varga
     "compute_vargas_for_point", "compute_vargas",
+
     # Yogas
     "detect_yogas", "house_index_for_longitude",
+
     # Houses & timescales helpers
     "compute_houses", "timescales_from_civil",
+
     # Validation (time-series aware)
-    "EvalResult", "evaluate_univariate", "bh_fdr", "holdout_replicate", "permutation_pvalue_corr",
+    "EvalResult", "evaluate_univariate",
+    "bh_fdr", "holdout_replicate", "permutation_pvalue_corr",
+
+    # Feature builders
     "feature_transit_proximity", "feature_dasha_lords_onehot", "feature_yoga_flags",
 ]
