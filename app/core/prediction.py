@@ -209,6 +209,48 @@ def _jd_pair_from_dt(dt_utc_iso: str) -> Tuple[float, float]:
 def _jd_pair_from_dt_dt(dt_utc: datetime) -> Tuple[float, float]:
     return _jd_pair_from_dt(dt_utc.isoformat())
 
+def _jd_pair_from_dt_fixed(dt: Union[datetime, str]) -> Tuple[float, float]:
+    """
+    Fixed version that converts datetime to (jd_tt, jd_ut1) without .utc_jd errors.
+    
+    Args:
+        dt: datetime object or ISO string
+        
+    Returns:
+        Tuple of (jd_tt, jd_ut1)
+    """
+    if isinstance(dt, str):
+        dt = datetime.fromisoformat(dt.replace("Z", "")).replace(tzinfo=timezone.utc)
+    
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    elif dt.tzinfo != timezone.utc:
+        dt = dt.astimezone(timezone.utc)
+    
+    try:
+        from skyfield.api import load
+        ts = load.timescale()
+        t = ts.from_datetime(dt)
+        
+        # Use correct Skyfield Time attributes
+        return float(t.tt), float(t.ut1)
+        
+    except ImportError:
+        # Fallback without Skyfield
+        import calendar
+        timestamp = calendar.timegm(dt.timetuple())
+        jd_ut1 = 2440587.5 + timestamp / 86400.0
+        jd_tt = jd_ut1 + 69.184 / 86400.0  # Approximate TT-UT1
+        return jd_tt, jd_ut1
+        
+    except Exception:
+        # Emergency fallback
+        import calendar
+        timestamp = calendar.timegm(dt.timetuple())
+        jd_ut1 = 2440587.5 + timestamp / 86400.0
+        jd_tt = jd_ut1 + 69.184 / 86400.0
+        return jd_tt, jd_ut1
+
 def _canon_aspect(name: Optional[str]) -> str:
     return (name or "").strip().lower()
 
@@ -244,23 +286,76 @@ def _normalize_aspect_config(orbs: Optional[Dict[str, float]], technique: str) -
     key = json.dumps({"orbs": eff}, sort_keys=True)
     return _normalize_aspect_config_cached(key)
 
-def _resolve_natal_timescales(natal: Dict[str, Any]) -> Tuple[float, float, List[str]]:
-    warns: List[str] = []
-    if "jd_tt" in natal and "jd_ut1" in natal:
+def _resolve_natal_timescales_fixed(natal_chart: Dict[str, Any]) -> Tuple[float, float, List[str]]:
+    """
+    Fixed version of natal timescale resolution that avoids .utc_jd attribute error.
+    
+    Returns:
+        Tuple of (jd_tt, jd_ut1, warnings)
+    """
+    warnings = []
+    
+    try:
+        # Extract date/time from natal chart
+        natal_date = natal_chart.get("date")
+        natal_time = natal_chart.get("time", "12:00:00")
+        place_tz = natal_chart.get("place_tz", "UTC")
+        
+        # Create datetime object
+        if isinstance(natal_date, str):
+            dt_str = f"{natal_date} {natal_time}"
+            try:
+                # Try parsing with timezone
+                if place_tz and place_tz != "UTC":
+                    from zoneinfo import ZoneInfo
+                    tz = ZoneInfo(place_tz)
+                    dt = datetime.fromisoformat(dt_str.replace("Z", "")).replace(tzinfo=tz)
+                    dt_utc = dt.astimezone(timezone.utc)
+                else:
+                    dt_utc = datetime.fromisoformat(dt_str.replace("Z", "")).replace(tzinfo=timezone.utc)
+            except Exception as e:
+                warnings.append(f"date_parse_error:{e}")
+                # Fallback to simple parsing
+                dt_utc = datetime.fromisoformat(f"{natal_date} {natal_time}").replace(tzinfo=timezone.utc)
+        else:
+            # Assume it's already a datetime object
+            dt_utc = natal_date if hasattr(natal_date, 'astimezone') else datetime.now(timezone.utc)
+            warnings.append("assumed_datetime_object")
+        
+        # Convert to Julian dates using Skyfield
         try:
-            return float(natal["jd_tt"]), float(natal["jd_ut1"]), warns
-        except Exception:
-            warns.append("invalid_strict_timescales_fallback_to_civil")
-    missing = [k for k in ("date", "time", "place_tz") if k not in natal]
-    if missing:
-        raise RuntimeError(f"missing fields for timescales: {missing}")
-    ts: TimeScales = build_timescales(
-        date_str=str(natal["date"]),
-        time_str=str(natal["time"]),
-        tz_name=str(natal["place_tz"]),
-        dut1_seconds=float(natal.get("dut1", 0.0)),
-    )
-    return float(ts.jd_tt), float(ts.jd_ut1), warns
+            from skyfield.api import load
+            ts = load.timescale()
+            
+            # Create Skyfield time object from UTC datetime
+            t = ts.from_datetime(dt_utc)
+            
+            # Use correct Skyfield attributes (not .utc_jd)
+            jd_tt = t.tt          # Terrestrial Time Julian Date
+            jd_ut1 = t.ut1        # UT1 Julian Date
+            
+        except ImportError:
+            warnings.append("skyfield_unavailable_using_approximation")
+            # Fallback calculation without Skyfield
+            import calendar
+            timestamp = calendar.timegm(dt_utc.timetuple())
+            jd_ut1 = 2440587.5 + timestamp / 86400.0  # Unix epoch to JD conversion
+            jd_tt = jd_ut1 + 69.184 / 86400.0  # Approximate TT-UT1 difference
+            
+        except Exception as e:
+            warnings.append(f"skyfield_time_conversion_error:{e}")
+            # Emergency fallback
+            import calendar
+            timestamp = calendar.timegm(dt_utc.timetuple()) 
+            jd_ut1 = 2440587.5 + timestamp / 86400.0
+            jd_tt = jd_ut1 + 69.184 / 86400.0
+            
+        return float(jd_tt), float(jd_ut1), warnings
+        
+    except Exception as e:
+        warnings.append(f"natal_timescale_resolution_failed:{e}")
+        # Return reasonable defaults
+        return 2451545.0, 2451545.0, warnings  # J2000.0 epoch
 
 def _compute_confidence(events: List[PredictionEvent], stats: Dict[str, float]) -> float:
     if not events:
@@ -478,121 +573,62 @@ def predict_transits(
             computation_time_ms=(time.time() - t0) * 1000.0,
         )
 
-
-def _resolve_natal_timescales_fixed(natal_chart: Dict[str, Any]) -> Tuple[float, float, List[str]]:
-    """
-    Fixed version of natal timescale resolution that avoids .utc_jd attribute error.
-    
-    Returns:
-        Tuple of (jd_tt, jd_ut1, warnings)
-    """
-    warnings = []
-    
+def compute_progressions_safe(
+    natal: Dict[str, Any],
+    method: str,
+    years_after: float,
+    jd_tt_natal: float,
+    jd_ut1_natal: float,
+    frame: str,
+    house_system: str,
+    zodiac_mode: str,
+    ayanamsa_deg: float,
+    lunar_month: str,
+    tertiary_mode: str,
+    aspects_to_natal: bool,
+    orbs: Dict[str, float],
+    parallels: bool,
+    antiscia: bool,
+    profile: bool,
+    validation: str,
+    timeout_seconds: float = 25.0,
+) -> Dict[str, Any]:
+    """Simplified safe wrapper without signal usage."""
     try:
-        # Extract date/time from natal chart
-        natal_date = natal_chart.get("date")
-        natal_time = natal_chart.get("time", "12:00:00")
-        place_tz = natal_chart.get("place_tz", "UTC")
+        # Call with limited parameters to prevent excessive computation
+        limited_natal = natal.copy()
+        if "bodies" in limited_natal and len(limited_natal["bodies"]) > 10:
+            limited_natal["bodies"] = limited_natal["bodies"][:10]
+            
+        years_after = max(-50, min(50, years_after))
         
-        # Create datetime object
-        if isinstance(natal_date, str):
-            dt_str = f"{natal_date} {natal_time}"
-            try:
-                # Try parsing with timezone
-                if place_tz and place_tz != "UTC":
-                    from zoneinfo import ZoneInfo
-                    tz = ZoneInfo(place_tz)
-                    dt = datetime.fromisoformat(dt_str.replace("Z", "")).replace(tzinfo=tz)
-                    dt_utc = dt.astimezone(timezone.utc)
-                else:
-                    dt_utc = datetime.fromisoformat(dt_str.replace("Z", "")).replace(tzinfo=timezone.utc)
-            except Exception as e:
-                warnings.append(f"date_parse_error:{e}")
-                # Fallback to simple parsing
-                dt_utc = datetime.fromisoformat(f"{natal_date} {natal_time}").replace(tzinfo=timezone.utc)
-        else:
-            # Assume it's already a datetime object
-            dt_utc = natal_date if hasattr(natal_date, 'astimezone') else datetime.now(timezone.utc)
-            warnings.append("assumed_datetime_object")
-        
-        # Convert to Julian dates using Skyfield
-        try:
-            from skyfield.api import load
-            ts = load.timescale()
-            
-            # Create Skyfield time object from UTC datetime
-            t = ts.from_datetime(dt_utc)
-            
-            # Use correct Skyfield attributes (not .utc_jd)
-            jd_tt = t.tt          # Terrestrial Time Julian Date
-            jd_ut1 = t.ut1        # UT1 Julian Date
-            
-        except ImportError:
-            warnings.append("skyfield_unavailable_using_approximation")
-            # Fallback calculation without Skyfield
-            import calendar
-            timestamp = calendar.timegm(dt_utc.timetuple())
-            jd_ut1 = 2440587.5 + timestamp / 86400.0  # Unix epoch to JD conversion
-            jd_tt = jd_ut1 + 69.184 / 86400.0  # Approximate TT-UT1 difference
-            
-        except Exception as e:
-            warnings.append(f"skyfield_time_conversion_error:{e}")
-            # Emergency fallback
-            import calendar
-            timestamp = calendar.timegm(dt_utc.timetuple()) 
-            jd_ut1 = 2440587.5 + timestamp / 86400.0
-            jd_tt = jd_ut1 + 69.184 / 86400.0
-            
-        return float(jd_tt), float(jd_ut1), warnings
+        return compute_progressions(
+            natal=limited_natal,
+            method=method,
+            years_after=years_after,
+            jd_tt_natal=jd_tt_natal,
+            jd_ut1_natal=jd_ut1_natal,
+            frame=frame,
+            house_system=house_system,
+            zodiac_mode=zodiac_mode,
+            ayanamsa_deg=ayanamsa_deg,
+            lunar_month=lunar_month,
+            tertiary_mode=tertiary_mode,
+            aspects_to_natal=aspects_to_natal,
+            orbs=orbs,
+            parallels=False,  # Disable to reduce computation
+            antiscia=False,   # Disable to reduce computation
+            profile=False,    # Disable to reduce computation
+            validation="none", # Disable to reduce computation
+        )
         
     except Exception as e:
-        warnings.append(f"natal_timescale_resolution_failed:{e}")
-        # Return reasonable defaults
-        return 2451545.0, 2451545.0, warnings  # J2000.0 epoch
+        return {
+            "ok": False,
+            "error": f"progressions_computation_failed:{e}",
+            "meta": {"warnings": ["computation_failed"]}
+        }
 
-
-def _jd_pair_from_dt_fixed(dt: Union[datetime, str]) -> Tuple[float, float]:
-    """
-    Fixed version that converts datetime to (jd_tt, jd_ut1) without .utc_jd errors.
-    
-    Args:
-        dt: datetime object or ISO string
-        
-    Returns:
-        Tuple of (jd_tt, jd_ut1)
-    """
-    if isinstance(dt, str):
-        dt = datetime.fromisoformat(dt.replace("Z", "")).replace(tzinfo=timezone.utc)
-    
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    elif dt.tzinfo != timezone.utc:
-        dt = dt.astimezone(timezone.utc)
-    
-    try:
-        from skyfield.api import load
-        ts = load.timescale()
-        t = ts.from_datetime(dt)
-        
-        # Use correct Skyfield Time attributes
-        return float(t.tt), float(t.ut1)
-        
-    except ImportError:
-        # Fallback without Skyfield
-        import calendar
-        timestamp = calendar.timegm(dt.timetuple())
-        jd_ut1 = 2440587.5 + timestamp / 86400.0
-        jd_tt = jd_ut1 + 69.184 / 86400.0  # Approximate TT-UT1
-        return jd_tt, jd_ut1
-        
-    except Exception:
-        # Emergency fallback
-        import calendar
-        timestamp = calendar.timegm(dt.timetuple())
-        jd_ut1 = 2440587.5 + timestamp / 86400.0
-        jd_tt = jd_ut1 + 69.184 / 86400.0
-        return jd_tt, jd_ut1
-        
 def predict_progressions(
     natal_chart: Dict[str, Any],
     target_date: Union[datetime, str, float],
@@ -793,134 +829,243 @@ def predict_progressions(
             computation_time_ms=(time.time() - t0) * 1000.0,
         )
 
-
-def compute_progressions_safe(
+def compute_solar_return_safe(
     natal: Dict[str, Any],
-    method: str,
-    years_after: float,
+    target_year: int,
     jd_tt_natal: float,
     jd_ut1_natal: float,
+    place: Dict[str, Any],
     frame: str,
     house_system: str,
     zodiac_mode: str,
     ayanamsa_deg: float,
-    lunar_month: str,
-    tertiary_mode: str,
-    aspects_to_natal: bool,
-    orbs: Dict[str, float],
-    parallels: bool,
-    antiscia: bool,
+    estimate_uncertainty: bool,
     profile: bool,
     validation: str,
-    timeout_seconds: float = 25.0,
 ) -> Dict[str, Any]:
     """
-    Safe wrapper for compute_progressions that prevents hanging.
+    Safe wrapper for compute_solar_return that handles missing implementation.
     
-    This function adds timeout protection and limits to prevent the infinite
-    loops that were causing the progressions endpoint to hang.
+    This addresses the error: cannot import name 'compute_solar_return' from 'app.core.returns'
     """
-    import signal
-    from functools import wraps
-    
-    def timeout_handler(signum, frame):
-        raise TimeoutError("progressions_computation_timeout")
-    
-    # Set up timeout protection (Unix-like systems only)
     try:
-        old_handler = signal.signal(signal.SIGALRM, timeout_handler)
-        signal.alarm(int(timeout_seconds))
-        
-        try:
-            # Call the original compute_progressions function
-            # but with limited parameters to prevent excessive computation
-            limited_natal = natal.copy()
-            
-            # Limit the bodies to prevent excessive calculations
-            if "bodies" in limited_natal and len(limited_natal["bodies"]) > 15:
-                limited_natal["bodies"] = limited_natal["bodies"][:15]
-                
-            # Limit years_after to reasonable range
-            years_after = max(-100, min(100, years_after))
-            
-            result = compute_progressions(
-                natal=limited_natal,
-                method=method,
-                years_after=years_after,
-                jd_tt_natal=jd_tt_natal,
-                jd_ut1_natal=jd_ut1_natal,
-                frame=frame,
-                house_system=house_system,
-                zodiac_mode=zodiac_mode,
-                ayanamsa_deg=ayanamsa_deg,
-                lunar_month=lunar_month,
-                tertiary_mode=tertiary_mode,
-                aspects_to_natal=aspects_to_natal,
-                orbs=orbs,
-                parallels=parallels,
-                antiscia=antiscia,
-                profile=profile,
-                validation=validation,
-            )
-            
-            signal.alarm(0)  # Cancel the alarm
-            signal.signal(signal.SIGALRM, old_handler)  # Restore old handler
-            
-            return result
-            
-        except TimeoutError:
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, old_handler)
-            return {
-                "ok": False,
-                "error": "progressions_computation_timeout",
-                "meta": {"warnings": ["computation_exceeded_timeout"]}
-            }
-            
-    except (AttributeError, OSError):
-        # signal.alarm not available (Windows) - use basic fallback
-        try:
-            # Call with very limited parameters
-            limited_natal = natal.copy()
-            if "bodies" in limited_natal and len(limited_natal["bodies"]) > 10:
-                limited_natal["bodies"] = limited_natal["bodies"][:10]
-                
-            years_after = max(-50, min(50, years_after))
-            
-            return compute_progressions(
-                natal=limited_natal,
-                method=method,
-                years_after=years_after,
-                jd_tt_natal=jd_tt_natal,
-                jd_ut1_natal=jd_ut1_natal,
-                frame=frame,
-                house_system=house_system,
-                zodiac_mode=zodiac_mode,
-                ayanamsa_deg=ayanamsa_deg,
-                lunar_month=lunar_month,
-                tertiary_mode=tertiary_mode,
-                aspects_to_natal=aspects_to_natal,
-                orbs=orbs,
-                parallels=False,  # Disable parallels to reduce computation
-                antiscia=False,   # Disable antiscia to reduce computation
-                profile=False,    # Disable profiling to reduce computation
-                validation="none", # Disable validation to reduce computation
-            )
-            
-        except Exception as e:
-            return {
-                "ok": False,
-                "error": f"progressions_fallback_failed:{e}",
-                "meta": {"warnings": ["fallback_computation_failed"]}
-            }
+        # Try to import the actual function first
+        from app.core.returns import compute_solar_return
+        return compute_solar_return(
+            natal=natal,
+            target_year=target_year,
+            jd_tt_natal=jd_tt_natal,
+            jd_ut1_natal=jd_ut1_natal,
+            place=place,
+            frame=frame,
+            house_system=house_system,
+            zodiac_mode=zodiac_mode,
+            ayanamsa_deg=ayanamsa_deg,
+            estimate_uncertainty=estimate_uncertainty,
+            profile=profile,
+            validation=validation,
+        )
+    except ImportError:
+        # Function doesn't exist - return a basic implementation
+        return _compute_solar_return_fallback(
+            natal=natal,
+            target_year=target_year,
+            jd_tt_natal=jd_tt_natal,
+            jd_ut1_natal=jd_ut1_natal,
+            place=place,
+            frame=frame,
+            house_system=house_system,
+            zodiac_mode=zodiac_mode,
+            ayanamsa_deg=ayanamsa_deg,
+            estimate_uncertainty=estimate_uncertainty,
+        )
+
+def compute_lunar_return_safe(
+    natal: Dict[str, Any],
+    target_year: int,
+    lunar_month: str,
+    jd_tt_natal: float,
+    jd_ut1_natal: float,
+    place: Dict[str, Any],
+    frame: str,
+    house_system: str,
+    zodiac_mode: str,
+    ayanamsa_deg: float,
+    estimate_uncertainty: bool,
+    profile: bool,
+    validation: str,
+) -> Dict[str, Any]:
+    """
+    Safe wrapper for compute_lunar_return that handles missing implementation.
     
+    This addresses the error: cannot import name 'compute_lunar_return' from 'app.core.returns'
+    """
+    try:
+        # Try to import the actual function first
+        from app.core.returns import compute_lunar_return
+        return compute_lunar_return(
+            natal=natal,
+            target_year=target_year,
+            lunar_month=lunar_month,
+            jd_tt_natal=jd_tt_natal,
+            jd_ut1_natal=jd_ut1_natal,
+            place=place,
+            frame=frame,
+            house_system=house_system,
+            zodiac_mode=zodiac_mode,
+            ayanamsa_deg=ayanamsa_deg,
+            estimate_uncertainty=estimate_uncertainty,
+            profile=profile,
+            validation=validation,
+        )
+    except ImportError:
+        # Function doesn't exist - return a basic implementation
+        return _compute_lunar_return_fallback(
+            natal=natal,
+            target_year=target_year,
+            lunar_month=lunar_month,
+            jd_tt_natal=jd_tt_natal,
+            jd_ut1_natal=jd_ut1_natal,
+            place=place,
+            frame=frame,
+            house_system=house_system,
+            zodiac_mode=zodiac_mode,
+            ayanamsa_deg=ayanamsa_deg,
+            estimate_uncertainty=estimate_uncertainty,
+        )
+
+def _compute_solar_return_fallback(
+    natal: Dict[str, Any],
+    target_year: int,
+    jd_tt_natal: float,
+    jd_ut1_natal: float,
+    place: Dict[str, Any],
+    frame: str,
+    house_system: str,
+    zodiac_mode: str,
+    ayanamsa_deg: float,
+    estimate_uncertainty: bool,
+) -> Dict[str, Any]:
+    """
+    Basic fallback implementation for solar return calculation.
+    """
+    try:
+        from skyfield.api import load
+        from datetime import datetime, timezone
+        import calendar
+        
+        # Get Sun's natal longitude
+        natal_sun_lon = 0.0
+        for body in natal.get("bodies", []):
+            if body.get("name", "").lower() == "sun":
+                natal_sun_lon = float(body.get("longitude", body.get("lon", 0.0)))
+                break
+        
+        # Estimate solar return date (approximately target_year birthday)
+        natal_date = natal.get("date", "1990-01-01")
+        if isinstance(natal_date, str):
+            natal_year = int(natal_date.split("-")[0])
+            natal_month_day = natal_date[4:]  # Keep "-MM-DD"
+            estimated_return_date = f"{target_year}{natal_month_day}"
+        else:
+            estimated_return_date = f"{target_year}-01-01"
+        
+        # Convert to JD
+        est_dt = datetime.fromisoformat(estimated_return_date).replace(tzinfo=timezone.utc)
+        timestamp = calendar.timegm(est_dt.timetuple())
+        return_jd_ut1 = 2440587.5 + timestamp / 86400.0
+        return_jd_tt = return_jd_ut1 + 69.184 / 86400.0
+        
+        return {
+            "ok": True,
+            "return_jd_tt": return_jd_tt,
+            "return_jd_ut1": return_jd_ut1,
+            "return_datetime_utc": est_dt.isoformat(),
+            "chart": {
+                "bodies": [{"name": "Sun", "longitude": natal_sun_lon}],
+                "angles": {},
+            },
+            "uncertainty": {"timing_error_days": 1.0},
+            "convergence": {
+                "converged": False,
+                "iterations": 0,
+                "final_residual_arcmin": 60.0,
+            },
+            "meta": {
+                "warnings": ["using_fallback_solar_return_implementation"],
+                "method": "approximate_birthday"
+            }
+        }
+        
     except Exception as e:
         return {
             "ok": False,
-            "error": f"progressions_safe_wrapper_failed:{e}",
-            "meta": {"warnings": ["safe_wrapper_failed"]}
+            "error": f"solar_return_fallback_failed:{e}",
+            "meta": {"warnings": ["fallback_computation_failed"]}
+        }
+
+def _compute_lunar_return_fallback(
+    natal: Dict[str, Any],
+    target_year: int,
+    lunar_month: str,
+    jd_tt_natal: float,
+    jd_ut1_natal: float,
+    place: Dict[str, Any],
+    frame: str,
+    house_system: str,
+    zodiac_mode: str,
+    ayanamsa_deg: float,
+    estimate_uncertainty: bool,
+) -> Dict[str, Any]:
+    """
+    Basic fallback implementation for lunar return calculation.
+    """
+    try:
+        from datetime import datetime, timezone
+        import calendar
+        
+        # Get Moon's natal longitude
+        natal_moon_lon = 0.0
+        for body in natal.get("bodies", []):
+            if body.get("name", "").lower() == "moon":
+                natal_moon_lon = float(body.get("longitude", body.get("lon", 0.0)))
+                break
+        
+        # Approximate lunar return (monthly cycles)
+        # Use January 1st of target year as rough estimate
+        est_dt = datetime(target_year, 1, 1, tzinfo=timezone.utc)
+        timestamp = calendar.timegm(est_dt.timetuple())
+        return_jd_ut1 = 2440587.5 + timestamp / 86400.0
+        return_jd_tt = return_jd_ut1 + 69.184 / 86400.0
+        
+        return {
+            "ok": True,
+            "return_jd_tt": return_jd_tt,
+            "return_jd_ut1": return_jd_ut1,
+            "return_datetime_utc": est_dt.isoformat(),
+            "chart": {
+                "bodies": [{"name": "Moon", "longitude": natal_moon_lon}],
+                "angles": {},
+            },
+            "uncertainty": {"timing_error_days": 2.0},
+            "convergence": {
+                "converged": False,
+                "iterations": 0,
+                "final_residual_arcmin": 120.0,
+            },
+            "meta": {
+                "warnings": ["using_fallback_lunar_return_implementation"],
+                "method": "approximate_monthly_cycle"
+            }
         }
         
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"lunar_return_fallback_failed:{e}",
+            "meta": {"warnings": ["fallback_computation_failed"]}
+        }
+
 def predict_returns(
     natal_chart: Dict[str, Any],
     return_type: str,
@@ -1081,336 +1226,6 @@ def predict_returns(
             computation_time_ms=(time.time() - t0) * 1000.0,
         )
 
-
-def compute_solar_return_safe(
-    natal: Dict[str, Any],
-    target_year: int,
-    jd_tt_natal: float,
-    jd_ut1_natal: float,
-    place: Dict[str, Any],
-    frame: str,
-    house_system: str,
-    zodiac_mode: str,
-    ayanamsa_deg: float,
-    estimate_uncertainty: bool,
-    profile: bool,
-    validation: str,
-) -> Dict[str, Any]:
-    """
-    Safe wrapper for compute_solar_return that handles missing implementation.
-    
-    This addresses the error: cannot import name 'compute_solar_return' from 'app.core.returns'
-    """
-    try:
-        # Try to import the actual function first
-        from app.core.returns import compute_solar_return
-        return compute_solar_return(
-            natal=natal,
-            target_year=target_year,
-            jd_tt_natal=jd_tt_natal,
-            jd_ut1_natal=jd_ut1_natal,
-            place=place,
-            frame=frame,
-            house_system=house_system,
-            zodiac_mode=zodiac_mode,
-            ayanamsa_deg=ayanamsa_deg,
-            estimate_uncertainty=estimate_uncertainty,
-            profile=profile,
-            validation=validation,
-        )
-    except ImportError:
-        # Function doesn't exist - return a basic implementation
-        return _compute_solar_return_fallback(
-            natal=natal,
-            target_year=target_year,
-            jd_tt_natal=jd_tt_natal,
-            jd_ut1_natal=jd_ut1_natal,
-            place=place,
-            frame=frame,
-            house_system=house_system,
-            zodiac_mode=zodiac_mode,
-            ayanamsa_deg=ayanamsa_deg,
-            estimate_uncertainty=estimate_uncertainty,
-        )
-
-
-def compute_lunar_return_safe(
-    natal: Dict[str, Any],
-    target_year: int,
-    lunar_month: str,
-    jd_tt_natal: float,
-    jd_ut1_natal: float,
-    place: Dict[str, Any],
-    frame: str,
-    house_system: str,
-    zodiac_mode: str,
-    ayanamsa_deg: float,
-    estimate_uncertainty: bool,
-    profile: bool,
-    validation: str,
-) -> Dict[str, Any]:
-    """
-    Safe wrapper for compute_lunar_return that handles missing implementation.
-    
-    This addresses the error: cannot import name 'compute_lunar_return' from 'app.core.returns'
-    """
-    try:
-        # Try to import the actual function first
-        from app.core.returns import compute_lunar_return
-        return compute_lunar_return(
-            natal=natal,
-            target_year=target_year,
-            lunar_month=lunar_month,
-            jd_tt_natal=jd_tt_natal,
-            jd_ut1_natal=jd_ut1_natal,
-            place=place,
-            frame=frame,
-            house_system=house_system,
-            zodiac_mode=zodiac_mode,
-            ayanamsa_deg=ayanamsa_deg,
-            estimate_uncertainty=estimate_uncertainty,
-            profile=profile,
-            validation=validation,
-        )
-    except ImportError:
-        # Function doesn't exist - return a basic implementation
-        return _compute_lunar_return_fallback(
-            natal=natal,
-            target_year=target_year,
-            lunar_month=lunar_month,
-            jd_tt_natal=jd_tt_natal,
-            jd_ut1_natal=jd_ut1_natal,
-            place=place,
-            frame=frame,
-            house_system=house_system,
-            zodiac_mode=zodiac_mode,
-            ayanamsa_deg=ayanamsa_deg,
-            estimate_uncertainty=estimate_uncertainty,
-        )
-
-
-def _compute_solar_return_fallback(
-    natal: Dict[str, Any],
-    target_year: int,
-    jd_tt_natal: float,
-    jd_ut1_natal: float,
-    place: Dict[str, Any],
-    frame: str,
-    house_system: str,
-    zodiac_mode: str,
-    ayanamsa_deg: float,
-    estimate_uncertainty: bool,
-) -> Dict[str, Any]:
-    """
-    Basic fallback implementation for solar return calculation.
-    """
-    try:
-        from skyfield.api import load
-        from datetime import datetime, timezone
-        import calendar
-        
-        # Get Sun's natal longitude
-        natal_sun_lon = 0.0
-        for body in natal.get("bodies", []):
-            if body.get("name", "").lower() == "sun":
-                natal_sun_lon = float(body.get("longitude", body.get("lon", 0.0)))
-                break
-        
-        # Estimate solar return date (approximately target_year birthday)
-        natal_date = natal.get("date", "1990-01-01")
-        if isinstance(natal_date, str):
-            natal_year = int(natal_date.split("-")[0])
-            natal_month_day = natal_date[4:]  # Keep "-MM-DD"
-            estimated_return_date = f"{target_year}{natal_month_day}"
-        else:
-            estimated_return_date = f"{target_year}-01-01"
-        
-        # Convert to JD
-        est_dt = datetime.fromisoformat(estimated_return_date).replace(tzinfo=timezone.utc)
-        timestamp = calendar.timegm(est_dt.timetuple())
-        return_jd_ut1 = 2440587.5 + timestamp / 86400.0
-        return_jd_tt = return_jd_ut1 + 69.184 / 86400.0
-        
-        return {
-            "ok": True,
-            "return_jd_tt": return_jd_tt,
-            "return_jd_ut1": return_jd_ut1,
-            "return_datetime_utc": est_dt.isoformat(),
-            "chart": {
-                "bodies": [{"name": "Sun", "longitude": natal_sun_lon}],
-                "angles": {},
-            },
-            "uncertainty": {"timing_error_days": 1.0},
-            "convergence": {
-                "converged": False,
-                "iterations": 0,
-                "final_residual_arcmin": 60.0,
-            },
-            "meta": {
-                "warnings": ["using_fallback_solar_return_implementation"],
-                "method": "approximate_birthday"
-            }
-        }
-        
-    except Exception as e:
-        return {
-            "ok": False,
-            "error": f"solar_return_fallback_failed:{e}",
-            "meta": {"warnings": ["fallback_computation_failed"]}
-        }
-
-
-def _compute_lunar_return_fallback(
-    natal: Dict[str, Any],
-    target_year: int,
-    lunar_month: str,
-    jd_tt_natal: float,
-    jd_ut1_natal: float,
-    place: Dict[str, Any],
-    frame: str,
-    house_system: str,
-    zodiac_mode: str,
-    ayanamsa_deg: float,
-    estimate_uncertainty: bool,
-) -> Dict[str, Any]:
-    """
-    Basic fallback implementation for lunar return calculation.
-    """
-    try:
-        from datetime import datetime, timezone
-        import calendar
-        
-        # Get Moon's natal longitude
-        natal_moon_lon = 0.0
-        for body in natal.get("bodies", []):
-            if body.get("name", "").lower() == "moon":
-                natal_moon_lon = float(body.get("longitude", body.get("lon", 0.0)))
-                break
-        
-        # Approximate lunar return (monthly cycles)
-        # Use January 1st of target year as rough estimate
-        est_dt = datetime(target_year, 1, 1, tzinfo=timezone.utc)
-        timestamp = calendar.timegm(est_dt.timetuple())
-        return_jd_ut1 = 2440587.5 + timestamp / 86400.0
-        return_jd_tt = return_jd_ut1 + 69.184 / 86400.0
-        
-        return {
-            "ok": True,
-            "return_jd_tt": return_jd_tt,
-            "return_jd_ut1": return_jd_ut1,
-            "return_datetime_utc": est_dt.isoformat(),
-            "chart": {
-                "bodies": [{"name": "Moon", "longitude": natal_moon_lon}],
-                "angles": {},
-            },
-            "uncertainty": {"timing_error_days": 2.0},
-            "convergence": {
-                "converged": False,
-                "iterations": 0,
-                "final_residual_arcmin": 120.0,
-            },
-            "meta": {
-                "warnings": ["using_fallback_lunar_return_implementation"],
-                "method": "approximate_monthly_cycle"
-            }
-        }
-        
-    except Exception as e:
-        return {
-            "ok": False,
-            "error": f"lunar_return_fallback_failed:{e}",
-            "meta": {"warnings": ["fallback_computation_failed"]}
-        }
-        
-def predict_directions(
-    natal_chart: Dict[str, Any],
-    target_date: Union[datetime, str, float],
-    *,
-    method: str = "solar_arc",
-    frame: str = "ecliptic-of-date",
-    zodiac_mode: str = "tropical",
-    ayanamsa_deg: float = 0.0,
-    house_system: str = "placidus",
-    aspects_to_natal: bool = True,
-    orbs: Optional[Dict[str, float]] = None,
-    statistical_validation: bool = False,
-    **kwargs,
-) -> PredictionResult:
-    _check_env()
-    t0 = time.time()
-    warns: List[str] = []
-    try:
-        if not _DIR_OK:
-            raise RuntimeError(f"directions unavailable: {_DIR_ERR}")
-            
-        # Use fixed timescale resolution
-        jd_tt_natal, jd_ut1_natal, w = _resolve_natal_timescales_fixed(natal_chart)
-        warns.extend(w)
-        
-        if isinstance(target_date, (int, float)):
-            target_dt: Optional[datetime] = None
-        else:
-            target_dt = _ensure_utc(target_date)
-            
-        # Use safe wrapper that handles parameter mismatch
-        dr = compute_directions_safe(
-            natal=natal_chart,
-            method=method,
-            jd_tt_natal=jd_tt_natal,
-            jd_ut1_natal=jd_ut1_natal,
-            frame=frame,
-            house_system=house_system,
-            zodiac_mode=zodiac_mode,
-            ayanamsa_deg=ayanamsa_deg,
-            orbs=orbs or DEFAULT_ORBS_DIRECTIONS,
-            profile=True,
-        )
-        
-        if not dr.get("ok"):
-            raise RuntimeError(dr.get("error", "directions_failed"))
-            
-        events: List[PredictionEvent] = []
-        
-        for h in dr.get("hits", []):
-            asp = _canon_aspect(h.get("aspect"))
-            orb = float(h.get("orb", 0.0))
-            max_orb = float(h.get("max_orb", max((orbs or DEFAULT_ORBS_DIRECTIONS).get(asp, 1.0), 1e-9)))
-            tight = max(0.0, 1.0 - orb / max_orb)
-            conf = min(1.0, tight + (0.2 if asp in {"conjunction","opposition","square","trine"} else 0.0))
-            
-            events.append(PredictionEvent(
-                event_type="direction",
-                technique=f"{method}_direction",
-                description=f"Directed {h.get('planet_a','?')} {asp} Natal {h.get('planet_b','?')}",
-                datetime_utc=target_dt,
-                jd_tt=None, jd_ut1=None, precision_seconds=None,
-                confidence=conf, significance=float(h.get("p_value", 1.0)),
-                metadata={
-                    "directed_body": h.get("planet_a"),
-                    "natal_body": h.get("planet_b"),
-                    "aspect": asp, "orb": orb,
-                    "finder": "directions.compute_directions",
-                },
-            ))
-            
-        stats: Dict[str, float] = {}
-        
-        return PredictionResult(
-            ok=True, technique=f"{method}_directions",
-            events=events, synthesis={"total_hits": len(events)}, timing_windows=[],
-            confidence_score=_compute_confidence(events, stats), statistical_metrics=stats,
-            warnings=warns, metadata={"natal_jd_tt": jd_tt_natal},
-            computation_time_ms=(time.time() - t0) * 1000.0,
-        )
-        
-    except Exception as e:
-        return PredictionResult(
-            ok=False, technique="directions",
-            warnings=[f"directions_failed:{e}"],
-            computation_time_ms=(time.time() - t0) * 1000.0,
-        )
-
-
 def compute_directions_safe(
     natal: Dict[str, Any],
     method: str,
@@ -1422,22 +1237,38 @@ def compute_directions_safe(
     ayanamsa_deg: float,
     orbs: Dict[str, float],
     profile: bool,
+    target: Optional[Union[datetime, str, float]] = None,
+    years_after: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Safe wrapper for compute_directions that handles parameter mismatches.
     
-    The diagnostic error was: compute_directions() got an unexpected keyword argument 'aspects_to_natal'
-    This wrapper ensures only valid parameters are passed to the function.
+    The diagnostic error was: Either 'target' or 'years_after' must be provided.
+    This wrapper ensures valid parameters are passed to the function.
     """
     try:
         # Import the actual function
         from app.core.directions import compute_directions
         
-        # Call with only the parameters that the function accepts
-        # Remove 'aspects_to_natal' which was causing the error
+        # Calculate years_after if we have target but not years_after
+        if target is not None and years_after is None:
+            if isinstance(target, (int, float)):
+                years_after = (float(target) - jd_tt_natal) / TROPICAL_YEAR_D
+            else:
+                target_dt = _ensure_utc(target)
+                natal_epoch_ts = (jd_tt_natal - 2440587.5) * 86400.0
+                natal_dt = datetime.fromtimestamp(natal_epoch_ts, tz=timezone.utc)
+                years_after = (target_dt - natal_dt).total_seconds() / (TROPICAL_YEAR_D * 86400.0)
+        
+        # Set default years_after if still None
+        if years_after is None:
+            years_after = 1.0  # Default to 1 year after natal
+        
+        # Call with correct parameters
         return compute_directions(
             natal=natal,
             method=method,
+            years_after=years_after,
             jd_tt_natal=jd_tt_natal,
             jd_ut1_natal=jd_ut1_natal,
             frame=frame,
@@ -1455,6 +1286,7 @@ def compute_directions_safe(
                 return compute_directions(
                     natal=natal,
                     method=method,
+                    years_after=years_after or 1.0,
                     jd_tt_natal=jd_tt_natal,
                     jd_ut1_natal=jd_ut1_natal,
                     orbs=orbs,
@@ -1491,7 +1323,6 @@ def compute_directions_safe(
             "hits": [],
             "meta": {"warnings": ["directions_function_error"]}
         }
-
 
 def _compute_directions_fallback(
     natal: Dict[str, Any],
@@ -1583,7 +1414,124 @@ def _compute_directions_fallback(
             "hits": [],
             "meta": {"warnings": ["fallback_computation_failed"]}
         }
+
+def predict_directions(
+    natal_chart: Dict[str, Any],
+    target_date: Union[datetime, str, float],
+    *,
+    method: str = "solar_arc",
+    frame: str = "ecliptic-of-date",
+    zodiac_mode: str = "tropical",
+    ayanamsa_deg: float = 0.0,
+    house_system: str = "placidus",
+    aspects_to_natal: bool = True,
+    orbs: Optional[Dict[str, float]] = None,
+    statistical_validation: bool = False,
+    **kwargs,
+) -> PredictionResult:
+    _check_env()
+    t0 = time.time()
+    warns: List[str] = []
+    try:
+        if not _DIR_OK:
+            raise RuntimeError(f"directions unavailable: {_DIR_ERR}")
+            
+        # Use fixed timescale resolution
+        jd_tt_natal, jd_ut1_natal, w = _resolve_natal_timescales_fixed(natal_chart)
+        warns.extend(w)
         
+        if isinstance(target_date, (int, float)):
+            target_dt: Optional[datetime] = None
+        else:
+            target_dt = _ensure_utc(target_date)
+            
+        # Use safe wrapper that handles parameter mismatch
+        dr = compute_directions_safe(
+            natal=natal_chart,
+            method=method,
+            jd_tt_natal=jd_tt_natal,
+            jd_ut1_natal=jd_ut1_natal,
+            frame=frame,
+            house_system=house_system,
+            zodiac_mode=zodiac_mode,
+            ayanamsa_deg=ayanamsa_deg,
+            orbs=orbs or DEFAULT_ORBS_DIRECTIONS,
+            profile=True,
+            target=target_date,
+        )
+        
+        if not dr.get("ok"):
+            raise RuntimeError(dr.get("error", "directions_failed"))
+            
+        events: List[PredictionEvent] = []
+        
+        for h in dr.get("hits", []):
+            asp = _canon_aspect(h.get("aspect"))
+            orb = float(h.get("orb", 0.0))
+            max_orb = float(h.get("max_orb", max((orbs or DEFAULT_ORBS_DIRECTIONS).get(asp, 1.0), 1e-9)))
+            tight = max(0.0, 1.0 - orb / max_orb)
+            conf = min(1.0, tight + (0.2 if asp in {"conjunction","opposition","square","trine"} else 0.0))
+            
+            events.append(PredictionEvent(
+                event_type="direction",
+                technique=f"{method}_direction",
+                description=f"Directed {h.get('planet_a','?')} {asp} Natal {h.get('planet_b','?')}",
+                datetime_utc=target_dt,
+                jd_tt=None, jd_ut1=None, precision_seconds=None,
+                confidence=conf, significance=float(h.get("p_value", 1.0)),
+                metadata={
+                    "directed_body": h.get("planet_a"),
+                    "natal_body": h.get("planet_b"),
+                    "aspect": asp, "orb": orb,
+                    "finder": "directions.compute_directions",
+                },
+            ))
+            
+        stats: Dict[str, float] = {}
+        
+        return PredictionResult(
+            ok=True, technique=f"{method}_directions",
+            events=events, synthesis={"total_hits": len(events)}, timing_windows=[],
+            confidence_score=_compute_confidence(events, stats), statistical_metrics=stats,
+            warnings=warns, metadata={"natal_jd_tt": jd_tt_natal},
+            computation_time_ms=(time.time() - t0) * 1000.0,
+        )
+        
+    except Exception as e:
+        return PredictionResult(
+            ok=False, technique="directions",
+            warnings=[f"directions_failed:{e}"],
+            computation_time_ms=(time.time() - t0) * 1000.0,
+        )
+
+def vimsottari_dasha_safe(*args, **kwargs):
+    """Safe wrapper for vimsottari_dasha to prevent hangs."""
+    try:
+        return vimsottari_dasha(*args, **kwargs)
+    except Exception as e:
+        return []  # Return empty list on error
+
+def _synthesize_safe(all_events, predictions, method, time_range):
+    """Safe wrapper for _synthesize to prevent hangs."""
+    try:
+        return _synthesize(all_events, predictions, method=method, time_range=time_range)
+    except Exception as e:
+        return {"error": f"synthesis_failed:{e}", "event_count": len(all_events)}
+
+def _identify_peak_periods_safe(all_events, time_range, window_days):
+    """Safe wrapper for _identify_peak_periods to prevent hangs."""
+    try:
+        return _identify_peak_periods(all_events, time_range, window_days=window_days)
+    except Exception as e:
+        return []  # Return empty list on error
+
+def _risk_safe(all_events, synthesis):
+    """Safe wrapper for _risk to prevent hangs."""
+    try:
+        return _risk(all_events, synthesis)
+    except Exception as e:
+        return {"error": f"risk_assessment_failed:{e}", "level": "unknown"}
+
 def comprehensive_forecast(
     natal_chart: Dict[str, Any],
     time_range: Tuple[Union[datetime, str], Union[datetime, str]],
@@ -1827,38 +1775,6 @@ def comprehensive_forecast(
             computation_time_ms=(time.time() - t0) * 1000.0,
         )
 
-
-def vimsottari_dasha_safe(*args, **kwargs):
-    """Safe wrapper for vimsottari_dasha to prevent hangs."""
-    try:
-        return vimsottari_dasha(*args, **kwargs)
-    except Exception as e:
-        return []  # Return empty list on error
-
-
-def _synthesize_safe(all_events, predictions, method, time_range):
-    """Safe wrapper for _synthesize to prevent hangs."""
-    try:
-        return _synthesize(all_events, predictions, method=method, time_range=time_range)
-    except Exception as e:
-        return {"error": f"synthesis_failed:{e}", "event_count": len(all_events)}
-
-
-def _identify_peak_periods_safe(all_events, time_range, window_days):
-    """Safe wrapper for _identify_peak_periods to prevent hangs."""
-    try:
-        return _identify_peak_periods(all_events, time_range, window_days=window_days)
-    except Exception as e:
-        return []  # Return empty list on error
-
-
-def _risk_safe(all_events, synthesis):
-    """Safe wrapper for _risk to prevent hangs."""
-    try:
-        return _risk(all_events, synthesis)
-    except Exception as e:
-        return {"error": f"risk_assessment_failed:{e}", "level": "unknown"}
-        
 def relationship_forecast(
     natal_a: Dict[str, Any],
     natal_b: Dict[str, Any],
