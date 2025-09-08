@@ -13,25 +13,44 @@ from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-# ───────────────────────── Force Module Reload (Fix for Python Caching) ─────────────────────────
+# ───────────────────────── Comprehensive Module Reload (Fix for Python Caching) ─────────────────────────
 import importlib
 
-# Force reload prediction module to clear Python cache
-try:
-    if 'app.core.prediction' in sys.modules:
-        print("Reloading cached prediction module...", file=sys.stderr)
-        importlib.reload(sys.modules['app.core.prediction'])
-        print("Prediction module reloaded successfully", file=sys.stderr)
-    else:
-        print("Prediction module not in cache yet", file=sys.stderr)
-except Exception as e:
-    print(f"Failed to reload prediction module: {e}", file=sys.stderr)
+# Force reload all prediction-related modules to clear Python cache
+modules_to_reload = [
+    'app.core.prediction',
+    'app.api.routes',
+    'app.core.predictive',
+    'app.core.progressions',
+    'app.core.returns',
+    'app.core.directions'
+]
+
+print("Starting comprehensive module reload...", file=sys.stderr)
+reload_results = {}
+
+for module_name in modules_to_reload:
+    try:
+        if module_name in sys.modules:
+            print(f"Reloading cached {module_name} module...", file=sys.stderr)
+            importlib.reload(sys.modules[module_name])
+            reload_results[module_name] = "reloaded"
+            print(f"{module_name} module reloaded successfully", file=sys.stderr)
+        else:
+            reload_results[module_name] = "not_in_cache"
+            print(f"{module_name} module not in cache yet", file=sys.stderr)
+    except Exception as e:
+        reload_results[module_name] = f"error: {e}"
+        print(f"Failed to reload {module_name}: {e}", file=sys.stderr)
+
+print(f"Module reload complete. Results: {reload_results}", file=sys.stderr)
 
 # ───────────────────────── import API blueprint ─────────────────────────
 _routes_import_err: str | None = None
 try:
     from app.api import routes as _routes_mod  # type: ignore
     _routes_bp = _routes_mod.api
+    print("Routes blueprint imported successfully", file=sys.stderr)
 except Exception as e:  # pragma: no cover
     _routes_bp = None
     _routes_import_err = repr(e)
@@ -169,14 +188,42 @@ def create_app() -> Flask:
             "routes_blueprint_loaded": _routes_bp is not None,
             "routes_import_error": _routes_import_err,
             "blueprints": list(app.blueprints.keys()),
+            "module_reload_results": reload_results,
         }), 200
 
-    # ───── Debug module reload endpoint ─────
+    # ───── Enhanced module reload endpoints ─────
+    @app.post("/__debug/reload-all")
+    def __debug_reload_all():
+        try:
+            modules_to_reload = [
+                'app.core.prediction',
+                'app.api.routes', 
+                'app.core.predictive',
+                'app.core.progressions',
+                'app.core.returns',
+                'app.core.directions'
+            ]
+            results = {}
+            for module_name in modules_to_reload:
+                try:
+                    if module_name in sys.modules:
+                        importlib.reload(sys.modules[module_name])
+                        results[module_name] = "reloaded"
+                        app.logger.info(f"Reloaded {module_name}")
+                    else:
+                        results[module_name] = "not_in_cache"
+                except Exception as e:
+                    results[module_name] = f"error: {str(e)}"
+                    app.logger.error(f"Failed to reload {module_name}: {e}")
+            
+            return jsonify({"ok": True, "results": results})
+        except Exception as e:
+            app.logger.error(f"Failed to reload modules: {e}")
+            return jsonify({"ok": False, "error": str(e)})
+
     @app.post("/__debug/reload-prediction")
     def __debug_reload_prediction():
         try:
-            import importlib
-            import sys
             if 'app.core.prediction' in sys.modules:
                 importlib.reload(sys.modules['app.core.prediction'])
                 app.logger.info("Prediction module reloaded successfully")
@@ -187,29 +234,87 @@ def create_app() -> Flask:
             app.logger.error(f"Failed to reload prediction module: {e}")
             return jsonify({"ok": False, "error": str(e)})
 
-    # ───── Module status endpoint ─────
+    # ───── Enhanced module status endpoint ─────
     @app.get("/__debug/module-status")
     def __debug_module_status():
         try:
-            prediction_loaded = 'app.core.prediction' in sys.modules
-            if prediction_loaded:
-                import app.core.prediction as pred_mod
-                # Check if the fixed function exists
-                has_fixed_function = hasattr(pred_mod, '_resolve_natal_timescales_fixed')
-                return jsonify({
-                    "ok": True,
-                    "prediction_module_loaded": prediction_loaded,
-                    "has_fixed_function": has_fixed_function,
-                    "module_file": getattr(pred_mod, '__file__', 'unknown'),
-                })
-            else:
-                return jsonify({
-                    "ok": True,
-                    "prediction_module_loaded": False,
-                    "has_fixed_function": False,
-                })
+            status = {}
+            modules_to_check = [
+                'app.core.prediction',
+                'app.api.routes',
+                'app.core.predictive',
+                'app.core.progressions',
+                'app.core.returns',
+                'app.core.directions'
+            ]
+            
+            for module_name in modules_to_check:
+                if module_name in sys.modules:
+                    try:
+                        module = sys.modules[module_name]
+                        status[module_name] = {
+                            "loaded": True,
+                            "file": getattr(module, '__file__', 'unknown'),
+                            "has_fixed_function": hasattr(module, '_resolve_natal_timescales_fixed') if module_name == 'app.core.prediction' else None
+                        }
+                    except Exception as e:
+                        status[module_name] = {"loaded": True, "error": str(e)}
+                else:
+                    status[module_name] = {"loaded": False}
+            
+            # Check if prediction module has the fixed function
+            prediction_status = "unknown"
+            if 'app.core.prediction' in sys.modules:
+                try:
+                    import app.core.prediction as pred_mod
+                    has_fixed = hasattr(pred_mod, '_resolve_natal_timescales_fixed')
+                    prediction_status = "fixed" if has_fixed else "not_fixed"
+                except Exception as e:
+                    prediction_status = f"error: {e}"
+            
+            return jsonify({
+                "ok": True,
+                "modules": status,
+                "prediction_fix_status": prediction_status,
+                "startup_reload_results": reload_results
+            })
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)})
+
+    # ───── Test endpoint to verify fixes ─────
+    @app.post("/__debug/test-prediction-fix")
+    def __debug_test_prediction_fix():
+        try:
+            # Try to import and call the fixed function directly
+            from app.core.prediction import _resolve_natal_timescales_fixed
+            
+            test_chart = {
+                "date": "1990-01-01",
+                "time": "12:00:00", 
+                "place_tz": "UTC"
+            }
+            
+            jd_tt, jd_ut1, warnings = _resolve_natal_timescales_fixed(test_chart)
+            
+            return jsonify({
+                "ok": True,
+                "fixed_function_works": True,
+                "jd_tt": jd_tt,
+                "jd_ut1": jd_ut1,
+                "warnings": warnings
+            })
+        except ImportError as e:
+            return jsonify({
+                "ok": False,
+                "fixed_function_works": False,
+                "error": f"Import error: {str(e)}"
+            })
+        except Exception as e:
+            return jsonify({
+                "ok": False,
+                "fixed_function_works": False,
+                "error": f"Execution error: {str(e)}"
+            })
 
     @app.get("/favicon.ico")
     def _noop_favicon():
@@ -219,13 +324,14 @@ def create_app() -> Flask:
     if _routes_bp is not None:
         # routes.py uses absolute '/api/...' paths; no url_prefix needed
         app.register_blueprint(_routes_bp)
+        app.logger.info("API routes blueprint registered successfully")
     else:
         # Minimal fallback so health dashboards don't look totally red
         @app.get("/api/health")
         def _health_fallback():
             return jsonify(ok=False, error="routes_blueprint_not_loaded", detail=_routes_import_err), 500
 
-    app.logger.info("App initialized; routes_loaded=%s", bool(_routes_bp))
+    app.logger.info("App initialized; routes_loaded=%s; reload_results=%s", bool(_routes_bp), reload_results)
     return app
 
 # ───────────────────────── app instance ─────────────────────────
@@ -247,4 +353,4 @@ CORS(
 )
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000))
