@@ -158,6 +158,42 @@ def parse_frame(val: Any | None) -> Literal["ecliptic-of-date", "ecliptic-j2000"
         raise ValidationError(_err("frame", "frame must be 'ecliptic-of-date' or 'ecliptic-j2000'"))
     return out  # type: ignore
 
+def parse_earth_model(val: Any | None) -> Literal["spherical", "wgs84"]:
+    """Parse earth model with validation."""
+    s = str(val or "spherical").strip().lower()
+    if s not in ("spherical", "wgs84"):
+        raise ValidationError(_err("earth_model", "earth_model must be 'spherical' or 'wgs84'"))
+    return s  # type: ignore
+
+def parse_bodies_list(val: Any) -> List[str]:
+    """Parse and validate list of celestial bodies."""
+    if val is None:
+        # Default major bodies for parans
+        return ["Sun", "Moon", "Mercury", "Venus", "Mars", "Jupiter", "Saturn", "Uranus", "Neptune", "Pluto"]
+    
+    if isinstance(val, str):
+        # Single body as string
+        return [val.strip()]
+    
+    if not isinstance(val, (list, tuple)):
+        raise ValidationError(_err("bodies", "must be array of strings or single string", "type_error.list"))
+    
+    bodies: List[str] = []
+    for i, body in enumerate(val):
+        if not isinstance(body, str):
+            raise ValidationError(_err(["bodies", i], "must be string", "type_error.string"))
+        
+        body_name = body.strip()
+        if not body_name:
+            raise ValidationError(_err(["bodies", i], "body name cannot be empty", "value_error"))
+        
+        bodies.append(body_name)
+    
+    if not bodies:
+        raise ValidationError(_err("bodies", "at least one body is required", "value_error"))
+    
+    return bodies
+
 
 # ───────────────────────── chart / predictions ─────────────────────────
 
@@ -775,6 +811,228 @@ def parse_returns_payload(body: Dict[str, Any]) -> ReturnsPayload:
     return out
 
 
+# ───────────────────────── parans payload (NEW) ─────────────────────────
+
+class SubjectParans(TypedDict, total=False):
+    """Subject data for timescale resolution in parans."""
+    date: str
+    time: str
+    place_tz: str
+
+class PlaceParans(TypedDict, total=False):
+    """Place coordinates for paran calculations."""
+    latitude: float
+    longitude: float
+    elev_m: float
+
+class ParansPayload(TypedDict, total=False):
+    """Complete payload structure for /api/parans endpoint."""
+    subject: SubjectParans
+    place: PlaceParans
+    jd_tt_ref: float
+    jd_ut1_ref: float
+    frame: Literal["ecliptic-of-date", "ecliptic-j2000"]
+    zodiac_mode: ZodiacMode
+    ayanamsa_deg: float
+    bodies: List[str]
+    tolerance_minutes: float
+    search_window_days: float
+    max_iters: int
+    fd_step_minutes: float
+    earth_model: Literal["spherical", "wgs84"]
+    apply_refraction: bool
+    pressure_hPa: float
+    temperature_C: float
+    profile: bool
+    validation: Literal["none", "basic"]
+
+def _parse_parans_subject(subject: Any) -> SubjectParans:
+    """Parse subject data for parans timescale resolution."""
+    if not isinstance(subject, dict):
+        raise ValidationError(_err("subject", "required object", "type_error.dict"))
+    
+    out: SubjectParans = {}
+    
+    # Only validate fields that are present
+    if "date" in subject:
+        date_val = subject["date"]
+        if not isinstance(date_val, str) or not date_val.strip():
+            raise ValidationError(_err(["subject", "date"], "must be non-empty string", "value_error"))
+        out["date"] = parse_date(str(date_val)).strftime("%Y-%m-%d")
+    
+    if "time" in subject:
+        time_val = subject["time"]
+        if not isinstance(time_val, str) or not time_val.strip():
+            raise ValidationError(_err(["subject", "time"], "must be non-empty string", "value_error"))
+        out["time"] = parse_time_str(str(time_val))
+    
+    if "place_tz" in subject:
+        tz_val = subject["place_tz"]
+        if not isinstance(tz_val, str) or not tz_val.strip():
+            raise ValidationError(_err(["subject", "place_tz"], "must be non-empty string", "value_error"))
+        out["place_tz"] = _validate_iana_tz(str(tz_val).strip(), ["subject", "place_tz"])
+    
+    return out
+
+def _parse_parans_place(place: Any) -> PlaceParans:
+    """Parse place coordinates for paran calculations."""
+    if not isinstance(place, dict):
+        raise ValidationError(_err("place", "required object", "type_error.dict"))
+    
+    # Latitude and longitude are required
+    lat = place.get("latitude")
+    lon = place.get("longitude")
+    if lat is None or lon is None:
+        raise ValidationError(_err("place", "latitude and longitude are required", "value_error"))
+    
+    try:
+        la, lo = parse_latlon(lat, lon, "place.latitude", "place.longitude")
+    except ValidationError as e:
+        # Re-raise with proper location context
+        details = e.errors()
+        for detail in details:
+            if detail["loc"] and detail["loc"][0] not in ["place.latitude", "place.longitude"]:
+                detail["loc"] = ["place"] + detail["loc"]
+        raise ValidationError(details)
+    
+    out: PlaceParans = {"latitude": la, "longitude": lo}
+    
+    # Optional elevation
+    if "elev_m" in place:
+        elev = _as_float(place.get("elev_m"))
+        if elev is None:
+            raise ValidationError(_err(["place", "elev_m"], "must be number", "type_error.float"))
+        out["elev_m"] = float(elev)
+    
+    return out
+
+def parse_parans_payload(body: Dict[str, Any]) -> ParansPayload:
+    """
+    Validate and normalize payload for /api/parans endpoint.
+    
+    Handles:
+    - subject: minimal natal-like dict for timescale resolution
+    - place: required latitude/longitude for horizon calculations
+    - optional strict timescales: jd_tt_ref + jd_ut1_ref
+    - bodies: list of celestial bodies (defaults to major planets)
+    - atmospheric/earth model parameters
+    - tolerance and search parameters
+    - frame, zodiac mode, ayanamsa
+    """
+    if not isinstance(body, dict):
+        raise ValidationError("payload must be an object")
+    
+    # Parse subject data
+    subject_raw = body.get("subject")
+    if subject_raw is None:
+        raise ValidationError(_err("subject", "required object", "value_error"))
+    subject = _parse_parans_subject(subject_raw)
+    
+    # Parse place data - required for horizon calculations
+    place_raw = body.get("place")
+    if place_raw is None:
+        raise ValidationError(_err("place", "required object with latitude/longitude", "value_error"))
+    place = _parse_parans_place(place_raw)
+    
+    # Strict timescales (both or neither)
+    jd_tt_ref = _as_float(body.get("jd_tt_ref"))
+    jd_ut1_ref = _as_float(body.get("jd_ut1_ref"))
+    
+    if (jd_tt_ref is None) ^ (jd_ut1_ref is None):
+        raise ValidationError(_err(["jd_tt_ref", "jd_ut1_ref"], "supply both or neither", "value_error"))
+    
+    have_strict_timescales = (jd_tt_ref is not None and jd_ut1_ref is not None)
+    
+    # If no strict timescales, we need subject date/time/place_tz
+    if not have_strict_timescales:
+        missing_fields = []
+        for required_field in ["date", "time", "place_tz"]:
+            if required_field not in subject:
+                missing_fields.append(f"subject.{required_field}")
+        
+        if missing_fields:
+            raise ValidationError(_err(
+                missing_fields,
+                "required when strict timescales not provided",
+                "value_error"
+            ))
+    
+    # Frame and coordinate system parameters
+    frame = parse_frame(body.get("frame"))
+    zodiac_mode = parse_mode(body.get("zodiac_mode") or body.get("mode"))
+    
+    # Ayanamsa
+    aya = _as_float(body.get("ayanamsa_deg", 0.0))
+    if aya is None:
+        raise ValidationError(_err("ayanamsa_deg", "must be a number", "type_error.float"))
+    ayanamsa_deg = float(aya)
+    
+    # Bodies list
+    bodies = parse_bodies_list(body.get("bodies"))
+    
+    # Tolerance and search parameters
+    tolerance_min = _as_float(body.get("tolerance_minutes", 4.0))
+    if tolerance_min is None or tolerance_min <= 0:
+        raise ValidationError(_err("tolerance_minutes", "must be > 0", "value_error"))
+    
+    window_days = _as_float(body.get("search_window_days", 1.0))
+    if window_days is None or window_days <= 0:
+        raise ValidationError(_err("search_window_days", "must be > 0", "value_error"))
+    
+    # Iteration parameters
+    max_iters = _as_int(body.get("max_iters", 10))
+    if max_iters is None or max_iters < 1:
+        raise ValidationError(_err("max_iters", "must be >= 1", "value_error"))
+    
+    fd_step_min = _as_float(body.get("fd_step_minutes", 2.0))
+    if fd_step_min is None or fd_step_min <= 0:
+        raise ValidationError(_err("fd_step_minutes", "must be > 0", "value_error"))
+    
+    # Earth model and atmospheric parameters
+    earth_model = parse_earth_model(body.get("earth_model"))
+    
+    apply_refraction = bool(_truthy(body.get("apply_refraction")) or False)
+    
+    pressure = _as_float(body.get("pressure_hPa", 1010.0))
+    if pressure is None or pressure <= 0:
+        raise ValidationError(_err("pressure_hPa", "must be > 0", "value_error"))
+    
+    temperature = _as_float(body.get("temperature_C", 10.0))
+    if temperature is None:
+        raise ValidationError(_err("temperature_C", "must be a number", "type_error.float"))
+    
+    # Diagnostic flags
+    profile = bool(_truthy(body.get("profile")) or False)
+    
+    validation = str(body.get("validation") or "basic").strip().lower()
+    if validation not in ("none", "basic"):
+        raise ValidationError(_err("validation", "must be 'none' or 'basic'", "value_error"))
+    
+    # Build output payload
+    out: ParansPayload = {
+        "subject": subject,
+        "place": place,
+        "jd_tt_ref": float(jd_tt_ref) if jd_tt_ref is not None else None,  # type: ignore
+        "jd_ut1_ref": float(jd_ut1_ref) if jd_ut1_ref is not None else None,  # type: ignore
+        "frame": frame,
+        "zodiac_mode": zodiac_mode,
+        "ayanamsa_deg": ayanamsa_deg,
+        "bodies": bodies,
+        "tolerance_minutes": float(tolerance_min),
+        "search_window_days": float(window_days),
+        "max_iters": int(max_iters),
+        "fd_step_minutes": float(fd_step_min),
+        "earth_model": earth_model,
+        "apply_refraction": apply_refraction,
+        "pressure_hPa": float(pressure),
+        "temperature_C": float(temperature),
+        "profile": profile,
+        "validation": validation,
+    }
+    
+    return out
+
+
 # ───────────────────────── timescale resolver (for predictive.py) ─────────────
 def resolve_timescales_from_civil_erfa(
     d: date,
@@ -852,5 +1110,6 @@ __all__ = [
     "parse_frame",
     "parse_progressions_payload",    # NEW
     "parse_returns_payload",         # NEW
+    "parse_parans_payload",          # NEW - Added for paran integration
     "resolve_timescales_from_civil_erfa",
 ]
