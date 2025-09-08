@@ -1,10 +1,12 @@
 # app/core/directions.py
 # -*- coding: utf-8 -*-
 """
-Directions (v11)
+Directions (v12)
 - Solar-Arc directions (Naibod & True-Sun), direct & converse.
 - Hits to natal planets/angles/cusps with configurable orbs.
 - Strict timescales; topocentric optional for snapshots; JSON-only outputs.
+- Fixed time format validation to accept both HH:MM and HH:MM:SS formats.
+- Enhanced TimeScales object compatibility.
 
 Public API
 ----------
@@ -13,7 +15,7 @@ compute_directions(
     *,
     method: str = "solar_arc",        # "solar_arc"
     rate: str = "naibod",             # "naibod" | "true_sun"
-    target: dict | None = None,       # {"date","time","place_tz"} → “as-of” epoch
+    target: dict | None = None,       # {"date","time","place_tz"} → "as-of" epoch
     years_after: float | None = None, # or explicit age in years
     jd_tt_natal: float | None = None,
     jd_ut1_natal: float | None = None,
@@ -53,6 +55,7 @@ from typing import Any, Dict, List, Optional, Iterable, Tuple
 from time import perf_counter
 import math
 import inspect
+import re
 
 # ── resilient imports ─────────────────────────────────────────────────────────
 try:
@@ -117,7 +120,25 @@ def _warn(ws: List[str], msg: str) -> None:
     if msg not in ws:
         ws.append(msg)
 
-# ── helpers shared with other core files (inlined here) ───────────────────────
+def _normalize_time_format(time_str: str) -> str:
+    """
+    Normalize time string to HH:MM:SS format.
+    Accepts both HH:MM and HH:MM:SS formats for consistency with other modules.
+    """
+    time_str = str(time_str).strip()
+    
+    # Match HH:MM:SS format (already correct)
+    if re.match(r'^\d{1,2}:\d{2}:\d{2}(?:\.\d+)?$', time_str):
+        return time_str
+    
+    # Match HH:MM format (needs seconds)
+    if re.match(r'^\d{1,2}:\d{2}$', time_str):
+        return f"{time_str}:00"
+    
+    # Invalid format
+    raise ValueError(f"Invalid time_str '{time_str}': expected HH:MM or HH:MM:SS[.frac]")
+
+# ── helpers shared with other core files (enhanced) ──────────────────────────
 def _resolve_ts_from_natal(natal: Dict[str, Any], jd_tt: Optional[float], jd_ut1: Optional[float], warnings: List[str]) -> Tuple[float,float,Dict[str,Any]]:
     if jd_tt is not None and jd_ut1 is not None:
         return float(jd_tt), float(jd_ut1), {"jd_tt": float(jd_tt), "jd_ut1": float(jd_ut1), "delta_t": None, "dut1": None}
@@ -126,13 +147,47 @@ def _resolve_ts_from_natal(natal: Dict[str, Any], jd_tt: Optional[float], jd_ut1
     date, time, tz = natal.get("date"), natal.get("time"), natal.get("place_tz")
     if not (date and time and tz):
         raise ValueError("Missing date/time/place_tz in natal for timescale resolution.")
-    ts = build_timescales(date_str=str(date), time_str=str(time), tz_name=str(tz), dut1_seconds=0.0)
+    
+    # Normalize time format to handle both HH:MM and HH:MM:SS
+    try:
+        normalized_time = _normalize_time_format(str(time))
+    except ValueError as e:
+        raise ValueError(str(e))  # Re-raise with same message for consistency
+    
+    ts = build_timescales(date_str=str(date), time_str=normalized_time, tz_name=str(tz), dut1_seconds=0.0)
     _warn(warnings, "strict_missing→computed_timescales_with_dut1=0.0s")
-    return float(ts["jd_tt"]), float(ts["jd_ut1"]), {
-        "jd_tt": float(ts["jd_tt"]),
-        "jd_ut1": float(ts["jd_ut1"]),
-        "delta_t": float(ts.get("delta_t", 0.0)),
-        "dut1": float(ts.get("dut1", 0.0)),
+    
+    # Handle both dict and object return types from build_timescales
+    if hasattr(ts, 'jd_tt') and hasattr(ts, 'jd_ut1'):
+        # Object with attributes
+        jd_tt = float(ts.jd_tt)
+        jd_ut1 = float(ts.jd_ut1)
+        delta_t = float(getattr(ts, 'delta_t', 0.0))
+        dut1 = float(getattr(ts, 'dut1', 0.0))
+    elif isinstance(ts, dict):
+        # Dictionary
+        jd_tt = float(ts["jd_tt"])
+        jd_ut1 = float(ts["jd_ut1"])
+        delta_t = float(ts.get("delta_t", 0.0))
+        dut1 = float(ts.get("dut1", 0.0))
+    else:
+        # Try both approaches for safety
+        try:
+            jd_tt = float(ts.jd_tt)
+            jd_ut1 = float(ts.jd_ut1)
+            delta_t = float(getattr(ts, 'delta_t', 0.0))
+            dut1 = float(getattr(ts, 'dut1', 0.0))
+        except AttributeError:
+            jd_tt = float(ts["jd_tt"])
+            jd_ut1 = float(ts["jd_ut1"])
+            delta_t = float(ts.get("delta_t", 0.0))
+            dut1 = float(ts.get("dut1", 0.0))
+    
+    return jd_tt, jd_ut1, {
+        "jd_tt": jd_tt,
+        "jd_ut1": jd_ut1,
+        "delta_t": delta_t,
+        "dut1": dut1,
     }
 
 def _resolve_years_since_birth(natal: Dict[str, Any], jd_ut1_natal: float, years_after: Optional[float], target: Optional[Dict[str, Any]], warnings: List[str]) -> Tuple[float, Optional[Dict[str, Any]]]:
@@ -142,10 +197,28 @@ def _resolve_years_since_birth(natal: Dict[str, Any], jd_ut1_natal: float, years
         date, time, tz = target.get("date"), target.get("time"), target.get("place_tz")
         if not (date and time and tz):
             raise ValueError("Target requires date/time/place_tz.")
-        ts = build_timescales(date_str=str(date), time_str=str(time), tz_name=str(tz), dut1_seconds=0.0)
-        jd_ut1_target = float(ts["jd_ut1"])
+        
+        # Normalize time format for target as well
+        try:
+            normalized_time = _normalize_time_format(str(time))
+        except ValueError as e:
+            raise ValueError(f"Target time format error: {e}")
+        
+        ts = build_timescales(date_str=str(date), time_str=normalized_time, tz_name=str(tz), dut1_seconds=0.0)
+        
+        # Handle both object and dict return types
+        if hasattr(ts, 'jd_ut1'):
+            jd_ut1_target = float(ts.jd_ut1)
+            jd_tt_target = float(ts.jd_tt)
+            delta_t = float(getattr(ts, 'delta_t', 0.0))
+        else:
+            jd_ut1_target = float(ts["jd_ut1"])
+            jd_tt_target = float(ts["jd_tt"])
+            delta_t = float(ts.get("delta_t", 0.0))
+        
         yrs = (jd_ut1_target - jd_ut1_natal) / TROPICAL_YEAR_D
-        return float(yrs), {"jd_tt": float(ts["jd_tt"]), "jd_ut1": jd_ut1_target, "delta_t": float(ts.get("delta_t", 0.0))}
+        return float(yrs), {"jd_tt": jd_tt_target, "jd_ut1": jd_ut1_target, "delta_t": delta_t}
+    
     if years_after is None:
         raise ValueError("Either 'target' or 'years_after' must be provided.")
     return float(years_after), None
@@ -332,13 +405,21 @@ def compute_directions(
     Compute Solar-Arc directions (direct/converse) and detect hits to natal targets.
     """
     if method.lower() != "solar_arc":
-        raise ValueError("Only 'solar_arc' is implemented in v11 core. (Primary directions planned as Phase-2.)")
+        raise ValueError("Only 'solar_arc' is implemented in v12 core. (Primary directions planned as Phase-2.)")
 
     t0 = perf_counter()
     prof: Dict[str, float] = {}
     warnings: List[str] = []
     _orbs = {**DEFAULT_ORBS, **(orbs or {})}
     arcs = arcs.lower()
+
+    # Validate arcs parameter
+    if arcs not in ("direct", "converse", "both"):
+        raise ValueError("arcs must be 'direct', 'converse', or 'both'")
+
+    # Validate rate parameter
+    if rate.lower() not in ("naibod", "true_sun"):
+        raise ValueError("rate must be 'naibod' or 'true_sun'")
 
     # Timescales (strict preferred)
     ts0 = perf_counter()
@@ -413,15 +494,28 @@ def compute_directions(
         try:
             # Sun should direct by ~yrs degrees (within generous 2° vs selected rate)
             idx = _rows_index(natal_rows)
-            sun_nat = float(idx["Sun"]["lon"])
-            if rows_direct:
-                sun_dir = float([r for r in rows_direct if r["name"]=="Sun"][0]["lon"])
-                sep = _abs_sep(sun_nat, sun_dir)
-                exp = arc_dir
-                checks.append({"name":"sun_arc_sanity","sep_deg": float(sep), "exp_arc_deg": float(exp), "pass": abs(sep-exp) <= 2.0})
-                ok = ok and (abs(sep-exp) <= 2.0)
+            if "Sun" not in idx:
+                checks.append({"name":"sun_arc_sanity","error": "Sun not found in natal positions", "pass": False})
+                ok = False
+            else:
+                sun_nat = float(idx["Sun"]["lon"])
+                if rows_direct:
+                    sun_dir_rows = [r for r in rows_direct if r["name"]=="Sun"]
+                    if sun_dir_rows:
+                        sun_dir = float(sun_dir_rows[0]["lon"])
+                        sep = _abs_sep(sun_nat, sun_dir)
+                        exp = arc_dir % 360.0  # Handle wrapping
+                        tolerance = 2.0
+                        passed = abs(sep - exp) <= tolerance
+                        checks.append({"name":"sun_arc_sanity","sep_deg": float(sep), "exp_arc_deg": float(exp), "tolerance": tolerance, "pass": passed})
+                        ok = ok and passed
+                    else:
+                        checks.append({"name":"sun_arc_sanity","error": "Sun not found in directed positions", "pass": False})
+                        ok = False
+                else:
+                    checks.append({"name":"sun_arc_sanity","note": "Direct arc not computed", "pass": True})
         except Exception as e:
-            checks.append({"name":"sun_arc_sanity","error": type(e).__name__, "pass": False})
+            checks.append({"name":"sun_arc_sanity","error": f"{type(e).__name__}: {str(e)}", "pass": False})
             ok = False
         validation_info = {"level": validation.lower(), "pass": bool(ok), "checks": checks}
 
@@ -434,10 +528,19 @@ def compute_directions(
         "target_timescales": target_ts,
         "method": "solar_arc",
         "rate": rate.lower(),
+        "arcs": arcs,
+        "include_hits_to": list(include_hits_to),
+        "orbs_used": dict(_orbs),
         "warnings": warnings,
     }
+    
     if profile:
         meta["profile"] = prof
+        prof["total_ms"] = (perf_counter() - t0) * 1000.0
+    
+    if validation_info:
+        meta["validation"] = validation_info
+    
     meta.setdefault("notes", []).append("Primary (semi-arc) directions are planned as Phase-2; this module currently implements Solar-Arc (Naibod & True-Sun).")
 
     return {
