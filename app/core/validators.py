@@ -306,7 +306,7 @@ def parse_rectification_payload(body: Dict[str, Any]) -> Dict[str, Any]:
 
 class EphemerisPayload(TypedDict, total=False):
     jd_tt: float
-    frame: Literal["ecliptic-of-date", "eclipctic-j2000"]  # keep original spelling in type to match parse_frame map
+    frame: Literal["ecliptic-of-date", "ecliptic-j2000"]
     bodies: List[str]
     names: List[str]
 
@@ -1667,7 +1667,7 @@ def _parse_directions_natal(natal_raw: Any) -> Dict[str, Any]:
                 if coord_field == "latitude" and not (-90.0 <= coord_val <= 90.0):
                     raise ValidationError(_err(f"natal.{coord_field}", "must be between -90 and 90 degrees", "value_error"))
                 elif coord_field == "longitude" and not (-180.0 <= coord_val <= 180.0):
-                    raise ValidationError(_err(f"natal.{coord_field}", "must be between -180 and 180 degrees", "value_error"))
+                    raise ValidationError(_err(f"natal.{coord_field}", "must be between -180.0 and 180.0 degrees", "value_error"))
                 natal[coord_field] = coord_val
 
     # Optional mode
@@ -1913,11 +1913,17 @@ def parse_prediction_payload_v2(body: Dict[str, Any]) -> Dict[str, Any]:
 
 # ───────────────────────── timescale resolver (for predictive.py) ─────────────
 
+class TimescalesOut(TypedDict):
+    jd_tt: float
+    jd_ut1: float
+    jd_utc: float
+    tz: str
+
 def resolve_timescales_from_civil_erfa(
     d: date,
     time_hh_mm_ss: str,
     place_tz: str,
-) -> Dict[str, float]:
+) -> TimescalesOut:
     """
     Convert a local civil (date, time, tz) into time scales used by the ephemeris.
     Returns: {"jd_tt", "jd_ut1", "jd_utc", "tz"}.
@@ -1964,6 +1970,7 @@ def resolve_timescales_from_civil_erfa(
         raise RuntimeError(f"Skyfield not installed: {e}") from e
 
     ts = load.timescale()
+    # Skyfield can take the aware UTC datetime directly, or components
     t = ts.utc(
         dt_utc.year, dt_utc.month, dt_utc.day,
         dt_utc.hour, dt_utc.minute, dt_utc.second + dt_utc.microsecond / 1e6
@@ -2030,5 +2037,6 @@ __all__ = [
     "parse_prediction_payload_v2",
 
     # utility
+    "TimescalesOut",
     "resolve_timescales_from_civil_erfa",
 ]
