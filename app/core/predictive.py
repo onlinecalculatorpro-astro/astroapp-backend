@@ -148,7 +148,7 @@ def _zodiacal_separation(a: float, b: float, target: float) -> float:
     return wrap180(angdiff(a, b) - target)
 
 # =============================================================================
-# TRANSITS (with caching & reduced ephemeris calls)
+# TRANSITS (optimized + bounded lon cache; optional prebatch)
 # =============================================================================
 
 @dataclass
@@ -165,19 +165,18 @@ class TransitEvent:
 
 class TransitEngine:
     """
-    Faster transit finder:
+    Optimized transit finder:
     - Batch ephemeris calls per boundary (t0, t1)
     - Carry forward lons(t1) → next step
-    - In-scan cache for lon(body, t) during refinement
     - Two-phase search: coarse bracket → refine (Brent–Dekker)
     - Guard band around orbs scaled by step & approx speed
     - De-duplicate near-identical roots at 1-second buckets
-
-    + Critical fixes:
-      (1) Pre-batch likely refinement times to avoid per-point adapter calls
-      (2) Early filtering using max-change-per-step bounds
-      (3) Bounded cache to cap memory & lookup overhead
+    - Bounded, lightweight lon cache to prevent memory growth
+    - Optional prebatch for refinement (off by default)
     """
+
+    # cache bound (empirically safe; tweakable)
+    _LON_CACHE_MAX = 2000
 
     # ---------- small helpers ----------
     @staticmethod
@@ -192,12 +191,13 @@ class TransitEngine:
         return 0.1
 
     @staticmethod
-    def _prune_lon_cache(lon_cache: Dict[Tuple[str, float], float], *, max_size: int = 2000) -> None:
+    def _prune_lon_cache(lon_cache: Dict[Tuple[str, float], float], *, max_size: int) -> None:
+        """Drop oldest ~25% by time key to cap memory usage."""
         if len(lon_cache) <= max_size:
             return
-        # Drop the oldest 25% by time key (second element)
         keep = max_size - max(1, max_size // 4)
-        for k in sorted(lon_cache.keys(), key=lambda kk: kk[1])[0:len(lon_cache)-keep]:
+        # sort by time component (2nd tuple element), oldest first
+        for k in sorted(lon_cache.keys(), key=lambda kk: kk[1])[: len(lon_cache) - keep]:
             lon_cache.pop(k, None)
 
     def __init__(
@@ -209,6 +209,8 @@ class TransitEngine:
         latitude: Optional[float] = None,
         longitude: Optional[float] = None,
         elevation_m: Optional[float] = None,
+        prebatch_refinement: bool = False,   # new: opt-in
+        lon_cache_max: Optional[int] = None, # new: override bound if desired
     ):
         self.ephem = ephem or EphemerisAdapter(EphemConfig(frame=frame))
         self.frame = frame
@@ -218,6 +220,8 @@ class TransitEngine:
             longitude=longitude,
             elevation_m=elevation_m,
         )
+        self.prebatch_refinement = bool(prebatch_refinement)
+        self._lon_cache_max = int(lon_cache_max) if isinstance(lon_cache_max, int) and lon_cache_max > 256 else self._LON_CACHE_MAX
         # threaded by caller
         self.sidereal_mode: bool = False
         self.ayanamsa_deg: float = 0.0
@@ -233,7 +237,7 @@ class TransitEngine:
             return {row["name"]: norm360(float(row["longitude"]) - ay) for row in res}
         return {row["name"]: float(row["longitude"]) for row in res}
 
-    # central cache-aware accessor
+    # cache-aware accessor for refinement
     def _lon_cached(self, name: str, t: float, lon_cache: Dict[Tuple[str, float], float]) -> float:
         key = (name, float(t))
         if key in lon_cache:
@@ -242,10 +246,11 @@ class TransitEngine:
         if name not in got:
             raise RuntimeError(f"no ephemeris for {name}@{t}")
         lon_cache[key] = float(got[name])
-        self._prune_lon_cache(lon_cache)
+        # bound the cache
+        self._prune_lon_cache(lon_cache, max_size=self._lon_cache_max)
         return lon_cache[key]
 
-    # batched preload for refinement windows
+    # optional preload for refinement windows
     def _preload_lons(self, body: str, times: Iterable[float], lon_cache: Dict[Tuple[str, float], float]) -> None:
         for t in times:
             key = (body, float(t))
@@ -254,9 +259,9 @@ class TransitEngine:
             got = self._lon_map(float(t), [body])
             if body in got:
                 lon_cache[key] = float(got[body])
-        self._prune_lon_cache(lon_cache)
+        self._prune_lon_cache(lon_cache, max_size=self._lon_cache_max)
 
-    # ---------- Brent–Dekker refinement with provided fa/fb ----------
+    # ---------- Brent–Dekker refinement ----------
     @staticmethod
     def _refine_zero_brent(f, a, b, fa, fb, *, max_iter=32, tol_days=1e-6) -> float:
         PROF["refinements"] += 1
@@ -312,29 +317,6 @@ class TransitEngine:
             if abs(fa) < abs(fb):
                 a, b = b, a; fa, fb = fb, fa
         return b
-
-    # refinement that pre-batches likely query times
-    def _refine_with_prebatch(
-        self,
-        *,
-        body: str,
-        f: Callable[[float], float],
-        a: float,
-        b: float,
-        fa: float,
-        fb: float,
-        lon_cache: Dict[Tuple[str, float], float],
-    ) -> float:
-        # Preload a small stencil of likely evaluation points for Brent:
-        # mid, terciles, and midpoints-of-terciles. This dramatically reduces
-        # on-demand ephemeris fetches during the root search.
-        mid = 0.5 * (a + b)
-        t13 = a + (b - a) / 3.0
-        t23 = a + 2.0 * (b - a) / 3.0
-        t38 = a + (b - a) * 3.0 / 8.0
-        t58 = a + (b - a) * 5.0 / 8.0
-        self._preload_lons(body, (a, b, mid, t13, t23, t38, t58), lon_cache)
-        return self._refine_zero_brent(f, a, b, fa, fb, tol_days=1e-6)
 
     # ---------- scans ----------
     def scan_aspects(
@@ -399,14 +381,14 @@ class TransitEngine:
         l0 = self._lon_map(t0, movers)
         for m, v in l0.items():
             lon_cache[(m, t0)] = float(v)
-        self._prune_lon_cache(lon_cache)
+        self._prune_lon_cache(lon_cache, max_size=self._lon_cache_max)
 
         while t0 < jd_end_tt - 1e-12:
             t1 = float(min(t0 + dt, jd_end_tt))
             l1 = self._lon_map(t1, movers)
             for m, v in l1.items():
                 lon_cache[(m, t1)] = float(v)
-            self._prune_lon_cache(lon_cache)
+            self._prune_lon_cache(lon_cache, max_size=self._lon_cache_max)
 
             for body in movers:
                 lon0 = l0.get(body); lon1 = l1.get(body)
@@ -444,15 +426,21 @@ class TransitEngine:
                         if not (sign_change or near):
                             continue
 
-                        # NEW: tighter early filter using hard bound for this step
+                        # tighter early filter using hard bound for this step
                         if min(abs(s0), abs(s1)) > (spec.orb_deg + max_change_possible):
                             continue
 
-                        # refine root using Brent with known endpoints
+                        # Brent refinement (optionally prebatch a small stencil)
                         f = make_sep(body, tgt_name, tgt_lon, spec)
-                        t_exact = self._refine_with_prebatch(
-                            body=body, f=f, a=t0, b=t1, fa=s0, fb=s1, lon_cache=lon_cache
-                        )
+                        if self.prebatch_refinement:
+                            mid = 0.5 * (t0 + t1)
+                            t13 = t0 + (t1 - t0) / 3.0
+                            t23 = t0 + 2.0 * (t1 - t0) / 3.0
+                            t38 = t0 + (t1 - t0) * 3.0 / 8.0
+                            t58 = t0 + (t1 - t0) * 5.0 / 8.0
+                            self._preload_lons(body, (t0, t1, mid, t13, t23, t38, t58), lon_cache)
+
+                        t_exact = self._refine_zero_brent(f, t0, t1, s0, s1, tol_days=1e-6)
 
                         # separation at exact
                         lon_now = _lon_cached(body, t_exact)
@@ -593,7 +581,6 @@ def find_transits_in_range(
     # natal target longitudes at start (apply sidereal if needed)
     nat_rows = ep.ecliptic_longitudes(float(start_jd_tt), tgts).get("results", [])
     PROF["ephem_calls"] += 1
-    # fast map to avoid rows_to_maps overhead
     nat_map = {row["name"]: float(row["longitude"]) for row in nat_rows} if nat_rows else {}
     targets: dict[str, float] = {}
     if eng.sidereal_mode:
@@ -1135,6 +1122,12 @@ def evaluate_univariate(
         effects.append(r_obs); pvals.append(p); ns.append(len(x))
 
     qvals, flags = bh_fdr(pvals, alpha=alpha) if names else ([], [])
+    for name, n, r, p, q, ok in zip(names, ns, effects, pvals, flags if names else [], [False]*len(names) if not names else []):
+        # If names is empty, loop doesn't run; above guard is just for type checkers.
+        pass
+
+    # Build results with correct tuples
+    qvals, flags = (bh_fdr(pvals, alpha=alpha) if names else ([], []))
     for name, n, r, p, q, ok in zip(names, ns, effects, pvals, qvals, flags):
         results.append(EvalResult(feature=name, n=n, effect_r=r, p_perm=p, q_fdr=q, accepted=ok))
     results.sort(key=lambda e: (e.q_fdr, e.p_perm, -abs(e.effect_r), e.feature))
@@ -1214,7 +1207,7 @@ def validate_predictions(
     fdr_correction: bool = True,
     **kwargs
 ) -> Dict[str, Any]:
-    # Minimal, safe default: returns neutral metrics (won’t block predictions)
+    # Minimal, safe default: returns neutral metrics (won't block predictions)
     return {"ok": True, "metrics": {"p_value": 1.0}, "warnings": []}
 
 # =============================================================================
