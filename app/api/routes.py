@@ -2563,8 +2563,10 @@ def predictive_evaluate():
       records: [{ jd_tt, outcome(0/1), natal_longitudes:{}, natal_cusps:[], birth_jd_tt, ayanamsa_deg }]
       feature:
         - "transit_proximity"   (+ movers[], orb_deg?)
+        - "dasha_lords_onehot"  (+ level?)
         - "dasha_l1"|"dasha_l2"|"dasha_l3"
         - "yoga_flags"          (+ names[])
+        - "angular_houses"
       perm_mode: "iid"|"within"|"circular"
       group_by: "subject_id" (optional)
       n_perm: 2000 (default)
@@ -2573,33 +2575,50 @@ def predictive_evaluate():
         body = request.get_json(force=True) or {}
         recs = body.get("records") or []
         if not (isinstance(recs, list) and recs):
-            return _json_error("validation_error", [{"loc":["records"],"msg":"non-empty list required"}], 400)
+            return json_error("validation_error", [{"loc":["records"],"msg":"non-empty list required"}], 400)
+        
         feature = (body.get("feature") or "transit_proximity").lower()
         perm_mode = (body.get("perm_mode") or "iid").lower()
         group_by = body.get("group_by")
         alpha = float(body.get("alpha", 0.05))
         n_perm = int(body.get("n_perm", 2000))
+        
         from app.core import predictive as pred
+        
+        # Feature parsing with proper handling
         if feature == "transit_proximity":
             movers = body.get("movers") or ["Sun","Moon","Mercury","Venus","Mars"]
             orb_deg = float(body.get("orb_deg", 1.0))
             ff = pred.feature_transit_proximity(movers=movers, orb_deg=orb_deg)
-        elif feature.startswith("dasha_l"):
-            level = int(feature.split("_l")[1])
+        
+        elif feature == "dasha_lords_onehot":
+            level = int(body.get("level", 1))  # Default to level 1
             ff = pred.feature_dasha_lords_onehot(level=level)
+        
+        elif feature.startswith("dasha_l") and len(feature) == 8 and feature[7].isdigit():
+            # Only match exact pattern "dasha_l1", "dasha_l2", etc.
+            level = int(feature[7])
+            ff = pred.feature_dasha_lords_onehot(level=level)
+        
         elif feature == "yoga_flags":
             names = body.get("yoga_names") or ["panch_mahapurusha","gajakesari","chandra_mangal","parivartana"]
             ff = pred.feature_yoga_flags(names)
+        
+        elif feature == "angular_houses":
+            ff = pred.feature_angular_houses()  # Implement this function
+        
         else:
-            return _json_error("validation_error", [{"loc":["feature"],"msg":"unknown"}], 400)
+            return json_error("validation_error", [{"loc":["feature"],"msg":"unknown feature"}], 400)
+        
         res = pred.evaluate_univariate(
             recs, ff, n_perm=n_perm, alpha=alpha,
             perm_mode=perm_mode, group_by=group_by, use_time=bool(body.get("use_time", True)),
             seed=body.get("seed")
         )
         return jsonify({"ok": True, "results": [r.__dict__ for r in res]}), 200
+        
     except Exception as e:
-        return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+        return json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
 
 @api.post("/api/predictive/holdout")
@@ -2610,23 +2629,39 @@ def predictive_holdout():
         body = request.get_json(force=True) or {}
         recs = body.get("records") or []
         if not (isinstance(recs, list) and recs):
-            return _json_error("validation_error", [{"loc":["records"],"msg":"non-empty list required"}], 400)
+            return json_error("validation_error", [{"loc":["records"],"msg":"non-empty list required"}], 400)
+        
         feature = (body.get("feature") or "transit_proximity").lower()
         perm_mode = (body.get("perm_mode") or "iid").lower()
         group_by = body.get("group_by")
+        
         from app.core import predictive as pred
+        
+        # Feature parsing with proper handling
         if feature == "transit_proximity":
             movers = body.get("movers") or ["Sun","Moon","Mercury","Venus","Mars"]
             orb_deg = float(body.get("orb_deg", 1.0))
             ff = pred.feature_transit_proximity(movers=movers, orb_deg=orb_deg)
-        elif feature.startswith("dasha_l"):
-            level = int(feature.split("_l")[1])
+        
+        elif feature == "dasha_lords_onehot":
+            level = int(body.get("level", 1))  # Default to level 1
             ff = pred.feature_dasha_lords_onehot(level=level)
+        
+        elif feature.startswith("dasha_l") and len(feature) == 8 and feature[7].isdigit():
+            # Only match exact pattern "dasha_l1", "dasha_l2", etc.
+            level = int(feature[7])
+            ff = pred.feature_dasha_lords_onehot(level=level)
+        
         elif feature == "yoga_flags":
             names = body.get("yoga_names") or ["panch_mahapurusha","gajakesari","chandra_mangal","parivartana"]
             ff = pred.feature_yoga_flags(names)
+        
+        elif feature == "angular_houses":
+            ff = pred.feature_angular_houses()  # Implement this function
+        
         else:
-            return _json_error("validation_error", [{"loc":["feature"],"msg":"unknown"}], 400)
+            return json_error("validation_error", [{"loc":["feature"],"msg":"unknown feature"}], 400)
+        
         res = pred.holdout_replicate(
             recs, ff,
             train_frac=float(body.get("train_frac", 0.7)),
@@ -2638,9 +2673,9 @@ def predictive_holdout():
             seed=body.get("seed")
         )
         return jsonify({"ok": True, **res}), 200
+        
     except Exception as e:
-        return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
-
+        return json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
 @api.post("/api/predictive/dasha")
 @rate_limit(RL_PREDICTIVE)
