@@ -1973,17 +1973,25 @@ class _CountingAdapter:
 @rate_limit(RL_PREDICTIVE)
 def predictive_transits():
     """
-    Scan transits (moving bodies vs target longitudes) with robust refinement.
+    Scan transits (moving bodies vs target longitudes).
 
-    Input options:
-      • time range: {date_start,time_start,date_end,time_end,timezone} OR jd_start_tt/jd_end_tt
-      • movers: array of body names (deduped, trimmed)
-      • targets_longitudes: { "Sun": 123.45, "Moon": ... }  (preferred fast-path)
-      • targets_chart: {date,time,place_tz[, ...]} (fallback)
-        └─ Performance default: ONLY bodies are harvested. To include angles/points, pass include_points=true.
+    Inputs:
+      • Time window: {date_start,time_start,date_end,time_end,timezone} OR jd_start_tt/jd_end_tt
+      • movers: ["Sun","Moon",...]  (array of strings; deduped/trimmed)
+      • targets_longitudes: {"Sun": 123.45, ...}  (fast path)
+      • targets_chart: {date,time,place_tz[, ...]}  (fallback)
+          - Default performance behavior: ONLY natal bodies are harvested.
+          - To also include angles/points: set include_target_points=true (alias: include_points).
+          - To restrict which items are harvested: provide target_names: ["Sun","Moon",...]
       • frame, topocentric + (latitude,longitude[,elevation_m]), zodiac_mode, ayanamsa_deg
       • include_minors, include_antiscia, antiscia_orb_deg, step_minutes (number or "auto")
+
+    Response headers:
+      • X-Compute-Time-ms — wall time (ms)
+      • X-Adapter-Calls   — ephemeris adapter call count during this request
+      • X-Targets         — #targets scanned
     """
+    # ---------- request body ----------
     try:
         body = request.get_json(force=True) or {}
     except Exception as e:
@@ -1994,8 +2002,25 @@ def predictive_transits():
 
     t_wall = time.perf_counter()
     adapter_calls = 0
+
+    # tiny local helper (robust wrap)
+    def _wrap360(x: float) -> float:
+        v = float(x) % 360.0
+        return v + 360.0 if v < 0.0 else v
+
+    # lightweight counting proxy for perf visibility
+    class _CountingAdapter:
+        def __init__(self, base):
+            self._base = base
+            self.calls = 0
+        def __getattr__(self, name):
+            return getattr(self._base, name)
+        def ecliptic_longitudes(self, *args, **kwargs):
+            self.calls += 1
+            return self._base.ecliptic_longitudes(*args, **kwargs)
+
     try:
-        # time window
+        # ---------- time window ----------
         try:
             jd0, jd1 = _parse_time_range_like(body)
         except ValidationError as e:
@@ -2003,78 +2028,98 @@ def predictive_transits():
         except Exception as e:
             return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
 
-        # movers
+        # ---------- movers ----------
         raw_movers = body.get("movers") or ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn"]
         if not isinstance(raw_movers, list):
-            return _json_error("validation_error", [{"loc":["movers"],"msg":"must be an array of strings"}], 400)
-        movers_seen = {}
+            return _json_error("validation_error", [{"loc": ["movers"], "msg": "must be an array of strings"}], 400)
         for m in raw_movers:
             if not isinstance(m, str):
-                return _json_error("validation_error", [{"loc":["movers"],"msg":"all movers must be strings"}], 400)
-            s = m.strip()
-            if s:
-                movers_seen.setdefault(s, True)
-        movers = list(movers_seen.keys())
+                return _json_error("validation_error", [{"loc": ["movers"], "msg": "all movers must be strings"}], 400)
+        movers = list(dict.fromkeys(s.strip() for s in raw_movers if isinstance(s, str) and s.strip()))
         if not movers:
-            return _json_error("validation_error", [{"loc":["movers"],"msg":"cannot be empty after trimming"}], 400)
+            return _json_error("validation_error", [{"loc": ["movers"], "msg": "cannot be empty after trimming"}], 400)
 
-        # targets
+        # ---------- targets (prefer direct map; else harvest from chart) ----------
         targets: Dict[str, float] = {}
+
+        # fast path
         raw_targets = body.get("targets_longitudes")
         if isinstance(raw_targets, dict):
             for k, v in raw_targets.items():
                 try:
                     name = str(k).strip()
-                    if name:
-                        targets[name] = _wrap360(float(v))
+                    val = float(v)
+                    if name and math.isfinite(val):
+                        targets[name] = _wrap360(val)
                 except Exception:
+                    # ignore bad entry
                     pass
 
+        # fallback: build from targets_chart
         if not targets and isinstance(body.get("targets_chart"), dict):
             targ = dict(body["targets_chart"])
             if "date" not in targ:
-                return _json_error("validation_error", [{"loc":["targets_chart","date"],"msg":"required"}], 400)
+                return _json_error("validation_error", [{"loc": ["targets_chart", "date"], "msg": "required"}], 400)
+
             tz_nat = targ.get("place_tz") or targ.get("timezone") or "UTC"
             try:
-                ts_nat = _compute_timescales_from_local(targ["date"], targ.get("time","00:00:00"), tz_nat, payload=targ)
+                ts_nat = _compute_timescales_from_local(targ["date"], targ.get("time", "00:00:00"), tz_nat, payload=targ)
             except ValidationError as e:
                 return _json_error("validation_error", e.errors(), 400)
             except Exception as e:
                 return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
+
             try:
                 ch = _call_compute_chart(targ, ts_nat)
             except Exception as e:
                 return _json_error("chart_internal", str(e) if DEBUG_VERBOSE else "chart_failed", 500)
 
-            # Performance default: only bodies; include points/angles only if explicitly requested
-            include_points = bool(body.get("include_points", False))
-            for row in (ch.get("bodies") or []):
-                if isinstance(row, dict):
+            # selection controls
+            include_target_points = bool(body.get("include_target_points") or body.get("include_points"))
+            target_names = set(
+                s.strip() for s in (body.get("target_names") or [])
+                if isinstance(s, str) and s.strip()
+            )
+
+            def _harvest(rows):
+                for row in (rows or []):
+                    if not isinstance(row, dict):
+                        continue
                     nm = str(row.get("name") or "").strip()
                     lon = row.get("longitude_deg")
-                    if nm and isinstance(lon, (int,float)):
-                        targets[nm] = _wrap360(float(lon))
-            if include_points:
-                for row in (ch.get("points") or []):
-                    if isinstance(row, dict):
-                        nm = str(row.get("name") or "").strip()
-                        lon = row.get("longitude_deg")
-                        if nm and isinstance(lon, (int,float)):
-                            targets[nm] = _wrap360(float(lon))
+                    if not (nm and isinstance(lon, (int, float)) and math.isfinite(float(lon))):
+                        continue
+                    if target_names and nm not in target_names:
+                        continue
+                    targets[nm] = _wrap360(float(lon))
+
+            # default: only bodies; optionally include points/angles
+            _harvest(ch.get("bodies"))
+            if include_target_points:
+                _harvest(ch.get("points"))
 
         if not targets:
-            return _json_error("validation_error",
-                               [{"loc":["targets_longitudes|targets_chart"],"msg":"no targets to scan"}], 400)
+            return _json_error(
+                "validation_error",
+                [{"loc": ["targets_longitudes|targets_chart"], "msg": "no valid targets to scan"}],
+                400,
+            )
 
-        # engine options
+        # ---------- engine options ----------
         frame = parse_frame(body.get("frame"))
+
+        # topocentric rules: explicit true requires coords; coords imply true
         topocentric_flag = bool(body.get("topocentric"))
         lat = body.get("latitude"); lon = body.get("longitude"); elev = body.get("elevation_m")
-        has_latlon = isinstance(lat,(int,float)) and isinstance(lon,(int,float))
+        has_latlon = isinstance(lat, (int, float)) and isinstance(lon, (int, float))
         if topocentric_flag and not has_latlon:
-            return _json_error("validation_error",
-                               [{"loc":["latitude","longitude"],"msg":"required when topocentric=true"}], 400)
+            return _json_error(
+                "validation_error",
+                [{"loc": ["latitude", "longitude"], "msg": "required when topocentric=true"}],
+                400,
+            )
         topocentric = topocentric_flag or has_latlon
+
         lat_f = lon_f = elev_f = None
         if has_latlon:
             try:
@@ -2085,21 +2130,24 @@ def predictive_transits():
             try:
                 elev_f = float(elev)
             except Exception:
-                return _json_error("validation_error", [{"loc":["elevation_m"],"msg":"must be a number"}], 400)
+                return _json_error("validation_error", [{"loc": ["elevation_m"], "msg": "must be a number"}], 400)
 
-        step_arg = _parse_step_minutes(body.get("step_minutes"), default_min=30.0)
+        step_arg = _parse_step_minutes(body.get("step_minutes"), default_min=30.0)  # supports "auto"
+
         zodiac_mode = (body.get("zodiac_mode") or "tropical").strip().lower()
         ayanamsa_deg = float(body.get("ayanamsa_deg", 0.0))
-        include_minors = bool(body.get("include_minors", False))
+
+        include_minors   = bool(body.get("include_minors", False))
         include_antiscia = bool(body.get("include_antiscia", False))
         antiscia_orb_deg = float(body.get("antiscia_orb_deg", 2.0))
 
+        # aspect set
         from app.core import predictive as pred
         aspects = list(pred.MAJOR_ASPECTS)
         if include_minors:
             aspects += list(pred.MINOR_ASPECTS)
 
-        # run engine with a counting proxy to surface adapter calls
+        # ---------- run engine ----------
         try:
             base_adapter = get_shared_adapter(frame)
             counting_adapter = _CountingAdapter(base_adapter)
@@ -2108,7 +2156,9 @@ def predictive_transits():
                 ephem=counting_adapter,
                 frame=frame,
                 topocentric=topocentric,
-                latitude=lat_f, longitude=lon_f, elevation_m=elev_f
+                latitude=lat_f,
+                longitude=lon_f,
+                elevation_m=elev_f,
             )
             eng.sidereal_mode = zodiac_mode.startswith("sidereal")
             eng.ayanamsa_deg = ayanamsa_deg
@@ -2119,7 +2169,7 @@ def predictive_transits():
                 movers=movers,
                 targets=targets,
                 aspects=aspects,
-                step_minutes=step_arg,              # supports "auto"
+                step_minutes=step_arg,          # number or "auto"
                 include_antiscia=include_antiscia,
                 antiscia_orb_deg=antiscia_orb_deg,
             )
@@ -2129,6 +2179,7 @@ def predictive_transits():
         except Exception as e:
             return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
+        # ---------- shape response ----------
         out = [{
             "jd_tt": float(e.jd_tt),
             "body": e.body,
