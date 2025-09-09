@@ -2559,186 +2559,258 @@ def predictive_stations():
 def predictive_evaluate():
     """
     Univariate permutation test with optional time-series aware permutations.
-    Body:
-      records: [{ jd_tt, outcome(0/1), natal_longitudes:{}, natal_cusps:[], birth_jd_tt, ayanamsa_deg }]
-      feature:
-        - "transit_proximity"   (+ movers[], orb_deg?)
-        - "dasha_lords_onehot"  (+ level?)
-        - "dasha_l1"|"dasha_l2"|"dasha_l3"
-        - "yoga_flags"          (+ names[])
-      perm_mode: "iid"|"within"|"circular"
-      group_by: "subject_id" (optional)
-      n_perm: 2000 (default)
     """
+
+    # ── Local helpers ────────────────────────────────────────────────
+    PLANET_NORMALIZATION = {
+        'sun': 'Sun', 'Sun': 'Sun', 'SUN': 'Sun',
+        'moon': 'Moon', 'Moon': 'Moon', 'MOON': 'Moon',
+        'mercury': 'Mercury', 'Mercury': 'Mercury', 'MERCURY': 'Mercury',
+        'venus': 'Venus', 'Venus': 'Venus', 'VENUS': 'Venus',
+        'mars': 'Mars', 'Mars': 'Mars', 'MARS': 'Mars',
+        'jupiter': 'Jupiter', 'Jupiter': 'Jupiter', 'JUPITER': 'Jupiter',
+        'saturn': 'Saturn', 'Saturn': 'Saturn', 'SATURN': 'Saturn',
+        'uranus': 'Uranus', 'Uranus': 'Uranus', 'URANUS': 'Uranus',
+        'neptune': 'Neptune', 'Neptune': 'Neptune', 'NEPTUNE': 'Neptune',
+        'pluto': 'Pluto', 'Pluto': 'Pluto', 'PLUTO': 'Pluto',
+        'ascendant': 'Ascendant', 'Ascendant': 'Ascendant', 'ASCENDANT': 'Ascendant',
+        'mc': 'MC', 'MC': 'MC', 'midheaven': 'MC', 'Midheaven': 'MC', 'MIDHEAVEN': 'MC',
+    }
+
+    def dup_titlecase_and_lower(name: str, value):
+        canonical = PLANET_NORMALIZATION.get(name, name)
+        if canonical.islower():
+            canonical = canonical.capitalize()
+        return [(canonical, value), (canonical.lower(), value)]
+
+    def normalize_lons(lons: dict) -> dict:
+        out = {}
+        for k, v in (lons or {}).items():
+            for kk, vv in dup_titlecase_and_lower(str(k), v):
+                out[kk] = vv
+        return out
+
+    def normalize_records(records: list) -> list:
+        norm = []
+        for rec in records:
+            if not isinstance(rec, dict):
+                continue
+            r = dict(rec)
+            if "natal_longitudes" in r and isinstance(r["natal_longitudes"], dict):
+                r["natal_longitudes"] = normalize_lons(r["natal_longitudes"])
+            norm.append(r)
+        return norm
+
+    def normalize_movers(movers: list) -> list:
+        out = []
+        for m in (movers or []):
+            canonical = PLANET_NORMALIZATION.get(m, m)
+            if canonical.islower():
+                canonical = canonical.capitalize()
+            if canonical not in out:
+                out.append(canonical)
+        return out
+
+    def clamp_int(x, lo, hi, default):
+        try:
+            v = int(x)
+        except Exception:
+            v = default
+        return max(lo, min(hi, v))
+
+    # ── Body parsing ────────────────────────────────────────────────
     try:
         body = request.get_json(force=True) or {}
-        recs = body.get("records") or []
-        if not (isinstance(recs, list) and recs):
-            return _json_error("validation_error", [{"loc":["records"],"msg":"non-empty list required"}], 400)
-        
-        # Planet name normalization mapping
-        PLANET_NORMALIZATION = {
-            'sun': 'Sun', 'Sun': 'Sun', 'SUN': 'Sun',
-            'moon': 'Moon', 'Moon': 'Moon', 'MOON': 'Moon',
-            'mercury': 'Mercury', 'Mercury': 'Mercury', 'MERCURY': 'Mercury',
-            'venus': 'Venus', 'Venus': 'Venus', 'VENUS': 'Venus',
-            'mars': 'Mars', 'Mars': 'Mars', 'MARS': 'Mars',
-            'jupiter': 'Jupiter', 'Jupiter': 'Jupiter', 'JUPITER': 'Jupiter',
-            'saturn': 'Saturn', 'Saturn': 'Saturn', 'SATURN': 'Saturn',
-            'uranus': 'Uranus', 'Uranus': 'Uranus', 'URANUS': 'Uranus',
-            'neptune': 'Neptune', 'Neptune': 'Neptune', 'NEPTUNE': 'Neptune',
-            'pluto': 'Pluto', 'Pluto': 'Pluto', 'PLUTO': 'Pluto',
-            'ascendant': 'Ascendant', 'Ascendant': 'Ascendant', 'ASCENDANT': 'Ascendant'
-        }
-        
-        # Normalize planet names in all records
-        normalized_recs = []
-        for rec in recs:
-            if "natal_longitudes" in rec:
-                normalized_lons = {}
-                for planet, lon in rec["natal_longitudes"].items():
-                    normalized_planet = PLANET_NORMALIZATION.get(planet, planet)
-                    normalized_lons[normalized_planet] = lon
-                
-                normalized_rec = rec.copy()
-                normalized_rec["natal_longitudes"] = normalized_lons
-                normalized_recs.append(normalized_rec)
-            else:
-                normalized_recs.append(rec)
-        
-        feature = (body.get("feature") or "transit_proximity").lower()
-        perm_mode = (body.get("perm_mode") or "iid").lower()
-        group_by = body.get("group_by")
-        alpha = float(body.get("alpha", 0.05))
-        n_perm = int(body.get("n_perm", 2000))
-        
-        from app.core import predictive as pred
-        
-        # Feature parsing with proper handling
-        if feature == "transit_proximity":
-            movers = body.get("movers") or ["Sun","Moon","Mercury","Venus","Mars"]
-            # Normalize mover names using the same mapping
-            normalized_movers = [PLANET_NORMALIZATION.get(m, m) for m in movers]
-            orb_deg = float(body.get("orb_deg", 1.0))
-            ff = pred.feature_transit_proximity(movers=normalized_movers, orb_deg=orb_deg)
-        
-        elif feature == "dasha_lords_onehot":
-            level = int(body.get("level", 1))  # Default to level 1
-            ff = pred.feature_dasha_lords_onehot(level=level)
-        
-        elif feature.startswith("dasha_l") and len(feature) == 8 and feature[7].isdigit():
-            # Only match exact pattern "dasha_l1", "dasha_l2", etc.
-            level = int(feature[7])
-            ff = pred.feature_dasha_lords_onehot(level=level)
-        
-        elif feature == "yoga_flags":
-            names = body.get("yoga_names") or ["panch_mahapurusha","gajakesari","chandra_mangal","parivartana"]
-            ff = pred.feature_yoga_flags(names)
-        
-        elif feature == "angular_houses":
-            return _json_error("validation_error", [{"loc":["feature"],"msg":"angular_houses feature not implemented"}], 400)
-        
-        else:
-            return _json_error("validation_error", [{"loc":["feature"],"msg":"unknown feature"}], 400)
-        
-        res = pred.evaluate_univariate(
-            normalized_recs, ff, n_perm=n_perm, alpha=alpha,
-            perm_mode=perm_mode, group_by=group_by, use_time=bool(body.get("use_time", True)),
-            seed=body.get("seed")
-        )
-        return jsonify({"ok": True, "results": [r.__dict__ for r in res]}), 200
-        
     except Exception as e:
-        return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
-        
-@api.post("/api/predictive/holdout")
-@rate_limit(RL_PREDICTIVE)
-def predictive_holdout():
-    """Train/holdout replication with the same feature menu as /evaluate."""
+        return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
+
+    recs = body.get("records") or []
+    if not (isinstance(recs, list) and recs):
+        return _json_error("validation_error", [{"loc": ["records"], "msg": "non-empty list required"}], 400)
+
+    normalized_recs = normalize_records(recs)
+
+    feature = str(body.get("feature") or "transit_proximity").lower()
+    perm_mode = str(body.get("perm_mode") or "iid").lower()
+    group_by = body.get("group_by")
+    alpha = float(body.get("alpha", 0.05))
+    n_perm = clamp_int(body.get("n_perm", 2000), 1, 10000, 2000)
+
+    from app.core import predictive as pred
+
+    # ── Feature selection ───────────────────────────────────────────
     try:
-        body = request.get_json(force=True) or {}
-        recs = body.get("records") or []
-        if not (isinstance(recs, list) and recs):
-            return _json_error("validation_error", [{"loc":["records"],"msg":"non-empty list required"}], 400)
-        
-        # Planet name normalization mapping (same as evaluate)
-        PLANET_NORMALIZATION = {
-            'sun': 'Sun', 'Sun': 'Sun', 'SUN': 'Sun',
-            'moon': 'Moon', 'Moon': 'Moon', 'MOON': 'Moon',
-            'mercury': 'Mercury', 'Mercury': 'Mercury', 'MERCURY': 'Mercury',
-            'venus': 'Venus', 'Venus': 'Venus', 'VENUS': 'Venus',
-            'mars': 'Mars', 'Mars': 'Mars', 'MARS': 'Mars',
-            'jupiter': 'Jupiter', 'Jupiter': 'Jupiter', 'JUPITER': 'Jupiter',
-            'saturn': 'Saturn', 'Saturn': 'Saturn', 'SATURN': 'Saturn',
-            'uranus': 'Uranus', 'Uranus': 'Uranus', 'URANUS': 'Uranus',
-            'neptune': 'Neptune', 'Neptune': 'Neptune', 'NEPTUNE': 'Neptune',
-            'pluto': 'Pluto', 'Pluto': 'Pluto', 'PLUTO': 'Pluto',
-            'ascendant': 'Ascendant', 'Ascendant': 'Ascendant', 'ASCENDANT': 'Ascendant'
-        }
-        
-        # Normalize planet names in all records
-        normalized_recs = []
-        for rec in recs:
-            if "natal_longitudes" in rec:
-                normalized_lons = {}
-                for planet, lon in rec["natal_longitudes"].items():
-                    normalized_planet = PLANET_NORMALIZATION.get(planet, planet)
-                    normalized_lons[normalized_planet] = lon
-                
-                normalized_rec = rec.copy()
-                normalized_rec["natal_longitudes"] = normalized_lons
-                normalized_recs.append(normalized_rec)
-            else:
-                normalized_recs.append(rec)
-        
-        feature = (body.get("feature") or "transit_proximity").lower()
-        perm_mode = (body.get("perm_mode") or "iid").lower()
-        group_by = body.get("group_by")
-        
-        from app.core import predictive as pred
-        
-        # Feature parsing with proper handling (same as evaluate)
         if feature == "transit_proximity":
-            movers = body.get("movers") or ["Sun","Moon","Mercury","Venus","Mars"]
-            # Normalize mover names using the same mapping
-            normalized_movers = [PLANET_NORMALIZATION.get(m, m) for m in movers]
+            movers = normalize_movers(body.get("movers") or ["Sun", "Moon", "Mercury", "Venus", "Mars"])
             orb_deg = float(body.get("orb_deg", 1.0))
-            ff = pred.feature_transit_proximity(movers=normalized_movers, orb_deg=orb_deg)
-        
+            ff = pred.feature_transit_proximity(movers=movers, orb_deg=orb_deg)
+
         elif feature == "dasha_lords_onehot":
-            level = int(body.get("level", 1))  # Default to level 1
+            level = clamp_int(body.get("level", 1), 1, 3, 1)
             ff = pred.feature_dasha_lords_onehot(level=level)
-        
+
         elif feature.startswith("dasha_l") and len(feature) == 8 and feature[7].isdigit():
-            # Only match exact pattern "dasha_l1", "dasha_l2", etc.
-            level = int(feature[7])
+            level = clamp_int(feature[7], 1, 3, 1)
             ff = pred.feature_dasha_lords_onehot(level=level)
-        
+
         elif feature == "yoga_flags":
-            names = body.get("yoga_names") or ["panch_mahapurusha","gajakesari","chandra_mangal","parivartana"]
+            names = body.get("yoga_names") or ["panch_mahapurusha", "gajakesari", "chandra_mangal", "parivartana"]
             ff = pred.feature_yoga_flags(names)
-        
+
         elif feature == "angular_houses":
-            return _json_error("validation_error", [{"loc":["feature"],"msg":"angular_houses feature not implemented"}], 400)
-        
+            return _json_error("validation_error", [{"loc": ["feature"], "msg": "angular_houses feature not implemented"}], 400)
+
         else:
-            return _json_error("validation_error", [{"loc":["feature"],"msg":"unknown feature"}], 400)
-        
-        res = pred.holdout_replicate(
+            return _json_error("validation_error", [{"loc": ["feature"], "msg": "unknown feature"}], 400)
+
+    except Exception as e:
+        return _json_error("validation_error", [{"loc": ["feature"], "msg": str(e)}], 400)
+
+    # ── Run evaluation ──────────────────────────────────────────────
+    try:
+        res = pred.evaluate_univariate(
             normalized_recs, ff,
-            train_frac=float(body.get("train_frac", 0.7)),
-            alpha=float(body.get("alpha", 0.05)),
-            n_perm_train=int(body.get("n_perm_train", 2000)),
-            n_perm_test=int(body.get("n_perm_test", 4000)),
+            n_perm=n_perm, alpha=alpha,
             perm_mode=perm_mode, group_by=group_by,
             use_time=bool(body.get("use_time", True)),
             seed=body.get("seed")
         )
-        return jsonify({"ok": True, **res}), 200
-        
+        return jsonify({"ok": True, "results": [getattr(r, "__dict__", r) for r in res]}), 200
     except Exception as e:
         return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
-        
+
+@api.post("/api/predictive/holdout")
+@rate_limit(RL_PREDICTIVE)
+def predictive_holdout():
+    """Train/holdout replication with the same feature menu as /evaluate."""
+
+    # ── Local helpers (same as above) ───────────────────────────────
+    PLANET_NORMALIZATION = {
+        'sun': 'Sun', 'Sun': 'Sun', 'SUN': 'Sun',
+        'moon': 'Moon', 'Moon': 'Moon', 'MOON': 'Moon',
+        'mercury': 'Mercury', 'Mercury': 'Mercury', 'MERCURY': 'Mercury',
+        'venus': 'Venus', 'Venus': 'Venus', 'VENUS': 'Venus',
+        'mars': 'Mars', 'Mars': 'Mars', 'MARS': 'Mars',
+        'jupiter': 'Jupiter', 'Jupiter': 'Jupiter', 'JUPITER': 'Jupiter',
+        'saturn': 'Saturn', 'Saturn': 'Saturn', 'SATURN': 'Saturn',
+        'uranus': 'Uranus', 'Uranus': 'Uranus', 'URANUS': 'Uranus',
+        'neptune': 'Neptune', 'Neptune': 'Neptune', 'NEPTUNE': 'Neptune',
+        'pluto': 'Pluto', 'Pluto': 'Pluto', 'PLUTO': 'Pluto',
+        'ascendant': 'Ascendant', 'Ascendant': 'Ascendant', 'ASCENDANT': 'Ascendant',
+        'mc': 'MC', 'MC': 'MC', 'midheaven': 'MC', 'Midheaven': 'MC', 'MIDHEAVEN': 'MC',
+    }
+
+    def dup_titlecase_and_lower(name: str, value):
+        canonical = PLANET_NORMALIZATION.get(name, name)
+        if canonical.islower():
+            canonical = canonical.capitalize()
+        return [(canonical, value), (canonical.lower(), value)]
+
+    def normalize_lons(lons: dict) -> dict:
+        out = {}
+        for k, v in (lons or {}).items():
+            for kk, vv in dup_titlecase_and_lower(str(k), v):
+                out[kk] = vv
+        return out
+
+    def normalize_records(records: list) -> list:
+        norm = []
+        for rec in records:
+            if not isinstance(rec, dict):
+                continue
+            r = dict(rec)
+            if "natal_longitudes" in r and isinstance(r["natal_longitudes"], dict):
+                r["natal_longitudes"] = normalize_lons(r["natal_longitudes"])
+            norm.append(r)
+        return norm
+
+    def normalize_movers(movers: list) -> list:
+        out = []
+        for m in (movers or []):
+            canonical = PLANET_NORMALIZATION.get(m, m)
+            if canonical.islower():
+                canonical = canonical.capitalize()
+            if canonical not in out:
+                out.append(canonical)
+        return out
+
+    def clamp_int(x, lo, hi, default):
+        try:
+            v = int(x)
+        except Exception:
+            v = default
+        return max(lo, min(hi, v))
+
+    # ── Body parsing ────────────────────────────────────────────────
+    try:
+        body = request.get_json(force=True) or {}
+    except Exception as e:
+        return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
+
+    recs = body.get("records") or []
+    if not (isinstance(recs, list) and recs):
+        return _json_error("validation_error", [{"loc": ["records"], "msg": "non-empty list required"}], 400)
+
+    normalized_recs = normalize_records(recs)
+
+    feature = str(body.get("feature") or "transit_proximity").lower()
+    perm_mode = str(body.get("perm_mode") or "iid").lower()
+    group_by = body.get("group_by")
+
+    from app.core import predictive as pred
+
+    # ── Feature selection ───────────────────────────────────────────
+    try:
+        if feature == "transit_proximity":
+            movers = normalize_movers(body.get("movers") or ["Sun", "Moon", "Mercury", "Venus", "Mars"])
+            orb_deg = float(body.get("orb_deg", 1.0))
+            ff = pred.feature_transit_proximity(movers=movers, orb_deg=orb_deg)
+
+        elif feature == "dasha_lords_onehot":
+            level = clamp_int(body.get("level", 1), 1, 3, 1)
+            ff = pred.feature_dasha_lords_onehot(level=level)
+
+        elif feature.startswith("dasha_l") and len(feature) == 8 and feature[7].isdigit():
+            level = clamp_int(feature[7], 1, 3, 1)
+            ff = pred.feature_dasha_lords_onehot(level=level)
+
+        elif feature == "yoga_flags":
+            names = body.get("yoga_names") or ["panch_mahapurusha", "gajakesari", "chandra_mangal", "parivartana"]
+            ff = pred.feature_yoga_flags(names)
+
+        elif feature == "angular_houses":
+            return _json_error("validation_error", [{"loc": ["feature"], "msg": "angular_houses feature not implemented"}], 400)
+
+        else:
+            return _json_error("validation_error", [{"loc": ["feature"], "msg": "unknown feature"}], 400)
+
+    except Exception as e:
+        return _json_error("validation_error", [{"loc": ["feature"], "msg": str(e)}], 400)
+
+    # ── Params ──────────────────────────────────────────────────────
+    train_frac = float(body.get("train_frac", 0.7))
+    if not (0.05 <= train_frac <= 0.95):
+        train_frac = 0.7
+    alpha = float(body.get("alpha", 0.05))
+    n_perm_train = clamp_int(body.get("n_perm_train", 2000), 1, 10000, 2000)
+    n_perm_test = clamp_int(body.get("n_perm_test", 4000), 1, 20000, 4000)
+
+    # ── Run holdout ─────────────────────────────────────────────────
+    try:
+        res = pred.holdout_replicate(
+            normalized_recs, ff,
+            train_frac=train_frac,
+            alpha=alpha,
+            n_perm_train=n_perm_train,
+            n_perm_test=n_perm_test,
+            perm_mode=perm_mode, group_by=group_by,
+            use_time=bool(body.get("use_time", True)),
+            seed=body.get("seed"),
+        )
+        return jsonify({"ok": True, **res}), 200
+    except Exception as e:
+        return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+
 @api.post("/api/predictive/dasha")
 @rate_limit(RL_PREDICTIVE)
 def predictive_dasha():
