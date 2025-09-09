@@ -2132,7 +2132,7 @@ def predictive_transits():
             except Exception:
                 return _json_error("validation_error", [{"loc": ["elevation_m"], "msg": "must be a number"}], 400)
 
-        step_arg = _parse_step_minutes(body.get("step_minutes"), default_min=30.0)  # supports "auto"
+        step_arg = _parse_step_minutes(body.get("step_minutes"), default_min=60.0)  # supports "auto"
 
         zodiac_mode = (body.get("zodiac_mode") or "tropical").strip().lower()
         ayanamsa_deg = float(body.get("ayanamsa_deg", 0.0))
