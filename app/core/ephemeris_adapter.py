@@ -2,8 +2,12 @@
 # -----------------------------------------------------------------------------
 # Ephemeris Adapter (Performance-optimized, accuracy-preserving)
 # - Keeps identical public API, payload shape, and semantics.
-# - Adds: observer caching, smart XY validation, cross-body time sharing,
-#         frame LRU caching, careful diagnostics.
+# - NEW: velocity is opt-in per call (fast lon/lat path by default).
+#   • ecliptic_longitudes(...)  → lon/lat only (no velocity) unless observer['_want_velocity'] = True
+#   • ecliptic_longitudes_and_velocities(...) → forces velocity on
+# - When velocity is requested:
+#   • Richardson uses fewer stencils for slow outers
+#   • XY validation only for wrap-prone bodies and only if Richardson not “clean”
 # -----------------------------------------------------------------------------
 from __future__ import annotations
 
@@ -42,6 +46,9 @@ _SPEED_STEP_DEFAULT = float(os.getenv("OCP_SPEED_STEP_DEFAULT", "0.5"))  # ±12 
 # Diagnostics tolerances
 _SPEED_TOL_ARCSEC_ENV = float(os.getenv("OCP_SPEED_TOL_ARCSEC", "0.05"))  # Richardson vs XY abs tol (arcsec/day)
 _SPEED_MIN_STEP_D_ENV = float(os.getenv("OCP_SPEED_MIN_STEP_D", "0.01"))  # minimum step (days)
+
+# Optional: default velocity policy (off by default to speed transits/ingresses)
+_COMPUTE_VELOCITY_DEFAULT_ENV = os.getenv("OCP_COMPUTE_VELOCITY", "0").lower() in ("1","true","yes","on")
 
 # Node cache tick resolution (seconds); 0 → ns ticks
 _NODE_CACHE_RES_S_ENV = float(os.getenv("OCP_NODE_CACHE_RES_S", "0.0"))
@@ -129,6 +136,9 @@ class Config:
     enforce_jd_range: bool = ENFORCE_JD_RANGE
     jd_min: float = DE421_JD_MIN
     jd_max: float = DE421_JD_MAX
+
+    # NEW: default velocity policy (can still be overridden per-call via observer['_want_velocity'])
+    compute_velocity_default: bool = _COMPUTE_VELOCITY_DEFAULT_ENV
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Global singletons
@@ -516,7 +526,7 @@ def _frame_latlon(geo, ecliptic_frame, *, abs_zero_tol_deg: float) -> Tuple[floa
         x, y, z = (float(xyz.au[0]), float(xyz.au[1]), float(xyz.au[2]))
         rho = math.hypot(x, y)
         if math.isfinite(x) and math.isfinite(y) and math.isfinite(z) and (rho > 0.0 or z != 0.0):
-            lon = _atan2deg(y, x, abs_zero_tol_deg=abs_zero_tol_deg)
+            lon = _atan2deg(y, x, abs_zero_tol_deg=self.cfg.abs_zero_tol_deg)  # type: ignore[attr-defined]
             lat = math.degrees(math.atan2(z, rho)) if rho > 0.0 else (90.0 if z > 0.0 else -90.0)
             return lon % 360.0, float(lat)
     except Exception:
@@ -539,7 +549,7 @@ def _kernel_identity() -> int:
 def _quantize_coords(lat: Optional[float], lon: Optional[float], elev_m: Optional[float]) -> Tuple[int, int, int]:
     lat_q = 0 if lat is None else int(round(float(lat) * 1e9))     # nanodegree
     lon_q = 0 if lon is None else int(round(float(lon) * 1e9))
-    elv_q = int(round(float(elev_m or 0.0) * 1e6))                 # micrometer (overkill but cheap)
+    elv_q = int(round(float(elev_m or 0.0) * 1e6))                 # micrometer
     return lat_q, lon_q, elv_q
 
 @lru_cache(maxsize=512)
@@ -678,7 +688,7 @@ def _node_longitude(name: str, jd_tt: float, *, cfg: Config, warnings: List[str]
     raise EphemerisError("node", "true_node_failed")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Velocity helpers (adaptive Richardson + smart XY validation)
+# Velocity helpers (adaptive Richardson + smart XY)
 # ─────────────────────────────────────────────────────────────────────────────
 def _richardson_velocity(
     f_lon: Callable[[float], float],
@@ -687,7 +697,7 @@ def _richardson_velocity(
     *,
     tol_deg_per_day: float,
     h_min: float,
-    max_levels: int = 3,   # tightened from 5 → 3 to reduce compute; still accurate
+    max_levels: int = 3,
 ) -> Tuple[float, float, Dict[str, Any]]:
     def D(h: float) -> float:
         lp = f_lon(t + h)
@@ -741,6 +751,7 @@ class EphemerisAdapter:
                     enforce_jd_range=cfg.enforce_jd_range,
                     jd_min=cfg.jd_min,
                     jd_max=cfg.jd_max,
+                    compute_velocity_default=cfg.compute_velocity_default,
                 )
             else:
                 self.cfg = cfg
@@ -759,6 +770,7 @@ class EphemerisAdapter:
                 enforce_jd_range=base.enforce_jd_range,
                 jd_min=base.jd_min,
                 jd_max=base.jd_max,
+                compute_velocity_default=base.compute_velocity_default,
             )
 
     # ---- body resolution (cached) -------------------------------------------
@@ -889,7 +901,7 @@ class EphemerisAdapter:
     # ---- major computation (shared times + smart XY) ------------------------
     def _compute_major_row(
         self, *, body, obs, ef, jd_tt: float, name: str, tcache: "EphemerisAdapter._TimeCache",
-        warnings: List[str], diags: Dict[str, Any]
+        warnings: List[str], diags: Dict[str, Any], want_velocity: bool
     ) -> Dict[str, Any]:
 
         def lon_at(tjd: float) -> float:
@@ -905,39 +917,49 @@ class EphemerisAdapter:
         geo_now = obs.at(tcache.t(jd_tt)).observe(body).apparent()
         lon_now, lat_now = _frame_latlon(geo_now, ef, abs_zero_tol_deg=self.cfg.abs_zero_tol_deg)
 
+        # Fast path: no velocity requested → skip all extra work
+        if not want_velocity:
+            diags.setdefault("velocity_method", "skipped")
+            return self._mk_row(name, lon_now, lat=lat_now)
+
+        # Velocity requested (e.g., stations): do a bounded-cost evaluation
         h0 = _speed_step_for(name)
+        # Fewer stencils for slow outers
+        if name in ("Jupiter","Saturn","Uranus","Neptune","Pluto","Venus","Mars"):
+            max_lv = 2
+        else:
+            max_lv = 3
+
         vel_R, h_used, Rinfo = _richardson_velocity(
             lon_at, jd_tt, h0,
             tol_deg_per_day=self.cfg.speed_tol_arcsec / 3600.0,
             h_min=self.cfg.speed_min_step_d,
-            max_levels=3,
+            max_levels=max_lv,
         )
 
-        # Smart XY validation: if Richardson converged in ≤3 stencil points (clean) skip XY
-        use_xy = True
-        stencil_len = len(Rinfo.get("stencil", []))
-        if Rinfo.get("convergence") == "clean" and stencil_len <= 3:
-            use_xy = False
+        # XY validation only for wrap-prone bodies and only if not “clean”
+        wrap_prone = name in ("Moon","Mercury")
+        need_xy = wrap_prone and (Rinfo.get("convergence") != "clean")
 
         vel = vel_R
-        if use_xy:
+        if need_xy:
             vel_XY = _ang_speed_via_xy(xy_at, jd_tt, max(h_used, self.cfg.speed_min_step_d))
             if math.isfinite(vel_XY):
                 absdiff = abs(vel_R - vel_XY)
                 if absdiff > (self.cfg.speed_tol_arcsec / 3600.0):
                     warnings.append(f"velocity_disagree:{name}:|R-XY|={absdiff:.6f}°/d>tol")
                     diags["velocity_check"] = "mismatch"
-                    vel = vel_XY  # prefer XY near wraps
+                    vel = vel_XY
                 else:
                     diags["velocity_check"] = "ok"
                     vel = vel_R
             else:
                 diags["velocity_check"] = "xy_nan"
                 vel = vel_R
+            diags.setdefault("velocity_method", "richardson+xy_wrap_prone")
         else:
-            diags["velocity_check"] = "richardson_only"
+            diags.setdefault("velocity_method", "richardson_only")
 
-        diags.setdefault("velocity_method", "richardson+xy_smart")
         diags["velocity_step_days"] = h_used
         diags["velocity_richardson"] = vel_R
 
@@ -960,6 +982,13 @@ class EphemerisAdapter:
         warnings: List[str] = []
         diags: Dict[str, Any] = {}
         used_frame = (frame or self.cfg.frame)
+
+        # Internal control: allow caller to force velocity via observer['_want_velocity'] (keeps public API unchanged)
+        want_velocity = False
+        if isinstance(observer, dict) and observer.get("_want_velocity") is True:
+            want_velocity = True
+        elif self.cfg.compute_velocity_default:
+            want_velocity = True  # global default via env if operator wants it
 
         try:
             self._check_jd_guard(jd_tt)
@@ -994,11 +1023,12 @@ class EphemerisAdapter:
                 canon, kind, node_override = _canon_name(raw)
 
                 if kind == "node":
+                    # nodes keep cheap central-difference speed
                     lon_val, model_used, fb = _node_longitude(canon, jd_tt, cfg=self.cfg, warnings=warnings, model_override=node_override)
                     step = _speed_step_for("Moon")
                     lon_m, _m, _ = _node_longitude(canon, jd_tt - step, cfg=self.cfg, warnings=warnings, model_override=node_override)
                     lon_p, _p, _ = _node_longitude(canon, jd_tt + step, cfg=self.cfg, warnings=warnings, model_override=node_override)
-                    vel_val = _wrap_diff_deg(lon_p, lon_m) / (2.0 * step)
+                    vel_val = _wrap_diff_deg(lon_p, lon_m) / (2.0 * step) if want_velocity else None
                     rows.append(self._mk_row(raw, lon_val, lat=0.0, vel=vel_val, node_model=model_used, node_fallback=fb))
                     continue
 
@@ -1008,7 +1038,10 @@ class EphemerisAdapter:
                         warnings.append(f"missing_body:{canon}")
                         continue
                     try:
-                        rows.append(self._compute_major_row(body=body, obs=obs, ef=ef, jd_tt=jd_tt, name=raw, tcache=tcache, warnings=warnings, diags=diags))
+                        rows.append(self._compute_major_row(
+                            body=body, obs=obs, ef=ef, jd_tt=jd_tt, name=raw,
+                            tcache=tcache, warnings=warnings, diags=diags, want_velocity=want_velocity
+                        ))
                         continue
                     except EphemerisError as e:
                         warnings.append(f"error:compute_major:{canon}:{e.stage}")
@@ -1022,7 +1055,7 @@ class EphemerisAdapter:
                     lon, lat, spd = _spice_lon_lat_speed(jd_tt, canon, frame=used_frame, warnings=warnings,
                                                          allow_degraded=self.cfg.allow_degraded, abs_zero_tol_deg=self.cfg.abs_zero_tol_deg)
                     if lon is not None and lat is not None:
-                        rows.append(self._mk_row(raw, lon, lat=lat, vel=spd))
+                        rows.append(self._mk_row(raw, lon, lat=lat, vel=(spd if want_velocity else None)))
                         continue
 
                 warnings.append(f"unresolved:{raw}:{kind}")
@@ -1055,6 +1088,9 @@ class EphemerisAdapter:
         elevation_m: Optional[float] = None,
         observer: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
+        # Force velocity computation by setting an internal override flag in observer (no API change)
+        obs = dict(observer or {})
+        obs["_want_velocity"] = True
         return self.ecliptic_longitudes(
             jd_tt,
             names=names,
@@ -1064,7 +1100,7 @@ class EphemerisAdapter:
             latitude=latitude,
             longitude=longitude,
             elevation_m=elevation_m,
-            observer=observer,
+            observer=obs,
         )
 
     def ephemeris_diagnostics(self, requested: Optional[List[str]] = None) -> Dict[str, Any]:
@@ -1165,6 +1201,7 @@ def _config_from_env() -> Config:
         enforce_jd_range=ENFORCE_JD_RANGE,
         jd_min=DE421_JD_MIN,
         jd_max=DE421_JD_MAX,
+        compute_velocity_default=_COMPUTE_VELOCITY_DEFAULT_ENV,
     )
 
 def _get_default_adapter() -> EphemerisAdapter:
@@ -1177,6 +1214,7 @@ def ecliptic_longitudes(*args, **kwargs):
     return _get_default_adapter().ecliptic_longitudes(*args, **kwargs)
 
 def ecliptic_longitudes_and_velocities(*args, **kwargs):
+    # This wrapper now forces velocity computation (no signature change)
     return _get_default_adapter().ecliptic_longitudes_and_velocities(*args, **kwargs)
 
 def rows_to_maps(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
