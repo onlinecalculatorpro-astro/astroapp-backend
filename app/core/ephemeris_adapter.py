@@ -1,13 +1,13 @@
 # app/core/ephemeris_adapter.py
 # -----------------------------------------------------------------------------
-# Ephemeris Adapter (Performance-optimized, accuracy-preserving)
+# Ephemeris Adapter (performance-optimized, accuracy-preserving)
 # - Keeps identical public API, payload shape, and semantics.
-# - NEW: velocity is opt-in per call (fast lon/lat path by default).
-#   • ecliptic_longitudes(...)  → lon/lat only (no velocity) unless observer['_want_velocity'] = True
-#   • ecliptic_longitudes_and_velocities(...) → forces velocity on
-# - When velocity is requested:
-#   • Richardson uses fewer stencils for slow outers
-#   • XY validation only for wrap-prone bodies and only if Richardson not “clean”
+# - NEW (opt-in helpers):
+#     • ecliptic_longitudes_and_velocities(...)  → forces velocity
+#     • ecliptic_longitudes_many(jd_tts, ...)    → multi-time batching
+# - Velocity is OFF by default for speed; endpoints that need speed can opt in.
+# - Adaptive Richardson for dλ/dt with smart XY fallback (wrap-prone bodies).
+# - Global LRU caches for bodies, frames, observers, and Skyfield Time objects.
 # -----------------------------------------------------------------------------
 from __future__ import annotations
 
@@ -137,7 +137,7 @@ class Config:
     jd_min: float = DE421_JD_MIN
     jd_max: float = DE421_JD_MAX
 
-    # NEW: default velocity policy (can still be overridden per-call via observer['_want_velocity'])
+    # NEW: default velocity policy (can be overridden per-call via observer['_want_velocity'])
     compute_velocity_default: bool = _COMPUTE_VELOCITY_DEFAULT_ENV
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -362,9 +362,11 @@ def load_kernel(kernel_name: str = "de421"):
     k, _ = _get_kernels()
     return k, current_kernel_name()
 
-def _to_tts(jd_tt: float):
+# Global, cross-call cached Skyfield Time objects (major speed win under load)
+@lru_cache(maxsize=8192)
+def _tt_time_for_jd(jd_tt: float):
     ts = _get_timescale()
-    return ts.tt_jd(jd_tt)
+    return ts.tt_jd(float(jd_tt))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SPICE helpers (optional small bodies)
@@ -513,6 +515,7 @@ def _get_ecliptic_frame_cached(frame: str):
 # Ecliptic lon/lat extraction + observer resolver
 # ─────────────────────────────────────────────────────────────────────────────
 def _frame_latlon(geo, ecliptic_frame, *, abs_zero_tol_deg: float) -> Tuple[float, float]:
+    # Preferred: Skyfield's lat/lon extractor
     try:
         lat, lon, _ = geo.frame_latlon(ecliptic_frame)
         lon_deg = float(lon.degrees) % 360.0
@@ -521,16 +524,18 @@ def _frame_latlon(geo, ecliptic_frame, *, abs_zero_tol_deg: float) -> Tuple[floa
             return lon_deg, lat_deg
     except Exception:
         pass
+    # Fallback: XYZ → spherical
     try:
         xyz = geo.frame_xyz(ecliptic_frame)
         x, y, z = (float(xyz.au[0]), float(xyz.au[1]), float(xyz.au[2]))
         rho = math.hypot(x, y)
         if math.isfinite(x) and math.isfinite(y) and math.isfinite(z) and (rho > 0.0 or z != 0.0):
-            lon = _atan2deg(y, x, abs_zero_tol_deg=self.cfg.abs_zero_tol_deg)  # type: ignore[attr-defined]
+            lon = _atan2deg(y, x, abs_zero_tol_deg=abs_zero_tol_deg)
             lat = math.degrees(math.atan2(z, rho)) if rho > 0.0 else (90.0 if z > 0.0 else -90.0)
             return lon % 360.0, float(lat)
     except Exception:
         pass
+    # Last resort older API:
     try:
         elat, elon, _ = geo.ecliptic_latlon()
         lon_deg = float(elon.degrees) % 360.0
@@ -639,16 +644,15 @@ def _true_node_geocentric_tick(cache_key: Tuple[int, float, float]) -> float:
         from skyfield.framelib import ecliptic_frame  # type: ignore
     except Exception:
         return float("nan")
-    ts = _get_timescale()
     main, _ = _get_kernels()
     try:
         earth = main["earth"]; moon = main["moon"]
     except Exception:
         return float("nan")
     try:
-        t0 = ts.tt_jd(jd_tt)
-        tp = ts.tt_jd(jd_tt + step)
-        tm = ts.tt_jd(jd_tt - step)
+        t0 = _tt_time_for_jd(jd_tt)
+        tp = _tt_time_for_jd(jd_tt + step)
+        tm = _tt_time_for_jd(jd_tt - step)
         r0 = tuple(map(float, earth.at(t0).observe(moon).apparent().frame_xyz(ecliptic_frame).au))
         rp = tuple(map(float, earth.at(tp).observe(moon).apparent().frame_xyz(ecliptic_frame).au))
         rm = tuple(map(float, earth.at(tm).observe(moon).apparent().frame_xyz(ecliptic_frame).au))
@@ -869,7 +873,7 @@ class EphemerisAdapter:
     @staticmethod
     def _mk_row(name: str, lon: float, *, lat: Optional[float] = None,
                 vel: Optional[float] = None, node_model: Optional[str] = None,
-                node_fallback: Optional[str] = None) -> Dict[str, Any]:
+                node_fallback: Optional[str] = None, jd_tt: Optional[float] = None) -> Dict[str, Any]:
         row: Dict[str, Any] = {"name": name, "body": str(name).lower(), "longitude": float(lon), "lon": float(lon)}
         if lat is not None and math.isfinite(lat):
             row["lat"] = float(lat); row["latitude"] = float(lat)
@@ -879,6 +883,8 @@ class EphemerisAdapter:
             row["node_model"] = node_model
         if node_fallback:
             row["node_fallback"] = node_fallback
+        if jd_tt is not None:
+            row["jd_tt"] = float(jd_tt)
         return row
 
     # ---- validation ---------------------------------------------------------
@@ -886,35 +892,23 @@ class EphemerisAdapter:
         if self.cfg.enforce_jd_range and not (self.cfg.jd_min <= float(jd_tt) <= self.cfg.jd_max):
             raise EphemerisError("validation", "Julian date outside DE421 nominal span", jd_tt=float(jd_tt))
 
-    # ---- shared time cache per-call -----------------------------------------
-    class _TimeCache:
-        def __init__(self, ts):
-            self.ts = ts
-            self._cache: Dict[float, Any] = {}
-        def t(self, jd: float):
-            v = self._cache.get(jd)
-            if v is None:
-                v = self.ts.tt_jd(jd)
-                self._cache[jd] = v
-            return v
-
-    # ---- major computation (shared times + smart XY) ------------------------
+    # ---- major computation (shared global times + smart XY) -----------------
     def _compute_major_row(
-        self, *, body, obs, ef, jd_tt: float, name: str, tcache: "EphemerisAdapter._TimeCache",
+        self, *, body, obs, ef, jd_tt: float, name: str,
         warnings: List[str], diags: Dict[str, Any], want_velocity: bool
     ) -> Dict[str, Any]:
 
         def lon_at(tjd: float) -> float:
-            geo = obs.at(tcache.t(tjd)).observe(body).apparent()
+            geo = obs.at(_tt_time_for_jd(tjd)).observe(body).apparent()
             lon, _ = _frame_latlon(geo, ef, abs_zero_tol_deg=self.cfg.abs_zero_tol_deg)
             return lon
 
         def xy_at(tjd: float) -> Tuple[float, float]:
-            xyz = obs.at(tcache.t(tjd)).observe(body).apparent().frame_xyz(ef)
+            xyz = obs.at(_tt_time_for_jd(tjd)).observe(body).apparent().frame_xyz(ef)
             return float(xyz.au[0]), float(xyz.au[1])
 
         # lon/lat now (one compute)
-        geo_now = obs.at(tcache.t(jd_tt)).observe(body).apparent()
+        geo_now = obs.at(_tt_time_for_jd(jd_tt)).observe(body).apparent()
         lon_now, lat_now = _frame_latlon(geo_now, ef, abs_zero_tol_deg=self.cfg.abs_zero_tol_deg)
 
         # Fast path: no velocity requested → skip all extra work
@@ -922,7 +916,7 @@ class EphemerisAdapter:
             diags.setdefault("velocity_method", "skipped")
             return self._mk_row(name, lon_now, lat=lat_now)
 
-        # Velocity requested (e.g., stations): do a bounded-cost evaluation
+        # Velocity requested (e.g., stations): bounded-cost evaluation
         h0 = _speed_step_for(name)
         # Fewer stencils for slow outers
         if name in ("Jupiter","Saturn","Uranus","Neptune","Pluto","Venus","Mars"):
@@ -997,7 +991,6 @@ class EphemerisAdapter:
                 _spice_bootstrap(warnings)
 
             main, _ = _get_kernels()
-            ts = _get_timescale()
             ef = _get_ecliptic_frame_cached(used_frame)
 
             obs, topo_resolved = _observer(
@@ -1009,15 +1002,12 @@ class EphemerisAdapter:
                 observer=observer,
                 meta_warnings=warnings,
             )
-            if main is None or obs is None or ef is None or ts is None:
-                raise EphemerisError("setup", "Ephemeris setup failed", main=bool(main), obs=bool(obs), ef=bool(ef), ts=bool(ts))
+            if main is None or obs is None or ef is None:
+                raise EphemerisError("setup", "Ephemeris setup failed", main=bool(main), obs=bool(obs), ef=bool(ef))
 
             wanted_src = names if names is not None else bodies
             wanted = (list(wanted_src) if wanted_src else list(_PLANET_KEYS.keys()))
             rows: List[Dict[str, Any]] = []
-
-            # per-call shared time cache
-            tcache = self._TimeCache(ts)
 
             for raw in wanted:
                 canon, kind, node_override = _canon_name(raw)
@@ -1040,7 +1030,7 @@ class EphemerisAdapter:
                     try:
                         rows.append(self._compute_major_row(
                             body=body, obs=obs, ef=ef, jd_tt=jd_tt, name=raw,
-                            tcache=tcache, warnings=warnings, diags=diags, want_velocity=want_velocity
+                            warnings=warnings, diags=diags, want_velocity=want_velocity
                         ))
                         continue
                     except EphemerisError as e:
@@ -1088,7 +1078,7 @@ class EphemerisAdapter:
         elevation_m: Optional[float] = None,
         observer: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
-        # Force velocity computation by setting an internal override flag in observer (no API change)
+        # Force velocity computation by setting an internal override flag in observer (no signature change)
         obs = dict(observer or {})
         obs["_want_velocity"] = True
         return self.ecliptic_longitudes(
@@ -1103,8 +1093,144 @@ class EphemerisAdapter:
             observer=obs,
         )
 
+    # NEW: multi-time batching (single setup + shared caches for big speedup)
+    def ecliptic_longitudes_many(
+        self,
+        jd_tts: List[float],
+        names: Optional[List[str]] = None,
+        bodies: Optional[List[str]] = None,
+        *,
+        frame: Optional[str] = None,
+        topocentric: bool = False,
+        latitude: Optional[float] = None,
+        longitude: Optional[float] = None,
+        elevation_m: Optional[float] = None,
+        observer: Optional[Dict[str, float]] = None,
+        with_velocity: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        warnings: List[str] = []
+        diags: Dict[str, Any] = {"batched_times": len(jd_tts or [])}
+        used_frame = (frame or self.cfg.frame)
+
+        if not isinstance(jd_tts, (list, tuple)) or not jd_tts:
+            return {"results": [], "meta": self._meta(used_frame, False, ["error:validation:empty_times"], diags), "center": "geocentric"}
+
+        want_velocity = bool(with_velocity) if with_velocity is not None else bool(self.cfg.compute_velocity_default)
+        if isinstance(observer, dict) and observer.get("_want_velocity") is True:
+            want_velocity = True
+
+        try:
+            for t in jd_tts:
+                self._check_jd_guard(float(t))
+
+            if self.cfg.enable_smalls and _SPICE_OK:
+                _spice_bootstrap(warnings)
+
+            main, _ = _get_kernels()
+            ef = _get_ecliptic_frame_cached(used_frame)
+
+            obs, topo_resolved = _observer(
+                main,
+                topocentric=topocentric,
+                latitude=latitude,
+                longitude=longitude,
+                elevation_m=elevation_m,
+                observer=observer,
+                meta_warnings=warnings,
+            )
+            if main is None or obs is None or ef is None:
+                raise EphemerisError("setup", "Ephemeris setup failed", main=bool(main), obs=bool(obs), ef=bool(ef))
+
+            wanted_src = names if names is not None else bodies
+            wanted = (list(wanted_src) if wanted_src else list(_PLANET_KEYS.keys()))
+            rows: List[Dict[str, Any]] = []
+
+            # Iterate by-body to reuse resolved kernel body & share XY/Richardson
+            for raw in wanted:
+                canon, kind, node_override = _canon_name(raw)
+
+                if kind == "node":
+                    step = _speed_step_for("Moon")
+                    for t in jd_tts:
+                        lon_val, model_used, fb = _node_longitude(canon, float(t), cfg=self.cfg, warnings=warnings, model_override=node_override)
+                        if want_velocity:
+                            lon_m, _m, _ = _node_longitude(canon, float(t) - step, cfg=self.cfg, warnings=warnings, model_override=node_override)
+                            lon_p, _p, _ = _node_longitude(canon, float(t) + step, cfg=self.cfg, warnings=warnings, model_override=node_override)
+                            vel_val = _wrap_diff_deg(lon_p, lon_m) / (2.0 * step)
+                        else:
+                            vel_val = None
+                        rows.append(self._mk_row(raw, lon_val, lat=0.0, vel=vel_val, node_model=model_used, node_fallback=fb, jd_tt=float(t)))
+                    continue
+
+                if kind == "major":
+                    body = self._get_body(canon)
+                    if body is None:
+                        warnings.append(f"missing_body:{canon}")
+                        continue
+
+                    # Prebuild small closures once per body
+                    def lon_at(tjd: float) -> float:
+                        geo = obs.at(_tt_time_for_jd(tjd)).observe(body).apparent()
+                        lon, _ = _frame_latlon(geo, ef, abs_zero_tol_deg=self.cfg.abs_zero_tol_deg)
+                        return lon
+                    def xy_at(tjd: float) -> Tuple[float, float]:
+                        xyz = obs.at(_tt_time_for_jd(tjd)).observe(body).apparent().frame_xyz(ef)
+                        return float(xyz.au[0]), float(xyz.au[1])
+
+                    for t in jd_tts:
+                        t = float(t)
+                        # lon/lat at t
+                        geo_now = obs.at(_tt_time_for_jd(t)).observe(body).apparent()
+                        lon_now, lat_now = _frame_latlon(geo_now, ef, abs_zero_tol_deg=self.cfg.abs_zero_tol_deg)
+                        vel_val: Optional[float] = None
+                        if want_velocity:
+                            h0 = _speed_step_for(canon)
+                            max_lv = 2 if canon in ("Jupiter","Saturn","Uranus","Neptune","Pluto","Venus","Mars") else 3
+                            vel_R, h_used, Rinfo = _richardson_velocity(
+                                lon_at, t, h0,
+                                tol_deg_per_day=self.cfg.speed_tol_arcsec / 3600.0,
+                                h_min=self.cfg.speed_min_step_d,
+                                max_levels=max_lv,
+                            )
+                            wrap_prone = canon in ("Moon","Mercury")
+                            if wrap_prone and (Rinfo.get("convergence") != "clean"):
+                                vel_XY = _ang_speed_via_xy(xy_at, t, max(h_used, self.cfg.speed_min_step_d))
+                                if math.isfinite(vel_XY) and abs(vel_R - vel_XY) > (self.cfg.speed_tol_arcsec / 3600.0):
+                                    vel_val = vel_XY
+                                else:
+                                    vel_val = vel_R
+                            else:
+                                vel_val = vel_R
+                        rows.append(self._mk_row(raw, lon_now, lat=lat_now, vel=vel_val, jd_tt=t))
+                    continue
+
+                if kind == "small" and self.cfg.enable_smalls and _SPICE_READY:
+                    for t in jd_tts:
+                        lon, lat, spd = _spice_lon_lat_speed(float(t), canon, frame=used_frame, warnings=warnings,
+                                                             allow_degraded=self.cfg.allow_degraded, abs_zero_tol_deg=self.cfg.abs_zero_tol_deg)
+                        if lon is not None and lat is not None:
+                            rows.append(self._mk_row(raw, lon, lat=lat, vel=(spd if want_velocity else None), jd_tt=float(t)))
+                    continue
+
+                warnings.append(f"unresolved:{raw}:{kind}")
+
+            payload = {
+                "results": rows,
+                "meta": self._meta(used_frame, topo_resolved, warnings, diags),
+                "center": "topocentric" if topo_resolved else "geocentric",
+            }
+            return payload
+
+        except EphemerisError as e:
+            warnings.append(f"error:{e.stage}:{e.message}")
+            return {
+                "results": [],
+                "meta": self._meta(used_frame or self.cfg.frame, False, warnings, diags),
+                "center": "geocentric",
+            }
+
     def ephemeris_diagnostics(self, requested: Optional[List[str]] = None) -> Dict[str, Any]:
-        main, extras = _get_kernels()
+        _, extras = _get_kernels()
         kernels = [p for p in _KERNEL_PATHS] or [EPHEMERIS_NAME_DEFAULT]
         if self.cfg.enable_smalls and _SPICE_OK and _spice_bootstrap():
             kernels = kernels + [f"[spice] {os.path.basename(p)}" for p in _SPICE_KERNELS]
@@ -1181,9 +1307,11 @@ class EphemerisAdapter:
         except Exception: pass
         try: _observer_cached.cache_clear()  # type: ignore[attr-defined]
         except Exception: pass
+        try: _tt_time_for_jd.cache_clear()  # type: ignore[attr-defined]
+        except Exception: pass
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Public module-level API (unchanged)
+# Public module-level API (unchanged; plus optional *many)
 # ─────────────────────────────────────────────────────────────────────────────
 _default_adapter: Optional[EphemerisAdapter] = None
 
@@ -1214,8 +1342,10 @@ def ecliptic_longitudes(*args, **kwargs):
     return _get_default_adapter().ecliptic_longitudes(*args, **kwargs)
 
 def ecliptic_longitudes_and_velocities(*args, **kwargs):
-    # This wrapper now forces velocity computation (no signature change)
     return _get_default_adapter().ecliptic_longitudes_and_velocities(*args, **kwargs)
+
+def ecliptic_longitudes_many(*args, **kwargs):
+    return _get_default_adapter().ecliptic_longitudes_many(*args, **kwargs)
 
 def rows_to_maps(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
     lon_map: Dict[str, float] = {}
@@ -1256,7 +1386,6 @@ def get_node_longitude(name: str, jd_tt: float) -> float:
     cfg = _get_default_adapter().cfg
     lon, _model, _fb = _node_longitude(canon, jd_tt, cfg=cfg, warnings=warnings, model_override=override)
     return lon
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Progressions (unchanged public behavior)
@@ -1389,6 +1518,7 @@ __all__ = [
     "_skyfield_available",
     "ecliptic_longitudes",
     "ecliptic_longitudes_and_velocities",
+    "ecliptic_longitudes_many",
     "rows_to_maps",
     "ephemeris_diagnostics",
     "load_kernel",
