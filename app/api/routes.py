@@ -2005,7 +2005,7 @@ def predictive_ingresses():
 
     if not _take_gate():
         return _busy()
-    t0 = time.perf_counter()
+    t_wall = time.perf_counter()
     try:
         try:
             jd0, jd1 = _parse_time_range_like(body)
@@ -2015,51 +2015,250 @@ def predictive_ingresses():
             return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
 
         raw_movers = body.get("movers") or ["Sun","Mercury","Venus","Mars","Jupiter","Saturn"]
-        movers = list(dict.fromkeys(m.strip() for m in raw_movers if m))
+        movers = [m.strip() for m in raw_movers if m and str(m).strip()]
+        if not movers:
+            return _json_error("validation_error", [{"msg": "movers cannot be empty"}], 400)
+
         frame = parse_frame(body.get("frame"))
 
-        from app.core import predictive as pred
-
+        from app.core.ephemeris_adapter import EphemerisAdapter, Config as EphemConfig  # local clarity
         shared_adapter = get_shared_adapter(frame)
-        eng = pred.TransitEngine(
-            ephem=shared_adapter,
-            frame=frame,
+
+        # Observing options (threaded through to adapter)
+        obs = dict(
             topocentric=bool(body.get("topocentric")),
-            latitude=float(body.get("latitude")) if isinstance(body.get("latitude"), (int,float)) else None,
-            longitude=float(body.get("longitude")) if isinstance(body.get("longitude"), (int,float)) else None,
-            elevation_m=float(body.get("elevation_m")) if isinstance(body.get("elevation_m"), (int,float)) else None,
+            latitude=(float(body["latitude"]) if isinstance(body.get("latitude"), (int, float)) else None),
+            longitude=(float(body["longitude"]) if isinstance(body.get("longitude"), (int, float)) else None),
+            elevation_m=(float(body["elevation_m"]) if isinstance(body.get("elevation_m"), (int, float)) else None),
         )
 
-        # sidereal thread-through
+        # Sidereal/tropical handling
         zodiac_mode = (body.get("zodiac_mode") or "tropical").lower()
         ayanamsa_deg = float(body.get("ayanamsa_deg", 0.0))
-        eng.sidereal_mode = zodiac_mode.startswith("sidereal")
-        eng.ayanamsa_deg = ayanamsa_deg
+        sidereal = zodiac_mode.startswith("sidereal")
+        ay = float(ayanamsa_deg if sidereal else 0.0)
 
+        # Step sizing
         step_arg = _parse_step_minutes(body.get("step_minutes"), default_min=60.0)
-        res = eng.find_ingresses(
-            jd_start_tt=float(jd0), jd_end_tt=float(jd1),
-            movers=[str(m) for m in movers],
-            step_minutes=step_arg
-        )
+
+        # ─────────────────────────── helpers ───────────────────────────
+        TAU = 360.0
+
+        def _norm360(x: float) -> float:
+            r = x % TAU
+            return r + TAU if r < 0.0 else r
+
+        def _wrap180(x: float) -> float:
+            v = ((x + 180.0) % 360.0) - 180.0
+            return 180.0 if v == -180.0 else v
+
+        def _nir(lon_trop: float) -> float:
+            return _norm360(float(lon_trop) - ay)
+
+        def _sign_idx(lon_deg: float) -> int:
+            return int(math.floor(_norm360(lon_deg) / 30.0)) % 12
+
+        def _lon_map(jd_tt: float, names: list[str]) -> dict[str, float]:
+            # one ephemeris call for all names at a given time (fast path)
+            rows = shared_adapter.ecliptic_longitudes(jd_tt, names, **obs).get("results", [])  # type: ignore[arg-type]
+            if not rows:
+                return {}
+            # return **sidereal-adjusted** longitudes if needed
+            if sidereal:
+                return {row["name"]: _nir(row["longitude"]) for row in rows}
+            return {row["name"]: float(row["longitude"]) for row in rows}
+
+        def _auto_step_minutes(names: list[str]) -> float:
+            caps = []
+            for m in names:
+                n = (m or "").lower()
+                if n == "moon": caps.append(10)
+                elif n in ("mercury", "venus", "mars"): caps.append(30)
+                elif n in ("sun", "jupiter", "saturn"): caps.append(90)
+                else: caps.append(180)
+            return float(max(5, min(caps) if caps else 60))
+
+        # Brent–Dekker root finder (days domain)
+        def _refine_zero_brent(f, a, b, fa, fb, *, max_iter=64, tol_days=1e-6) -> float:
+            if fa == 0.0: return a
+            if fb == 0.0: return b
+            # Ensure bracket; if not bracketed, fallback to bisection attempt
+            if fa * fb > 0.0:
+                aa, bb = a, b
+                for _ in range(max_iter):
+                    m = 0.5 * (aa + bb)
+                    fm = f(m)
+                    if fm == 0.0 or (bb - aa) <= tol_days:
+                        return m
+                    if fa * fm <= 0.0:
+                        bb, fb = m, fm
+                    else:
+                        aa, fa = m, fm
+                return 0.5 * (aa + bb)
+
+            c, fc = a, fa
+            d = e = b - a
+            for _ in range(max_iter):
+                if abs(fb) < abs(fa):
+                    a, b = b, a; fa, fb = fb, fa
+                m = 0.5 * (a + b)
+                tol = tol_days
+                if abs(b - a) <= tol:
+                    return b
+                # inverse quadratic interpolation or secant
+                if fa != fc and fb != fc:
+                    s = (a*fb*fc)/((fa - fb)*(fa - fc)) + (b*fa*fc)/((fb - fa)*(fb - fc)) + (c*fa*fb)/((fc - fa)*(fc - fb))
+                else:
+                    s = b - fb*(b - a)/(fb - fa)
+                # acceptability checks; else bisection
+                cond = not ((3*a + b)/4 < s < b if a < b else b < s < (3*a + b)/4)
+                cond |= (e and abs(s - b) >= abs(e) / 2)
+                cond |= (not e and abs(s - b) >= abs(d) / 2)
+                cond |= (abs(e) < tol)
+                cond |= (abs(d) < tol)
+                if cond:
+                    s = m
+                    d = e = b - a
+                else:
+                    d, e = e, b - s
+                fs = f(s)
+                c, fc = a, fa
+                if (fa * fs) < 0:
+                    b, fb = s, fs
+                else:
+                    a, fa = s, fs
+                if abs(fa) < abs(fb):
+                    a, b = b, a; fa, fb = fb, fa
+            return b
+
+        # ────────────────────────── core scan ──────────────────────────
+        if isinstance(step_arg, str):
+            step_minutes = _auto_step_minutes(movers)
+        else:
+            step_minutes = float(step_arg) if float(step_arg) > 0.0 else _auto_step_minutes(movers)
+        dt = float(step_minutes) / (24.0 * 60.0)
+
+        t0 = float(jd0)
+        events: list[dict[str, object]] = []
+        dedupe: set[tuple[str, int]] = set()  # (body, 1s-bucket)
+
+        # prime at t0
+        l0 = _lon_map(t0, movers)
+        s0 = {k: _sign_idx(v) for k, v in l0.items()}
+
+        while t0 < jd1 - 1e-12:
+            t1 = min(t0 + dt, jd1)
+            l1 = _lon_map(t1, movers)
+
+            for body in movers:
+                if body not in l0 or body not in l1:
+                    continue
+
+                a = float(l0[body])  # already sidereal-adjusted if needed
+                b = float(l1[body])
+                s_prev = int(s0.get(body, _sign_idx(a)))
+                s_next = _sign_idx(b)
+
+                if s_prev == s_next:
+                    continue  # no sign change for this mover this step
+
+                # Determine boundary crossed and motion direction via shortest-path delta
+                delta = _wrap180(b - a)
+                forward = delta > 0.0
+
+                # The exact zodiacal edge in degrees (0..330 step 30)
+                if forward:
+                    boundary = (s_prev + 1) % 12
+                    edge_deg = 30.0 * boundary
+                else:
+                    boundary = s_prev  # crossing "down" to lower edge of current sign
+                    edge_deg = 30.0 * boundary
+
+                # Define root function: L_nir(t) - edge_deg wrapped to [-180,180]
+                def f(tt: float) -> float:
+                    lm = _lon_map(tt, [body]).get(body)
+                    if lm is None:
+                        return 0.0
+                    return _wrap180(float(lm) - edge_deg)
+
+                fa = _wrap180(a - edge_deg)
+                fb = _wrap180(b - edge_deg)
+
+                # If not bracketed (rare), try adjacent edge as a defensive fallback
+                if fa == 0.0:
+                    t_exact = t0
+                elif fb == 0.0:
+                    t_exact = t1
+                elif fa * fb > 0.0:
+                    alt_edge = 30.0 * ((boundary + (1 if forward else -1)) % 12)
+                    fa2 = _wrap180(a - alt_edge)
+                    fb2 = _wrap180(b - alt_edge)
+                    if fa2 * fb2 > 0.0:
+                        # can't bracket cleanly; skip this step for this body
+                        continue
+                    def f2(tt: float) -> float:
+                        lm = _lon_map(tt, [body]).get(body)
+                        if lm is None:
+                            return 0.0
+                        return _wrap180(float(lm) - alt_edge)
+                    t_exact = _refine_zero_brent(f2, t0, t1, fa2, fb2, tol_days=1e-6)
+                    edge_deg = alt_edge
+                else:
+                    t_exact = _refine_zero_brent(f, t0, t1, fa, fb, tol_days=1e-6)
+
+                # fetch exact longitude at root and build event
+                lm_exact = _lon_map(t_exact, [body]).get(body)
+                if lm_exact is None:
+                    continue
+                n_exact = float(lm_exact)
+                from_sign = s_prev
+                to_sign = _sign_idx(n_exact)
+
+                # 1-sec dedupe
+                bucket = int(round(t_exact * 86400.0))
+                key = (body, bucket)
+                if key in dedupe:
+                    continue
+                dedupe.add(key)
+
+                events.append({
+                    "jd_tt": float(t_exact),
+                    "body": body,
+                    "from_sign": int(from_sign),
+                    "to_sign": int(to_sign),
+                    "longitude_deg": float(n_exact),  # sidereal-adjusted if requested
+                })
+
+            # slide window
+            t0 = t1
+            l0 = l1
+            s0 = {k: _sign_idx(v) for k, v in l0.items()}
+
+        events.sort(key=lambda e: (e["jd_tt"], e["body"]))
         resp = jsonify({
             "ok": True,
             "window": {
-                "jd_start_tt": jd0,
-                "jd_end_tt": jd1,
-                "step_minutes": (step_arg if isinstance(step_arg, float) else "auto"),
+                "jd_start_tt": float(jd0),
+                "jd_end_tt": float(jd1),
+                "step_minutes": (step_minutes if not isinstance(step_arg, str) else "auto"),
             },
-            "engine": {"frame": frame, "topocentric": bool(body.get("topocentric")),
-                       "zodiac_mode": zodiac_mode, "ayanamsa_deg": ayanamsa_deg},
+            "engine": {
+                "frame": frame,
+                "topocentric": bool(obs["topocentric"]),
+                "zodiac_mode": zodiac_mode,
+                "ayanamsa_deg": ayanamsa_deg
+            },
             "movers": movers,
-            "results": res
+            "results": events
         })
         resp.status_code = 200
-        resp.headers["X-Compute-Time-ms"] = f"{(time.perf_counter() - t0)*1000:.0f}"
+        resp.headers["X-Compute-Time-ms"] = f"{(time.perf_counter() - t_wall)*1000:.0f}"
         return resp
+
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
     except Exception as e:
+        # keep a clean 500 for truly unexpected errors
         return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
     finally:
         _give_gate()
