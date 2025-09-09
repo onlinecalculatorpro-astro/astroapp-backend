@@ -70,13 +70,7 @@ except Exception as e:
     build_timescales = None  # type: ignore
     TimeScales = None  # type: ignore
 
-# Optional legacy predictions engine (kept for backwards compatibility)
-try:
-    from app.core.predict import predict as predict_engine  # legacy
-except Exception:
-    predict_engine = None  # type: ignore
-
-# V2 Prediction Engine (NEW - comprehensive prediction system)
+# Prediction Engine (NEW - comprehensive prediction system)
 try:
     from app.core.prediction import (
         predict_transits,
@@ -1740,21 +1734,25 @@ from typing import Any, Dict, List, Tuple, Optional
 import os, time, math, threading
 from flask import request, jsonify
 
-# Global adapter for performance optimization
+# Global adapter for performance optimization (per-frame cache)
 from app.core.ephemeris_adapter import EphemerisAdapter, Config as EphemConfig
 
-_GLOBAL_EPHEM_ADAPTER = None
+_GLOBAL_ADAPTERS: Dict[str, EphemerisAdapter] = {}
 _ADAPTER_LOCK = threading.Lock()
 
+def _norm_frame_key(frame: Optional[str]) -> str:
+    s = (frame or "ecliptic-of-date").strip().lower()
+    return "ecliptic-j2000" if s in ("ecliptic-j2000", "j2000", "ecl-j2000") else "ecliptic-of-date"
+
 def get_shared_adapter(frame: str = "ecliptic-of-date") -> EphemerisAdapter:
-    """Get or create a shared EphemerisAdapter instance for performance optimization."""
-    global _GLOBAL_EPHEM_ADAPTER
-    if _GLOBAL_EPHEM_ADAPTER is None:
-        with _ADAPTER_LOCK:
-            if _GLOBAL_EPHEM_ADAPTER is None:
-                cfg = EphemConfig(frame=frame, compute_velocity_default=False)
-                _GLOBAL_EPHEM_ADAPTER = EphemerisAdapter(cfg)
-    return _GLOBAL_EPHEM_ADAPTER
+    """Get or create a shared EphemerisAdapter instance (per frame) for performance."""
+    key = _norm_frame_key(frame)
+    with _ADAPTER_LOCK:
+        ep = _GLOBAL_ADAPTERS.get(key)
+        if ep is None:
+            ep = EphemerisAdapter(EphemConfig(frame=key, compute_velocity_default=False))
+            _GLOBAL_ADAPTERS[key] = ep
+        return ep
 
 # small concurrency gate to avoid 429s under burst load from the same pod
 _PRED_MAX_CONC = int(os.getenv("PREDICTIVE_MAX_CONCURRENCY", "2"))
@@ -1774,6 +1772,13 @@ def _give_gate():
         _PRED_SEM.release()
     except Exception:
         pass
+
+def _split_dt(s: str, fallback: str) -> Tuple[str, str]:
+    """Split 'YYYY-MM-DD[ T]HH:MM:SS' into (date, time) with sensible fallbacks."""
+    s = (s or "").strip().replace("T", " ")
+    if len(s) <= 10:
+        return s[:10], fallback
+    return s[:10], (s[11:19] or fallback)
 
 def _parse_time_range_like(body: Dict[str, Any]) -> Tuple[float, float]:
     """
@@ -1799,8 +1804,10 @@ def _parse_time_range_like(body: Dict[str, Any]) -> Tuple[float, float]:
         s0, s1 = tr[0], tr[1]
         if not (isinstance(s0, str) and isinstance(s1, str)):
             raise ValidationError([{"loc": ["time_range"], "msg": "items must be strings"}])
-        ts0 = _compute_timescales_from_local(s0[:10], ("00:00:00" if len(s0) == 10 else s0[11:19] or "00:00:00"), tz, payload=body)
-        ts1 = _compute_timescales_from_local(s1[:10], ("23:59:59" if len(s1) == 10 else s1[11:19] or "23:59:59"), tz, payload=body)
+        d0, t0 = _split_dt(s0, "00:00:00")
+        d1, t1 = _split_dt(s1, "23:59:59")
+        ts0 = _compute_timescales_from_local(d0, t0, tz, payload=body)
+        ts1 = _compute_timescales_from_local(d1, t1, tz, payload=body)
         jd0f, jd1f = float(ts0["jd_tt"]), float(ts1["jd_tt"])
         if jd1f <= jd0f:
             raise ValidationError([{"loc": ["time_range"], "msg": "end must be after start"}])
@@ -1866,9 +1873,10 @@ def predictive_transits():
             return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
 
         # -------- movers / targets --------
-        movers = body.get("movers") or ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn"]
-        if not (isinstance(movers, list) and all(isinstance(x, str) and x for x in movers)):
+        raw_movers = body.get("movers") or ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn"]
+        if not (isinstance(raw_movers, list) and all(isinstance(x, str) and x for x in raw_movers)):
             return _json_error("validation_error", [{"loc":["movers"],"msg":"must be a list of names"}], 400)
+        movers = list(dict.fromkeys(m.strip() for m in raw_movers if m))
 
         # targets_longitudes: direct map (preferred, fastest path)
         targets: Dict[str, float] = {}
@@ -1930,11 +1938,9 @@ def predictive_transits():
 
         # -------- run engine with shared adapter --------
         try:
-            # Get shared adapter for performance optimization
             shared_adapter = get_shared_adapter(frame)
-            
             eng = pred.TransitEngine(
-                ephem=shared_adapter,  # Use shared adapter instead of creating new one
+                ephem=shared_adapter,
                 frame=frame,
                 topocentric=topocentric,
                 latitude=lat, longitude=lon, elevation_m=elev
@@ -1972,7 +1978,11 @@ def predictive_transits():
         ]
         resp = jsonify({
             "ok": True,
-            "window": {"jd_start_tt": float(jd0), "jd_end_tt": float(jd1), "step_minutes": (step_arg if isinstance(step_arg, float) else "auto")},
+            "window": {
+                "jd_start_tt": float(jd0),
+                "jd_end_tt": float(jd1),
+                "step_minutes": (step_arg if isinstance(step_arg, float) else "auto"),
+            },
             "engine": {"frame": frame, "topocentric": topocentric, "zodiac_mode": zodiac_mode, "ayanamsa_deg": ayanamsa_deg},
             "targets": targets,
             "movers": movers,
@@ -2004,16 +2014,15 @@ def predictive_ingresses():
         except Exception as e:
             return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
 
-        movers = body.get("movers") or ["Sun","Mercury","Venus","Mars","Jupiter","Saturn"]
+        raw_movers = body.get("movers") or ["Sun","Mercury","Venus","Mars","Jupiter","Saturn"]
+        movers = list(dict.fromkeys(m.strip() for m in raw_movers if m))
         frame = parse_frame(body.get("frame"))
 
         from app.core import predictive as pred
-        
-        # Use shared adapter for performance optimization
+
         shared_adapter = get_shared_adapter(frame)
-        
         eng = pred.TransitEngine(
-            ephem=shared_adapter,  # Use shared adapter
+            ephem=shared_adapter,
             frame=frame,
             topocentric=bool(body.get("topocentric")),
             latitude=float(body.get("latitude")) if isinstance(body.get("latitude"), (int,float)) else None,
@@ -2027,12 +2036,24 @@ def predictive_ingresses():
         eng.sidereal_mode = zodiac_mode.startswith("sidereal")
         eng.ayanamsa_deg = ayanamsa_deg
 
+        step_arg = _parse_step_minutes(body.get("step_minutes"), default_min=60.0)
         res = eng.find_ingresses(
             jd_start_tt=float(jd0), jd_end_tt=float(jd1),
             movers=[str(m) for m in movers],
-            step_minutes=_parse_step_minutes(body.get("step_minutes"), default_min=60.0)
+            step_minutes=step_arg
         )
-        resp = jsonify({"ok": True, "window": {"jd_start_tt": jd0, "jd_end_tt": jd1}, "movers": movers, "results": res})
+        resp = jsonify({
+            "ok": True,
+            "window": {
+                "jd_start_tt": jd0,
+                "jd_end_tt": jd1,
+                "step_minutes": (step_arg if isinstance(step_arg, float) else "auto"),
+            },
+            "engine": {"frame": frame, "topocentric": bool(body.get("topocentric")),
+                       "zodiac_mode": zodiac_mode, "ayanamsa_deg": ayanamsa_deg},
+            "movers": movers,
+            "results": res
+        })
         resp.status_code = 200
         resp.headers["X-Compute-Time-ms"] = f"{(time.perf_counter() - t0)*1000:.0f}"
         return resp
@@ -2063,19 +2084,17 @@ def predictive_stations():
         except Exception as e:
             return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
 
-        # default to ~30 hours if only start provided (handled by _parse_time_range_like already),
-        # but preserve your original behavior by allowing override via step_minutes or explicit jd1.
+        # default to ~30 hours if only start provided is already handled by _parse_time_range_like
 
-        movers = body.get("movers") or ["Mercury","Venus","Mars","Jupiter","Saturn","Uranus","Neptune","Pluto"]
+        raw_movers = body.get("movers") or ["Mercury","Venus","Mars","Jupiter","Saturn","Uranus","Neptune","Pluto"]
+        movers = list(dict.fromkeys(m.strip() for m in raw_movers if m))
         frame = parse_frame(body.get("frame"))
 
         from app.core import predictive as pred
-        
-        # Use shared adapter for performance optimization
+
         shared_adapter = get_shared_adapter(frame)
-        
         eng = pred.TransitEngine(
-            ephem=shared_adapter,  # Use shared adapter
+            ephem=shared_adapter,
             frame=frame,
             topocentric=bool(body.get("topocentric")),
             latitude=float(body.get("latitude")) if isinstance(body.get("latitude"), (int,float)) else None,
@@ -2089,12 +2108,24 @@ def predictive_stations():
         eng.sidereal_mode = zodiac_mode.startswith("sidereal")
         eng.ayanamsa_deg = ayanamsa_deg
 
+        step_arg = _parse_step_minutes(body.get("step_minutes"), default_min=60.0)
         res = eng.find_stations(
             jd_start_tt=float(jd0), jd_end_tt=float(jd1),
             movers=[str(m) for m in movers],
-            step_minutes=_parse_step_minutes(body.get("step_minutes"), default_min=60.0)
+            step_minutes=step_arg
         )
-        resp = jsonify({"ok": True, "window": {"jd_start_tt": jd0, "jd_end_tt": jd1}, "movers": movers, "results": res})
+        resp = jsonify({
+            "ok": True,
+            "window": {
+                "jd_start_tt": jd0,
+                "jd_end_tt": jd1,
+                "step_minutes": (step_arg if isinstance(step_arg, float) else "auto"),
+            },
+            "engine": {"frame": frame, "topocentric": bool(body.get("topocentric")),
+                       "zodiac_mode": zodiac_mode, "ayanamsa_deg": ayanamsa_deg},
+            "movers": movers,
+            "results": res
+        })
         resp.status_code = 200
         resp.headers["X-Compute-Time-ms"] = f"{(time.perf_counter() - t0)*1000:.0f}"
         return resp
@@ -2271,6 +2302,7 @@ def predictive_yogas():
         return jsonify({"ok": True, "results": res}), 200
     except Exception as e:
         return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+
         
 # ───────────────────────── PROGRESSIONS ─────────────────────────
 @api.post("/api/progressions")
