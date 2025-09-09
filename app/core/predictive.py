@@ -4,8 +4,6 @@ from __future__ import annotations
 """
 Predictive Toolkit — Transits • Dasha • Varga • Yoga • Validation
 
-This module is a single import hub used by prediction.py.
-
 Exports (see __all__):
 - Transits: TransitEngine, TransitEvent, find_transits_in_range
 - Dasha:   DashaPeriod, vimsottari_dasha, predict_dasha_periods
@@ -21,6 +19,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Literal, Callable
 import math
 import random
 import logging
+from datetime import datetime, date as _date
+from types import SimpleNamespace
 
 # ───────────────────── precise backends (soft imports) ─────────────────────
 # Ephemeris adapter
@@ -31,7 +31,6 @@ try:
     _EPH_OK = True
     _EPH_ERR = None
 except Exception as e:
-    # Do NOT raise at import time; defer error until a function needs it
     _EPH_OK = False
     _EPH_ERR = e
     EphemerisAdapter = None          # type: ignore
@@ -73,6 +72,9 @@ except Exception as e:
     _ts_resolve = None  # type: ignore
 
 log = logging.getLogger(__name__)
+
+# Lightweight telemetry (can be read in meta)
+PROF = {"ephem_calls": 0, "refinements": 0}
 
 # =============================================================================
 # Common math helpers
@@ -169,9 +171,9 @@ class TransitEngine:
     - Batch ephemeris calls per boundary (t0, t1)
     - Carry forward lons(t1) → next step
     - In-scan cache for lon(body, t) during refinement
-    - Two-phase search: coarse bracket → refine (bisection)
-    - Guard band around orbs to catch slow zero-crossings
-    - De-duplicate near-identical roots at step boundaries
+    - Two-phase search: coarse bracket → refine (Brent–Dekker)
+    - Guard band around orbs scaled by step & approx speed
+    - De-duplicate near-identical roots at 1-second buckets
     """
 
     def __init__(
@@ -192,38 +194,77 @@ class TransitEngine:
             longitude=longitude,
             elevation_m=elevation_m,
         )
-        # will be set by the public wrapper; keeps API unchanged
+        # threaded by caller
         self.sidereal_mode: bool = False
         self.ayanamsa_deg: float = 0.0
 
-    # ---------- ephemeris wrappers ----------
+    # ---------- ephemeris wrappers (fast path; avoid rows_to_maps) ----------
     def _lon_map(self, jd_tt: float, names: List[str]) -> Dict[str, float]:
-        r = self.ephem.ecliptic_longitudes(jd_tt, names, **self.obs)
-        lmap = rows_to_maps(r.get("results", []))["longitudes"]
+        res = self.ephem.ecliptic_longitudes(jd_tt, names, **self.obs).get("results", [])
+        PROF["ephem_calls"] += 1
+        if not res:
+            return {}
         if self.sidereal_mode:
             ay = self.ayanamsa_deg
-            return {k: norm360(float(v) - ay) for k, v in lmap.items()}
-        return {k: float(v) for k, v in lmap.items()}
+            return {row["name"]: norm360(float(row["longitude"]) - ay) for row in res}
+        return {row["name"]: float(row["longitude"]) for row in res}
 
-    # ---------- root finding ----------
+    # ---------- Brent–Dekker refinement with provided fa/fb ----------
     @staticmethod
-    def _refine_zero(f, t0, t1, *, max_iter=32, tol_days=1e-6) -> float:
-        f0 = f(t0); f1 = f(t1)
-        if not (math.isfinite(f0) and math.isfinite(f1)):
-            return (t0 + t1) / 2.0
-        if f0 == 0.0: return t0
-        if f1 == 0.0: return t1
-        a, b = (t0, t1); fa, fb = (f0, f1)
+    def _refine_zero_brent(f, a, b, fa, fb, *, max_iter=32, tol_days=1e-6) -> float:
+        PROF["refinements"] += 1
+        if fa == 0.0: return a
+        if fb == 0.0: return b
+        # Fallback: ensure bracket; if not, do bisection
+        if fa * fb > 0.0:
+            aa, bb = a, b
+            for _ in range(max_iter):
+                m = 0.5 * (aa + bb)
+                fm = f(m)
+                if fm == 0.0 or (bb - aa) <= tol_days:
+                    return m
+                if fa * fm <= 0:
+                    bb, fb = m, fm
+                else:
+                    aa, fa = m, fm
+            return 0.5 * (aa + bb)
+
+        c, fc = a, fa
+        d = e = b - a
         for _ in range(max_iter):
+            if fb == 0.0:
+                return b
+            if abs(fa) < abs(fb):
+                a, b = b, a; fa, fb = fb, fa
             m = 0.5 * (a + b)
-            fm = f(m)
-            if fm == 0.0 or (b - a) <= tol_days:
-                return m
-            if fa * fm <= 0.0:
-                b, fb = m, fm
+            tol = tol_days
+            if abs(b - a) <= tol:
+                return b
+            # inverse quadratic interpolation or secant
+            if fa != fc and fb != fc:
+                s = (a*fb*fc)/((fa - fb)*(fa - fc)) + (b*fa*fc)/((fb - fa)*(fb - fc)) + (c*fa*fb)/((fc - fa)*(fc - fb))
             else:
-                a, fa = m, fm
-        return 0.5 * (a + b)
+                s = b - fb*(b - a)/(fb - fa)
+            # Acceptability checks; else bisection
+            cond = not ((3*a + b)/4 < s < b if a < b else b < s < (3*a + b)/4)
+            cond |= (e and abs(s - b) >= abs(e)/2)
+            cond |= (not e and abs(s - b) >= abs(d)/2)
+            cond |= (abs(e) < tol)
+            cond |= (abs(d) < tol)
+            if cond:
+                s = m
+                d = e = b - a
+            else:
+                d, e = e, b - s
+            fs = f(s)
+            c, fc = a, fa
+            if (fa * fs) < 0:
+                b, fb = s, fs
+            else:
+                a, fa = s, fs
+            if abs(fa) < abs(fb):
+                a, b = b, a; fa, fb = fb, fa
+        return b
 
     # ---------- scans ----------
     def scan_aspects(
@@ -251,20 +292,20 @@ class TransitEngine:
         tgt_img_anti = {k: antiscia_longitude(v) for k, v in targets.items()}
         tgt_img_contra = {k: contra_antiscia_longitude(v) for k, v in targets.items()}
 
-        # Guard band around orb (0.25°..0.75°; capped by half the orb)
-        def guard_for(spec: AspectSpec) -> float:
-            return max(0.25, min(0.75, spec.orb_deg * 0.5))
+        # Guard band scaled by step & approx speed
+        def guard_for(spec: AspectSpec, dt_days: float, body: str) -> float:
+            b = body.lower()
+            speed = 13.5 if b == "moon" else 1.2 if b in ("mercury","venus") else \
+                    0.8 if b == "mars" else 1.0 if b == "sun" else 0.2
+            return max(0.15, min(spec.orb_deg * 0.33, speed * dt_days * 1.5))
 
-        # step size (days). Support "auto" without changing signature.
+        # step size (days). Support "auto"
         auto = (isinstance(step_minutes, str) and step_minutes.lower() == "auto") or (float(step_minutes) <= 0.0)
         if auto:
-            # conservative auto step; refinement gives exact time
-            # Moon 10m, personal 30m, Sun/Jupiter/Saturn 60–120m, outers 180m
-            # Use the tightest among requested movers.
             caps_min = []
             for m in movers:
                 n = m.lower()
-                if n in ("moon",): caps_min.append(10)
+                if n == "moon": caps_min.append(10)
                 elif n in ("mercury","venus","mars"): caps_min.append(30)
                 elif n in ("sun","jupiter","saturn"): caps_min.append(90)
                 else: caps_min.append(180)
@@ -287,9 +328,11 @@ class TransitEngine:
             lon_cache[key] = lon
             return lon
 
+        # Prebuild separation closures per (target, spec, body-kind)
         def make_sep(body: str, tgt_name: str, tgt_lon: float, spec: AspectSpec):
             if spec.kind == "zodiacal":
-                return lambda t: _zodiacal_separation(_lon_cached(body, t), tgt_lon, spec.angle)
+                ang = float(spec.angle)
+                return lambda t: wrap180(angdiff(_lon_cached(body, t), tgt_lon) - ang)
             elif spec.kind == "antiscia":
                 img = tgt_img_anti[tgt_name]
                 return lambda t: wrap180(_lon_cached(body, t) - img)
@@ -313,8 +356,11 @@ class TransitEngine:
                 lon0 = l0.get(body); lon1 = l1.get(body)
                 if lon0 is None or lon1 is None:
                     continue
+
                 for tgt_name, tgt_lon in targets.items():
+                    # compute once per target
                     for spec in asp_list:
+                        # quick separations on boundaries
                         if spec.kind == "zodiacal":
                             s0 = _zodiacal_separation(lon0, tgt_lon, spec.angle)
                             s1 = _zodiacal_separation(lon1, tgt_lon, spec.angle)
@@ -327,18 +373,22 @@ class TransitEngine:
 
                         if not (math.isfinite(s0) and math.isfinite(s1)):
                             continue
+
+                        # Skip obvious far misses
                         if abs(s0) > 120.0 and abs(s1) > 120.0:
                             continue
 
+                        # Candidate test
                         sign_change = (s0 == 0.0) or (s1 == 0.0) or ((s0 * s1) < 0.0)
-                        near = (min(abs(s0), abs(s1)) <= (spec.orb_deg + guard_for(spec)))
+                        near = (min(abs(s0), abs(s1)) <= (spec.orb_deg + guard_for(spec, dt, body)))
                         if not (sign_change or near):
                             continue
 
-                        # refine root
+                        # refine root using Brent with known endpoints
                         f = make_sep(body, tgt_name, tgt_lon, spec)
-                        t_exact = self._refine_zero(f, t0, t1, tol_days=1e-6)
+                        t_exact = self._refine_zero_brent(f, t0, t1, s0, s1, tol_days=1e-6)
 
+                        # separation at exact
                         lon_now = _lon_cached(body, t_exact)
                         if spec.kind == "zodiacal":
                             sep = _zodiacal_separation(lon_now, tgt_lon, spec.angle)
@@ -346,13 +396,12 @@ class TransitEngine:
                             img_now = tgt_img_anti[tgt_name] if spec.kind == "antiscia" else tgt_img_contra[tgt_name]
                             sep = wrap180(lon_now - img_now)
 
-                        # applying/separating
-                        epsd = 5.0 / (24.0 * 60.0)
-                        before = f(t_exact - epsd)
-                        applying = (abs(before) > abs(sep))
+                        # applying/separating (use boundary trend; avoids extra call)
+                        applying = (abs(s1) < abs(s0))
 
-                        # de-dup
-                        key = (body, tgt_name, spec.name, int(round(t_exact * 1e7)))
+                        # de-dup (1-second bucket)
+                        bucket = int(round(t_exact * 86400.0))
+                        key = (body, tgt_name, spec.name, bucket)
                         if key in dedupe:
                             continue
                         dedupe.add(key)
@@ -380,9 +429,6 @@ class TransitEngine:
 # =============================================================================
 # Public transit wrapper expected by prediction.py
 # =============================================================================
-
-from datetime import datetime, date as _date
-from types import SimpleNamespace
 
 def _to_date(s) -> _date:
     if isinstance(s, _date):
@@ -480,34 +526,39 @@ def find_transits_in_range(
 
     # natal target longitudes at start (apply sidereal if needed)
     nat_rows = ep.ecliptic_longitudes(float(start_jd_tt), tgts).get("results", [])
-    nat_map = rows_to_maps(nat_rows)["longitudes"]
+    PROF["ephem_calls"] += 1
+    # fast map to avoid rows_to_maps overhead
+    nat_map = {row["name"]: float(row["longitude"]) for row in nat_rows} if nat_rows else {}
     targets: dict[str, float] = {}
-    for k, v in nat_map.items():
-        val = float(v)
-        if math.isfinite(val):
-            if eng.sidereal_mode:
-                val = norm360(val - ay)
-            targets[k] = val
+    if eng.sidereal_mode:
+        for k, v in nat_map.items():
+            val = norm360(float(v) - ay)
+            if math.isfinite(val):
+                targets[k] = val
+    else:
+        for k, v in nat_map.items():
+            val = float(v)
+            if math.isfinite(val):
+                targets[k] = val
 
     specs = _aspects_from_kwargs({"aspects": aspects, "orbs": (orbs or {})})
     include_antiscia = bool(kwargs.get("include_antiscia", False))
     antiscia_orb = float(kwargs.get("antiscia_orb_deg", 2.0))
-    # allow auto without changing signature
-    step_arg = kwargs.get("step_minutes", 30.0)
-    step_min = step_arg if isinstance(step_arg, (int, float)) else 30.0
+    # allow auto without changing signature (default to "auto")
+    step_arg = kwargs.get("step_minutes", "auto")
 
     try:
         evs = eng.scan_aspects(
             jd_start_tt=float(start_jd_tt), jd_end_tt=float(end_jd_tt),
             movers=movers, targets=targets, aspects=specs,
-            step_minutes=step_min, include_antiscia=include_antiscia, antiscia_orb_deg=antiscia_orb,
+            step_minutes=step_arg, include_antiscia=include_antiscia, antiscia_orb_deg=antiscia_orb,
         )
     except Exception as e:
         return {
             "ok": False,
             "error": f"transit_scan_failed:{e}",
             "transits": [],
-            "meta": {"frame": frame, "zodiac_mode": zodiac_mode, "ayanamsa_deg": ay},
+            "meta": {"frame": frame, "zodiac_mode": zodiac_mode, "ayanamsa_deg": ay, "prof": dict(PROF)},
             "computation_time_ms": (_time.perf_counter() - t0_wall) * 1000.0,
         }
 
@@ -542,6 +593,7 @@ def find_transits_in_range(
             "frame": frame,
             "zodiac_mode": zodiac_mode,
             "ayanamsa_deg": ay,
+            "prof": dict(PROF),
         },
         "computation_time_ms": (_time.perf_counter() - t0_wall) * 1000.0,
     }
@@ -654,8 +706,9 @@ def predict_dasha_periods(
 
     # Need Moon tropical longitude at birth; ask adapter
     ep = EphemerisAdapter(EphemConfig(frame="ecliptic-of-date"))
-    mm = rows_to_maps(ep.ecliptic_longitudes(birth_jd_tt, ["Moon"]).get("results", []))["longitudes"]
-    moon_lon_trop = float(mm.get("Moon") or mm.get("moon") or 0.0)
+    mm_rows = ep.ecliptic_longitudes(birth_jd_tt, ["Moon"]).get("results", [])
+    PROF["ephem_calls"] += 1
+    moon_lon_trop = float(mm_rows[0]["longitude"]) if mm_rows else 0.0
 
     periods = vimsottari_dasha(
         birth_jd_tt=birth_jd_tt,
@@ -666,9 +719,7 @@ def predict_dasha_periods(
     )
 
     out: List[Dict[str, Any]] = []
-    # Filter to provided date window
     def jd_to_iso(jd_tt: float) -> str:
-        # rough conversion; prediction.py only displays/use jd_tt
         unix = (jd_tt - 2440587.5) * 86400.0
         return datetime.utcfromtimestamp(unix).isoformat() + "Z"
     for p in periods:
@@ -914,7 +965,9 @@ def permutation_pvalue_corr(
     abs_obs = abs(r_obs)
     y_work = y[:]
 
-    for _ in range(n_perm):
+    # Early-stop heuristic: if lower-bound p exceeds ~0.2 after 200 perms, stop
+    k_last = 0
+    for k in range(1, n_perm + 1):
         if perm_mode == "iid":
             if strata is None:
                 rnd.shuffle(y_work)
@@ -932,8 +985,8 @@ def permutation_pvalue_corr(
             for gi, g in enumerate(groups):
                 ord_idx = order_in_group.get(gi, g[:])
                 if not ord_idx: continue
-                k = rnd.randrange(len(ord_idx))
-                shifted = ord_idx[k:] + ord_idx[:k]
+                s = rnd.randrange(len(ord_idx))
+                shifted = ord_idx[s:] + ord_idx[:s]
                 vals = [y_work[i] for i in ord_idx]
                 for i, v in zip(shifted, vals):
                     y_work[i] = v
@@ -942,7 +995,13 @@ def permutation_pvalue_corr(
         if abs(r_perm) >= abs_obs - 1e-15:
             extreme += 1
 
-    p = (extreme + 1.0) / (n_perm + 1.0)
+        # heuristic early stop (keeps API & statistical meaning intact for large p)
+        if k >= 200 and (extreme + 1.0) / (k + 1.0) > 0.20:
+            k_last = k
+            break
+        k_last = k
+
+    p = (extreme + 1.0) / (k_last + 1.0)
     return r_obs, p
 
 def bh_fdr(pvals: List[float], alpha: float = 0.05) -> Tuple[List[float], List[bool]]:
@@ -1108,18 +1167,28 @@ def feature_transit_proximity(
         jd = float(rec["jd_tt"]); targets: Dict[str, float] = rec.get(targets_key, {}) or {}
         if not targets: return {}
         try:
-            r = ephem.ecliptic_longitudes(jd, movers)
-            lmap = rows_to_maps(r.get("results", []))["longitudes"]
+            res = ephem.ecliptic_longitudes(jd, movers)
+            rows = res.get("results", [])
+            PROF["ephem_calls"] += 1
+            if rows:
+                lmap = {row["name"]: float(row["longitude"]) for row in rows}
+            else:
+                lmap = {}
         except Exception:
             lmap = {}
+        if not lmap:
+            # very robust fallback (per-mover)
             for m in movers:
-                lrow = ephem.ecliptic_longitudes(jd, [m]).get("results", [])
-                if lrow: lmap[m] = float(lrow[0]["longitude"])
+                rows = ephem.ecliptic_longitudes(jd, [m]).get("results", [])
+                PROF["ephem_calls"] += 1
+                if rows:
+                    lmap[m] = float(rows[0]["longitude"])
         hit = 0
+        zsep = _zodiacal_separation
         for _, lm in lmap.items():
             for _, lt in targets.items():
                 for spec in aspects:
-                    if abs(_zodiacal_separation(lm, lt, spec.angle)) <= max(0.0, orb_deg):
+                    if abs(zsep(lm, lt, spec.angle)) <= max(0.0, orb_deg):
                         hit = 1; break
                 if hit: break
             if hit: break
