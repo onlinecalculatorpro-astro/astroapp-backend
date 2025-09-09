@@ -2047,8 +2047,10 @@ def predictive_ingresses():
 
     if not _take_gate():
         return _busy()
+
     t_wall = time.perf_counter()
     try:
+        # ── inputs / validation ───────────────────────────────────────
         try:
             jd0, jd1 = _parse_time_range_like(body)
         except ValidationError as e:
@@ -2056,17 +2058,17 @@ def predictive_ingresses():
         except Exception as e:
             return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
 
-        raw_movers = body.get("movers") or ["Sun","Mercury","Venus","Mars","Jupiter","Saturn"]
+        raw_movers = body.get("movers") or ["Sun", "Mercury", "Venus", "Mars", "Jupiter", "Saturn"]
         movers = [m.strip() for m in raw_movers if m and str(m).strip()]
         if not movers:
             return _json_error("validation_error", [{"msg": "movers cannot be empty"}], 400)
 
         frame = parse_frame(body.get("frame"))
 
-        from app.core.ephemeris_adapter import EphemerisAdapter, Config as EphemConfig  # local clarity
+        from app.core.ephemeris_adapter import EphemerisAdapter, Config as EphemConfig  # noqa: F401
         shared_adapter = get_shared_adapter(frame)
 
-        # Observing options (threaded through to adapter)
+        # observing options (threaded to adapter)
         obs = dict(
             topocentric=bool(body.get("topocentric")),
             latitude=(float(body["latitude"]) if isinstance(body.get("latitude"), (int, float)) else None),
@@ -2074,16 +2076,16 @@ def predictive_ingresses():
             elevation_m=(float(body["elevation_m"]) if isinstance(body.get("elevation_m"), (int, float)) else None),
         )
 
-        # Sidereal/tropical handling
+        # sidereal / tropical
         zodiac_mode = (body.get("zodiac_mode") or "tropical").lower()
         ayanamsa_deg = float(body.get("ayanamsa_deg", 0.0))
         sidereal = zodiac_mode.startswith("sidereal")
         ay = float(ayanamsa_deg if sidereal else 0.0)
 
-        # Step sizing
+        # step sizing (string → auto)
         step_arg = _parse_step_minutes(body.get("step_minutes"), default_min=60.0)
 
-        # ─────────────────────────── helpers ───────────────────────────
+        # ── helpers ──────────────────────────────────────────────────
         TAU = 360.0
 
         def _norm360(x: float) -> float:
@@ -2094,37 +2096,64 @@ def predictive_ingresses():
             v = ((x + 180.0) % 360.0) - 180.0
             return 180.0 if v == -180.0 else v
 
-        def _nir(lon_trop: float) -> float:
+        def _nir(lon_trop: float) -> float:  # tropical → (optional) sidereal
             return _norm360(float(lon_trop) - ay)
 
         def _sign_idx(lon_deg: float) -> int:
             return int(math.floor(_norm360(lon_deg) / 30.0)) % 12
 
-        def _lon_map(jd_tt: float, names: list[str]) -> dict[str, float]:
-            # one ephemeris call for all names at a given time (fast path)
-            rows = shared_adapter.ecliptic_longitudes(jd_tt, names, **obs).get("results", [])  # type: ignore[arg-type]
+        # per-request memo cache: (rounded_jd, body) → lon (deg, sidereal-adjusted if needed)
+        lon_cache: dict[tuple[float, str], float] = {}
+
+        def _cache_key(jd_tt: float, name: str) -> tuple[float, str]:
+            # ~0.0864 s buckets (1e-6 day) is tight enough and greatly improves reuse
+            return (round(float(jd_tt), 6), name)
+
+        def _lon_one(jd_tt: float, name: str) -> float | None:
+            k = _cache_key(jd_tt, name)
+            if k in lon_cache:
+                return lon_cache[k]
+            rows = shared_adapter.ecliptic_longitudes(jd_tt, [name], **obs).get("results", [])
             if not rows:
-                return {}
-            # return **sidereal-adjusted** longitudes if needed
+                return None
+            lon = float(rows[0]["longitude"])
             if sidereal:
-                return {row["name"]: _nir(row["longitude"]) for row in rows}
-            return {row["name"]: float(row["longitude"]) for row in rows}
+                lon = _nir(lon)
+            lon_cache[k] = lon
+            return lon
+
+        def _lon_map(jd_tt: float, names: list[str]) -> dict[str, float]:
+            # batched fast path; also populate cache for each body
+            rows = shared_adapter.ecliptic_longitudes(jd_tt, names, **obs).get("results", [])
+            out: dict[str, float] = {}
+            for row in rows or []:
+                nm = row["name"]
+                lon = float(row["longitude"])
+                if sidereal:
+                    lon = _nir(lon)
+                out[nm] = lon
+                lon_cache[_cache_key(jd_tt, nm)] = lon
+            return out
 
         def _auto_step_minutes(names: list[str]) -> float:
+            # slightly bolder autos (Brent refinement guarantees accuracy)
             caps = []
             for m in names:
                 n = (m or "").lower()
-                if n == "moon": caps.append(10)
-                elif n in ("mercury", "venus", "mars"): caps.append(30)
-                elif n in ("sun", "jupiter", "saturn"): caps.append(90)
+                if n == "moon": caps.append(20)                        # was 10
+                elif n in ("mercury", "venus", "mars"): caps.append(60)
+                elif n in ("sun", "jupiter", "saturn"): caps.append(120)
                 else: caps.append(180)
-            return float(max(5, min(caps) if caps else 60))
+            return float(max(15, min(caps) if caps else 90))
 
-        # Brent–Dekker root finder (days domain)
+        # Brent–Dekker root finder on [a,b] in days; f returns wrapped delta (deg)
         def _refine_zero_brent(f, a, b, fa, fb, *, max_iter=64, tol_days=1e-6) -> float:
-            if fa == 0.0: return a
-            if fb == 0.0: return b
-            # Ensure bracket; if not bracketed, fallback to bisection attempt
+            if fa == 0.0:
+                return a
+            if fb == 0.0:
+                return b
+
+            # ensure bracket; if not, fall back to bisection attempts
             if fa * fb > 0.0:
                 aa, bb = a, b
                 for _ in range(max_iter):
@@ -2142,22 +2171,24 @@ def predictive_ingresses():
             d = e = b - a
             for _ in range(max_iter):
                 if abs(fb) < abs(fa):
-                    a, b = b, a; fa, fb = fb, fa
+                    a, b = b, a
+                    fa, fb = fb, fa
                 m = 0.5 * (a + b)
                 tol = tol_days
                 if abs(b - a) <= tol:
                     return b
-                # inverse quadratic interpolation or secant
+                # inverse quadratic or secant
                 if fa != fc and fb != fc:
-                    s = (a*fb*fc)/((fa - fb)*(fa - fc)) + (b*fa*fc)/((fb - fa)*(fb - fc)) + (c*fa*fb)/((fc - fa)*(fc - fb))
+                    s = (a * fb * fc) / ((fa - fb) * (fa - fc)) \
+                        + (b * fa * fc) / ((fb - fa) * (fb - fc)) \
+                        + (c * fa * fb) / ((fc - fa) * (fc - fb))
                 else:
-                    s = b - fb*(b - a)/(fb - fa)
-                # acceptability checks; else bisection
+                    s = b - fb * (b - a) / (fb - fa)
+                # acceptability; otherwise bisection
                 cond = not ((3*a + b)/4 < s < b if a < b else b < s < (3*a + b)/4)
                 cond |= (e and abs(s - b) >= abs(e) / 2)
                 cond |= (not e and abs(s - b) >= abs(d) / 2)
-                cond |= (abs(e) < tol)
-                cond |= (abs(d) < tol)
+                cond |= (abs(e) < tol) or (abs(d) < tol)
                 if cond:
                     s = m
                     d = e = b - a
@@ -2170,10 +2201,11 @@ def predictive_ingresses():
                 else:
                     a, fa = s, fs
                 if abs(fa) < abs(fb):
-                    a, b = b, a; fa, fb = fb, fa
+                    a, b = b, a
+                    fa, fb = fb, fa
             return b
 
-        # ────────────────────────── core scan ──────────────────────────
+        # ── core scan ─────────────────────────────────────────────────
         if isinstance(step_arg, str):
             step_minutes = _auto_step_minutes(movers)
         else:
@@ -2182,7 +2214,8 @@ def predictive_ingresses():
 
         t0 = float(jd0)
         events: list[dict[str, object]] = []
-        dedupe: set[tuple[str, int]] = set()  # (body, 1s-bucket)
+        # dedupe by (body, second-bucket, boundary-edge) to avoid accidental merges
+        dedupe: set[tuple[str, int, int]] = set()
 
         # prime at t0
         l0 = _lon_map(t0, movers)
@@ -2196,37 +2229,55 @@ def predictive_ingresses():
                 if body not in l0 or body not in l1:
                     continue
 
-                a = float(l0[body])  # already sidereal-adjusted if needed
+                a = float(l0[body])  # already sidereal-adjusted if requested
                 b = float(l1[body])
                 s_prev = int(s0.get(body, _sign_idx(a)))
                 s_next = _sign_idx(b)
 
                 if s_prev == s_next:
-                    continue  # no sign change for this mover this step
+                    continue  # no sign change over this coarse step
 
-                # Determine boundary crossed and motion direction via shortest-path delta
+                # direction via shortest-path delta
                 delta = _wrap180(b - a)
                 forward = delta > 0.0
 
-                # The exact zodiacal edge in degrees (0..330 step 30)
+                # which boundary we crossed
                 if forward:
                     boundary = (s_prev + 1) % 12
                     edge_deg = 30.0 * boundary
                 else:
-                    boundary = s_prev  # crossing "down" to lower edge of current sign
+                    boundary = s_prev
                     edge_deg = 30.0 * boundary
 
-                # Define root function: L_nir(t) - edge_deg wrapped to [-180,180]
+                # root function around edge: wrap(λ(tt) - edge)
                 def f(tt: float) -> float:
-                    lm = _lon_map(tt, [body]).get(body)
-                    if lm is None:
-                        return 0.0
-                    return _wrap180(float(lm) - edge_deg)
+                    lm = _lon_one(tt, body)
+                    return 0.0 if lm is None else _wrap180(float(lm) - edge_deg)
 
                 fa = _wrap180(a - edge_deg)
                 fb = _wrap180(b - edge_deg)
 
-                # If not bracketed (rare), try adjacent edge as a defensive fallback
+                # try linear pre-bracket to shrink [t0,t1] before Brent
+                ta, tb = t0, t1
+                den = _wrap180(b - a)
+                if den != 0.0:
+                    frac = _wrap180(edge_deg - a) / den
+                    if 0.0 <= frac <= 1.0:
+                        t_est = t0 + frac * (t1 - t0)
+                        pad = 0.25 * (t1 - t0)
+                        ta, tb = max(t0, t_est - pad), min(t1, t_est + pad)
+                        la = _lon_one(ta, body)
+                        lb = _lon_one(tb, body)
+                        if la is not None and lb is not None:
+                            fa2 = _wrap180(float(la) - edge_deg)
+                            fb2 = _wrap180(float(lb) - edge_deg)
+                            if fa2 * fb2 <= 0.0:
+                                # tighten bracket & signs
+                                t0b, t1b = ta, tb
+                                fa, fb = fa2, fb2
+                                ta, tb = t0b, t1b
+
+                # not bracketed? try adjacent edge defensively
                 if fa == 0.0:
                     t_exact = t0
                 elif fb == 0.0:
@@ -2236,29 +2287,25 @@ def predictive_ingresses():
                     fa2 = _wrap180(a - alt_edge)
                     fb2 = _wrap180(b - alt_edge)
                     if fa2 * fb2 > 0.0:
-                        # can't bracket cleanly; skip this step for this body
                         continue
                     def f2(tt: float) -> float:
-                        lm = _lon_map(tt, [body]).get(body)
-                        if lm is None:
-                            return 0.0
-                        return _wrap180(float(lm) - alt_edge)
-                    t_exact = _refine_zero_brent(f2, t0, t1, fa2, fb2, tol_days=1e-6)
+                        lm = _lon_one(tt, body)
+                        return 0.0 if lm is None else _wrap180(float(lm) - alt_edge)
+                    t_exact = _refine_zero_brent(f2, ta, tb, fa2, fb2, tol_days=1e-6)
                     edge_deg = alt_edge
                 else:
-                    t_exact = _refine_zero_brent(f, t0, t1, fa, fb, tol_days=1e-6)
+                    t_exact = _refine_zero_brent(f, ta, tb, fa, fb, tol_days=1e-6)
 
-                # fetch exact longitude at root and build event
-                lm_exact = _lon_map(t_exact, [body]).get(body)
+                # exact longitude at root (served from cache if already hit)
+                lm_exact = _lon_one(t_exact, body)
                 if lm_exact is None:
                     continue
                 n_exact = float(lm_exact)
                 from_sign = s_prev
                 to_sign = _sign_idx(n_exact)
 
-                # 1-sec dedupe
-                bucket = int(round(t_exact * 86400.0))
-                key = (body, bucket)
+                bucket = int(math.floor(t_exact * 86400.0 + 0.5))
+                key = (body, bucket, int(edge_deg))
                 if key in dedupe:
                     continue
                 dedupe.add(key)
@@ -2288,10 +2335,10 @@ def predictive_ingresses():
                 "frame": frame,
                 "topocentric": bool(obs["topocentric"]),
                 "zodiac_mode": zodiac_mode,
-                "ayanamsa_deg": ayanamsa_deg
+                "ayanamsa_deg": ayanamsa_deg,
             },
             "movers": movers,
-            "results": events
+            "results": events,
         })
         resp.status_code = 200
         resp.headers["X-Compute-Time-ms"] = f"{(time.perf_counter() - t_wall)*1000:.0f}"
@@ -2300,7 +2347,6 @@ def predictive_ingresses():
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
     except Exception as e:
-        # keep a clean 500 for truly unexpected errors
         return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
     finally:
         _give_gate()
@@ -2317,8 +2363,9 @@ def predictive_stations():
     if not _take_gate():
         return _busy()
     t_wall = time.perf_counter()
+
     try:
-        # ── time window ─────────────────────────────────────────────────────────
+        # ── window ────────────────────────────────────────────────────────────
         try:
             jd0, jd1 = _parse_time_range_like(body)
         except ValidationError as e:
@@ -2326,7 +2373,7 @@ def predictive_stations():
         except Exception as e:
             return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
 
-        # ── inputs / defaults ──────────────────────────────────────────────────
+        # ── inputs ───────────────────────────────────────────────────────────
         raw_movers = body.get("movers") or ["Mercury","Venus","Mars","Jupiter","Saturn","Uranus","Neptune","Pluto"]
         movers = [str(m).strip() for m in raw_movers if m and str(m).strip()]
         if not movers:
@@ -2335,7 +2382,6 @@ def predictive_stations():
         frame = parse_frame(body.get("frame"))
         shared_adapter = get_shared_adapter(frame)
 
-        # Observer (thread through)
         obs = dict(
             topocentric=bool(body.get("topocentric")),
             latitude=(float(body["latitude"]) if isinstance(body.get("latitude"), (int, float)) else None),
@@ -2343,16 +2389,14 @@ def predictive_stations():
             elevation_m=(float(body["elevation_m"]) if isinstance(body.get("elevation_m"), (int, float)) else None),
         )
 
-        # Sidereal support
         zodiac_mode = (body.get("zodiac_mode") or "tropical").lower()
         ayanamsa_deg = float(body.get("ayanamsa_deg", 0.0))
         sidereal = zodiac_mode.startswith("sidereal")
         ay = float(ayanamsa_deg if sidereal else 0.0)
 
-        # Step sizing (auto or explicit)
         step_arg = _parse_step_minutes(body.get("step_minutes"), default_min=60.0)
 
-        # ── helpers ────────────────────────────────────────────────────────────
+        # ── helpers ──────────────────────────────────────────────────────────
         TAU = 360.0
 
         def _norm360(x: float) -> float:
@@ -2366,76 +2410,139 @@ def predictive_stations():
         def _nir(lon_trop: float) -> float:
             return _norm360(float(lon_trop) - ay)
 
+        # per-request caches
+        lon_cache: dict[tuple[str, float], float] = {}   # (body, round(jd,6))
+        spd_cache: dict[tuple[str, float, float], float] = {}  # (body, round(jd,6), h)
+
+        def _k(jd: float) -> float:
+            # ~0.0864 s bucket
+            return round(float(jd), 6)
+
         def _lon_map(jd_tt: float, names: list[str]) -> dict[str, float]:
             rows = shared_adapter.ecliptic_longitudes(jd_tt, names, **obs).get("results", [])
+            out: dict[str, float] = {}
+            for row in rows or []:
+                nm = row["name"]
+                lon = float(row["longitude"])
+                if sidereal:
+                    lon = _nir(lon)
+                out[nm] = lon
+                lon_cache[(nm, _k(jd_tt))] = lon
+            return out
+
+        def _lon_one(jd_tt: float, body: str) -> float | None:
+            kk = (body, _k(jd_tt))
+            if kk in lon_cache:
+                return lon_cache[kk]
+            rows = shared_adapter.ecliptic_longitudes(jd_tt, [body], **obs).get("results", [])
             if not rows:
-                return {}
+                return None
+            lon = float(rows[0]["longitude"])
             if sidereal:
-                return {row["name"]: _nir(row["longitude"]) for row in rows}
-            return {row["name"]: float(row["longitude"]) for row in rows}
+                lon = _nir(lon)
+            lon_cache[kk] = lon
+            return lon
 
         def _auto_step_minutes(names: list[str]) -> float:
-            # Stations evolve slowly; 60 min is fine; inner planets can use 30
+            # Stations are slow; coarser is fine; refinement finds exact t
             caps = []
             for m in names:
                 n = (m or "").lower()
-                if n in ("mercury", "venus"): caps.append(30)
-                elif n in ("mars",): caps.append(45)
-                else: caps.append(60)
-            return float(max(15, min(caps) if caps else 60))
+                if n in ("mercury", "venus"): caps.append(90)   # inner planets: still coarse; refine later
+                elif n in ("mars",):           caps.append(180)
+                else:                          caps.append(360)
+            return float(max(30, min(caps) if caps else 180))
 
-        # Brent–Dekker on speed function s(t)
-        def _refine_zero_brent(f, a, b, fa, fb, *, max_iter=64, tol_days=1e-6) -> float | None:
+        # central-difference speed (deg/day) with wrap
+        def _speed(body: str, t: float, h: float, lo: float, hi: float) -> float:
+            key = (body, _k(t), h)
+            if key in spd_cache:
+                return spd_cache[key]
+            t_m = max(lo, t - h); t_p = min(hi, t + h)
+            if t_p - t_m < 1e-9:  # widen a bit if degenerate
+                t_m = max(lo, t - 2*h); t_p = min(hi, t + 2*h)
+            la = _lon_one(t_m, body); lb = _lon_one(t_p, body)
+            if la is None or lb is None:
+                v = float("nan")
+            else:
+                diff = _wrap180(float(lb) - float(la))
+                dt = (t_p - t_m)
+                v = diff / dt if dt > 0.0 else float("nan")
+            spd_cache[key] = v
+            return v
+
+        # Quadratic (parabolic) refine using three samples around mid
+        def _refine_parabolic(body: str, a: float, b: float, h: float, lo: float, hi: float) -> float | None:
+            m = 0.5*(a+b)
+            # sample speeds at a, m, b
+            s_a = _speed(body, a, h, lo, hi)
+            s_m = _speed(body, m, h, lo, hi)
+            s_b = _speed(body, b, h, lo, hi)
+            if not (math.isfinite(s_a) and math.isfinite(s_m) and math.isfinite(s_b)):
+                return None
+            # fit parabola through (a,s_a), (m,s_m), (b,s_b)
+            # x' ∈ { -1,0,1 } after mapping t ∈ {a,m,b} to x' = (t - m)/(b-a)/0.5
+            # The vertex (zero) x0' = (s_a - s_b) / (2*(s_a - 2*s_m + s_b)) (if denom ≠ 0)
+            denom = (s_a - 2*s_m + s_b)
+            if abs(denom) < 1e-12:
+                return None
+            x0p = (s_a - s_b) / (2.0 * denom)
+            if -1.5 <= x0p <= 1.5:
+                t0 = m + x0p * (b - a) * 0.5
+                return max(lo, min(hi, t0))
+            return None
+
+        # Brent–Dekker fallback on s(t)
+        def _refine_zero_brent(body: str, a: float, b: float, fa: float, fb: float, *, h: float, lo: float, hi: float,
+                               max_iter=64, tol_days=1e-6) -> float | None:
             if not (math.isfinite(fa) and math.isfinite(fb)):
                 return None
             if fa == 0.0: return a
             if fb == 0.0: return b
+            # ensure bracket by bisection if needed
             if fa * fb > 0.0:
-                # Try to find a bracket by probing midpoints
                 aa, bb = a, b
                 for _ in range(32):
-                    m = 0.5 * (aa + bb)
-                    fm = f(m)
+                    m = 0.5*(aa+bb)
+                    fm = _speed(body, m, h, lo, hi)
                     if not math.isfinite(fm):
                         break
-                    if fm == 0.0 or abs(bb - aa) <= tol_days:
+                    if fm == 0.0 or abs(bb-aa) <= tol_days:
                         return m
                     if fa * fm <= 0.0:
                         bb, fb = m, fm
                     else:
                         aa, fa = m, fm
                 if fa * fb > 0.0:
-                    return None  # failed to bracket
+                    return None
                 a, b = aa, bb
             c, fc = a, fa
             d = e = b - a
             for _ in range(max_iter):
                 if abs(fb) < abs(fa):
                     a, b = b, a; fa, fb = fb, fa
-                m = 0.5 * (a + b)
+                m = 0.5*(a+b)
                 tol = tol_days
-                if abs(b - a) <= tol:
+                if abs(b-a) <= tol:
                     return b
-                # inverse quadratic or secant
+                # inverse quadratic / secant
                 if fa != fc and fb != fc:
-                    s = (a*fb*fc)/((fa - fb)*(fa - fc)) + (b*fa*fc)/((fb - fa)*(fb - fc)) + (c*fa*fb)/((fc - fa)*(fc - fb))
+                    s = (a*fb*fc)/((fa-fb)*(fa-fc)) + (b*fa*fc)/((fb-fa)*(fb-fc)) + (c*fa*fb)/((fc-fa)*(fc-fb))
                 else:
-                    s = b - fb*(b - a)/(fb - fa)
+                    s = b - fb*(b-a)/(fb-fa)
                 # acceptability checks; else bisection
                 cond = not ((3*a + b)/4 < s < b if a < b else b < s < (3*a + b)/4)
-                cond |= (e and abs(s - b) >= abs(e)/2)
-                cond |= (not e and abs(s - b) >= abs(d)/2)
-                cond |= (abs(e) < tol)
-                cond |= (abs(d) < tol)
+                cond |= (e and abs(s-b) >= abs(e)/2)
+                cond |= (not e and abs(s-b) >= abs(d)/2)
+                cond |= (abs(e) < tol) or (abs(d) < tol)
                 if cond:
                     s = m
                     d = e = b - a
                 else:
                     d, e = e, b - s
-                fs = f(s)
+                fs = _speed(body, s, h, lo, hi)
                 if not math.isfinite(fs):
-                    # fall back to bisection
-                    s = m; fs = f(s)
+                    s = m; fs = _speed(body, s, h, lo, hi)
                 c, fc = a, fa
                 if (fa * fs) < 0:
                     b, fb = s, fs
@@ -2445,127 +2552,84 @@ def predictive_stations():
                     a, b = b, a; fa, fb = fb, fa
             return b
 
-        # central-difference speed (deg/day) with wrap handling
-        def _lon_cached(jd_tt: float, body: str, cache: dict[tuple[str, float], float]) -> float | None:
-            k = (body, float(jd_tt))
-            if k in cache:
-                return cache[k]
-            m = _lon_map(jd_tt, [body])
-            if body not in m:
-                return None
-            cache[k] = float(m[body])
-            return cache[k]
-
-        def _speed(body: str, t: float, cache: dict[tuple[str, float], float], h: float, lo: float, hi: float) -> float:
-            # Clamp a symmetric stencil to [lo,hi]; fall back to one-sided if at edges
-            t_m = max(lo, t - h)
-            t_p = min(hi, t + h)
-            if abs(t_p - t_m) < 1e-9:  # degenerate
-                # Nudge inside the interval
-                t_m = max(lo, t - 2*h)
-                t_p = min(hi, t + 2*h)
-            la = _lon_cached(t_m, body, cache)
-            lb = _lon_cached(t_p, body, cache)
-            if la is None or lb is None:
-                return float("nan")
-            diff = _wrap180(float(lb) - float(la))
-            dt = (t_p - t_m)
-            if dt <= 0.0:
-                return float("nan")
-            return diff / dt  # deg/day
-
-        # ── scan ───────────────────────────────────────────────────────────────
+        # ── scan ──────────────────────────────────────────────────────────────
         if isinstance(step_arg, str):
             step_minutes = _auto_step_minutes(movers)
         else:
             step_minutes = float(step_arg) if float(step_arg) > 0.0 else _auto_step_minutes(movers)
         dt = float(step_minutes) / (24.0 * 60.0)
 
-        # Small derivative half-stencil (15 minutes by default, but tied to step)
-        h = min(0.5 * dt, 15.0 / (24.0 * 60.0)) or (15.0 / (24.0 * 60.0))
+        # derivative half-stencil (tie to dt, clamp to ≤ 30m)
+        h = min(0.5*dt, 30.0/(24.0*60.0)) or (15.0/(24.0*60.0))
 
-        # Prime cache at window boundaries (batch)
+        # warm caches at boundaries (batched)
         _ = _lon_map(float(jd0), movers)
         _ = _lon_map(float(jd1), movers)
 
         events: list[dict[str, object]] = []
         dedupe: set[tuple[str, int]] = set()
-        cache: dict[tuple[str, float], float] = {}
 
-        t0 = float(jd0)
-        while t0 < jd1 - 1e-12:
-            t1 = min(t0 + dt, jd1)
-
-            # Warm cache at step endpoints (single call per endpoint)
-            _ = _lon_map(t0, movers)
-            _ = _lon_map(t1, movers)
+        t = float(jd0)
+        while t < jd1 - 1e-12:
+            t_next = min(t + dt, jd1)
+            # warm at step endpoints (batched)
+            _ = _lon_map(t, movers)
+            _ = _lon_map(t_next, movers)
 
             for body in movers:
-                # Speed at step endpoints
-                s0 = _speed(body, t0, cache, h, jd0, jd1)
-                s1 = _speed(body, t1, cache, h, jd0, jd1)
+                s0 = _speed(body, t, h, jd0, jd1)
+                s1 = _speed(body, t_next, h, jd0, jd1)
                 if not (math.isfinite(s0) and math.isfinite(s1)):
                     continue
 
-                # Station if speed crosses zero (or touches near-zero)
-                sign_change = (s0 == 0.0) or (s1 == 0.0) or ((s0 * s1) < 0.0)
-                near_zero = (min(abs(s0), abs(s1)) <= 0.05)  # ~0.05 deg/day threshold
-                if not (sign_change or near_zero):
+                # coarse detection: sign change or near zero at either end
+                if not ((s0 == 0.0) or (s1 == 0.0) or (s0*s1 < 0.0) or (min(abs(s0),abs(s1)) <= 0.05)):
                     continue
 
-                # Root refine on s(t) within [t0,t1]
-                def f(tt: float) -> float:
-                    return _speed(body, tt, cache, h, jd0, jd1)
-
-                t_exact = _refine_zero_brent(f, t0, t1, s0, s1, tol_days=1e-6)
-                if t_exact is None or not (t0 - 1e-9 <= t_exact <= t1 + 1e-9):
-                    # Fallback: pick the argmin |s| among t0,mid,t1
-                    tm = 0.5 * (t0 + t1)
-                    sm = f(tm)
-                    # If still not finite, skip
+                # parabolic refine first (cheap), then Brent fallback
+                t_star = _refine_parabolic(body, t, t_next, h, jd0, jd1)
+                if t_star is None:
+                    t_star = _refine_zero_brent(body, t, t_next, s0, s1, h=h, lo=jd0, hi=jd1, tol_days=1e-6)
+                if t_star is None or not (t - 1e-9 <= t_star <= t_next + 1e-9):
+                    # fallback to minimum |s| among {t, mid, t_next}
+                    mid = 0.5*(t + t_next)
+                    sm = _speed(body, mid, h, jd0, jd1)
                     if not math.isfinite(sm):
                         continue
-                    cand = min([(abs(s0), t0), (abs(sm), tm), (abs(s1), t1)], key=lambda x: x[0])[1]
-                    t_exact = cand
+                    t_star = min([(abs(s0), t), (abs(sm), mid), (abs(s1), t_next)], key=lambda x: x[0])[1]
 
-                # Build event
-                lon_exact = _lon_cached(t_exact, body, cache)
-                if lon_exact is None:
+                lon_star = _lon_one(t_star, body)
+                if lon_star is None:
                     continue
 
-                # Determine turning kind: SR (direct→retro) or SD (retro→direct)
-                # Use small delta around exact time to inspect sign
-                eps = max(1.0 / (24.0 * 60.0), 0.25 * h)  # >= 1 minute
-                sb = _speed(body, max(jd0, t_exact - eps), cache, h, jd0, jd1)
-                sa = _speed(body, min(jd1, t_exact + eps), cache, h, jd0, jd1)
-                kind = "station"
-                direction = None
+                # determine SR / SD (direction change)
+                eps = max(1.0/(24.0*60.0), 0.25*h)  # ≥ 1 minute
+                sb = _speed(body, max(jd0, t_star - eps), h, jd0, jd1)
+                sa = _speed(body, min(jd1, t_star + eps), h, jd0, jd1)
+                kind, direction = "station", None
                 if math.isfinite(sb) and math.isfinite(sa):
                     if sb > 0 and sa < 0:
-                        kind = "SR"  # turning retrograde
-                        direction = "retrograde"
+                        kind, direction = "SR", "retrograde"
                     elif sb < 0 and sa > 0:
-                        kind = "SD"  # turning direct
-                        direction = "direct"
+                        kind, direction = "SD", "direct"
 
-                # de-dup by 1-second bucket
-                bucket = int(round(float(t_exact) * 86400.0))
+                bucket = int(round(float(t_star) * 86400.0))
                 key = (body, bucket)
                 if key in dedupe:
                     continue
                 dedupe.add(key)
 
                 events.append({
-                    "jd_tt": float(t_exact),
+                    "jd_tt": float(t_star),
                     "body": body,
                     "kind": kind,
                     "direction": direction,
-                    "longitude_deg": float(lon_exact),
+                    "longitude_deg": float(lon_star),
                     "speed_before_deg_per_day": float(sb) if math.isfinite(sb) else None,
                     "speed_after_deg_per_day": float(sa) if math.isfinite(sa) else None,
                 })
 
-            t0 = t1
+            t = t_next
 
         events.sort(key=lambda e: (e["jd_tt"], e["body"]))
         resp = jsonify({
