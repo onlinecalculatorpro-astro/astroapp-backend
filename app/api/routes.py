@@ -1203,14 +1203,56 @@ def report():
 @api.post("/api/aspects")
 @rate_limit(RL_ASPECTS)
 def aspects():
+    def _norm_orbs(orbs_raw):
+        """Ensure orbs is a dict[str,float]."""
+        if not isinstance(orbs_raw, dict):
+            return {}
+        out = {}
+        for k, v in orbs_raw.items():
+            try:
+                f = float(v)
+            except Exception:
+                continue
+            out[str(k).strip().lower()] = f
+        return out
+
+    def _norm_aspects(aspects_raw):
+        """Ensure aspects is a list[str]."""
+        if aspects_raw is None:
+            return None
+        if isinstance(aspects_raw, str):
+            return [aspects_raw.strip().lower()]
+        if isinstance(aspects_raw, (list, tuple)):
+            return [str(a).strip().lower() for a in aspects_raw if a]
+        return None
+
+    def _norm_bodies(bodies_raw):
+        """Ensure bodies is a list[str]."""
+        if bodies_raw is None:
+            return None
+        if isinstance(bodies_raw, str):
+            return [bodies_raw.strip()]
+        if isinstance(bodies_raw, (list, tuple)):
+            return [str(b).strip() for b in bodies_raw if b]
+        return None
+
     try:
         body = request.get_json(force=True) or {}
         payload = parse_chart_payload(body)
 
-        # Allow additional aspects-specific parameters
-        for k in ("orbs", "aspects", "bodies", "points", "mode", "houses"):
-            if k in body:
-                payload[k] = body[k]
+        # Normalized additional parameters
+        if "orbs" in body:
+            payload["orbs"] = _norm_orbs(body.get("orbs"))
+        if "aspects" in body:
+            payload["aspects"] = _norm_aspects(body.get("aspects"))
+        if "bodies" in body:
+            payload["bodies"] = _norm_bodies(body.get("bodies"))
+        if "points" in body:
+            payload["points"] = body.get("points")  # keep raw, engine decides
+        if "mode" in body:
+            payload["mode"] = str(body.get("mode")).strip().lower()
+        if "houses" in body:
+            payload["houses"] = bool(body.get("houses"))
 
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
@@ -1259,7 +1301,7 @@ def aspects():
         "chart": chart,
         "houses": houses,
         "aspects": aspects_result,
-        "meta": meta
+        "meta": meta,
     }), 200
 
 # ───────────────────────── helper function for returns ─────────────────────────
