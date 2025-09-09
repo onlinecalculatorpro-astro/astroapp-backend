@@ -18,10 +18,15 @@ import os
 import inspect
 import time
 import traceback
-import warnings  # NEW: to optionally silence ERFA "dubious year" warnings
+import warnings  # to optionally silence ERFA "dubious year" warnings
 
-# Optional: silence ERFA “dubious year” warnings
-warnings.filterwarnings("ignore", message=r"ERFA function .*dubious year")
+# Narrow: silence only ERFA “dubious year” warnings from erfa module
+warnings.filterwarnings(
+    "ignore",
+    message=r"ERFA function .*dubious year",
+    category=UserWarning,
+    module=r"erfa"
+)
 
 __all__ = ["compute_chart", "clear_ephemeris_cache"]
 
@@ -199,6 +204,7 @@ class _W:
     ADAPTER_ERROR = "adapter_error"
     ADAPTER_PARSE_ERROR = "adapter_response_parse_error"
     BODY_NAME_FUZZY_MATCH = "body_name_fuzzy_matched"
+    DUT1_CLAMPED = "dut1_clamped"  # NEW: clamp warning
 
 
 def _warn_add(store: List[str], seen: set[str], code: str, detail: Optional[str] = None) -> None:
@@ -370,6 +376,7 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
         _warn_add(warnings, seen, _W.LEAP_SECOND)
         t = _normalize_time_for_leap_second(str(t))
 
+    # Preferred: time_kernel (dynamic)
     if _tk is not None:
         for fname in ("timescales_from_civil", "compute_timescales", "build_timescales", "to_timescales", "from_civil"):
             fn = getattr(_tk, fname, None)
@@ -435,21 +442,22 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
                 ju, jt, j1 = map(float, out[:3])
                 return ju, jt, j1
 
-    if not isinstance(d, str) or not isinstance(t, str):
-        missing = [k for k, v in (("jd_ut", jd_ut), ("jd_tt", jd_tt), ("jd_ut1", jd_ut1)) if not isinstance(v, (int, float))]
-        raise AstronomyError("timescales_missing", f"Supply {', '.join(missing)} or provide date/time/tz")
-
+    # Next: timescales module for UTC JD and ΔT
     def _jd_utc_via_ts(d_: str, t_: str, z_: str) -> float:
         if _ts is None:
             raise RuntimeError("timescales module not available")
         return float(_ts.julian_day_utc(d_, t_, z_))
 
+    # stdlib fallback (hardened)
     def _jd_utc_via_stdlib(d_: str, t_: str, z_: str) -> float:
         from datetime import datetime, timezone
         from zoneinfo import ZoneInfo
         parts = t_.split(":")
         timestr = t_ if len(parts) >= 3 else (t_ + ":00")
-        dt_local = datetime.fromisoformat(f"{d_}T{timestr}").replace(tzinfo=ZoneInfo(z_))
+        try:
+            dt_local = datetime.fromisoformat(f"{d_}T{timestr}").replace(tzinfo=ZoneInfo(z_))
+        except Exception as e:
+            raise AstronomyError("timescales_missing", f"Invalid tz '{z_}': {e}")
         dt_utc = dt_local.astimezone(timezone.utc)
         Y, M, D = dt_utc.year, dt_utc.month, dt_utc.day
         h = dt_utc.hour + dt_utc.minute / 60 + dt_utc.second / 3600 + dt_utc.microsecond / 3.6e9
@@ -461,13 +469,22 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
         JD0 = int(365.25 * (Y + 4716)) + int(30.6001 * (M + 1)) + D + B - 1524.5
         return JD0 + h / 24.0
 
+    if not isinstance(d, str) or not isinstance(t, str):
+        missing = [k for k, v in (("jd_ut", jd_ut), ("jd_tt", jd_tt), ("jd_ut1", jd_ut1)) if not isinstance(v, (int, float))]
+        raise AstronomyError("timescales_missing", f"Supply {', '.join(missing)} or provide date/time/tz")
+
     used_stdlib = False
     try:
         jd_utc = _jd_utc_via_ts(d, t, tz)
     except Exception:
-        jd_utc = _jd_utc_via_stdlib(d, t, tz)
-        used_stdlib = True
-        _warn_add(warnings, seen, _W.TIME_STD_FALLBACK)
+        try:
+            jd_utc = _jd_utc_via_stdlib(d, t, tz)
+            used_stdlib = True
+            _warn_add(warnings, seen, _W.TIME_STD_FALLBACK)
+        except AstronomyError:
+            raise
+        except Exception as e:
+            raise AstronomyError("timescales_missing", f"Failed to compute JD from {d} {t} {tz}: {e}")
 
     try:
         y, m = map(int, str(d).split("-")[:2])
@@ -485,11 +502,19 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
         if not used_stdlib:
             _warn_add(warnings, seen, _W.DELTAT_CONST)
 
+    # DUT1 (clamped to IERS bounds)
     dut1_s = payload.get("dut1")
     if not isinstance(dut1_s, (int, float)):
         dut1_s = payload.get("dut1_seconds")
     if not isinstance(dut1_s, (int, float)):
         dut1_s = CFG.dut1_seconds
+    try:
+        dut1_s = float(dut1_s)
+    except Exception:
+        dut1_s = 0.0
+    if abs(dut1_s) > 0.9:
+        _warn_add(warnings, seen, _W.DUT1_CLAMPED, f"{dut1_s}")
+        dut1_s = max(-0.9, min(0.9, dut1_s))
 
     jd_ut_calc = float(jd_utc)
     jd_ut1_calc = float(jd_utc) + (float(dut1_s) / 86400.0)
@@ -578,7 +603,7 @@ def _ayanamsa_deg_cached(jd_tt_q: float, ay_key: str) -> Tuple[float, str]:
 
 def _resolve_ayanamsa(
     jd_tt: float, ayanamsa: Any, warnings: List[str], seen: set[str]
-) -> Tuple[Optional[float], Optional[str]]:
+) -> Tuple[Optional[float], Optional[str]]:  # degree value, note
     if ayanamsa is None or (isinstance(ayanamsa, str) and not str(ayanamsa).strip()):
         key = CFG.ayanamsa_default
     elif isinstance(ayanamsa, (int, float)):
@@ -600,7 +625,7 @@ def _adapter_source_tag() -> str:
     except Exception:
         return str(tag)
 
-# NEW: helper to surface ephemeris kernel path and coverage from the adapter
+# helper to surface ephemeris kernel path and coverage from the adapter
 def _adapter_kernel_info():
     path = None
     coverage = None
@@ -976,10 +1001,9 @@ def _cached_positions(
             # 2) Positional with kwargs (works for wrappers that accept **kwargs)
             try:
                 extra = dict(geo_kw)
-                # avoid duplicate keyword if fn(jd_tt, ...) used
-                if "jd_tt" in bk:  # jd_tt as kw
+                if "jd_tt" in bk:
                     return fn(bk["jd_tt"], names_list, **{k: v for k, v in extra.items() if k != "jd_tt"})
-                if "jd" in bk:     # jd as kw
+                if "jd" in bk:
                     return fn(bk["jd"], names_list, **{k: v for k, v in extra.items() if k != "jd"})
             except Exception:
                 pass
@@ -1099,7 +1123,7 @@ def _longitudes_and_speeds(
         l0 = _norm360(float(now_lon[nm])) if nm in now_lon else None
         spd: Optional[float] = float(now_spd[nm]) if nm in now_spd and now_spd[nm] is not None else None
         if l0 is None:
-            out[nm] = (None, None)
+            # skip missing instead of storing (None, None) which breaks type promise
             continue
         if spd is None:
             step = _adaptive_speed_step(nm, speed_step_days)
@@ -1222,16 +1246,16 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
     if eph is None:
         raise AstronomyError("ephemeris_unavailable", f"ephemeris_adapter import failed: {_EPH_IMPORT_ERROR!r}")
 
-    warnings: List[str] = []
+    warnings_list: List[str] = []
     _seen: set[str] = set()
 
     mode = _validate_mode(payload)
     frame_raw = payload.get("frame")
     frame = (str(frame_raw).strip() if isinstance(frame_raw, str) and frame_raw.strip() else "ecliptic-of-date")
 
-    majors_req, points_req = _split_bodies_points(payload, warnings, _seen)
+    majors_req, points_req = _split_bodies_points(payload, warnings_list, _seen)
 
-    jd_ut, jd_tt, jd_ut1 = _ensure_timescales(payload, warnings, _seen)
+    jd_ut, jd_tt, jd_ut1 = _ensure_timescales(payload, warnings_list, _seen)
 
     topocentric = _coerce_bool(payload.get("topocentric"), False)
     if topocentric:
@@ -1239,11 +1263,11 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
         lon_in = payload.get("longitude")
         elev_in = payload.get("elev_m") or payload.get("elevation_m") or payload.get("elevation")
         if not (_is_finite(lat_in) and _is_finite(lon_in)):
-            _warn_add(warnings, _seen, _W.TOPO_MISSING_COORDS)
+            _warn_add(warnings_list, _seen, _W.TOPO_MISSING_COORDS)
             topocentric = False
             lat = lon = elev = None
         else:
-            lat, lon, elev, downgraded = _validate_and_normalize_geo_for_topo(lat_in, lon_in, elev_in, warnings, _seen)
+            lat, lon, elev, downgraded = _validate_and_normalize_geo_for_topo(lat_in, lon_in, elev_in, warnings_list, _seen)
             if downgraded:
                 topocentric = False
                 lat = lon = elev = None
@@ -1260,14 +1284,14 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
         longitude=lon,
         elevation_m=elev,
         speed_step_days=CFG.speed_fd_step_days,
-        warnings=warnings,
+        warnings=warnings_list,
         seen=_seen,
         frame=frame,
     )
 
     ay_deg: Optional[float] = None
     if mode == "sidereal":
-        ay_deg, _ = _resolve_ayanamsa(jd_tt, payload.get("ayanamsa"), warnings, _seen)
+        ay_deg, _ = _resolve_ayanamsa(jd_tt, payload.get("ayanamsa"), warnings_list, _seen)
 
     out_bodies: List[Dict[str, Any]] = []
     missing_bodies: List[str] = []
@@ -1290,7 +1314,7 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
             geo_map, _src = _longitudes_only_geocentric(jd_tt, [nm], frame=frame)
             if nm in geo_map and _is_num(geo_map[nm]):
                 lon_deg = float(geo_map[nm])
-                _warn_add(warnings, _seen, _W.TOPO_FALLBACK_GEO, nm)
+                _warn_add(warnings_list, _seen, _W.TOPO_FALLBACK_GEO, nm)
         if lon_deg is None:
             missing_bodies.append(nm)
             continue
@@ -1308,7 +1332,7 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
         )
 
     if missing_bodies:
-        _warn_add(warnings, _seen, _W.ADAPTER_MISS_BODIES, ", ".join(missing_bodies))
+        _warn_add(warnings_list, _seen, _W.ADAPTER_MISS_BODIES, ", ".join(missing_bodies))
 
     out_points: List[Dict[str, Any]] = []
     if points_req:
@@ -1331,7 +1355,7 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
 
         for nm in points_req:
             if nm not in lon_map_nodes:
-                _warn_add(warnings, _seen, _W.ADAPTER_MISS_POINTS, nm)
+                _warn_add(warnings_list, _seen, _W.ADAPTER_MISS_POINTS, nm)
                 out_points.append(
                     {
                         "name": nm,
@@ -1360,7 +1384,7 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
             )
 
         if source_nodes and source_nodes != source_tag:
-            _warn_add(warnings, _seen, _W.PTS_SOURCE_MISMATCH, source_nodes)
+            _warn_add(warnings_list, _seen, _W.PTS_SOURCE_MISMATCH, source_nodes)
 
     asc_deg, mc_deg, dbg = _compute_angles(
         jd_ut1=jd_ut1,
@@ -1369,7 +1393,7 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
         longitude=lon,
         mode=mode,
         ayanamsa_deg=ay_deg,
-        warnings=warnings,
+        warnings=warnings_list,
         seen=_seen,
     )
 
@@ -1380,18 +1404,16 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
         "frame": frame,
         "center": center,
         "topocentric": bool(topocentric),
-        "observer": center,
-        "source": str(source_tag),
         "angles_engine": ("ERFA gst06a + true_obliquity" if erfa is not None else "Meeus fallback"),
+        "angles_frame": "true-of-date",
+        "source": str(source_tag),
         "module": _PROJECT_SOURCE_TAG,
         **dbg,
     }
     if topocentric and isinstance(elev, (int, float)):
-        meta["elevation_m"] = float(elev)
-    if warnings:
-        meta["warnings"] = list(warnings)
+        meta["observer"] = {"latitude": lat, "longitude": lon, "elevation_m": float(elev)}
 
-    # NEW: Ephemeris debug — expose which kernel is actually loaded
+    # Ephemeris debug — expose which kernel is actually loaded
     _kpath, _kcov = _adapter_kernel_info()
     if _kpath:
         meta["ephemeris_path"] = str(_kpath)
@@ -1416,6 +1438,6 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
         "asc_deg": (float(asc_deg) if asc_deg is not None else None),
         "mc_deg": (float(mc_deg) if mc_deg is not None else None),
         "meta": meta,
-        "warnings": list(warnings),
+        "warnings": list(warnings_list),
     }
     return out
