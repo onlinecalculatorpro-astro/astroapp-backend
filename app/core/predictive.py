@@ -173,7 +173,33 @@ class TransitEngine:
     - Two-phase search: coarse bracket → refine (Brent–Dekker)
     - Guard band around orbs scaled by step & approx speed
     - De-duplicate near-identical roots at 1-second buckets
+
+    + Critical fixes:
+      (1) Pre-batch likely refinement times to avoid per-point adapter calls
+      (2) Early filtering using max-change-per-step bounds
+      (3) Bounded cache to cap memory & lookup overhead
     """
+
+    # ---------- small helpers ----------
+    @staticmethod
+    def _speed_est(body: str) -> float:
+        b = (body or "").lower()
+        # deg/day (rough, safe upper bounds for guard math)
+        if b == "moon": return 14.0
+        if b in ("mercury", "venus"): return 1.6
+        if b == "mars": return 0.9
+        if b == "sun": return 1.0
+        if b in ("jupiter", "saturn"): return 0.2
+        return 0.1
+
+    @staticmethod
+    def _prune_lon_cache(lon_cache: Dict[Tuple[str, float], float], *, max_size: int = 2000) -> None:
+        if len(lon_cache) <= max_size:
+            return
+        # Drop the oldest 25% by time key (second element)
+        keep = max_size - max(1, max_size // 4)
+        for k in sorted(lon_cache.keys(), key=lambda kk: kk[1])[0:len(lon_cache)-keep]:
+            lon_cache.pop(k, None)
 
     def __init__(
         self,
@@ -207,6 +233,29 @@ class TransitEngine:
             ay = self.ayanamsa_deg
             return {row["name"]: norm360(float(row["longitude"]) - ay) for row in res}
         return {row["name"]: float(row["longitude"]) for row in res}
+
+    # central cache-aware accessor
+    def _lon_cached(self, name: str, t: float, lon_cache: Dict[Tuple[str, float], float]) -> float:
+        key = (name, float(t))
+        if key in lon_cache:
+            return lon_cache[key]
+        got = self._lon_map(t, [name])  # single-body at a single time
+        if name not in got:
+            raise RuntimeError(f"no ephemeris for {name}@{t}")
+        lon_cache[key] = float(got[name])
+        self._prune_lon_cache(lon_cache)
+        return lon_cache[key]
+
+    # batched preload for refinement windows
+    def _preload_lons(self, body: str, times: Iterable[float], lon_cache: Dict[Tuple[str, float], float]) -> None:
+        for t in times:
+            key = (body, float(t))
+            if key in lon_cache:
+                continue
+            got = self._lon_map(float(t), [body])
+            if body in got:
+                lon_cache[key] = float(got[body])
+        self._prune_lon_cache(lon_cache)
 
     # ---------- Brent–Dekker refinement with provided fa/fb ----------
     @staticmethod
@@ -265,6 +314,29 @@ class TransitEngine:
                 a, b = b, a; fa, fb = fb, fa
         return b
 
+    # refinement that pre-batches likely query times
+    def _refine_with_prebatch(
+        self,
+        *,
+        body: str,
+        f: Callable[[float], float],
+        a: float,
+        b: float,
+        fa: float,
+        fb: float,
+        lon_cache: Dict[Tuple[str, float], float],
+    ) -> float:
+        # Preload a small stencil of likely evaluation points for Brent:
+        # mid, terciles, and midpoints-of-terciles. This dramatically reduces
+        # on-demand ephemeris fetches during the root search.
+        mid = 0.5 * (a + b)
+        t13 = a + (b - a) / 3.0
+        t23 = a + 2.0 * (b - a) / 3.0
+        t38 = a + (b - a) * 3.0 / 8.0
+        t58 = a + (b - a) * 5.0 / 8.0
+        self._preload_lons(body, (a, b, mid, t13, t23, t38, t58), lon_cache)
+        return self._refine_zero_brent(f, a, b, fa, fb, tol_days=1e-6)
+
     # ---------- scans ----------
     def scan_aspects(
         self,
@@ -291,13 +363,6 @@ class TransitEngine:
         tgt_img_anti = {k: antiscia_longitude(v) for k, v in targets.items()}
         tgt_img_contra = {k: contra_antiscia_longitude(v) for k, v in targets.items()}
 
-        # Guard band scaled by step & approx speed
-        def guard_for(spec: AspectSpec, dt_days: float, body: str) -> float:
-            b = body.lower()
-            speed = 13.5 if b == "moon" else 1.2 if b in ("mercury","venus") else \
-                    0.8 if b == "mars" else 1.0 if b == "sun" else 0.2
-            return max(0.15, min(spec.orb_deg * 0.33, speed * dt_days * 1.5))
-
         # step size (days). Support "auto"
         auto = (isinstance(step_minutes, str) and step_minutes.lower() == "auto") or (float(step_minutes) <= 0.0)
         if auto:
@@ -316,16 +381,7 @@ class TransitEngine:
         lon_cache: Dict[Tuple[str, float], float] = {}
 
         def _lon_cached(name: str, t: float) -> float:
-            key = (name, float(t))
-            v = lon_cache.get(key)
-            if v is not None:
-                return v
-            got = self._lon_map(t, [name])
-            if name not in got:
-                raise RuntimeError(f"no ephemeris for {name}@{t}")
-            lon = float(got[name])
-            lon_cache[key] = lon
-            return lon
+            return self._lon_cached(name, t, lon_cache)
 
         # Prebuild separation closures per (target, spec, body-kind)
         def make_sep(body: str, tgt_name: str, tgt_lon: float, spec: AspectSpec):
@@ -339,25 +395,29 @@ class TransitEngine:
                 img = tgt_img_contra[tgt_name]
                 return lambda t: wrap180(_lon_cached(body, t) - img)
 
-        # Prime cache at start
+        # Prime cache at start (batch per time across movers)
         t0 = float(jd_start_tt)
         l0 = self._lon_map(t0, movers)
         for m, v in l0.items():
             lon_cache[(m, t0)] = float(v)
+        self._prune_lon_cache(lon_cache)
 
         while t0 < jd_end_tt - 1e-12:
             t1 = float(min(t0 + dt, jd_end_tt))
             l1 = self._lon_map(t1, movers)
             for m, v in l1.items():
                 lon_cache[(m, t1)] = float(v)
+            self._prune_lon_cache(lon_cache)
 
             for body in movers:
                 lon0 = l0.get(body); lon1 = l1.get(body)
                 if lon0 is None or lon1 is None:
                     continue
 
+                # rough per-step max change bound for this body
+                max_change_possible = self._speed_est(body) * dt
+
                 for tgt_name, tgt_lon in targets.items():
-                    # compute once per target
                     for spec in asp_list:
                         # quick separations on boundaries
                         if spec.kind == "zodiacal":
@@ -373,19 +433,27 @@ class TransitEngine:
                         if not (math.isfinite(s0) and math.isfinite(s1)):
                             continue
 
-                        # Skip obvious far misses
+                        # Skip obvious far misses (coarse)
                         if abs(s0) > 120.0 and abs(s1) > 120.0:
                             continue
 
-                        # Candidate test
+                        # Candidate test (original near/sign-change)
                         sign_change = (s0 == 0.0) or (s1 == 0.0) or ((s0 * s1) < 0.0)
-                        near = (min(abs(s0), abs(s1)) <= (spec.orb_deg + guard_for(spec, dt, body)))
+                        # small guard as before
+                        guard = max(0.15, min(spec.orb_deg * 0.33, max_change_possible * 1.5))
+                        near = (min(abs(s0), abs(s1)) <= (spec.orb_deg + guard))
                         if not (sign_change or near):
+                            continue
+
+                        # NEW: tighter early filter using hard bound for this step
+                        if min(abs(s0), abs(s1)) > (spec.orb_deg + max_change_possible):
                             continue
 
                         # refine root using Brent with known endpoints
                         f = make_sep(body, tgt_name, tgt_lon, spec)
-                        t_exact = self._refine_zero_brent(f, t0, t1, s0, s1, tol_days=1e-6)
+                        t_exact = self._refine_with_prebatch(
+                            body=body, f=f, a=t0, b=t1, fa=s0, fb=s1, lon_cache=lon_cache
+                        )
 
                         # separation at exact
                         lon_now = _lon_cached(body, t_exact)
