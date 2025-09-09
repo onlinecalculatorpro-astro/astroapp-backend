@@ -14,13 +14,12 @@ Exports (see __all__):
 - Feature builders: feature_transit_proximity, feature_dasha_lords_onehot, feature_yoga_flags
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Literal, Callable
 import math
 import random
 import logging
 from datetime import datetime, date as _date
-from types import SimpleNamespace
 
 # ───────────────────── precise backends (soft imports) ─────────────────────
 # Ephemeris adapter
