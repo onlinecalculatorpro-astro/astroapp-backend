@@ -1740,6 +1740,22 @@ from typing import Any, Dict, List, Tuple, Optional
 import os, time, math, threading
 from flask import request, jsonify
 
+# Global adapter for performance optimization
+from app.core.ephemeris_adapter import EphemerisAdapter, Config as EphemConfig
+
+_GLOBAL_EPHEM_ADAPTER = None
+_ADAPTER_LOCK = threading.Lock()
+
+def get_shared_adapter(frame: str = "ecliptic-of-date") -> EphemerisAdapter:
+    """Get or create a shared EphemerisAdapter instance for performance optimization."""
+    global _GLOBAL_EPHEM_ADAPTER
+    if _GLOBAL_EPHEM_ADAPTER is None:
+        with _ADAPTER_LOCK:
+            if _GLOBAL_EPHEM_ADAPTER is None:
+                cfg = EphemConfig(frame=frame, compute_velocity_default=False)
+                _GLOBAL_EPHEM_ADAPTER = EphemerisAdapter(cfg)
+    return _GLOBAL_EPHEM_ADAPTER
+
 # small concurrency gate to avoid 429s under burst load from the same pod
 _PRED_MAX_CONC = int(os.getenv("PREDICTIVE_MAX_CONCURRENCY", "2"))
 _PRED_SEM_TIMEOUT_S = float(os.getenv("PREDICTIVE_SEM_TIMEOUT_S", "25"))
@@ -1912,9 +1928,13 @@ def predictive_transits():
         if include_minors:
             aspects += list(pred.MINOR_ASPECTS)
 
-        # -------- run engine --------
+        # -------- run engine with shared adapter --------
         try:
+            # Get shared adapter for performance optimization
+            shared_adapter = get_shared_adapter(frame)
+            
             eng = pred.TransitEngine(
+                ephem=shared_adapter,  # Use shared adapter instead of creating new one
                 frame=frame,
                 topocentric=topocentric,
                 latitude=lat, longitude=lon, elevation_m=elev
@@ -1985,10 +2005,16 @@ def predictive_ingresses():
             return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
 
         movers = body.get("movers") or ["Sun","Mercury","Venus","Mars","Jupiter","Saturn"]
+        frame = parse_frame(body.get("frame"))
 
         from app.core import predictive as pred
+        
+        # Use shared adapter for performance optimization
+        shared_adapter = get_shared_adapter(frame)
+        
         eng = pred.TransitEngine(
-            frame=parse_frame(body.get("frame")),
+            ephem=shared_adapter,  # Use shared adapter
+            frame=frame,
             topocentric=bool(body.get("topocentric")),
             latitude=float(body.get("latitude")) if isinstance(body.get("latitude"), (int,float)) else None,
             longitude=float(body.get("longitude")) if isinstance(body.get("longitude"), (int,float)) else None,
@@ -2041,10 +2067,16 @@ def predictive_stations():
         # but preserve your original behavior by allowing override via step_minutes or explicit jd1.
 
         movers = body.get("movers") or ["Mercury","Venus","Mars","Jupiter","Saturn","Uranus","Neptune","Pluto"]
+        frame = parse_frame(body.get("frame"))
 
         from app.core import predictive as pred
+        
+        # Use shared adapter for performance optimization
+        shared_adapter = get_shared_adapter(frame)
+        
         eng = pred.TransitEngine(
-            frame=parse_frame(body.get("frame")),
+            ephem=shared_adapter,  # Use shared adapter
+            frame=frame,
             topocentric=bool(body.get("topocentric")),
             latitude=float(body.get("latitude")) if isinstance(body.get("latitude"), (int,float)) else None,
             longitude=float(body.get("longitude")) if isinstance(body.get("longitude"), (int,float)) else None,
@@ -2239,7 +2271,7 @@ def predictive_yogas():
         return jsonify({"ok": True, "results": res}), 200
     except Exception as e:
         return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
-
+        
 # ───────────────────────── PROGRESSIONS ─────────────────────────
 @api.post("/api/progressions")
 @rate_limit(RL_PROGRESSIONS)
