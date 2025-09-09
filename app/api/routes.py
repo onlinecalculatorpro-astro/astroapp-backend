@@ -1772,7 +1772,6 @@ def _serialize_relationship_forecast(forecast: Any) -> Dict[str, Any]:
 
 
 # ───────────────────────── predictive (transits • validation • dasha • varga • yogas) ─────────────────────────
-from __future__ import annotations
 from typing import Any, Dict, List, Tuple, Optional
 import os, time, math, threading
 from flask import request, jsonify
