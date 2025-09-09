@@ -2566,7 +2566,6 @@ def predictive_evaluate():
         - "dasha_lords_onehot"  (+ level?)
         - "dasha_l1"|"dasha_l2"|"dasha_l3"
         - "yoga_flags"          (+ names[])
-        - "angular_houses"
       perm_mode: "iid"|"within"|"circular"
       group_by: "subject_id" (optional)
       n_perm: 2000 (default)
@@ -2575,7 +2574,7 @@ def predictive_evaluate():
         body = request.get_json(force=True) or {}
         recs = body.get("records") or []
         if not (isinstance(recs, list) and recs):
-            return json_error("validation_error", [{"loc":["records"],"msg":"non-empty list required"}], 400)
+            return _json_error("validation_error", [{"loc":["records"],"msg":"non-empty list required"}], 400)
         
         feature = (body.get("feature") or "transit_proximity").lower()
         perm_mode = (body.get("perm_mode") or "iid").lower()
@@ -2605,10 +2604,10 @@ def predictive_evaluate():
             ff = pred.feature_yoga_flags(names)
         
         elif feature == "angular_houses":
-            ff = pred.feature_angular_houses()  # Implement this function
+            return _json_error("validation_error", [{"loc":["feature"],"msg":"angular_houses feature not implemented"}], 400)
         
         else:
-            return json_error("validation_error", [{"loc":["feature"],"msg":"unknown feature"}], 400)
+            return _json_error("validation_error", [{"loc":["feature"],"msg":"unknown feature"}], 400)
         
         res = pred.evaluate_univariate(
             recs, ff, n_perm=n_perm, alpha=alpha,
@@ -2618,8 +2617,7 @@ def predictive_evaluate():
         return jsonify({"ok": True, "results": [r.__dict__ for r in res]}), 200
         
     except Exception as e:
-        return json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
-
+        return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
 @api.post("/api/predictive/holdout")
 @rate_limit(RL_PREDICTIVE)
@@ -2629,7 +2627,7 @@ def predictive_holdout():
         body = request.get_json(force=True) or {}
         recs = body.get("records") or []
         if not (isinstance(recs, list) and recs):
-            return json_error("validation_error", [{"loc":["records"],"msg":"non-empty list required"}], 400)
+            return _json_error("validation_error", [{"loc":["records"],"msg":"non-empty list required"}], 400)
         
         feature = (body.get("feature") or "transit_proximity").lower()
         perm_mode = (body.get("perm_mode") or "iid").lower()
@@ -2657,10 +2655,10 @@ def predictive_holdout():
             ff = pred.feature_yoga_flags(names)
         
         elif feature == "angular_houses":
-            ff = pred.feature_angular_houses()  # Implement this function
+            return _json_error("validation_error", [{"loc":["feature"],"msg":"angular_houses feature not implemented"}], 400)
         
         else:
-            return json_error("validation_error", [{"loc":["feature"],"msg":"unknown feature"}], 400)
+            return _json_error("validation_error", [{"loc":["feature"],"msg":"unknown feature"}], 400)
         
         res = pred.holdout_replicate(
             recs, ff,
@@ -2675,8 +2673,8 @@ def predictive_holdout():
         return jsonify({"ok": True, **res}), 200
         
     except Exception as e:
-        return json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
-
+        return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+        
 @api.post("/api/predictive/dasha")
 @rate_limit(RL_PREDICTIVE)
 def predictive_dasha():
