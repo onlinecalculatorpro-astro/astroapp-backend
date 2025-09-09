@@ -1736,154 +1736,234 @@ def _serialize_relationship_forecast(forecast: Any) -> Dict[str, Any]:
 
 
 # ───────────────────────── predictive (transits • validation • dasha • varga • yogas) ─────────────────────────
+from typing import Any, Dict, List, Tuple, Optional
+import os, time, math, threading
+from flask import request, jsonify
+
+# small concurrency gate to avoid 429s under burst load from the same pod
+_PRED_MAX_CONC = int(os.getenv("PREDICTIVE_MAX_CONCURRENCY", "2"))
+_PRED_SEM_TIMEOUT_S = float(os.getenv("PREDICTIVE_SEM_TIMEOUT_S", "25"))
+_PRED_SEM = threading.Semaphore(_PRED_MAX_CONC)
+
+def _busy():
+    resp = _json_error("server_busy", "try again shortly", 429)
+    resp.headers["Retry-After"] = "2"
+    return resp
+
+def _take_gate():
+    return _PRED_SEM.acquire(timeout=_PRED_SEM_TIMEOUT_S)
+
+def _give_gate():
+    try:
+        _PRED_SEM.release()
+    except Exception:
+        pass
+
+def _parse_time_range_like(body: Dict[str, Any]) -> Tuple[float, float]:
+    """
+    Accepts any of:
+      - jd_start_tt & jd_end_tt (floats)
+      - time_range: [start, end] where each item can be ISO date or full ISO datetime
+      - date*_*/time*_* + place_tz / timezone (old shape)
+    Returns (jd0, jd1) in TT, raises ValidationError-compatible dict on problems.
+    """
+    # direct JDs
+    jd0 = body.get("jd_start_tt")
+    jd1 = body.get("jd_end_tt")
+    if isinstance(jd0, (int, float)) and isinstance(jd1, (int, float)):
+        jd0f, jd1f = float(jd0), float(jd1)
+        if not (math.isfinite(jd0f) and math.isfinite(jd1f) and jd1f > jd0f):
+            raise ValidationError([{"loc": ["jd_start_tt", "jd_end_tt"], "msg": "invalid range"}])
+        return jd0f, jd1f
+
+    # time_range: ["YYYY-MM-DD" | ISO, "YYYY-MM-DD" | ISO]
+    tr = body.get("time_range")
+    if isinstance(tr, (list, tuple)) and len(tr) == 2:
+        tz = body.get("place_tz") or body.get("timezone") or "UTC"
+        s0, s1 = tr[0], tr[1]
+        if not (isinstance(s0, str) and isinstance(s1, str)):
+            raise ValidationError([{"loc": ["time_range"], "msg": "items must be strings"}])
+        ts0 = _compute_timescales_from_local(s0[:10], ("00:00:00" if len(s0) == 10 else s0[11:19] or "00:00:00"), tz, payload=body)
+        ts1 = _compute_timescales_from_local(s1[:10], ("23:59:59" if len(s1) == 10 else s1[11:19] or "23:59:59"), tz, payload=body)
+        jd0f, jd1f = float(ts0["jd_tt"]), float(ts1["jd_tt"])
+        if jd1f <= jd0f:
+            raise ValidationError([{"loc": ["time_range"], "msg": "end must be after start"}])
+        return jd0f, jd1f
+
+    # legacy civil fields
+    date0 = body.get("date_start") or body.get("date")
+    time0 = body.get("time_start") or body.get("time") or "00:00:00"
+    date1 = body.get("date_end")
+    time1 = body.get("time_end") or "23:59:59"
+    tz = body.get("place_tz") or body.get("timezone") or "UTC"
+    if not (isinstance(date0, str) and isinstance(time0, str)):
+        raise ValidationError([{"loc": ["date_start/time_start"], "msg": "required"}])
+    ts0 = _compute_timescales_from_local(date0, time0, tz, payload=body)
+    if isinstance(date1, str):
+        ts1 = _compute_timescales_from_local(date1, time1, tz, payload=body)
+        jd0f, jd1f = float(ts0["jd_tt"]), float(ts1["jd_tt"])
+    else:
+        jd0f = float(ts0["jd_tt"])
+        jd1f = jd0f + 1.0  # default 24h window
+    if not (math.isfinite(jd0f) and math.isfinite(jd1f) and jd1f > jd0f):
+        raise ValidationError([{"loc": ["jd_start_tt", "jd_end_tt"], "msg": "invalid range"}])
+    return jd0f, jd1f
+
+def _parse_step_minutes(v: Any, *, default_min: float) -> Any:
+    """
+    Accept numeric minutes (>0) or "auto"/0/None → "auto".
+    Returns either float minutes or the string "auto" (engine understands both).
+    """
+    if v is None:
+        return "auto" if default_min <= 0 else default_min
+    if isinstance(v, str) and v.strip().lower() == "auto":
+        return "auto"
+    try:
+        f = float(v)
+        return "auto" if f <= 0 else f
+    except Exception:
+        return default_min
+
 @api.post("/api/predictive/transits")
 @rate_limit(RL_PREDICTIVE)
 def predictive_transits():
     """
-    Scan transits (moving bodies vs target longitudes) with bisection refinement.
-    Accepts either a concrete targets map or a "targets_chart" (natal chart params).
+    Scan transits (moving bodies vs target longitudes) with robust refinement.
+    Accepts either a direct targets map or a 'targets_chart' (natal chart params).
+    Also accepts 'time_range' in addition to jd/date fields.
     """
     try:
         body = request.get_json(force=True) or {}
     except Exception as e:
         return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
 
-    # -------- time window (jd_tt) --------
+    if not _take_gate():
+        return _busy()
+    t0 = time.perf_counter()
     try:
-        jd0 = body.get("jd_start_tt")
-        jd1 = body.get("jd_end_tt")
-        if not (isinstance(jd0, (int, float)) and isinstance(jd1, (int, float))):
-            # derive from civil times
-            date0 = body.get("date_start") or body.get("date")
-            time0 = body.get("time_start") or body.get("time") or "00:00:00"
-            date1 = body.get("date_end")
-            time1 = body.get("time_end") or "23:59:59"
-            tz = body.get("place_tz") or body.get("timezone") or "UTC"
-            if not (isinstance(date0, str) and isinstance(time0, str)):
-                return _json_error("validation_error", [{"loc": ["date_start/time_start"], "msg": "required"}], 400)
-            ts0 = _compute_timescales_from_local(date0, time0, tz, payload=body)
-            if not isinstance(date1, str):
-                # default: 24h window from start
-                jd0 = float(ts0["jd_tt"]); jd1 = jd0 + 1.0
-            else:
-                ts1 = _compute_timescales_from_local(date1, time1, tz, payload=body)
-                jd0 = float(ts0["jd_tt"]); jd1 = float(ts1["jd_tt"])
-        if not (math.isfinite(jd0) and math.isfinite(jd1)) or jd1 <= jd0:
-            return _json_error("validation_error", [{"loc": ["jd_start_tt", "jd_end_tt"], "msg": "invalid range"}], 400)
-    except ValidationError as e:
-        return _json_error("validation_error", e.errors(), 400)
-    except Exception as e:
-        return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
-
-    # -------- movers / targets --------
-    movers = body.get("movers") or ["Sun", "Moon", "Mercury", "Venus", "Mars", "Jupiter", "Saturn"]
-    if not (isinstance(movers, list) and all(isinstance(x, str) and x for x in movers)):
-        return _json_error("validation_error", [{"loc": ["movers"], "msg": "must be a list of names"}], 400)
-
-    # targets_longitudes: direct map (preferred, fastest path)
-    targets: Dict[str, float] = {}
-    raw_targets = body.get("targets_longitudes")
-    if isinstance(raw_targets, dict):
-        for k, v in raw_targets.items():
-            try:
-                targets[str(k)] = _wrap360(float(v))
-            except Exception:
-                pass
-
-    # Or: build targets from a chart payload (e.g., natal)
-    if not targets and isinstance(body.get("targets_chart"), dict):
-        targ = dict(body["targets_chart"])
-        tz = targ.get("place_tz") or targ.get("timezone") or "UTC"
+        # -------- time window (jd_tt) --------
         try:
-            ts_nat = _compute_timescales_from_local(targ["date"], targ["time"], tz, payload=targ)
-        except Exception as e:
-            return _json_error("validation_error", [{"loc": ["targets_chart"], "msg": str(e)}], 400)
-        try:
-            ch = _call_compute_chart(targ, ts_nat)
-        except Exception as e:
-            return _json_error("chart_internal", str(e) if DEBUG_VERBOSE else "chart_failed", 500)
-
-        # Extract longitudes from chart
-        bodies = ch.get("bodies", []) or []
-        points = ch.get("points", []) or []
-        for row in bodies + points:
-            if isinstance(row, dict) and "name" in row and isinstance(row.get("longitude_deg"), (int, float)):
-                targets[str(row["name"])] = _wrap360(float(row["longitude_deg"]))
-
-    if not targets:
-        return _json_error("validation_error", [{"loc": ["targets_longitudes|targets_chart"], "msg": "no targets to scan"}], 400)
-
-    # -------- engine options --------
-    # topocentric honored if lat/lon provided or topocentric:true explicitly
-    topocentric = bool(body.get("topocentric")) or (isinstance(body.get("latitude"), (int, float)) and isinstance(body.get("longitude"), (int, float)))
-    lat = float(body.get("latitude")) if isinstance(body.get("latitude"), (int, float)) else None
-    lon = float(body.get("longitude")) if isinstance(body.get("longitude"), (int, float)) else None
-    elev = float(body.get("elevation_m")) if isinstance(body.get("elevation_m"), (int, float)) else None
-    # Normalize frame (accepts aliases like 'ecl-j2000')
-    frame = parse_frame(body.get("frame"))
-    # Step minutes must be positive
-    step_min = float(body.get("step_minutes") or 30.0)
-    if not (step_min > 0):
-        return _json_error("validation_error", [{"loc": ["step_minutes"], "msg": "must be > 0"}], 400)
-    # Optional: validate lat/lon if user provided either
-    if topocentric and (lat is not None or lon is not None):
-        try:
-            lat, lon = parse_latlon(lat, lon)
+            jd0, jd1 = _parse_time_range_like(body)
         except ValidationError as e:
             return _json_error("validation_error", e.errors(), 400)
+        except Exception as e:
+            return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
 
-    include_antiscia = bool(body.get("include_antiscia", False))
-    antiscia_orb_deg = float(body.get("antiscia_orb_deg", 2.0))
+        # -------- movers / targets --------
+        movers = body.get("movers") or ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn"]
+        if not (isinstance(movers, list) and all(isinstance(x, str) and x for x in movers)):
+            return _json_error("validation_error", [{"loc":["movers"],"msg":"must be a list of names"}], 400)
 
-    # aspect set: majors by default; allow minor switch
-    from app.core import predictive as pred  # local import to avoid circulars at module import
-    aspects = list(pred.MAJOR_ASPECTS)
-    if body.get("include_minors"):
-        aspects += list(pred.MINOR_ASPECTS)
+        # targets_longitudes: direct map (preferred, fastest path)
+        targets: Dict[str, float] = {}
+        raw_targets = body.get("targets_longitudes")
+        if isinstance(raw_targets, dict):
+            for k, v in raw_targets.items():
+                try:
+                    targets[str(k)] = _wrap360(float(v))
+                except Exception:
+                    pass
 
-    # -------- run engine --------
-    try:
-        eng = pred.TransitEngine(
-            frame=frame,
-            topocentric=topocentric,
-            latitude=lat, longitude=lon, elevation_m=elev
+        # Or build targets from a chart payload (e.g., natal)
+        if not targets and isinstance(body.get("targets_chart"), dict):
+            targ = dict(body["targets_chart"])
+            tz_nat = targ.get("place_tz") or targ.get("timezone") or "UTC"
+            try:
+                ts_nat = _compute_timescales_from_local(targ["date"], targ.get("time", "00:00:00"), tz_nat, payload=targ)
+            except Exception as e:
+                return _json_error("validation_error", [{"loc":["targets_chart"], "msg": str(e)}], 400)
+            try:
+                ch = _call_compute_chart(targ, ts_nat)
+            except Exception as e:
+                return _json_error("chart_internal", str(e) if DEBUG_VERBOSE else "chart_failed", 500)
+            for row in (ch.get("bodies") or []) + (ch.get("points") or []):
+                if isinstance(row, dict) and "name" in row and isinstance(row.get("longitude_deg"), (int, float)):
+                    targets[str(row["name"])] = _wrap360(float(row["longitude_deg"]))
+
+        if not targets:
+            return _json_error("validation_error", [{"loc":["targets_longitudes|targets_chart"],"msg":"no targets to scan"}], 400)
+
+        # -------- engine options --------
+        topocentric = bool(body.get("topocentric")) or (
+            isinstance(body.get("latitude"), (int,float)) and isinstance(body.get("longitude"), (int,float))
         )
-        events = eng.scan_aspects(
-            jd_start_tt=float(jd0),
-            jd_end_tt=float(jd1),
-            movers=[str(m) for m in movers],
-            targets=targets,
-            aspects=aspects,
-            step_minutes=step_min,
-            include_antiscia=include_antiscia,
-            antiscia_orb_deg=antiscia_orb_deg,
-        )
-    except Exception as e:
-        return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+        lat = float(body.get("latitude")) if isinstance(body.get("latitude"), (int,float)) else None
+        lon = float(body.get("longitude")) if isinstance(body.get("longitude"), (int,float)) else None
+        elev = float(body.get("elevation_m")) if isinstance(body.get("elevation_m"), (int,float)) else None
+        frame = parse_frame(body.get("frame"))
+        step_arg = _parse_step_minutes(body.get("step_minutes"), default_min=30.0)
+        if topocentric and (lat is not None or lon is not None):
+            try:
+                lat, lon = parse_latlon(lat, lon)
+            except ValidationError as e:
+                return _json_error("validation_error", e.errors(), 400)
 
-    # shape response
-    out = [
-        {
-            "jd_tt": e.jd_tt,
-            "body": e.body,
-            "target": e.target,
-            "aspect": e.aspect,
-            "kind": e.kind,
-            "separation_deg": e.separation_deg,
-            "applying": e.applying,
-            "exact": e.exact,
-            "meta": e.meta,
-        }
-        for e in events
-    ]
-    return jsonify({
-        "ok": True,
-        "window": {"jd_start_tt": float(jd0), "jd_end_tt": float(jd1), "step_minutes": step_min},
-        "engine": {"frame": frame, "topocentric": topocentric},
-        "targets": targets,
-        "movers": movers,
-        "results": out
-    }), 200
+        include_antiscia = bool(body.get("include_antiscia", False))
+        antiscia_orb_deg = float(body.get("antiscia_orb_deg", 2.0))
+        include_minors = bool(body.get("include_minors", False))
+
+        # sidereal options (thread through to engine)
+        zodiac_mode = (body.get("zodiac_mode") or "tropical").lower()
+        ayanamsa_deg = float(body.get("ayanamsa_deg", 0.0))
+
+        # aspect set
+        from app.core import predictive as pred
+        aspects = list(pred.MAJOR_ASPECTS)
+        if include_minors:
+            aspects += list(pred.MINOR_ASPECTS)
+
+        # -------- run engine --------
+        try:
+            eng = pred.TransitEngine(
+                frame=frame,
+                topocentric=topocentric,
+                latitude=lat, longitude=lon, elevation_m=elev
+            )
+            # thread sidereal into engine (no API change)
+            eng.sidereal_mode = zodiac_mode.startswith("sidereal")
+            eng.ayanamsa_deg = ayanamsa_deg
+
+            events = eng.scan_aspects(
+                jd_start_tt=float(jd0),
+                jd_end_tt=float(jd1),
+                movers=[str(m) for m in movers],
+                targets=targets,
+                aspects=aspects,
+                step_minutes=step_arg,              # supports "auto"
+                include_antiscia=include_antiscia,
+                antiscia_orb_deg=antiscia_orb_deg,
+            )
+        except Exception as e:
+            return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+
+        out = [
+            {
+                "jd_tt": e.jd_tt,
+                "body": e.body,
+                "target": e.target,
+                "aspect": e.aspect,
+                "kind": e.kind,
+                "separation_deg": e.separation_deg,
+                "applying": e.applying,
+                "exact": e.exact,
+                "meta": e.meta,
+            }
+            for e in events
+        ]
+        resp = jsonify({
+            "ok": True,
+            "window": {"jd_start_tt": float(jd0), "jd_end_tt": float(jd1), "step_minutes": (step_arg if isinstance(step_arg, float) else "auto")},
+            "engine": {"frame": frame, "topocentric": topocentric, "zodiac_mode": zodiac_mode, "ayanamsa_deg": ayanamsa_deg},
+            "targets": targets,
+            "movers": movers,
+            "results": out
+        })
+        resp.status_code = 200
+        resp.headers["X-Compute-Time-ms"] = f"{(time.perf_counter() - t0)*1000:.0f}"
+        return resp
+    finally:
+        _give_gate()
+
 
 @api.post("/api/predictive/ingresses")
 @rate_limit(RL_PREDICTIVE)
@@ -1893,21 +1973,19 @@ def predictive_ingresses():
     except Exception as e:
         return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
 
+    if not _take_gate():
+        return _busy()
+    t0 = time.perf_counter()
     try:
-        # time window
-        jd0 = body.get("jd_start_tt"); jd1 = body.get("jd_end_tt")
-        if not (isinstance(jd0, (int, float)) and isinstance(jd1, (int, float))):
-            date0 = body.get("date_start") or body.get("date")
-            time0 = body.get("time_start") or body.get("time") or "00:00:00"
-            date1 = body.get("date_end"); time1 = body.get("time_end") or "23:59:59"
-            tz = body.get("place_tz") or body.get("timezone") or "UTC"
-            ts0 = _compute_timescales_from_local(date0, time0, tz, payload=body)
-            jd0 = float(ts0["jd_tt"])
-            if isinstance(date1, str):
-                jd1 = float(_compute_timescales_from_local(date1, time1, tz, payload=body)["jd_tt"])
-            else:
-                jd1 = jd0 + 1.0
+        try:
+            jd0, jd1 = _parse_time_range_like(body)
+        except ValidationError as e:
+            return _json_error("validation_error", e.errors(), 400)
+        except Exception as e:
+            return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
+
         movers = body.get("movers") or ["Sun","Mercury","Venus","Mars","Jupiter","Saturn"]
+
         from app.core import predictive as pred
         eng = pred.TransitEngine(
             frame=parse_frame(body.get("frame")),
@@ -1916,16 +1994,29 @@ def predictive_ingresses():
             longitude=float(body.get("longitude")) if isinstance(body.get("longitude"), (int,float)) else None,
             elevation_m=float(body.get("elevation_m")) if isinstance(body.get("elevation_m"), (int,float)) else None,
         )
+
+        # sidereal thread-through
+        zodiac_mode = (body.get("zodiac_mode") or "tropical").lower()
+        ayanamsa_deg = float(body.get("ayanamsa_deg", 0.0))
+        eng.sidereal_mode = zodiac_mode.startswith("sidereal")
+        eng.ayanamsa_deg = ayanamsa_deg
+
         res = eng.find_ingresses(
             jd_start_tt=float(jd0), jd_end_tt=float(jd1),
             movers=[str(m) for m in movers],
-            step_minutes=float(body.get("step_minutes") or 60.0)
+            step_minutes=_parse_step_minutes(body.get("step_minutes"), default_min=60.0)
         )
-        return jsonify({"ok": True, "window": {"jd_start_tt": jd0, "jd_end_tt": jd1}, "movers": movers, "results": res}), 200
+        resp = jsonify({"ok": True, "window": {"jd_start_tt": jd0, "jd_end_tt": jd1}, "movers": movers, "results": res})
+        resp.status_code = 200
+        resp.headers["X-Compute-Time-ms"] = f"{(time.perf_counter() - t0)*1000:.0f}"
+        return resp
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
     except Exception as e:
         return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+    finally:
+        _give_gate()
+
 
 @api.post("/api/predictive/stations")
 @rate_limit(RL_PREDICTIVE)
@@ -1934,20 +2025,23 @@ def predictive_stations():
         body = request.get_json(force=True) or {}
     except Exception as e:
         return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
+
+    if not _take_gate():
+        return _busy()
+    t0 = time.perf_counter()
     try:
-        jd0 = body.get("jd_start_tt"); jd1 = body.get("jd_end_tt")
-        if not (isinstance(jd0, (int, float)) and isinstance(jd1, (int, float))):
-            date0 = body.get("date_start") or body.get("date")
-            time0 = body.get("time_start") or body.get("time") or "00:00:00"
-            date1 = body.get("date_end"); time1 = body.get("time_end") or "23:59:59"
-            tz = body.get("place_tz") or body.get("timezone") or "UTC"
-            ts0 = _compute_timescales_from_local(date0, time0, tz, payload=body)
-            jd0 = float(ts0["jd_tt"])
-            if isinstance(date1, str):
-                jd1 = float(_compute_timescales_from_local(date1, time1, tz, payload=body)["jd_tt"])
-            else:
-                jd1 = jd0 + 30.0/1440.0 * 60.0  # default ~30 hours
+        try:
+            jd0, jd1 = _parse_time_range_like(body)
+        except ValidationError as e:
+            return _json_error("validation_error", e.errors(), 400)
+        except Exception as e:
+            return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
+
+        # default to ~30 hours if only start provided (handled by _parse_time_range_like already),
+        # but preserve your original behavior by allowing override via step_minutes or explicit jd1.
+
         movers = body.get("movers") or ["Mercury","Venus","Mars","Jupiter","Saturn","Uranus","Neptune","Pluto"]
+
         from app.core import predictive as pred
         eng = pred.TransitEngine(
             frame=parse_frame(body.get("frame")),
@@ -1956,16 +2050,29 @@ def predictive_stations():
             longitude=float(body.get("longitude")) if isinstance(body.get("longitude"), (int,float)) else None,
             elevation_m=float(body.get("elevation_m")) if isinstance(body.get("elevation_m"), (int,float)) else None,
         )
+
+        # sidereal thread-through
+        zodiac_mode = (body.get("zodiac_mode") or "tropical").lower()
+        ayanamsa_deg = float(body.get("ayanamsa_deg", 0.0))
+        eng.sidereal_mode = zodiac_mode.startswith("sidereal")
+        eng.ayanamsa_deg = ayanamsa_deg
+
         res = eng.find_stations(
             jd_start_tt=float(jd0), jd_end_tt=float(jd1),
             movers=[str(m) for m in movers],
-            step_minutes=float(body.get("step_minutes") or 60.0)
+            step_minutes=_parse_step_minutes(body.get("step_minutes"), default_min=60.0)
         )
-        return jsonify({"ok": True, "window": {"jd_start_tt": jd0, "jd_end_tt": jd1}, "movers": movers, "results": res}), 200
+        resp = jsonify({"ok": True, "window": {"jd_start_tt": jd0, "jd_end_tt": jd1}, "movers": movers, "results": res})
+        resp.status_code = 200
+        resp.headers["X-Compute-Time-ms"] = f"{(time.perf_counter() - t0)*1000:.0f}"
+        return resp
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
     except Exception as e:
         return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+    finally:
+        _give_gate()
+
 
 @api.post("/api/predictive/evaluate")
 @rate_limit(RL_PREDICTIVE)
@@ -1993,7 +2100,6 @@ def predictive_evaluate():
         alpha = float(body.get("alpha", 0.05))
         n_perm = int(body.get("n_perm", 2000))
         from app.core import predictive as pred
-        # build feature fn
         if feature == "transit_proximity":
             movers = body.get("movers") or ["Sun","Moon","Mercury","Venus","Mars"]
             orb_deg = float(body.get("orb_deg", 1.0))
@@ -2015,12 +2121,11 @@ def predictive_evaluate():
     except Exception as e:
         return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
+
 @api.post("/api/predictive/holdout")
 @rate_limit(RL_PREDICTIVE)
 def predictive_holdout():
-    """
-    Train/holdout replication with the same feature menu as /evaluate.
-    """
+    """Train/holdout replication with the same feature menu as /evaluate."""
     try:
         body = request.get_json(force=True) or {}
         recs = body.get("records") or []
@@ -2056,6 +2161,7 @@ def predictive_holdout():
     except Exception as e:
         return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
+
 @api.post("/api/predictive/dasha")
 @rate_limit(RL_PREDICTIVE)
 def predictive_dasha():
@@ -2084,6 +2190,7 @@ def predictive_dasha():
     except Exception as e:
         return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
+
 @api.post("/api/predictive/vargas")
 @rate_limit(RL_PREDICTIVE)
 def predictive_vargas():
@@ -2106,6 +2213,7 @@ def predictive_vargas():
         return jsonify({"ok": True, "results": res}), 200
     except Exception as e:
         return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+
 
 @api.post("/api/predictive/yogas")
 @rate_limit(RL_PREDICTIVE)
