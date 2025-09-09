@@ -13,14 +13,14 @@
 #   • ΔAT (TAI−UTC) via erfa.dat.
 #   • DUT1 must be within ±0.9 s (IERS) with tiny epsilon.
 #   • UTC < 1960 rejected (policy).
-#   • Time zone offset via zoneinfo; DST ambiguity flagged.
+#   • Time zone offset via zoneinfo; DST ambiguity flagged; DST nonexistent resolved forward w/ warning.
 #   • No POSIX timestamp math feeds any JD.
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
-from typing import Tuple, List, Dict, Any
+from typing import Tuple, List, Dict, Any, Optional
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from decimal import Decimal, ROUND_HALF_UP
@@ -131,23 +131,54 @@ def _micro_to_ifrac_1e4(us: int) -> int:
     """Round microseconds to 1e-4 s (100 µs) half-up, clamped to 0..9999."""
     return min(9999, (int(us) + 50) // 100)
 
-# ───────────────────────────── Time zone / UTC helpers ─────────────────────────────
+# ───────────────────────── DST classification / resolution ───────────────────
 
-def _fold_offsets(z: ZoneInfo, naive_local: datetime) -> Tuple[int, List[str]]:
+def _roundtrip_matches(naive: datetime, aware_local: datetime, tz: ZoneInfo) -> bool:
+    """Check if aware_local → UTC → tz returns the same naive civil time."""
+    back = aware_local.astimezone(timezone.utc).astimezone(tz).replace(tzinfo=None)
+    return back == naive
+
+def _classify_local_time(naive: datetime, tz: ZoneInfo) -> Tuple[str, Optional[datetime], Dict[str, Any]]:
     """
-    Compute tz offset seconds for a naive local datetime.
-    Detect DST ambiguity; prefer fold=0 but warn if fold=1 differs.
+    Classify a naive local datetime in tz:
+      returns (kind, dt_valid, meta)
+      kind: 'valid' | 'ambiguous' | 'nonexistent'
+      dt_valid: timezone-aware local dt to use (None for nonexistent)
     """
-    warnings: List[str] = []
-    aware0 = naive_local.replace(tzinfo=z, fold=0)
-    off0 = aware0.utcoffset()
-    if off0 is None:
-        raise ValueError("Timezone returned None utcoffset()")
-    aware1 = naive_local.replace(tzinfo=z, fold=1)
-    off1 = aware1.utcoffset()
-    if off1 is not None and off1 != off0:
-        warnings.append("dst_ambiguous")
-    return int(off0.total_seconds()), warnings
+    assert naive.tzinfo is None
+    dt0 = naive.replace(tzinfo=tz, fold=0)
+    dt1 = naive.replace(tzinfo=tz, fold=1)
+
+    ok0 = _roundtrip_matches(naive, dt0, tz)
+    ok1 = _roundtrip_matches(naive, dt1, tz)
+
+    if ok0 and ok1:
+        # Both representable; if offsets differ → ambiguous fallback hour
+        amb = (dt0.utcoffset() != dt1.utcoffset())
+        if amb:
+            return "ambiguous", dt0, {"folds_valid": True, "offsets_differ": True}
+        return "valid", dt0, {"folds_valid": True, "offsets_differ": False}
+
+    if not ok0 and not ok1:
+        return "nonexistent", None, {"folds_valid": False}
+
+    # One fold maps cleanly — treat as valid (some zones collapse fold semantics)
+    chosen = dt0 if ok0 else dt1
+    return "valid", chosen, {"folds_valid": ok0 != ok1}
+
+def _resolve_nonexistent_forward(naive: datetime, tz: ZoneInfo, *, max_minutes: int = 180) -> Tuple[Optional[datetime], Optional[int]]:
+    """
+    Shift forward minute-by-minute to the nearest representable local time.
+    Returns (resolved_local_aware, minutes_shifted) or (None, None) if not found.
+    """
+    for minutes in range(1, max_minutes + 1):
+        cand = naive + timedelta(minutes=minutes)
+        kind, dt_valid, _ = _classify_local_time(cand, tz)
+        if kind in ("valid", "ambiguous"):
+            return dt_valid, minutes
+    return None, None
+
+# ───────────────────────── Time zone / UTC helpers ───────────────────────────
 
 def _local_to_utc_calendar(
     date_str: str,
@@ -157,7 +188,12 @@ def _local_to_utc_calendar(
     """
     Convert local civil time (in tz) to UTC calendar fields for ERFA.
     Returns: (iy, im, id, ih, imin, isec, ifrac_1e4, tz_offset_seconds, warnings[])
+    Handles:
+      • Leap seconds (ss == 60)
+      • DST ambiguous: warn 'dst_ambiguous' (prefer fold=0)
+      • DST nonexistent: normalize forward with warning 'dst_nonexistent_resolved_forward'
     """
+    # Parse inputs
     iy, im, iday, warn_date = _parse_date_str(date_str)
     ih, imin, isec_in, frac_str = _parse_time(time_str)
     warnings: List[str] = list(warn_date)
@@ -169,38 +205,57 @@ def _local_to_utc_calendar(
     if warn_prec:
         warnings.append("microsecond_precision_clamped")
 
-    # Build a local datetime for tz resolution:
+    # Build a naive local datetime for tz resolution:
     # - normal seconds: apply carry (if any)
     # - leap second: represent as :59 + fraction (never carry)
     build_sec = (59 if leap_sec else isec_in) + (1 if (not leap_sec and carry) else 0)
+    base_naive = datetime(iy, im, iday, ih, imin, min(build_sec, 59), microsecond=micro)
 
+    if build_sec == 60:
+        base_naive = base_naive + timedelta(seconds=1)
+
+    # Load tz
     try:
-        z = ZoneInfo(tz_name)
+        tz = ZoneInfo(tz_name)
     except ZoneInfoNotFoundError as e:
         raise ValueError(f"Unknown IANA time zone '{tz_name}'") from e
 
-    base_local = datetime(iy, im, iday, ih, imin, min(build_sec, 59), microsecond=micro, tzinfo=None)
-    if build_sec == 60:
-        base_local = base_local + timedelta(seconds=1)
+    # Classify local time (valid / ambiguous / nonexistent)
+    kind, aware_local, meta = _classify_local_time(base_naive, tz)
+    if kind == "ambiguous":
+        warnings.append("dst_ambiguous")
+    elif kind == "nonexistent":
+        # Normalize forward to the earliest valid local time; warn with details
+        resolved, minutes = _resolve_nonexistent_forward(base_naive, tz)
+        if resolved is None:
+            # Could not resolve within window → reject (rare)
+            raise ValueError("nonexistent_local_time_unresolvable")
+        aware_local = resolved
+        warnings.append(
+            f"dst_nonexistent_resolved_forward(+{minutes}m,to={resolved.replace(tzinfo=None).isoformat(sep=' ')})"
+        )
 
-    tz_off_sec, wz = _fold_offsets(z, base_local)
-    warnings.extend(wz)
+    # Compute tz offset seconds from the chosen local instant
+    off = aware_local.utcoffset()
+    if off is None:
+        raise ValueError("Timezone returned None utcoffset()")
+    tz_off_sec = int(off.total_seconds())
 
-    aware_local = base_local.replace(tzinfo=z, fold=0)
+    # Local → UTC
     aware_utc = aware_local.astimezone(timezone.utc)
 
-    # UTC calendar fields
+    # UTC calendar fields (for ERFA dtf2d)
     iy_u, im_u, id_u = aware_utc.year, aware_utc.month, aware_utc.day
     ih_u, in_u, is_u = aware_utc.hour, aware_utc.minute, aware_utc.second
 
-    # ERFA dtf2d inputs
+    # ERFA dtf2d fractional seconds handling
     if leap_sec:
         # Represent the leap second itself
         isec_erfa = 60
         ifrac_erfa = ifrac_in_1e4
     else:
+        # If carry consumed the fraction exactly to next whole second
         if carry and ifrac_in_1e4 == 0:
-            # Already carried to next whole second
             isec_erfa = is_u
             ifrac_erfa = 0
         else:
@@ -279,7 +334,7 @@ def build_timescales(
     if abs(dut1_seconds) > 0.9 + 1e-12:
         raise ValueError(f"dut1_seconds out of range (|DUT1| ≤ 0.9 s): {dut1_seconds}")
 
-    # Local → UTC calendar fields
+    # Local → UTC calendar fields (handles DST ambiguous/nonexistent + leap seconds)
     iy_u, im_u, id_u, ih_u, in_u, is_u, ifrac_u, tz_off, wz = _local_to_utc_calendar(
         date_str, time_str, tz_name
     )
