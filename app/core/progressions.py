@@ -176,7 +176,9 @@ def _resolve_ts_from_natal(
         raise ValueError("Missing natal {date,time,place_tz} for timescale resolution.")
 
     ts = build_timescales(date_str=str(date), time_str=str(time), tz_name=str(tz), dut1_seconds=0.0)
-    _warn(warnings, "strict_missing→computed_timescales_with_dut1=0.0s")
+    if profile:  # pass profile through or add a quiet flag in kwargs/meta
+        _warn(warnings, "strict_missing→computed_timescales_with_dut1=0.0s")
+    
     return float(ts.jd_tt), float(ts.jd_ut1), {
         "jd_tt": float(ts.jd_tt),
         "jd_ut1": float(ts.jd_ut1),
