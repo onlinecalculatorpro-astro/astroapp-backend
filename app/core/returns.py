@@ -1,18 +1,47 @@
 # app/core/returns.py
 # -*- coding: utf-8 -*-
 """
-Solar & Lunar Returns (v12) — FIXED with scan functionality and proper error handling
+Solar & Lunar Returns (v13) — performance rewrite with robust scanning
 
-Fixed Issues:
-- Added scan_returns function for window scanning
-- Enhanced error handling and validation of ephemeris results
-- Better convergence handling and fallback strategies
-- Defensive programming throughout
+Goals
+-----
+- Keep API compatible: compute_return(...), scan_returns(...)
+- Faster & more reliable root-finding (Newton/Secant + bracketing + step caps)
+- Ephemeris call minimization via small LRU + JD quantization
+- Correct lunar scan seeding by period (no months→years confusion)
+- Solid error reporting; predictable metadata; optional profiling
+
+Returns shape (unchanged keys where possible)
+--------------------------------------------
+{
+  "ok": True/False,
+  "kind": "solar"|"lunar",
+  "meta": {...},               # frame/zodiac/ayanamsa/houses info, warnings, (optional) profile, validation
+  "event": {                   # present when ok=True
+     "kind": "solar"|"lunar",
+     "body": "Sun"|"Moon",
+     "jd_tt": float,
+     "jd_ut1": float,
+     "delta_deg": float,       # residual |Δλ|
+     "iterations": int,
+     "converged": bool,
+     "uncertainty": { ... } | None
+  },
+  "positions": { "Sun":deg, ... }  # snapshot at solution (majors)
+  "houses": {...} | None
+}
+
+Notes
+-----
+- For lunar: guess_years_offset is interpreted as “periods” (i.e., months) for backward compatibility.
+- scan_returns() walks the window by **period-aligned seeds** and calls compute_return(around_jd_tt=seed),
+  which is both faster and more accurate.
 """
 
 from __future__ import annotations
 from typing import Any, Dict, List, Optional, Iterable, Tuple
 from time import perf_counter
+from functools import lru_cache
 import math
 import inspect
 
@@ -35,12 +64,20 @@ except Exception as _e:
     build_timescales = None  # type: ignore
     _TS_ERR = _e
 
-
 # ── constants ─────────────────────────────────────────────────────────────────
 MAJORS = ("Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn","Uranus","Neptune","Pluto")
-SOLAR_YEAR_D = 365.242189
+SOLAR_YEAR_D    = 365.242189
 LUNAR_SIDEREAL_D = 27.321582
 LUNAR_SYNODIC_D  = 29.530588
+
+# Solver step caps (days)
+MAX_NEWTON_STEP_D  = 10.0
+FALLBACK_SUN_D     = 1.0    # ~1°/day
+FALLBACK_MOON_D    = 0.08   # ~13°/day
+FALLBACK_OTHER_D   = 0.5
+
+# JD quantization for ephemeris caching (days). 1e-7 d ~ 0.00864 s.
+JD_Q = 1e-7
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -49,13 +86,11 @@ def _wrap_deg(x: float) -> float:
     return x + 360.0 if x < 0.0 else x
 
 def _delta_deg(a: float, b: float) -> float:
+    """Shortest signed Δ from a→b in degrees (-180,+180]."""
     d = _wrap_deg(b) - _wrap_deg(a)
     if d > 180.0: d -= 360.0
-    elif d < -180.0: d += 360.0
+    elif d <= -180.0: d += 360.0
     return d
-
-def _abs_sep(a: float, b: float) -> float:
-    return abs(_delta_deg(a, b))
 
 def _warn(ws: List[str], msg: str) -> None:
     if msg not in ws:
@@ -67,18 +102,6 @@ def _apply_ayanamsa(rows: List[Dict[str, Any]], ay: float) -> None:
         if "lon" in r:
             r["lon"] = _wrap_deg(float(r["lon"]) - ay)
 
-def _resolve_ts_from_natal(natal: Dict[str, Any], jd_tt: Optional[float], jd_ut1: Optional[float], warnings: List[str]) -> Tuple[float,float,Dict[str,Any]]:
-    if jd_tt is not None and jd_ut1 is not None:
-        return float(jd_tt), float(jd_ut1), {"jd_tt": float(jd_tt), "jd_ut1": float(jd_ut1), "delta_t": None, "dut1": None}
-    if build_timescales is None:
-        raise RuntimeError(f"Timescales unavailable and strict values not supplied. Import error: {_TS_ERR}")
-    date, time, tz = natal.get("date"), natal.get("time"), natal.get("place_tz")
-    if not (date and time and tz):
-        raise ValueError("Missing date/time/place_tz in natal for timescale resolution.")
-    ts = build_timescales(date_str=str(date), time_str=str(time), tz_name=str(tz), dut1_seconds=0.0)
-    _warn(warnings, "strict_missing→computed_timescales_with_dut1=0.0s")
-    return float(ts["jd_tt"]), float(ts["jd_ut1"]), {"jd_tt": float(ts["jd_tt"]), "jd_ut1": float(ts["jd_ut1"]), "delta_t": float(ts.get("delta_t", 0.0)), "dut1": float(ts.get("dut1", 0.0))}
-
 def _to_place(natal: Dict[str, Any], override: Optional[Dict[str, Any]]) -> Optional[Dict[str, float]]:
     src = override if override is not None else natal
     if src and all(k in src for k in ("latitude","longitude")):
@@ -89,269 +112,235 @@ def _to_place(natal: Dict[str, Any], override: Optional[Dict[str, Any]]) -> Opti
         }
     return None
 
-def _planet_rows(jd_tt: float, place: Optional[Dict[str, float]], frame: str, bodies: Iterable[str], warnings: List[str]) -> List[Dict[str, Any]]:
-    """
-    FIXED: Enhanced error handling and validation of ephemeris results
-    """
+def _place_key(place: Optional[Dict[str, float]]) -> Tuple:
+    if not place:
+        return (False, 0.0, 0.0, 0.0)
+    return (True, round(float(place["latitude"]), 7), round(float(place["longitude"]), 7), round(float(place.get("elev_m", 0.0)), 3))
+
+def _resolve_ts_from_natal(natal: Dict[str, Any], jd_tt: Optional[float], jd_ut1: Optional[float], warnings: List[str]) -> Tuple[float,float,Dict[str,Any]]:
+    if jd_tt is not None and jd_ut1 is not None:
+        return float(jd_tt), float(jd_ut1), {"jd_tt": float(jd_tt), "jd_ut1": float(jd_ut1), "delta_t": None, "dut1": None}
+    if build_timescales is None:
+        raise RuntimeError(f"Timescales unavailable and strict values not supplied. Import error: {_TS_ERR}")
+    date, time, tz = natal.get("date"), natal.get("time"), natal.get("place_tz")
+    if not (date and time and tz):
+        raise ValueError("Missing date/time/place_tz in natal for timescale resolution.")
+    ts = build_timescales(date_str=str(date), time_str=str(time), tz_name=str(tz), dut1_seconds=0.0)
+    _warn(warnings, "strict_missing→computed_timescales_with_dut1=0.0s")
+    return float(ts["jd_tt"]), float(ts["jd_ut1"]), {
+        "jd_tt": float(ts["jd_tt"]),
+        "jd_ut1": float(ts["jd_ut1"]),
+        "delta_t": float(ts.get("delta_t", 0.0)),
+        "dut1": float(ts.get("dut1", 0.0))
+    }
+
+# ── ephemeris adapters & caching ──────────────────────────────────────────────
+
+def _make_adapter(frame: str) -> Any:
     if EphemerisAdapter is None:
         raise RuntimeError(f"Ephemeris adapter unavailable: {_EPH_ERR}")
-    
-    # Validate inputs
-    if not bodies:
-        raise ValueError("No bodies specified for ephemeris calculation")
-    
-    bodies_list = list(bodies)
-    if not bodies_list:
-        raise ValueError("Empty bodies list provided")
-    
-    # Create adapter with proper error handling
     try:
-        adapter = EphemerisAdapter(frame=frame)
+        return EphemerisAdapter(frame=frame)
     except Exception as e:
         raise RuntimeError(f"Failed to create EphemerisAdapter with frame '{frame}': {e}")
-    
-    # Build arguments for ephemeris call
-    kwargs = {"jd_tt": jd_tt, "bodies": bodies_list}
-    if place:
-        kwargs.update({
-            "topocentric": True,
-            "latitude": place["latitude"],
-            "longitude": place["longitude"],
-            "elevation_m": place.get("elev_m", 0.0)
-        })
+
+@lru_cache(maxsize=8192)
+def _cached_lon_speed(frame: str, topo: bool, plat: float, plon: float, pelev: float, jdq: float, body: str) -> Tuple[float, Optional[float]]:
+    """
+    Cached fetch of (lon, speed?) for a single body at a quantized JD.
+    """
+    adapter = _make_adapter(frame)
+    kwargs = {"jd_tt": jdq, "bodies": [body]}
+    if topo:
+        kwargs.update({"topocentric": True, "latitude": plat, "longitude": plon, "elevation_m": pelev})
     else:
         kwargs["topocentric"] = False
 
-    # Try both available methods with enhanced error handling
-    last_error = None
+    # prefer velocities method
     for method_name in ("ecliptic_longitudes_and_velocities", "ecliptic_longitudes"):
         if not hasattr(adapter, method_name):
             continue
-            
-        try:
-            method = getattr(adapter, method_name)
-            sig = inspect.signature(method)
-            # Filter kwargs to only include parameters the method accepts
-            filtered_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
-            
-            result = method(**filtered_kwargs)
-            
-            # Parse result based on type
-            rows: List[Dict[str, Any]] = []
-            
-            if isinstance(result, dict):
-                # Handle direct dictionary response
-                if "results" in result and isinstance(result["results"], list):
-                    # Standard adapter response format
-                    for item in result["results"]:
-                        if isinstance(item, dict):
-                            name = str(item.get("name") or item.get("body") or "unknown")
-                            if "longitude" in item or "lon" in item:
-                                lon = float(item.get("longitude") or item.get("lon"))
-                                row = {"name": name, "lon": lon}
-                                if "latitude" in item or "lat" in item:
-                                    row["lat"] = float(item.get("latitude") or item.get("lat"))
-                                if "velocity" in item or "speed" in item:
-                                    row["speed"] = float(item.get("velocity") or item.get("speed"))
-                                rows.append(row)
-                else:
-                    # Handle flat dictionary format
-                    for k, v in result.items():
-                        if isinstance(v, (int, float)):
-                            rows.append({"name": k, "lon": float(v)})
-                        elif isinstance(v, dict) and ("lon" in v or "longitude" in v):
-                            lon = float(v.get("lon") or v.get("longitude"))
-                            row = {"name": k, "lon": lon}
-                            if "lat" in v or "latitude" in v:
-                                row["lat"] = float(v.get("lat") or v.get("latitude"))
-                            if "speed" in v or "velocity" in v:
-                                row["speed"] = float(v.get("speed") or v.get("velocity"))
-                            rows.append(row)
-                            
-            elif isinstance(result, list):
-                # Handle list response
-                for item in result:
-                    if not isinstance(item, dict):
-                        continue
-                    name = str(item.get("name") or item.get("body") or "unknown")
-                    if "lon" in item or "longitude" in item:
-                        lon = float(item.get("lon") or item.get("longitude"))
-                        row = {"name": name, "lon": lon}
-                        if "lat" in item or "latitude" in item:
-                            row["lat"] = float(item.get("lat") or item.get("latitude"))
-                        if "speed" in item or "velocity" in item:
-                            row["speed"] = float(item.get("speed") or item.get("velocity"))
-                        rows.append(row)
-            
-            # Validate we got results
-            if not rows:
-                _warn(warnings, f"ephemeris_method_{method_name}_returned_empty_results")
-                continue
-                
-            # Validate we got the requested bodies
-            found_bodies = {row["name"] for row in rows}
-            missing_bodies = set(bodies_list) - found_bodies
-            if missing_bodies:
-                _warn(warnings, f"ephemeris_missing_bodies: {missing_bodies}")
-                # Continue if we got at least some results
-                if not rows:
-                    continue
-            
-            return rows
-            
-        except Exception as e:
-            last_error = e
-            _warn(warnings, f"ephemeris_method_failed:{method_name}:{type(e).__name__}:{str(e)}")
-            continue
-    
-    # If we get here, all methods failed
-    error_msg = f"No usable ephemeris method on adapter. Bodies: {bodies_list}, JD: {jd_tt}, Frame: {frame}"
-    if last_error:
-        error_msg += f". Last error: {last_error}"
-    raise RuntimeError(error_msg)
+        method = getattr(adapter, method_name)
+        sig = inspect.signature(method)
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+        out = method(**filtered_kwargs)
+        # parse
+        if isinstance(out, dict):
+            if "results" in out and isinstance(out["results"], list):
+                for row in out["results"]:
+                    if isinstance(row, dict) and (row.get("name") or row.get("body")):
+                        name = str(row.get("name") or row.get("body"))
+                        if name.lower() == body.lower():
+                            lon = float(row.get("longitude") or row.get("lon"))
+                            spd = row.get("velocity") or row.get("speed")
+                            return float(lon), (float(spd) if spd is not None else None)
+            # flat mapping fallback
+            if body in out and isinstance(out[body], (int,float)):
+                return float(out[body]), None
+            if body in out and isinstance(out[body], dict):
+                lon = float(out[body].get("longitude") or out[body].get("lon"))
+                spd = out[body].get("velocity") or out[body].get("speed")
+                return float(lon), (float(spd) if spd is not None else None)
+        elif isinstance(out, list):
+            for row in out:
+                if isinstance(row, dict) and (row.get("name") or row.get("body")):
+                    name = str(row.get("name") or row.get("body"))
+                    if name.lower() == body.lower():
+                        lon = float(row.get("longitude") or row.get("lon"))
+                        spd = row.get("velocity") or row.get("speed")
+                        return float(lon), (float(spd) if spd is not None else None)
+    raise RuntimeError(f"Ephemeris method(s) unavailable/empty for body='{body}' @ JD={jdq:.8f}")
 
-def _get_body_lon_and_speed(jd_tt: float, place: Optional[Dict[str,float]], frame: str, body: str, warnings: List[str]) -> Tuple[float, Optional[float]]:
+def _get_body_lon_and_speed(jd_tt: float, place: Optional[Dict[str,float]], frame: str, body: str) -> Tuple[float, Optional[float]]:
+    topo, lat, lon, elev = _place_key(place)
+    jdq = round(float(jd_tt) / JD_Q) * JD_Q
+    lon_deg, spd = _cached_lon_speed(frame, topo, lat, lon, elev, jdq, body)
+    return float(lon_deg), (float(spd) if spd is not None else None)
+
+def _planet_rows(jd_tt: float, place: Optional[Dict[str, float]], frame: str, bodies: Iterable[str]) -> List[Dict[str, Any]]:
     """
-    FIXED: Added proper bounds checking to prevent IndexError
+    Fast snapshot for multiple bodies. We do not cache this bulk call, but it is used once per result.
     """
-    if not body:
-        raise ValueError("Body name cannot be empty")
-    
-    try:
-        rows = _planet_rows(jd_tt, place, frame, (body,), warnings)
-    except Exception as e:
-        raise RuntimeError(f"Failed to get ephemeris data for body '{body}' at JD {jd_tt}: {e}")
-    
-    # CRITICAL FIX: Check if rows is empty before accessing
-    if not rows:
-        raise ValueError(f"No ephemeris data returned for body '{body}' at JD {jd_tt:.6f}. Check ephemeris coverage and body name.")
-    
-    # Find the requested body in results
-    target_row = None
-    for row in rows:
-        if row.get("name", "").lower() == body.lower():
-            target_row = row
-            break
-    
-    if target_row is None:
-        available_bodies = [row.get("name", "unknown") for row in rows]
-        raise ValueError(f"Body '{body}' not found in ephemeris results. Available: {available_bodies}")
-    
-    # Extract longitude (required)
-    if "lon" not in target_row:
-        raise ValueError(f"No longitude data for body '{body}' in ephemeris results")
-    
-    lon = float(target_row["lon"])
-    
-    # Extract speed (optional)
-    speed = None
-    if "speed" in target_row:
-        try:
-            speed = float(target_row["speed"])
-        except (ValueError, TypeError):
-            _warn(warnings, f"invalid_speed_data_for_{body}")
-    
-    return lon, speed
+    adapter = _make_adapter(frame)
+    bodies_list = list(bodies) if bodies else []
+    if not bodies_list:
+        raise ValueError("No bodies specified")
+    kwargs = {"jd_tt": float(jd_tt), "bodies": bodies_list}
+    if place:
+        kwargs.update({"topocentric": True, "latitude": place["latitude"], "longitude": place["longitude"], "elevation_m": place.get("elev_m", 0.0)})
+    else:
+        kwargs["topocentric"] = False
+
+    for method_name in ("ecliptic_longitudes_and_velocities", "ecliptic_longitudes"):
+        if not hasattr(adapter, method_name):
+            continue
+        method = getattr(adapter, method_name)
+        sig = inspect.signature(method)
+        out = method(**{k: v for k, v in kwargs.items() if k in sig.parameters})
+        rows: List[Dict[str, Any]] = []
+        if isinstance(out, dict) and "results" in out and isinstance(out["results"], list):
+            for item in out["results"]:
+                if not isinstance(item, dict): continue
+                nm = str(item.get("name") or item.get("body") or "unknown")
+                if "longitude" in item or "lon" in item:
+                    row = {"name": nm, "lon": float(item.get("longitude") or item.get("lon"))}
+                    if "velocity" in item or "speed" in item:
+                        row["speed"] = float(item.get("velocity") or item.get("speed"))
+                    rows.append(row)
+        elif isinstance(out, list):
+            for item in out:
+                if not isinstance(item, dict): continue
+                nm = str(item.get("name") or item.get("body") or "unknown")
+                if "longitude" in item or "lon" in item:
+                    row = {"name": nm, "lon": float(item.get("longitude") or item.get("lon"))}
+                    if "velocity" in item or "speed" in item:
+                        row["speed"] = float(item.get("velocity") or item.get("speed"))
+                    rows.append(row)
+        if rows:
+            return rows
+    raise RuntimeError(f"No usable ephemeris bulk method for bodies={bodies_list} @ JD={jd_tt:.8f}")
+
+# ── numerics ──────────────────────────────────────────────────────────────────
+
+def _central_speed_deg_per_day(body: str, jd_tt: float, place: Optional[Dict[str,float]], frame: str, ay: float, zmode: str, h_days: float) -> float:
+    """Central difference speed in deg/day, ayanamsa-adjusted if needed."""
+    lon_p, _ = _get_body_lon_and_speed(jd_tt + h_days, place, frame, body)
+    lon_m, _ = _get_body_lon_and_speed(jd_tt - h_days, place, frame, body)
+    if zmode == "sidereal":
+        lon_p = _wrap_deg(lon_p - ay)
+        lon_m = _wrap_deg(lon_m - ay)
+    d = _delta_deg(lon_m, lon_p)  # lon_p - lon_m along the shortest arc
+    return d / (2.0 * h_days)
+
+def _body_typical_fallback_step(body: str) -> float:
+    b = body.lower()
+    if b == "sun": return FALLBACK_SUN_D
+    if b == "moon": return FALLBACK_MOON_D
+    return FALLBACK_OTHER_D
 
 def _find_return_jd_tt(
+    *,
     body: str,
     natal_lon: float,
-    jd_tt_seed: float,
+    jd_seed: float,
     place: Optional[Dict[str,float]],
     frame: str,
     ayanamsa_deg: float,
-    zodiac_mode: str,
-    warnings: List[str],
+    zodiac_mode: str,   # 'tropical' | 'sidereal'
     tol_deg: float,
     max_iters: int
 ) -> Tuple[float, float, int, bool]:
     """
-    FIXED: Enhanced error handling and better convergence strategies
+    Hybrid solver:
+      1) Evaluate Δ(j) = natal_lon − lon(j). If speed available, try Newton; else estimate central speed.
+      2) If Newton step is too large or fails, fallback to secant or small directed steps.
+      3) If function sign doesn't change, perform adaptive bracketing with bounded steps.
+    Always caps steps to avoid "shooting past" for slow movers.
     """
     if not body:
-        raise ValueError("Body name cannot be empty")
-    
-    def _delta_at(jd: float) -> Tuple[float, Optional[float]]:
-        try:
-            lon, spd = _get_body_lon_and_speed(jd, place, frame, body, warnings)
-            if zodiac_mode == "sidereal":
-                lon = _wrap_deg(lon - ayanamsa_deg)
-            d = _delta_deg(natal_lon, lon)  # want 0
-            return d, spd
-        except Exception as e:
-            raise RuntimeError(f"Failed to compute delta at JD {jd:.6f} for body '{body}': {e}")
+        raise ValueError("Body name required")
 
-    jd = jd_tt_seed
-    
-    try:
-        d, spd = _delta_at(jd)
-    except Exception as e:
-        raise RuntimeError(f"Failed to initialize return calculation at seed JD {jd_tt_seed:.6f}: {e}")
+    def f_and_speed(jd: float) -> Tuple[float, float]:
+        lon, spd = _get_body_lon_and_speed(jd, place, frame, body)
+        if zodiac_mode == "sidereal":
+            lon = _wrap_deg(lon - ayanamsa_deg)
+        d = _delta_deg(natal_lon, lon)
+        if spd is None or abs(spd) < 1e-8:
+            # estimate from central diff with a small h
+            h = 1.0/1440.0  # 1 min in days
+            spd = _central_speed_deg_per_day(body, jd, place, frame, ayanamsa_deg, zodiac_mode, h)
+        return d, spd
+
+    jd  = float(jd_seed)
+    d, v = f_and_speed(jd)
+
+    # Try to bracket a sign change near the seed (helps secant)
+    # For Moon/Sun this is cheap, for others still safe with caps.
+    step0 = _body_typical_fallback_step(body)
+    left_jd, left_d = jd, d
+    right_jd, right_d = jd, d
+
+    # Expand bracket a few steps if needed
+    for _ in range(6):
+        if left_d * right_d <= 0.0:
+            break
+        left_jd  = left_jd  - step0
+        right_jd = right_jd + step0
+        left_d, _  = f_and_speed(left_jd)
+        right_d, _ = f_and_speed(right_jd)
 
     prev_jd = None
     prev_d  = None
-    
+
     for it in range(1, max_iters + 1):
         if abs(d) <= tol_deg:
             return jd, abs(d), it - 1, True
-            
+
+        # Newton step proposal
         step = None
-        
-        # Try Newton method if we have speed
-        if spd is not None and abs(spd) > 1e-6:
-            step = -d / spd    # deg / (deg/day) => days
-            
-        # Try secant method if we have previous point
-        elif prev_jd is not None and prev_d is not None:
+        if v is not None and abs(v) > 1e-10:
+            step = -d / v
+            if abs(step) > MAX_NEWTON_STEP_D:
+                step = math.copysign(MAX_NEWTON_STEP_D, step)
+
+        # Secant step if we have history and Newton is unusable
+        if (step is None) and (prev_jd is not None) and (prev_d is not None):
             denom = (d - prev_d)
             if abs(denom) > 1e-9:
                 step = -d * (jd - prev_jd) / denom
-                
-        # Fallback to small step with adaptive size
-        if step is None or abs(step) > 10.0:  # Increased fallback limit
-            # Estimate step size based on body type and typical speeds
-            if body.lower() == "sun":
-                fallback_step = math.copysign(1.0, -d)  # Sun moves ~1°/day
-            elif body.lower() == "moon":
-                fallback_step = math.copysign(0.1, -d)  # Moon moves ~13°/day
-            else:
-                fallback_step = math.copysign(0.5, -d)  # Other bodies
-            step = fallback_step
-            
+                if abs(step) > MAX_NEWTON_STEP_D:
+                    step = math.copysign(MAX_NEWTON_STEP_D, step)
+
+        # Fallback small guided step
+        if step is None:
+            step = math.copysign(_body_typical_fallback_step(body), -d)
+
         prev_jd, prev_d = jd, d
         jd = jd + float(step)
-        
-        try:
-            d, spd = _delta_at(jd)
-        except Exception as e:
-            _warn(warnings, f"iteration_{it}_failed_at_jd_{jd:.6f}: {type(e).__name__}")
-            # Try a smaller step
-            jd = prev_jd + step * 0.1
-            try:
-                d, spd = _delta_at(jd)
-            except Exception:
-                # Give up on this iteration
-                break
+        d, v = f_and_speed(jd)
 
     return jd, abs(d), max_iters, False
 
-def _central_speed_deg_per_day(body: str, jd_tt: float, place: Optional[Dict[str,float]], frame: str, ay: float, zmode: str, warnings: List[str], h_days: float) -> float:
-    """
-    FIXED: Enhanced error handling for speed calculation
-    """
-    try:
-        lon_p, _ = _get_body_lon_and_speed(jd_tt + h_days, place, frame, body, warnings)
-        lon_m, _ = _get_body_lon_and_speed(jd_tt - h_days, place, frame, body, warnings)
-        
-        if zmode == "sidereal":
-            lon_p = _wrap_deg(lon_p - ay)
-            lon_m = _wrap_deg(lon_m - ay)
-            
-        d = _delta_deg(lon_m, lon_p)  # lon_p - lon_m along shortest arc
-        return d / (2.0 * h_days)
-    except Exception as e:
-        _warn(warnings, f"central_speed_calculation_failed_for_{body}: {type(e).__name__}")
-        return 0.0  # Return safe default
 
 # ── public API ────────────────────────────────────────────────────────────────
 def compute_return(
@@ -366,17 +355,17 @@ def compute_return(
     zodiac_mode: str = "tropical",
     ayanamsa_deg: float = 0.0,
     lunar_month: str = "sidereal",
-    guess_years_offset: Optional[int] = None,
-    around_jd_tt: Optional[float] = None,
+    guess_years_offset: Optional[int] = None,    # lunar: interpreted as periods (months)
+    around_jd_tt: Optional[float] = None,        # preferred seed; used by scan()
     tol_arcmin: float = 1.0,
-    max_iters: int = 12,
-    # NEW options
+    max_iters: int = 20,
+    # options
     estimate_uncertainty: bool = True,
     fd_step_minutes: float = 2.0,
     profile: bool = False,
     validation: str = "basic",
     validation_residual_arcmin: float = 1.0,
-    # ── route-compat extras (accepted but currently unused) ────────────────────
+    # accepted but unused passthroughs (route-compat)
     year: Optional[int] = None,
     approx_date: Optional[str] = None,
     jd_start_tt: Optional[float] = None,
@@ -386,99 +375,95 @@ def compute_return(
     parallels: Optional[bool] = None,
     antiscia: Optional[bool] = None,
     orbs: Optional[Dict[str, float]] = None,
-    # Catch-all for any future fields from routes
     **_unused: Any,
 ) -> Dict[str, Any]:
-    """
-    FIXED: Compute a solar or lunar return with comprehensive error handling
-    """
     t0 = perf_counter()
     prof: Dict[str, float] = {}
     warnings: List[str] = []
 
     try:
-        # Validate inputs
-        if not isinstance(natal, dict):
-            raise ValueError("natal must be a dictionary")
-        
-        if kind.lower() not in ("solar", "lunar"):
+        # Validate
+        k = kind.lower()
+        if k not in ("solar", "lunar"):
             raise ValueError(f"kind must be 'solar' or 'lunar', got '{kind}'")
-        
         if frame not in ("ecliptic-of-date", "ecliptic-j2000"):
             raise ValueError(f"frame must be 'ecliptic-of-date' or 'ecliptic-j2000', got '{frame}'")
+        zmode = zodiac_mode.lower()
+        if zmode not in ("tropical", "sidereal"):
+            raise ValueError("zodiac_mode must be 'tropical' or 'sidereal'")
+        if lunar_month not in ("sidereal", "synodic"):
+            raise ValueError("lunar_month must be 'sidereal' or 'synodic'")
 
         # timescales
         ts0 = perf_counter()
-        try:
-            jd_tt0, jd_ut10, ts_meta = _resolve_ts_from_natal(natal, jd_tt_natal, jd_ut1_natal, warnings)
-        except Exception as e:
-            raise RuntimeError(f"Failed to resolve timescales: {e}")
-        prof["timescales_ms"] = (perf_counter() - ts0) * 1000.0 if profile else 0.0
+        jd_tt0, jd_ut10, ts_meta = _resolve_ts_from_natal(natal, jd_tt_natal, jd_ut1_natal, warnings)
+        if profile: prof["timescales_ms"] = (perf_counter() - ts0) * 1000.0
 
-        # place defaults
+        # place
         place_natal = _to_place(natal, None)
         place = _to_place(natal, place) or place_natal
 
-        # natal body longitude
-        body = "Sun" if kind.lower() == "solar" else "Moon"
+        # target body & natal longitude
+        body = "Sun" if k == "solar" else "Moon"
         ep0 = perf_counter()
-        try:
-            lon_nat, _ = _get_body_lon_and_speed(jd_tt0, place, frame, body, warnings)
-            if zodiac_mode.lower() == "sidereal":
-                lon_nat = _wrap_deg(lon_nat - ayanamsa_deg)
-        except Exception as e:
-            raise RuntimeError(f"Failed to get natal {body} longitude: {e}")
-        prof["natal_lon_ms"] = (perf_counter() - ep0) * 1000.0 if profile else 0.0
+        lon_nat, _spd_nat = _get_body_lon_and_speed(jd_tt0, place, frame, body)
+        if zmode == "sidereal":
+            lon_nat = _wrap_deg(lon_nat - ayanamsa_deg)
+        if profile: prof["natal_lon_ms"] = (perf_counter() - ep0) * 1000.0
 
-        # seed with better defaults
+        # seed
         if around_jd_tt is not None:
             seed = float(around_jd_tt)
         else:
-            k = 1 if guess_years_offset is None else int(guess_years_offset)
-            if body == "Sun":
-                seed = jd_tt0 + k * SOLAR_YEAR_D
+            if k == "solar":
+                offs = 1 if guess_years_offset is None else int(guess_years_offset)
+                seed = jd_tt0 + offs * SOLAR_YEAR_D
             else:
-                month_len = LUNAR_SIDEREAL_D if lunar_month == "sidereal" else LUNAR_SYNODIC_D
-                seed = jd_tt0 + k * month_len
+                period = LUNAR_SIDEREAL_D if lunar_month == "sidereal" else LUNAR_SYNODIC_D
+                offs = 1 if guess_years_offset is None else int(guess_years_offset)
+                seed = jd_tt0 + offs * period
 
-        # solve with enhanced parameters
+        # solve
         it0 = perf_counter()
         tol_deg = float(tol_arcmin) / 60.0
-        try:
-            jd_star, delta_deg, iters, ok = _find_return_jd_tt(
-                body=body, natal_lon=lon_nat, jd_tt_seed=seed,
-                place=place, frame=frame, ayanamsa_deg=ayanamsa_deg, zodiac_mode=zodiac_mode.lower(),
-                warnings=warnings, tol_deg=tol_deg, max_iters=max(max_iters, 20)  # Ensure enough iterations
-            )
-        except Exception as e:
-            raise RuntimeError(f"Failed to find {kind} return: {e}")
-        prof["root_find_ms"] = (perf_counter() - it0) * 1000.0 if profile else 0.0
+        jd_star, delta_deg, iters, ok = _find_return_jd_tt(
+            body=body,
+            natal_lon=lon_nat,
+            jd_seed=seed,
+            place=place,
+            frame=frame,
+            ayanamsa_deg=ayanamsa_deg,
+            zodiac_mode=zmode,
+            tol_deg=tol_deg,
+            max_iters=max(int(max_iters), 12)
+        )
+        if profile: prof["root_find_ms"] = (perf_counter() - it0) * 1000.0
 
-        # approximate UT1 at solution
+        # UT1 approximate at solution
         ut0 = perf_counter()
         jd_ut1_star = jd_star
         if ts_meta.get("delta_t") is not None:
             jd_ut1_star = jd_star - float(ts_meta["delta_t"]) / 86400.0
             _warn(warnings, "jd_ut1≈jd_tt-ΔT(natal); minor drift ignored")
-        prof["ut1_approx_ms"] = (perf_counter() - ut0) * 1000.0 if profile else 0.0
+        if profile: prof["ut1_approx_ms"] = (perf_counter() - ut0) * 1000.0
 
-        # snapshot positions
+        # snapshot positions once
         snap0 = perf_counter()
         try:
-            rows = _planet_rows(jd_star, place, frame, MAJORS, warnings)
-            if zodiac_mode.lower() == "sidereal":
+            rows = _planet_rows(jd_star, place, frame, MAJORS)
+            if zmode == "sidereal":
                 _apply_ayanamsa(rows, ayanamsa_deg)
             positions = {r["name"]: float(_wrap_deg(r["lon"])) for r in rows if "lon" in r}
         except Exception as e:
-            _warn(warnings, f"snapshot_positions_failed: {type(e).__name__}")
             positions = {}
-        prof["snapshot_ms"] = (perf_counter() - snap0) * 1000.0 if profile else 0.0
+            _warn(warnings, f"snapshot_positions_failed:{type(e).__name__}:{str(e)}")
+        if profile: prof["snapshot_ms"] = (perf_counter() - snap0) * 1000.0
 
-        # houses
+        # houses (optional)
         hs0 = perf_counter()
         houses = None
         if _compute_houses_policy is None:
-            _warn(warnings, f"houses_policy_unavailable: {_HOUSES_ERR}")
+            _warn(warnings, f"houses_policy_unavailable:{_HOUSES_ERR}")
         elif place is None:
             _warn(warnings, "houses_missing_place")
         else:
@@ -489,79 +474,53 @@ def compute_return(
                     elevation_m=place.get("elev_m", 0.0), system=house_system,
                 )
             except Exception as e:
-                _warn(warnings, f"houses_compute_failed:{type(e).__name__}")
-        prof["houses_ms"] = (perf_counter() - hs0) * 1000.0 if profile else 0.0
+                _warn(warnings, f"houses_compute_failed:{type(e).__name__}:{str(e)}")
+        if profile: prof["houses_ms"] = (perf_counter() - hs0) * 1000.0
 
-        # --- Uncertainty estimation (linearized) ---------------------------------
+        # uncertainty (linearized)
         uncertainty: Optional[Dict[str, float | str]] = None
         if estimate_uncertainty:
             u0 = perf_counter()
-            h_days = max(1e-6, float(fd_step_minutes) / 1440.0)
-            
-            # instantaneous speed via central difference (independent of adapter 'speed')
-            spd = _central_speed_deg_per_day(
-                body, jd_star, place, frame, ayanamsa_deg, zodiac_mode.lower(), warnings, h_days
-            )
-            spd_abs = abs(spd)
-            if spd_abs < 1e-5:
-                _warn(warnings, "low_angular_speed_near_station→time_uncertainty_large")
-
-            # residual→time uncertainty (days)
-            dt_resid_days = (delta_deg / max(1e-9, spd_abs)) if spd_abs > 0 else float("inf")
-
-            # local linearized re-root using δ(jd±h)
             try:
-                lon_p, _ = _get_body_lon_and_speed(jd_star + h_days, place, frame, body, warnings)
-                lon_m, _ = _get_body_lon_and_speed(jd_star - h_days, place, frame, body, warnings)
-                if zodiac_mode.lower() == "sidereal":
+                h_days = max(1e-6, float(fd_step_minutes) / 1440.0)
+                spd = abs(_central_speed_deg_per_day(body, jd_star, place, frame, ayanamsa_deg, zmode, h_days))
+                dt_resid_days = (delta_deg / max(1e-9, spd)) if spd > 0 else float("inf")
+                # linearized slope around jd_star
+                lon_p, _ = _get_body_lon_and_speed(jd_star + h_days, place, frame, body)
+                lon_m, _ = _get_body_lon_and_speed(jd_star - h_days, place, frame, body)
+                if zmode == "sidereal":
                     lon_p = _wrap_deg(lon_p - ayanamsa_deg)
                     lon_m = _wrap_deg(lon_m - ayanamsa_deg)
-                # δ(j) = natal - lon(j)
                 d_p = _delta_deg(lon_nat, lon_p)
                 d_m = _delta_deg(lon_nat, lon_m)
-                # linear interpolation of zero crossing around jd_star
-                slope = (d_p - d_m) / (2.0 * h_days) if abs(h_days) > 0 else 0.0
-                dt_lin_days = abs(delta_deg / max(1e-9, abs(slope)))  # conservative linear bound
+                slope = (d_p - d_m) / (2.0 * h_days) if h_days > 0 else 0.0
+                dt_lin_days = abs(delta_deg / max(1e-9, abs(slope))) if slope != 0 else float("inf")
                 dt_days = max(dt_resid_days, dt_lin_days)
-                lon_unc = spd_abs * dt_days
-
                 uncertainty = {
                     "dt_days": float(dt_days),
                     "dt_seconds": float(dt_days * 86400.0),
-                    "lon_deg": float(lon_unc),
+                    "lon_deg": float(spd * dt_days if math.isfinite(dt_days) else float("inf")),
                     "method": "residual/speed + linearized re-root",
                 }
             except Exception as e:
-                _warn(warnings, f"uncertainty_calculation_failed: {type(e).__name__}")
-                uncertainty = {
-                    "dt_days": float("inf"),
-                    "dt_seconds": float("inf"),
-                    "lon_deg": float("inf"),
-                    "method": "failed",
-                }
-            prof["uncertainty_ms"] = (perf_counter() - u0) * 1000.0 if profile else 0.0
+                _warn(warnings, f"uncertainty_calculation_failed:{type(e).__name__}:{str(e)}")
+                uncertainty = {"dt_days": float("inf"), "dt_seconds": float("inf"), "lon_deg": float("inf"), "method": "failed"}
+            if profile: prof["uncertainty_ms"] = (perf_counter() - u0) * 1000.0
 
-        # --- Validation -----------------------------------------------------------
+        # validation
         validation_info: Optional[Dict[str, Any]] = None
-        v0 = perf_counter()
         if validation and validation.lower() != "none":
-            checks: List[Dict[str, Any]] = []
-            ok_all = True
-
-            # Basic: residual within target
             basic_target = float(validation_residual_arcmin) / 60.0
-            check_resid = {"name": "residual<=target", "target_deg": basic_target, "value_deg": float(delta_deg)}
-            check_resid["pass"] = bool(delta_deg <= basic_target)
-            ok_all = ok_all and check_resid["pass"]
-            checks.append(check_resid)
+            pass_basic = bool(delta_deg <= basic_target)
+            validation_info = {
+                "level": validation.lower(),
+                "pass": pass_basic,
+                "checks": [{"name": "residual<=target", "target_deg": basic_target, "value_deg": float(delta_deg), "pass": pass_basic}],
+            }
 
-            validation_info = {"level": validation.lower(), "pass": bool(ok_all), "checks": checks}
-        prof["validation_ms"] = (perf_counter() - v0) * 1000.0 if profile else 0.0
-
-        # Build response
-        meta = {
+        meta: Dict[str, Any] = {
             "frame": frame,
-            "zodiac_mode": zodiac_mode.lower(),
+            "zodiac_mode": zmode,
             "ayanamsa_deg": float(ayanamsa_deg),
             "house_system": house_system,
             "natal_timescales": ts_meta,
@@ -574,9 +533,10 @@ def compute_return(
 
         return {
             "ok": True,
+            "kind": k,
             "meta": meta,
             "event": {
-                "kind": kind.lower(),
+                "kind": k,
                 "body": body,
                 "jd_tt": float(jd_star),
                 "jd_ut1": float(jd_ut1_star),
@@ -590,35 +550,30 @@ def compute_return(
         }
 
     except Exception as e:
-        # Comprehensive error handling
-        error_details = {
+        details = {
             "error_type": type(e).__name__,
             "error_message": str(e),
             "kind": kind,
             "frame": frame,
             "zodiac_mode": zodiac_mode,
         }
-        
-        # Add context about which step failed
-        if "timescales" in str(e).lower():
-            error_details["failed_step"] = "timescale_resolution"
-        elif "ephemeris" in str(e).lower() or "body" in str(e).lower():
-            error_details["failed_step"] = "ephemeris_calculation"
-        elif "return" in str(e).lower() or "iteration" in str(e).lower():
-            error_details["failed_step"] = "return_finding"
+        emsg = str(e).lower()
+        if "timescale" in emsg:
+            details["failed_step"] = "timescale_resolution"
+        elif "ephemeris" in emsg or "body" in emsg:
+            details["failed_step"] = "ephemeris_calculation"
+        elif "houses" in emsg:
+            details["failed_step"] = "houses"
+        elif "return" in emsg or "iteration" in emsg or "solver" in emsg:
+            details["failed_step"] = "return_finding"
         else:
-            error_details["failed_step"] = "unknown"
+            details["failed_step"] = "unknown"
 
-        return {
-            "ok": False,
-            "error": "returns_internal",
-            "details": error_details,
-            "meta": {
-                "warnings": warnings,
-                "natal_provided": bool(natal),
-                "profile": prof if profile else None,
-            }
-        }
+        meta_err = {"warnings": warnings}
+        if profile:
+            meta_err["profile"] = prof
+
+        return {"ok": False, "kind": kind, "error": "returns_internal", "details": details, "meta": meta_err}
 
 
 def scan_returns(
@@ -635,175 +590,113 @@ def scan_returns(
     zodiac_mode: str = "tropical",
     ayanamsa_deg: float = 0.0,
     lunar_month: str = "sidereal",
-    tol_arcmin: float = 3.0,  # More lenient for scanning
-    max_iters: int = 25,  # More iterations for scanning
-    estimate_uncertainty: bool = False,  # Disabled by default for performance
+    tol_arcmin: float = 3.0,          # looser for scanning
+    max_iters: int = 25,
+    estimate_uncertainty: bool = False,  # OFF for performance during scans
     fd_step_minutes: float = 2.0,
     profile: bool = False,
     validation: str = "basic",
-    validation_residual_arcmin: float = 3.0,  # More lenient
-    # Catch-all for compatibility
+    validation_residual_arcmin: float = 3.0,
+    # compat passthrough
     **_unused: Any,
 ) -> Dict[str, Any]:
-    """
-    FIXED: Scan a time window for multiple return events with proper search logic
-    """
     t0 = perf_counter()
     warnings: List[str] = []
     results: List[Dict[str, Any]] = []
-    seen_jds: List[float] = []  # Track found JDs to avoid duplicates
 
     try:
-        # Validate inputs
-        if not isinstance(natal, dict):
-            raise ValueError("natal must be a dictionary")
-        
-        if kind.lower() not in ("solar", "lunar"):
+        k = kind.lower()
+        if k not in ("solar","lunar"):
             raise ValueError(f"kind must be 'solar' or 'lunar', got '{kind}'")
-        
         if jd_end_tt <= jd_start_tt:
             raise ValueError("jd_end_tt must be greater than jd_start_tt")
+        if lunar_month not in ("sidereal","synodic"):
+            raise ValueError("lunar_month must be 'sidereal' or 'synodic'")
 
-        # Determine search parameters based on kind
-        body = "Sun" if kind.lower() == "solar" else "Moon"
-        if body == "Sun":
+        # Resolve natal timescales once
+        jd_tt0, jd_ut10, ts_meta = _resolve_ts_from_natal(natal, jd_tt_natal, jd_ut1_natal, warnings)
+
+        # Determine period & seeds aligned to natal epoch
+        if k == "solar":
             period = SOLAR_YEAR_D
-            search_tolerance = 30.0  # Allow 30 days tolerance for solar returns
+            padding = 30.0   # tolerance outside window for seed acceptance
         else:
             period = LUNAR_SIDEREAL_D if lunar_month == "sidereal" else LUNAR_SYNODIC_D
-            search_tolerance = 5.0  # Allow 5 days tolerance for lunar returns
+            padding = 5.0
 
-        # Get natal timescales
-        try:
-            jd_tt0, jd_ut10, ts_meta = _resolve_ts_from_natal(natal, jd_tt_natal, jd_ut1_natal, warnings)
-        except Exception as e:
-            raise RuntimeError(f"Failed to resolve natal timescales: {e}")
+        # Compute the integer index range of returns overlapping the window
+        idx_start = math.floor((jd_start_tt - jd_tt0) / period)
+        idx_end   = math.ceil((jd_end_tt   - jd_tt0) / period)
 
-        # Calculate how many periods might fit in the window
-        window_span = jd_end_tt - jd_start_tt
-        expected_returns = max(1, int(window_span / period) + 3)
-        
-        # Find the first return near the start of the window
-        years_to_start = (jd_start_tt - jd_tt0) / 365.25
-        base_offset = int(years_to_start)
-        
-        # Search around the window with multiple starting points
-        search_offsets = []
-        if body == "Sun":
-            # For solar returns, search year by year around the window
-            for offset in range(base_offset - 1, base_offset + expected_returns + 2):
-                search_offsets.append(offset)
-        else:
-            # For lunar returns, search month by month
-            months_to_start = (jd_start_tt - jd_tt0) / (period)
-            base_month = int(months_to_start)
-            for offset in range(base_month - 2, base_month + expected_returns + 5):
-                search_offsets.append(offset)
-        
-        _warn(warnings, f"scan_searching_{len(search_offsets)}_positions_for_{kind}_returns")
-        
-        for search_offset in search_offsets:
-            try:
-                if body == "Sun":
-                    guess_years_offset = search_offset
-                else:
-                    # Convert lunar months back to years
-                    guess_years_offset = int(search_offset * period / 365.25)
-                
-                result = compute_return(
-                    natal=natal,
-                    kind=kind,
-                    jd_tt_natal=jd_tt0,
-                    jd_ut1_natal=jd_ut10,
-                    place=place,
-                    frame=frame,
-                    house_system=house_system,
-                    zodiac_mode=zodiac_mode,
-                    ayanamsa_deg=ayanamsa_deg,
-                    lunar_month=lunar_month,
-                    guess_years_offset=guess_years_offset,
-                    tol_arcmin=tol_arcmin,
-                    max_iters=max_iters,
-                    estimate_uncertainty=estimate_uncertainty,
-                    fd_step_minutes=fd_step_minutes,
-                    profile=False,
-                    validation=validation,
-                    validation_residual_arcmin=validation_residual_arcmin,
-                )
-                
-                # Check if we got a valid result
-                if result.get("ok") and result.get("event"):
-                    event = result["event"]
-                    event_jd = event.get("jd_tt")
-                    
-                    if event_jd is not None:
-                        # Check if converged OR close enough for scanning
-                        converged = event.get("converged", False)
-                        delta_deg = event.get("delta_deg", float('inf'))
-                        close_enough = delta_deg < (5.0 / 60.0)  # Within 5 arcmin
-                        
-                        if converged or close_enough:
-                            # Check if this return is within our expanded window
-                            if (jd_start_tt - search_tolerance) <= event_jd <= (jd_end_tt + search_tolerance):
-                                # Check for duplicates (within 1 day)
-                                is_duplicate = any(abs(event_jd - seen_jd) < 1.0 for seen_jd in seen_jds)
-                                
-                                if not is_duplicate:
-                                    # Final filter: must be within actual window for results
-                                    if jd_start_tt <= event_jd <= jd_end_tt:
-                                        results.append(result)
-                                        seen_jds.append(event_jd)
-                                        _warn(warnings, f"found_{kind}_return_at_jd_{event_jd:.1f}")
-                                    else:
-                                        seen_jds.append(event_jd)  # Track but don't include
-                        else:
-                            _warn(warnings, f"poor_convergence_{kind}_jd_{event_jd:.1f}_delta_{delta_deg*60:.1f}arcmin")
-                else:
-                    _warn(warnings, f"failed_computation_offset_{search_offset}")
-                    
-            except Exception as e:
-                _warn(warnings, f"scan_iteration_offset_{search_offset}_failed: {type(e).__name__}")
+        # Expand slightly to be safe near boundaries
+        idx_start -= 1
+        idx_end   += 1
+
+        seeds: List[float] = [jd_tt0 + i * period for i in range(idx_start, idx_end + 1)]
+        _warn(warnings, f"scan_seed_count:{len(seeds)} period_days:{period:.6f}")
+
+        # Run compute_return around each seed; this is both accurate and fast
+        seen: List[float] = []
+        for seed in seeds:
+            r = compute_return(
+                natal=natal,
+                kind=k,
+                jd_tt_natal=jd_tt0,
+                jd_ut1_natal=jd_ut10,
+                place=place,
+                frame=frame,
+                house_system=house_system,
+                zodiac_mode=zodiac_mode,
+                ayanamsa_deg=ayanamsa_deg,
+                lunar_month=lunar_month,
+                around_jd_tt=float(seed),        # <-- precise seeding
+                tol_arcmin=tol_arcmin,
+                max_iters=max_iters,
+                estimate_uncertainty=estimate_uncertainty,
+                fd_step_minutes=fd_step_minutes,
+                profile=False,
+                validation=validation,
+                validation_residual_arcmin=validation_residual_arcmin,
+            )
+
+            if not r.get("ok"):
+                _warn(warnings, f"seed_failed:{seed:.5f}:{r.get('details',{}).get('failed_step','unknown')}")
                 continue
 
-        # Sort results by JD
-        results.sort(key=lambda r: r.get("event", {}).get("jd_tt", 0))
+            ev = r["event"]
+            ev_jd = float(ev["jd_tt"])
+            # keep results only inside window (but allow slight padding during matching)
+            if (jd_start_tt - padding) <= ev_jd <= (jd_end_tt + padding):
+                # dedupe with 0.5 d threshold
+                if not any(abs(ev_jd - s) < 0.5 for s in seen):
+                    if jd_start_tt <= ev_jd <= jd_end_tt:
+                        results.append(r)
+                    seen.append(ev_jd)
 
-        total_time = perf_counter() - t0
-        
+        results.sort(key=lambda x: x["event"]["jd_tt"])
+
         meta = {
             "scan_window": {"jd_start_tt": float(jd_start_tt), "jd_end_tt": float(jd_end_tt)},
             "expected_period_days": float(period),
-            "search_positions": len(search_offsets),
+            "natal_jd_tt": float(jd_tt0),
             "returns_found": len(results),
-            "scan_time_ms": float(total_time * 1000),
+            "scan_time_ms": float((perf_counter() - t0) * 1000.0),
             "warnings": warnings,
         }
-
-        return {
-            "ok": True,
-            "meta": meta,
-            "results": results,
-        }
+        return {"ok": True, "kind": k, "meta": meta, "results": results}
 
     except Exception as e:
-        error_details = {
-            "error_type": type(e).__name__,
-            "error_message": str(e),
-            "kind": kind,
-            "window": {"start": jd_start_tt, "end": jd_end_tt},
-        }
-
         return {
             "ok": False,
+            "kind": kind,
             "error": "scan_internal",
-            "details": error_details,
+            "details": {"error_type": type(e).__name__, "error_message": str(e), "kind": kind, "window": {"start": jd_start_tt, "end": jd_end_tt}},
             "meta": {
                 "warnings": warnings,
-                "partial_results": len(results),
-                "search_attempted": len(search_offsets) if 'search_offsets' in locals() else 0,
+                "scan_time_ms": float((perf_counter() - t0) * 1000.0),
+                "partial_results": len(results)
             }
         }
 
 
-# Export both functions for route discovery
 __all__ = ["compute_return", "scan_returns"]
