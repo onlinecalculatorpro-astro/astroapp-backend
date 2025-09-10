@@ -2121,19 +2121,22 @@ def predictive_transits():
         if not (isinstance(raw_movers, list) and all(isinstance(x, str) and x for x in raw_movers)):
             return _json_error("validation_error", [{"loc":["movers"],"msg":"must be a list of names"}], 400)
 
-        movers = list(dict.fromkeys(m.strip() for m in raw_movers if m))
+        # Pre-process movers once
+        movers = [m.strip() for m in raw_movers if m and isinstance(m, str)]
+        movers = list(dict.fromkeys(movers))  # deduplicate while preserving order
 
         # targets_longitudes: direct map (preferred, fastest path)
         targets: Dict[str, float] = {}
         raw_targets = body.get("targets_longitudes")
         if isinstance(raw_targets, dict):
+            # Batch process targets for better performance
             for k, v in raw_targets.items():
                 try:
                     targets[str(k)] = _wrap360(float(v))
-                except Exception:
-                    pass
+                except (ValueError, TypeError):
+                    continue  # Skip invalid entries
 
-        # Or build targets from a chart payload (e.g., natal)
+        # Or build targets from a chart payload (e.g., natal) - only if no direct targets
         if not targets and isinstance(body.get("targets_chart"), dict):
             targ = dict(body["targets_chart"])
             tz_nat = targ.get("place_tz") or targ.get("timezone") or "UTC"
@@ -2147,20 +2150,28 @@ def predictive_transits():
             except Exception as e:
                 return _json_error("chart_internal", str(e) if DEBUG_VERBOSE else "chart_failed", 500)
 
-            for row in (ch.get("bodies") or []) + (ch.get("points") or []):
-                if isinstance(row, dict) and "name" in row and isinstance(row.get("longitude_deg"), (int, float)):
-                    targets[str(row["name"])] = _wrap360(float(row["longitude_deg"]))
+            # Extract targets more efficiently
+            for row_list in [ch.get("bodies", []), ch.get("points", [])]:
+                for row in row_list:
+                    if (isinstance(row, dict) and 
+                        "name" in row and 
+                        isinstance(row.get("longitude_deg"), (int, float))):
+                        targets[str(row["name"])] = _wrap360(float(row["longitude_deg"]))
 
         if not targets:
             return _json_error("validation_error", [{"loc":["targets_longitudes|targets_chart"],"msg":"no targets to scan"}], 400)
 
         # -------- engine options --------
-        topocentric = bool(body.get("topocentric")) or (
-            isinstance(body.get("latitude"), (int,float)) and isinstance(body.get("longitude"), (int,float))
-        )
-        lat = float(body.get("latitude")) if isinstance(body.get("latitude"), (int,float)) else None
-        lon = float(body.get("longitude")) if isinstance(body.get("longitude"), (int,float)) else None
-        elev = float(body.get("elevation_m")) if isinstance(body.get("elevation_m"), (int,float)) else None
+        lat = body.get("latitude")
+        lon = body.get("longitude")
+        topocentric = (bool(body.get("topocentric")) or 
+                      (isinstance(lat, (int, float)) and isinstance(lon, (int, float))))
+        
+        # Only convert if actually numeric
+        lat = float(lat) if isinstance(lat, (int, float)) else None
+        lon = float(lon) if isinstance(lon, (int, float)) else None
+        elev = float(body.get("elevation_m")) if isinstance(body.get("elevation_m"), (int, float)) else None
+        
         frame = parse_frame(body.get("frame"))
         step_arg = _parse_step_minutes(body.get("step_minutes"), default_min=30.0)
 
@@ -2178,11 +2189,8 @@ def predictive_transits():
         zodiac_mode = (body.get("zodiac_mode") or "tropical").lower()
         ayanamsa_deg = float(body.get("ayanamsa_deg", 0.0))
 
-        # aspect set
-        from app.core import predictive as pred
-        aspects = list(pred.MAJOR_ASPECTS)
-        if include_minors:
-            aspects += list(pred.MINOR_ASPECTS)
+        # Use pre-computed aspect sets
+        aspects = _ALL_ASPECTS if include_minors else _MAJOR_ASPECTS
 
         # -------- run engine with shared adapter --------
         try:
@@ -2203,7 +2211,7 @@ def predictive_transits():
             events = eng.scan_aspects(
                 jd_start_tt=float(jd0),
                 jd_end_tt=float(jd1),
-                movers=[str(m) for m in movers],
+                movers=movers,  # Already strings, no need to convert again
                 targets=targets,
                 aspects=aspects,
                 step_minutes=step_arg,  # supports "auto"
@@ -2213,6 +2221,7 @@ def predictive_transits():
         except Exception as e:
             return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
+        # Build response more efficiently
         out = [
             {
                 "jd_tt": e.jd_tt,
@@ -2235,7 +2244,12 @@ def predictive_transits():
                 "jd_end_tt": float(jd1),
                 "step_minutes": (step_arg if isinstance(step_arg, float) else "auto"),
             },
-            "engine": {"frame": frame, "topocentric": topocentric, "zodiac_mode": zodiac_mode, "ayanamsa_deg": ayanamsa_deg},
+            "engine": {
+                "frame": frame, 
+                "topocentric": topocentric, 
+                "zodiac_mode": zodiac_mode, 
+                "ayanamsa_deg": ayanamsa_deg
+            },
             "targets": targets,
             "movers": movers,
             "results": out
