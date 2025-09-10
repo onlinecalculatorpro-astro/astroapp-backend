@@ -1,15 +1,18 @@
 # app/core/validators.py
 from __future__ import annotations
 
+import math
 import re
 from datetime import datetime, date, timedelta
-from typing import Any, Dict, Tuple, List, Optional, Union, TypedDict, Literal
+from typing import Any, Dict, Tuple, List, Optional, Union, TypedDict, Literal, Sequence
 from zoneinfo import ZoneInfo
 
 # ───────────────────────── errors ─────────────────────────
 
+
 class ValidationError(ValueError):
     """Structured validator error compatible with routes.py (has .errors())."""
+
     def __init__(self, details: Union[str, Dict[str, Any], List[Dict[str, Any]]]):
         if isinstance(details, str):
             self._details = [{"loc": [], "msg": details, "type": "value_error"}]
@@ -30,82 +33,117 @@ class ValidationError(ValueError):
 
 # ───────────────────────── helpers ─────────────────────────
 
-def _err(loc: List[str] | str, msg: str, typ: str = "value_error") -> Dict[str, Any]:
-    return {"loc": [loc] if isinstance(loc, str) else loc, "msg": msg, "type": typ}
+
+def _err(loc: Sequence[str] | str, msg: str, typ: str = "value_error") -> Dict[str, Any]:
+    return {"loc": [loc] if isinstance(loc, str) else list(loc), "msg": msg, "type": typ}
+
 
 def _as_float(v: Any) -> Optional[float]:
+    """Parse value as finite float. Returns None for None, NaN, inf, or invalid."""
     try:
         if v is None:
             return None
+        if isinstance(v, bool):
+            # Do not treat booleans as numbers by default here.
+            return float(int(v))
         x = float(v)
-        if x != x:  # NaN
+        if not math.isfinite(x):
             return None
         return x
     except Exception:
         return None
 
+
 def _as_int(v: Any) -> Optional[int]:
+    """Parse value as integer (accepts numeric strings/floats). Returns None if invalid."""
     try:
         if v is None:
             return None
         if isinstance(v, bool):
             return int(v)
         if isinstance(v, int):
-            return int(v)
+            return v
         s = str(v).strip()
-        return int(float(s))
+        if s == "":
+            return None
+        # Allow floats that are whole numbers or numeric strings (e.g. "12e3")
+        f = float(s)
+        if not math.isfinite(f):
+            return None
+        return int(f)
     except Exception:
         return None
 
+
 def _truthy(val: Any) -> Optional[bool]:
+    """Parse common truthy/falsey values. Returns None if unknown."""
     if isinstance(val, bool):
         return val
     if val is None:
         return None
+    if isinstance(val, (int, float)) and math.isfinite(float(val)):
+        return bool(int(val != 0))
     s = str(val).strip().lower()
     if s in {"1", "true", "t", "yes", "y", "on"}:
         return True
-    if s in {"0", "false", "f", "no", "n", "off"}:  # Fixed: 'f' is false
+    if s in {"0", "false", "f", "no", "n", "off"}:  # 'f' recognized as false
         return False
     return None
 
+
 def _validate_iana_tz(tz: str, loc: Optional[List[str]] = None) -> str:
-    # Only validate if provided; routes will default to UTC otherwise.
+    """Validate IANA timezone string, raising ValidationError with location context."""
     try:
         _ = ZoneInfo(tz)
     except Exception:
-        raise ValidationError([{
-            "loc": loc or ["tz"],
-            "msg": "must be a valid IANA zone like 'Asia/Kolkata'",
-            "type": "value_error",
-        }])
+        raise ValidationError(
+            [
+                {
+                    "loc": loc or ["tz"],
+                    "msg": "must be a valid IANA zone like 'Asia/Kolkata'",
+                    "type": "value_error",
+                }
+            ]
+        )
     return tz
 
 
 # ───────────────────────── atomic parsers ─────────────────────────
 
-_TIME_RE = re.compile(r"^\s*(?P<h>\d{1,2}):(?P<m>\d{2})(?::(?P<s>\d{2})(?:\.(?P<f>\d+))?)?\s*$")
+_TIME_RE = re.compile(
+    r"^\s*(?P<h>\d{1,2}):(?P<m>\d{2})(?::(?P<s>\d{2})(?:\.(?P<f>\d+))?)?\s*$"
+)
+
 
 def _normalize_time_hms(s: str) -> str:
     """
-    Accept 'HH:MM', 'HH:MM:SS', or 'HH:MM:SS.frac'. Allow leap-second (SS==60).
+    Accept 'HH:MM', 'HH:MM:SS', or 'HH:MM:SS.frac'. Allow leap second (SS==60).
     Disallow 24:00 except exactly '24:00:00'. Return canonical 'HH:MM:SS[.frac]'.
     """
     m = _TIME_RE.match(s or "")
     if not m:
-        raise ValidationError(_err("time", "time must be 'HH:MM' or 'HH:MM:SS[.frac]'", "value_error.time"))
-    hh = int(m.group("h")); mm = int(m.group("m"))
-    ss = int(m.group("s") or 0); frac = (m.group("f") or "")
+        raise ValidationError(
+            _err("time", "time must be 'HH:MM' or 'HH:MM:SS[.frac]'", "value_error.time")
+        )
+    hh = int(m.group("h"))
+    mm = int(m.group("m"))
+    ss = int(m.group("s") or 0)
+    frac = (m.group("f") or "")
+
     if not (0 <= hh <= 24 and 0 <= mm <= 59 and 0 <= ss <= 60):
         raise ValidationError(_err("time", "time fields out of range", "value_error.time"))
     if hh == 24:
         if not (mm == 0 and ss == 0 and frac == ""):
-            raise ValidationError(_err("time", "24:00:00 is only allowed exactly", "value_error.time"))
+            raise ValidationError(
+                _err("time", "24:00:00 is only allowed exactly", "value_error.time")
+            )
         return "24:00:00"
+
     frac = "".join(ch for ch in frac if ch.isdigit())
     if m.group("s") is None:
         return f"{hh:02d}:{mm:02d}:00"
     return f"{hh:02d}:{mm:02d}:{ss:02d}" + (f".{frac}" if frac else "")
+
 
 def parse_date(s: str) -> date:
     try:
@@ -113,18 +151,26 @@ def parse_date(s: str) -> date:
     except Exception:
         raise ValidationError(_err("date", "date must be 'YYYY-MM-DD'", "value_error.date"))
 
+
 def parse_time_str(s: str) -> str:
     return _normalize_time_hms(s)
 
-def parse_latlon(lat: Any, lon: Any, lat_key="latitude", lon_key="longitude") -> Tuple[float, float]:
-    lat_f = _as_float(lat); lon_f = _as_float(lon)
+
+def parse_latlon(
+    lat: Any, lon: Any, lat_key: str = "latitude", lon_key: str = "longitude"
+) -> Tuple[float, float]:
+    lat_f = _as_float(lat)
+    lon_f = _as_float(lon)
     if lat_f is None or lon_f is None:
-        raise ValidationError(_err([lat_key, lon_key], "latitude/longitude must be finite numbers", "type_error.float"))
+        raise ValidationError(
+            _err([lat_key, lon_key], "latitude/longitude must be finite numbers", "type_error.float")
+        )
     if not (-90.0 <= lat_f <= 90.0):
         raise ValidationError(_err(lat_key, "latitude must be between -90 and 90"))
     if not (-180.0 <= lon_f <= 180.0):
         raise ValidationError(_err(lon_key, "longitude must be between -180 and 180"))
     return float(lat_f), float(lon_f)
+
 
 def parse_mode(mode: Any | None) -> Literal["sidereal", "tropical"]:
     m = str(mode or "tropical").strip().lower()
@@ -132,15 +178,17 @@ def parse_mode(mode: Any | None) -> Literal["sidereal", "tropical"]:
         raise ValidationError(_err("mode", "mode must be 'tropical' or 'sidereal'", "value_error.mode"))
     return m  # type: ignore
 
+
 def parse_house_system(val: Any | None) -> Optional[str]:
     if val is None:
         return None
     s = str(val).strip().lower()
     if not s:
         return None
-    if s in ("whole-sign", "whole_sign", "wholesign", "whole sign"):
+    if s in {"whole-sign", "whole_sign", "wholesign", "whole sign"}:
         return "whole"
     return s
+
 
 def parse_frame(val: Any | None) -> Literal["ecliptic-of-date", "ecliptic-j2000"]:
     s = str(val or "ecliptic-of-date").strip().lower()
@@ -156,8 +204,11 @@ def parse_frame(val: Any | None) -> Literal["ecliptic-of-date", "ecliptic-j2000"
     }
     out = aliases.get(s) or s
     if out not in ("ecliptic-of-date", "ecliptic-j2000"):
-        raise ValidationError(_err("frame", "frame must be 'ecliptic-of-date' or 'ecliptic-j2000'"))
+        raise ValidationError(
+            _err("frame", "frame must be 'ecliptic-of-date' or 'ecliptic-j2000'")
+        )
     return out  # type: ignore
+
 
 def parse_earth_model(val: Any | None) -> Literal["spherical", "wgs84"]:
     """Parse earth model with validation."""
@@ -166,14 +217,29 @@ def parse_earth_model(val: Any | None) -> Literal["spherical", "wgs84"]:
         raise ValidationError(_err("earth_model", "earth_model must be 'spherical' or 'wgs84'"))
     return s  # type: ignore
 
+
 def parse_bodies_list(val: Any) -> List[str]:
     """Parse and validate list of celestial bodies."""
     if val is None:
         # Default major bodies for parans
-        return ["Sun", "Moon", "Mercury", "Venus", "Mars", "Jupiter", "Saturn", "Uranus", "Neptune", "Pluto"]
+        return [
+            "Sun",
+            "Moon",
+            "Mercury",
+            "Venus",
+            "Mars",
+            "Jupiter",
+            "Saturn",
+            "Uranus",
+            "Neptune",
+            "Pluto",
+        ]
 
     if isinstance(val, str):
-        return [val.strip()]
+        s = val.strip()
+        if not s:
+            raise ValidationError(_err("bodies", "body name cannot be empty", "value_error"))
+        return [s]
 
     if not isinstance(val, (list, tuple)):
         raise ValidationError(_err("bodies", "must be array of strings or single string", "type_error.list"))
@@ -195,9 +261,10 @@ def parse_bodies_list(val: Any) -> List[str]:
 
 # ───────────────────────── chart / predictions (v1) ─────────────────────────
 
+
 class ChartPayload(TypedDict, total=False):
     date: str
-    time: str           # canonical 'HH:MM:SS[.frac]'
+    time: str  # canonical 'HH:MM:SS[.frac]'
     place_tz: Optional[str]
     timezone: Optional[str]
     latitude: float | None
@@ -208,6 +275,7 @@ class ChartPayload(TypedDict, total=False):
     topocentric: bool
     ayanamsa: float | str | None
     dut1: float | None  # optional, numeric if present
+
 
 def parse_chart_payload(body: Dict[str, Any]) -> ChartPayload:
     """
@@ -286,6 +354,7 @@ def parse_chart_payload(body: Dict[str, Any]) -> ChartPayload:
     }
     return out
 
+
 def parse_prediction_payload(body: Dict[str, Any]) -> Tuple[ChartPayload, Any]:
     chart = parse_chart_payload(body)
     # horizon is routed through to predictions; validate lightly here
@@ -297,6 +366,7 @@ def parse_prediction_payload(body: Dict[str, Any]) -> Tuple[ChartPayload, Any]:
         raise ValidationError(_err("horizon", "must be an object, number, or string", "value_error"))
     return chart, horizon
 
+
 def parse_rectification_payload(body: Dict[str, Any]) -> Dict[str, Any]:
     # kept for completeness parity with routes
     return parse_chart_payload(body)
@@ -304,11 +374,13 @@ def parse_rectification_payload(body: Dict[str, Any]) -> Dict[str, Any]:
 
 # ───────────────────────── ephemeris payload ─────────────────────────
 
+
 class EphemerisPayload(TypedDict, total=False):
     jd_tt: float
     frame: Literal["ecliptic-of-date", "ecliptic-j2000"]
     bodies: List[str]
     names: List[str]
+
 
 def _names_from(body: Dict[str, Any]) -> Optional[List[str]]:
     # accept bodies / names / planets; strings, numbers -> strings
@@ -337,6 +409,7 @@ def _names_from(body: Dict[str, Any]) -> Optional[List[str]]:
         return out
     return None
 
+
 def parse_ephemeris_payload(body: Dict[str, Any], require_bodies: bool = False) -> EphemerisPayload:
     """
     Minimal, route-friendly parser:
@@ -352,7 +425,9 @@ def parse_ephemeris_payload(body: Dict[str, Any], require_bodies: bool = False) 
     if jd_tt is None and isinstance(body.get("timescales"), dict):
         jd_tt = _as_float(body["timescales"].get("jd_tt"))
     if jd_tt is None:
-        raise ValidationError([{"loc": ["jd_tt"], "msg": "required (or provide timescales.jd_tt)", "type": "value_error"}])
+        raise ValidationError(
+            [{"loc": ["jd_tt"], "msg": "required (or provide timescales.jd_tt)", "type": "value_error"}]
+        )
 
     frame = parse_frame(body.get("frame"))
 
@@ -374,6 +449,7 @@ TertiaryMode = Literal["day-for-month", "lunar-day-for-year"]
 ZodiacMode = Literal["tropical", "sidereal"]
 LunarMonthKind = Literal["synodic", "sidereal"]
 
+
 class NatalProgressions(TypedDict, total=False):
     date: str
     time: str
@@ -382,15 +458,18 @@ class NatalProgressions(TypedDict, total=False):
     longitude: float
     elev_m: float
 
+
 class TargetProgressions(TypedDict, total=False):
     date: str
     time: str
     place_tz: str
 
+
 class PlaceOverride(TypedDict, total=False):
     latitude: float
     longitude: float
     elev_m: float
+
 
 class ProgressionsPayload(TypedDict, total=False):
     natal: NatalProgressions
@@ -412,6 +491,7 @@ class ProgressionsPayload(TypedDict, total=False):
     antiscia: bool
     profile: bool
     validation: Literal["none", "basic"]
+
 
 def _parse_progressions_natal(natal: Any) -> NatalProgressions:
     if not isinstance(natal, dict):
@@ -441,6 +521,7 @@ def _parse_progressions_natal(natal: Any) -> NatalProgressions:
 
     return out
 
+
 def _parse_progressions_target(target: Any) -> TargetProgressions:
     if not isinstance(target, dict):
         raise ValidationError(_err("target", "must be object", "type_error.dict"))
@@ -453,6 +534,7 @@ def _parse_progressions_target(target: Any) -> TargetProgressions:
         "place_tz": _validate_iana_tz(str(tz_val).strip(), ["target", "place_tz"]),
     }
 
+
 def _parse_place_override(place: Any) -> PlaceOverride:
     if not isinstance(place, dict):
         raise ValidationError(_err("place", "must be object", "type_error.dict"))
@@ -461,9 +543,10 @@ def _parse_place_override(place: Any) -> PlaceOverride:
     if place.get("elev_m") is not None:
         elev = _as_float(place.get("elev_m"))
         if elev is None:
-            raise ValidationError(_err(["place","elev_m"], "must be number", "type_error.float"))
+            raise ValidationError(_err(["place", "elev_m"], "must be number", "type_error.float"))
         out["elev_m"] = float(elev)
     return out
+
 
 def parse_progressions_payload(body: Dict[str, Any]) -> ProgressionsPayload:
     """
@@ -488,14 +571,16 @@ def parse_progressions_payload(body: Dict[str, Any]) -> ProgressionsPayload:
     jd_tt_natal = _as_float(body.get("jd_tt_natal"))
     jd_ut1_natal = _as_float(body.get("jd_ut1_natal"))
     if (jd_tt_natal is None) ^ (jd_ut1_natal is None):
-        raise ValidationError(_err(["jd_tt_natal","jd_ut1_natal"], "supply both or neither", "value_error"))
-    have_strict_ts = (jd_tt_natal is not None and jd_ut1_natal is not None)
+        raise ValidationError(_err(["jd_tt_natal", "jd_ut1_natal"], "supply both or neither", "value_error"))
+    have_strict_ts = jd_tt_natal is not None and jd_ut1_natal is not None
 
     # if no strict timescales, ensure we have natal date/time/place_tz
     if not have_strict_ts:
         for key in ("date", "time", "place_tz"):
             if key not in natal:
-                raise ValidationError(_err(["natal", key], "required when strict timescales are not supplied", "value_error"))
+                raise ValidationError(
+                    _err(["natal", key], "required when strict timescales are not supplied", "value_error")
+                )
 
     # method
     method_raw = (body.get("method") or "secondary").strip().lower()
@@ -510,7 +595,7 @@ def parse_progressions_payload(body: Dict[str, Any]) -> ProgressionsPayload:
     if target_raw is not None:
         target = _parse_progressions_target(target_raw)
     if target is None and years_after is None:
-        raise ValidationError(_err(["target","years_after"], "provide either target or years_after", "value_error"))
+        raise ValidationError(_err(["target", "years_after"], "provide either target or years_after", "value_error"))
 
     # place override (optional)
     place_override: Optional[PlaceOverride] = None
@@ -595,6 +680,7 @@ def parse_progressions_payload(body: Dict[str, Any]) -> ProgressionsPayload:
 
 ReturnKind = Literal["solar", "lunar"]
 
+
 class NatalReturns(TypedDict, total=False):
     date: str
     time: str
@@ -602,6 +688,7 @@ class NatalReturns(TypedDict, total=False):
     latitude: float
     longitude: float
     elev_m: float
+
 
 class ReturnsPayload(TypedDict, total=False):
     natal: NatalReturns
@@ -613,7 +700,7 @@ class ReturnsPayload(TypedDict, total=False):
     house_system: str
     zodiac_mode: ZodiacMode
     ayanamsa_deg: float
-    lunar_month: LunarMonthKind           # used for lunar seed length (sidereal|synodic); default "sidereal"
+    lunar_month: LunarMonthKind  # used for lunar seed length (sidereal|synodic); default "sidereal"
     guess_years_offset: int | None
     around_jd_tt: float | None
     tol_arcmin: float
@@ -623,6 +710,7 @@ class ReturnsPayload(TypedDict, total=False):
     profile: bool
     validation: Literal["none", "basic", "extended"]
     validation_residual_arcmin: float
+
 
 def _parse_returns_natal(natal: Any) -> NatalReturns:
     """Parse natal chart data for returns, allowing flexible field requirements"""
@@ -674,6 +762,7 @@ def _parse_returns_natal(natal: Any) -> NatalReturns:
 
     return out
 
+
 def parse_returns_payload(body: Dict[str, Any]) -> ReturnsPayload:
     """
     Validate + normalize payload for /api/return (solar/lunar).
@@ -693,9 +782,9 @@ def parse_returns_payload(body: Dict[str, Any]) -> ReturnsPayload:
     jd_ut1_natal = _as_float(body.get("jd_ut1_natal"))
 
     if (jd_tt_natal is None) ^ (jd_ut1_natal is None):
-        raise ValidationError(_err(["jd_tt_natal","jd_ut1_natal"], "supply both or neither", "value_error"))
+        raise ValidationError(_err(["jd_tt_natal", "jd_ut1_natal"], "supply both or neither", "value_error"))
 
-    have_strict_timescales = (jd_tt_natal is not None and jd_ut1_natal is not None)
+    have_strict_timescales = jd_tt_natal is not None and jd_ut1_natal is not None
 
     # If no strict timescales, we need natal date/time/place_tz
     if not have_strict_timescales:
@@ -705,11 +794,7 @@ def parse_returns_payload(body: Dict[str, Any]) -> ReturnsPayload:
                 missing_fields.append(f"natal.{required_field}")
 
         if missing_fields:
-            raise ValidationError(_err(
-                missing_fields,
-                "required strings",
-                "value_error"
-            ))
+            raise ValidationError(_err(missing_fields, "required strings", "value_error"))
 
     # Return kind validation
     raw_kind = (body.get("kind") or body.get("type") or "solar").strip().lower()
@@ -803,17 +888,20 @@ def parse_returns_payload(body: Dict[str, Any]) -> ReturnsPayload:
 
 # ───────────────────────── parans (v1) ─────────────────────────
 
+
 class SubjectParans(TypedDict, total=False):
     """Subject data for timescale resolution in parans."""
     date: str
     time: str
     place_tz: str
 
+
 class PlaceParans(TypedDict, total=False):
     """Place coordinates for paran calculations."""
     latitude: float
     longitude: float
     elev_m: float
+
 
 class ParansPayload(TypedDict, total=False):
     """Complete payload structure for /api/parans endpoint."""
@@ -835,6 +923,7 @@ class ParansPayload(TypedDict, total=False):
     temperature_C: float
     profile: bool
     validation: Literal["none", "basic"]
+
 
 def _parse_parans_subject(subject: Any) -> SubjectParans:
     """Parse subject data for parans timescale resolution."""
@@ -863,6 +952,7 @@ def _parse_parans_subject(subject: Any) -> SubjectParans:
         out["place_tz"] = _validate_iana_tz(str(tz_val).strip(), ["subject", "place_tz"])
 
     return out
+
 
 def _parse_parans_place(place: Any) -> PlaceParans:
     """Parse place coordinates for paran calculations."""
@@ -896,6 +986,7 @@ def _parse_parans_place(place: Any) -> PlaceParans:
 
     return out
 
+
 def parse_parans_payload(body: Dict[str, Any]) -> ParansPayload:
     """
     Validate and normalize payload for /api/parans endpoint.
@@ -916,11 +1007,11 @@ def parse_parans_payload(body: Dict[str, Any]) -> ParansPayload:
     if (jd_tt_ref is None) ^ (jd_ut1_ref is None):
         raise ValidationError(_err(["jd_tt_ref", "jd_ut1_ref"], "supply both or neither", "value_error"))
 
-    have_strict_timescales = (jd_tt_ref is not None and jd_ut1_ref is not None)
+    have_strict_timescales = jd_tt_ref is not None and jd_ut1_ref is not None
 
     # Subject data - only required if strict timescales not provided
     subject_raw = body.get("subject")
-    subject = {}
+    subject: SubjectParans | Dict[str, Any] = {}
 
     if have_strict_timescales:
         if subject_raw is not None:
@@ -934,11 +1025,7 @@ def parse_parans_payload(body: Dict[str, Any]) -> ParansPayload:
             if required_field not in subject:
                 missing_fields.append(f"subject.{required_field}")
         if missing_fields:
-            raise ValidationError(_err(
-                missing_fields,
-                "required when strict timescales not provided",
-                "value_error"
-            ))
+            raise ValidationError(_err(missing_fields, "required when strict timescales not provided", "value_error"))
 
     # Frame and coordinate system parameters
     frame = parse_frame(body.get("frame"))
@@ -1016,6 +1103,7 @@ def parse_parans_payload(body: Dict[str, Any]) -> ParansPayload:
 
 # ───────────────────────── synastry / composite / synastry-report ─────────────
 
+
 class NatalSynastry(TypedDict, total=False):
     """Minimal natal data for synastry calculations."""
     date: str
@@ -1026,11 +1114,13 @@ class NatalSynastry(TypedDict, total=False):
     elev_m: float
     mode: str
 
+
 class PlaceSynastry(TypedDict, total=False):
     """Place override for synastry calculations."""
     latitude: float
     longitude: float
     elev_m: float
+
 
 class SynastryPayload(TypedDict, total=False):
     """Payload for /api/synastry endpoint."""
@@ -1050,6 +1140,7 @@ class SynastryPayload(TypedDict, total=False):
     parallels: bool
     antiscia: bool
 
+
 class CompositePayload(TypedDict, total=False):
     """Payload for /api/composite endpoint."""
     natal_a: NatalSynastry
@@ -1062,6 +1153,7 @@ class CompositePayload(TypedDict, total=False):
     house_system: str
     ayanamsa_deg: float
     zodiac_mode: str
+
 
 class SynastryReportPayload(TypedDict, total=False):
     """Payload for /api/synastry/report endpoint."""
@@ -1082,6 +1174,7 @@ class SynastryReportPayload(TypedDict, total=False):
     antiscia: bool
     composite_method: str
     composite_place_ref: PlaceSynastry
+
 
 def _parse_natal_synastry(natal_raw: Any) -> NatalSynastry:
     """Parse and validate natal data for synastry."""
@@ -1136,6 +1229,7 @@ def _parse_natal_synastry(natal_raw: Any) -> NatalSynastry:
 
     return natal
 
+
 def _parse_place_synastry(place_raw: Any) -> PlaceSynastry:
     """Parse and validate place override for synastry."""
     if not isinstance(place_raw, dict):
@@ -1167,6 +1261,7 @@ def _parse_place_synastry(place_raw: Any) -> PlaceSynastry:
 
     return place
 
+
 def _parse_orbs_dict(orbs_raw: Any) -> Dict[str, float]:
     """Parse and validate orbs dictionary."""
     if not isinstance(orbs_raw, dict):
@@ -1174,8 +1269,14 @@ def _parse_orbs_dict(orbs_raw: Any) -> Dict[str, float]:
 
     orbs: Dict[str, float] = {}
     valid_aspects = {
-        "conjunction", "opposition", "trine", "square", "sextile", "quincunx",
-        "parallel_arcmin", "antiscia"
+        "conjunction",
+        "opposition",
+        "trine",
+        "square",
+        "sextile",
+        "quincunx",
+        "parallel_arcmin",
+        "antiscia",
     }
 
     for aspect, orb_raw in orbs_raw.items():
@@ -1184,7 +1285,7 @@ def _parse_orbs_dict(orbs_raw: Any) -> Dict[str, float]:
 
         aspect_clean = aspect.strip().lower()
         if aspect_clean not in valid_aspects:
-            raise ValidationError(_err(f"orbs.{aspect}", f"unknown aspect type", "value_error"))
+            raise ValidationError(_err(f"orbs.{aspect}", "unknown aspect type", "value_error"))
 
         orb = _as_float(orb_raw)
         if orb is None:
@@ -1195,6 +1296,7 @@ def _parse_orbs_dict(orbs_raw: Any) -> Dict[str, float]:
         orbs[aspect_clean] = orb
 
     return orbs
+
 
 def parse_synastry_payload(body: Dict[str, Any]) -> SynastryPayload:
     """Validate and normalize payload for /api/synastry endpoint."""
@@ -1272,6 +1374,7 @@ def parse_synastry_payload(body: Dict[str, Any]) -> SynastryPayload:
 
     return out
 
+
 def parse_composite_payload(body: Dict[str, Any]) -> CompositePayload:
     """Validate and normalize payload for /api/composite endpoint."""
     if not isinstance(body, dict):
@@ -1321,6 +1424,7 @@ def parse_composite_payload(body: Dict[str, Any]) -> CompositePayload:
 
     return out
 
+
 def parse_synastry_report_payload(body: Dict[str, Any]) -> SynastryReportPayload:
     """Validate and normalize payload for /api/synastry/report endpoint."""
     if not isinstance(body, dict):
@@ -1348,7 +1452,6 @@ def parse_synastry_report_payload(body: Dict[str, Any]) -> SynastryReportPayload
         out["composite_place_ref"] = composite_place_ref
 
     return out
-
 
 # ───────────────────────── relocation / astrocartography ─────────────────────────
 
@@ -1619,7 +1722,7 @@ def parse_astrocartography_payload(body: Dict[str, Any]) -> AstrocartographyPayl
     return out
 
 
-# ───────────────────────── directions (v1) ─────────────────────────
+# ───────────────────────── directions ─────────────────────────
 
 class DirectionsPayload(TypedDict, total=False):
     """Payload for /api/directions endpoint."""
@@ -1872,7 +1975,7 @@ def parse_directions_payload(body: Dict[str, Any]) -> DirectionsPayload:
     return out
 
 
-# ───────────────────────── V2 PREDICTION ENGINE PARSER ─────────────────────────
+# ───────────────────────── PREDICTION ENGINE PARSER ─────────────────────────
 
 def parse_prediction_payload_v2(body: Dict[str, Any]) -> Dict[str, Any]:
     """
