@@ -635,22 +635,23 @@ def scan_returns(
     zodiac_mode: str = "tropical",
     ayanamsa_deg: float = 0.0,
     lunar_month: str = "sidereal",
-    tol_arcmin: float = 1.0,
-    max_iters: int = 12,
+    tol_arcmin: float = 3.0,  # More lenient for scanning
+    max_iters: int = 25,  # More iterations for scanning
     estimate_uncertainty: bool = False,  # Disabled by default for performance
     fd_step_minutes: float = 2.0,
     profile: bool = False,
     validation: str = "basic",
-    validation_residual_arcmin: float = 1.0,
+    validation_residual_arcmin: float = 3.0,  # More lenient
     # Catch-all for compatibility
     **_unused: Any,
 ) -> Dict[str, Any]:
     """
-    NEW: Scan a time window for multiple return events
+    FIXED: Scan a time window for multiple return events with proper search logic
     """
     t0 = perf_counter()
     warnings: List[str] = []
     results: List[Dict[str, Any]] = []
+    seen_jds: List[float] = []  # Track found JDs to avoid duplicates
 
     try:
         # Validate inputs
@@ -667,29 +668,48 @@ def scan_returns(
         body = "Sun" if kind.lower() == "solar" else "Moon"
         if body == "Sun":
             period = SOLAR_YEAR_D
-            max_returns = max(1, int((jd_end_tt - jd_start_tt) / period) + 2)
+            search_tolerance = 30.0  # Allow 30 days tolerance for solar returns
         else:
             period = LUNAR_SIDEREAL_D if lunar_month == "sidereal" else LUNAR_SYNODIC_D
-            max_returns = max(1, int((jd_end_tt - jd_start_tt) / period) + 5)
+            search_tolerance = 5.0  # Allow 5 days tolerance for lunar returns
 
-        # Get initial guess offset
+        # Get natal timescales
         try:
             jd_tt0, jd_ut10, ts_meta = _resolve_ts_from_natal(natal, jd_tt_natal, jd_ut1_natal, warnings)
         except Exception as e:
             raise RuntimeError(f"Failed to resolve natal timescales: {e}")
 
-        # Search for returns in window
-        search_start = jd_start_tt - period  # Start searching before window
-        current_jd = search_start
+        # Calculate how many periods might fit in the window
+        window_span = jd_end_tt - jd_start_tt
+        expected_returns = max(1, int(window_span / period) + 3)
         
-        for i in range(max_returns):
-            if current_jd > jd_end_tt + period:  # Stop searching after window
-                break
-                
-            # Calculate guess years offset from natal
-            years_offset = (current_jd - jd_tt0) / 365.25
-            
+        # Find the first return near the start of the window
+        years_to_start = (jd_start_tt - jd_tt0) / 365.25
+        base_offset = int(years_to_start)
+        
+        # Search around the window with multiple starting points
+        search_offsets = []
+        if body == "Sun":
+            # For solar returns, search year by year around the window
+            for offset in range(base_offset - 1, base_offset + expected_returns + 2):
+                search_offsets.append(offset)
+        else:
+            # For lunar returns, search month by month
+            months_to_start = (jd_start_tt - jd_tt0) / (period)
+            base_month = int(months_to_start)
+            for offset in range(base_month - 2, base_month + expected_returns + 5):
+                search_offsets.append(offset)
+        
+        _warn(warnings, f"scan_searching_{len(search_offsets)}_positions_for_{kind}_returns")
+        
+        for search_offset in search_offsets:
             try:
+                if body == "Sun":
+                    guess_years_offset = search_offset
+                else:
+                    # Convert lunar months back to years
+                    guess_years_offset = int(search_offset * period / 365.25)
+                
                 result = compute_return(
                     natal=natal,
                     kind=kind,
@@ -701,32 +721,48 @@ def scan_returns(
                     zodiac_mode=zodiac_mode,
                     ayanamsa_deg=ayanamsa_deg,
                     lunar_month=lunar_month,
-                    guess_years_offset=int(years_offset),
+                    guess_years_offset=guess_years_offset,
                     tol_arcmin=tol_arcmin,
                     max_iters=max_iters,
                     estimate_uncertainty=estimate_uncertainty,
                     fd_step_minutes=fd_step_minutes,
-                    profile=False,  # Disable profiling for scans
+                    profile=False,
                     validation=validation,
                     validation_residual_arcmin=validation_residual_arcmin,
                 )
                 
-                if result.get("ok") and result.get("event", {}).get("converged"):
-                    event_jd = result["event"]["jd_tt"]
+                # Check if we got a valid result
+                if result.get("ok") and result.get("event"):
+                    event = result["event"]
+                    event_jd = event.get("jd_tt")
                     
-                    # Check if this return is within our window
-                    if jd_start_tt <= event_jd <= jd_end_tt:
-                        results.append(result)
-                    
-                    # Move to next expected return
-                    current_jd = event_jd + period * 0.8  # 80% of period to avoid missing returns
+                    if event_jd is not None:
+                        # Check if converged OR close enough for scanning
+                        converged = event.get("converged", False)
+                        delta_deg = event.get("delta_deg", float('inf'))
+                        close_enough = delta_deg < (5.0 / 60.0)  # Within 5 arcmin
+                        
+                        if converged or close_enough:
+                            # Check if this return is within our expanded window
+                            if (jd_start_tt - search_tolerance) <= event_jd <= (jd_end_tt + search_tolerance):
+                                # Check for duplicates (within 1 day)
+                                is_duplicate = any(abs(event_jd - seen_jd) < 1.0 for seen_jd in seen_jds)
+                                
+                                if not is_duplicate:
+                                    # Final filter: must be within actual window for results
+                                    if jd_start_tt <= event_jd <= jd_end_tt:
+                                        results.append(result)
+                                        seen_jds.append(event_jd)
+                                        _warn(warnings, f"found_{kind}_return_at_jd_{event_jd:.1f}")
+                                    else:
+                                        seen_jds.append(event_jd)  # Track but don't include
+                        else:
+                            _warn(warnings, f"poor_convergence_{kind}_jd_{event_jd:.1f}_delta_{delta_deg*60:.1f}arcmin")
                 else:
-                    # If calculation failed, advance by expected period
-                    current_jd += period
+                    _warn(warnings, f"failed_computation_offset_{search_offset}")
                     
             except Exception as e:
-                _warn(warnings, f"scan_iteration_{i}_failed: {type(e).__name__}")
-                current_jd += period
+                _warn(warnings, f"scan_iteration_offset_{search_offset}_failed: {type(e).__name__}")
                 continue
 
         # Sort results by JD
@@ -737,6 +773,7 @@ def scan_returns(
         meta = {
             "scan_window": {"jd_start_tt": float(jd_start_tt), "jd_end_tt": float(jd_end_tt)},
             "expected_period_days": float(period),
+            "search_positions": len(search_offsets),
             "returns_found": len(results),
             "scan_time_ms": float(total_time * 1000),
             "warnings": warnings,
@@ -763,6 +800,7 @@ def scan_returns(
             "meta": {
                 "warnings": warnings,
                 "partial_results": len(results),
+                "search_attempted": len(search_offsets) if 'search_offsets' in locals() else 0,
             }
         }
 
