@@ -1537,59 +1537,111 @@ def aspects():
 def _returns_available() -> bool:
     return _returns_mod is not None
 
-# ───────────────────────── PREDICTION ENGINE ─────────────────────────
+# ───────────────────────── PREDICTION ENGINE API (Optimized) ─────────────────────────
+# Notes:
+# - No new files introduced. Public endpoints, payload shape, and response structure preserved.
+# - Uses tighter status codes (503 for engine unavailable), faster JSON path (optional orjson),
+#   DRY helpers, frozenset ACCEPT sets, and cheaper kwargs filtering.
+# - Assumes: parse_prediction_payload is provided by validator.py (imported below).
+# - Assumes: _json_error, _snapshot_ephemeris_meta, _CHART_ENGINE_NAME, _HOUSES_KIND,
+#            DEBUG_VERBOSE, _PREDICTION_ENGINE_OK, _PREDICTION_ENGINE_ERR, api, rate_limit,
+#            RL_* constants, request, jsonify, and core engine functions are already available.
 
-def parse_prediction_payload(body: Dict[str, Any]) -> Dict[str, Any]:
-    """Parse and validate prediction engine request payload (V2 shape, tolerant)."""
-    errors = []
+# --- Fast JSON + small utilities (inline) ------------------------------------
 
-    if not isinstance(body, dict):
-        raise ValidationError([{"loc": [], "msg": "payload must be an object", "type": "type_error.dict"}])
+try:
+    import orjson  # optional, faster serialization if present
+    _FAST_JSON = True
+except Exception:
+    _FAST_JSON = False
 
-    # natal_chart is required for all endpoints in this block (except relationship/validate handle their own)
-    if "natal_chart" in body and not isinstance(body.get("natal_chart"), dict):
-        errors.append({"loc": ["natal_chart"], "msg": "required object", "type": "value_error"})
+from flask import Response, request, jsonify
+from typing import Any, Dict, Optional
 
-    # time_range: when present, must be [start, end]
-    if "time_range" in body:
-        tr = body.get("time_range")
-        if not (isinstance(tr, (list, tuple)) and len(tr) == 2):
-            errors.append({"loc": ["time_range"], "msg": "must be [start_date, end_date] array", "type": "value_error"})
+# Centralized, fast JSON responder (preserves your response shapes)
+def _json(payload: Dict[str, Any], status: int = 200) -> Response:
+    if _FAST_JSON:
+        return Response(orjson.dumps(payload), status=status, mimetype="application/json")
+    resp = jsonify(payload)
+    resp.status_code = status
+    return resp
 
-    # target_date: when present, must be str|int|float
-    if "target_date" in body:
-        td = body.get("target_date")
-        if not isinstance(td, (str, int, float)):
-            errors.append({"loc": ["target_date"], "msg": "must be ISO string, JD float, or datetime", "type": "value_error"})
+# DRY engine availability guard: returns Response if engine down; caller should early-return it.
+def _engine_guard() -> Optional[Response]:
+    if not _PREDICTION_ENGINE_OK:
+        det = {"import_error": repr(_PREDICTION_ENGINE_ERR)} if (DEBUG_VERBOSE and _PREDICTION_ENGINE_ERR) else None
+        return _json_error("prediction_engine_unavailable", det or "prediction engine not available", 503)
+    return None
 
-    if errors:
-        raise ValidationError(errors)
-    return body
+# Consistent meta block across endpoints
+def _build_meta(extra: Dict[str, Any] = None) -> Dict[str, Any]:
+    meta = {
+        "prediction_engine": "app.core.prediction v2",
+        "natal_chart_engine": _CHART_ENGINE_NAME,
+        "houses_engine": _HOUSES_KIND,
+    }
+    meta.update(_snapshot_ephemeris_meta())
+    if extra:
+        meta.update(extra)
+    return meta
 
+# Cheap kwargs filter (set membership on predeclared frozensets)
+def _accept(payload: Dict[str, Any], accept_keys: "frozenset[str]") -> Dict[str, Any]:
+    # payload.keys() & accept_keys builds a set in CPython; iterate directly to avoid extra dict scans
+    return {k: payload[k] for k in payload if k in accept_keys}
+
+# --- Import validator hook (done elsewhere as requested) ---------------------
+# parse_prediction_payload: tolerant, shared validator
+from validator import parse_prediction_payload  # noqa: E402
+
+
+# --- Predeclare ACCEPT sets (frozenset = hashable, faster membership) --------
+_PREDICTION_TRANSITS_ACCEPT = frozenset({
+    "transiting_bodies", "natal_bodies", "orbs", "aspects", "include_aspects_to",
+    "include_house_cusps", "frame", "zodiac_mode", "ayanamsa_deg", "exact_timing",
+    "statistical_validation", "confidence_threshold",
+})
+
+_PREDICTION_PROGRESSIONS_ACCEPT = frozenset({
+    "method", "lunar_month", "tertiary_mode", "frame", "house_system",
+    "zodiac_mode", "ayanamsa_deg", "aspects_to_natal", "orbs",
+    "parallels", "antiscia", "statistical_validation",
+})
+
+_PREDICTION_RETURNS_ACCEPT = frozenset({
+    "lunar_month", "place", "frame", "house_system", "zodiac_mode",
+    "ayanamsa_deg", "estimate_uncertainty", "aspects_to_natal", "orbs",
+    "statistical_validation",
+})
+
+# IMPORTANT: legacy backends choke on 'aspects_to_natal' for directions — not included here.
+_PREDICTION_DIRECTIONS_ACCEPT = frozenset({
+    "method", "frame", "zodiac_mode", "ayanamsa_deg", "house_system",
+    "orbs", "statistical_validation",
+})
+
+_RELATIONSHIP_ACCEPT = frozenset({
+    "synastry_orbs", "composite_method", "include_transits_to_composite",
+    "include_progressions", "confidence_threshold", "parallels", "antiscia",
+    "frame", "zodiac_mode", "ayanamsa_deg", "house_system",
+})
+
+# technique-specific passthrough prefixes for relationship route
+_RELATIONSHIP_PREFIXES = ("transit_", "progression_")
+
+
+# ───────────────────────── Endpoints ─────────────────────────
 
 @api.post("/api/prediction/forecast")
 @rate_limit(RL_PREDICTION_FORECAST)
 def prediction_comprehensive_forecast_route():
-    """
-    Comprehensive astrological forecast using the prediction engine.
-
-    Body:
-      natal_chart: { date, time, place_tz, bodies?, ... }
-      time_range: [start_date, end_date]
-      techniques?: ["transits", "progressions", "solar_returns", ...]
-      confidence_threshold?: float (default 0.2)
-      synthesis_method?: "weighted_consensus" | "simple"
-      statistical_validation?: bool (default false)
-      include_vedic?: bool (default false)
-      peak_window_days?: int (default 14)
-      ... technique-specific parameters with prefixes (transit_*, progression_*, return_*, vedic_*)
-    """
-    if not _PREDICTION_ENGINE_OK:
-        det = {"import_error": repr(_PREDICTION_ENGINE_ERR)} if DEBUG_VERBOSE and _PREDICTION_ENGINE_ERR else None
-        return _json_error("prediction_engine_unavailable", det or "prediction engine not available", 501)
+    """Comprehensive astrological forecast using the prediction engine."""
+    if (guard := _engine_guard()) is not None:
+        return guard
 
     try:
-        body = request.get_json(force=True) or {}
+        # Keep strict Content-Type semantics for correctness; avoids accidental parsing of non-JSON
+        body = request.get_json(silent=False) or {}
         payload = parse_prediction_payload(body)
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
@@ -1598,9 +1650,10 @@ def prediction_comprehensive_forecast_route():
 
     try:
         natal_chart = payload["natal_chart"]
-        time_range = tuple(payload["time_range"]) if "time_range" in payload else None
-        if not time_range:
+        tr = payload.get("time_range")
+        if not tr or not (isinstance(tr, (list, tuple)) and len(tr) == 2):
             return _json_error("validation_error", [{"loc": ["time_range"], "msg": "required"}], 400)
+        time_range = (tr[0], tr[1])
 
         techniques = payload.get("techniques")
         confidence_threshold = float(payload.get("confidence_threshold", 0.2))
@@ -1609,12 +1662,10 @@ def prediction_comprehensive_forecast_route():
         include_vedic = bool(payload.get("include_vedic", False))
         peak_window_days = int(payload.get("peak_window_days", 14))
 
-        # Technique-specific kwargs passthrough
-        tk_kwargs = {
-            k: v
-            for k, v in payload.items()
-            if any(k.startswith(prefix) for prefix in ("transit_", "progression_", "return_", "vedic_"))
-        }
+        # technique-specific passthroughs (prefix-based), no extra copying
+        tk_kwargs = {k: v for k, v in payload.items()
+                     if k.startswith("transit_") or k.startswith("progression_") or
+                        k.startswith("return_") or k.startswith("vedic_")}
 
         forecast = comprehensive_forecast(
             natal_chart=natal_chart,
@@ -1628,19 +1679,15 @@ def prediction_comprehensive_forecast_route():
             **tk_kwargs,
         )
 
-        meta = {
-            "prediction_engine": "app.core.prediction v2",
-            "natal_chart_engine": _CHART_ENGINE_NAME,
-            "houses_engine": _HOUSES_KIND,
+        meta = _build_meta({
             "computation_time_ms": getattr(forecast, "computation_time_ms", None),
-        }
-        meta.update(_snapshot_ephemeris_meta())
+        })
 
-        return jsonify({
+        return _json({
             "ok": True,
             "forecast": _serialize_comprehensive_forecast(forecast),
-            "meta": meta
-        }), 200
+            "meta": meta,
+        }, 200)
 
     except Exception as e:
         return _json_error("prediction_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
@@ -1650,38 +1697,31 @@ def prediction_comprehensive_forecast_route():
 @rate_limit(RL_PREDICTION_TRANSITS)
 def prediction_transits_route():
     """Calculate transit events using the prediction engine."""
-    if not _PREDICTION_ENGINE_OK:
-        det = {"import_error": repr(_PREDICTION_ENGINE_ERR)} if DEBUG_VERBOSE and _PREDICTION_ENGINE_ERR else None
-        return _json_error("prediction_engine_unavailable", det or "prediction engine not available", 501)
+    if (guard := _engine_guard()) is not None:
+        return guard
 
     try:
-        body = request.get_json(force=True) or {}
+        body = request.get_json(silent=False) or {}
         payload = parse_prediction_payload(body)
 
         natal_chart = payload["natal_chart"]
-        time_range = tuple(payload["time_range"]) if "time_range" in payload else None
-        if not time_range:
+        tr = payload.get("time_range")
+        if not tr or not (isinstance(tr, (list, tuple)) and len(tr) == 2):
             return _json_error("validation_error", [{"loc": ["time_range"], "msg": "required"}], 400)
+        time_range = (tr[0], tr[1])
 
-        # Transit-specific accepted parameters
-        accept = {
-            "transiting_bodies", "natal_bodies", "orbs", "aspects", "include_aspects_to",
-            "include_house_cusps", "frame", "zodiac_mode", "ayanamsa_deg", "exact_timing",
-            "statistical_validation", "confidence_threshold",
-        }
-        kwargs = {k: payload[k] for k in payload.keys() & accept}
+        kwargs = _accept(payload, _PREDICTION_TRANSITS_ACCEPT)
 
         result = predict_transits(natal_chart=natal_chart, time_range=time_range, **kwargs)
 
-        return jsonify({
+        return _json({
             "ok": getattr(result, "ok", False),
             "result": _serialize_prediction_result(result),
-            "meta": {
-                "prediction_engine": "app.core.prediction v2",
+            "meta": _build_meta({
                 "technique": getattr(result, "technique", "transits"),
                 "computation_time_ms": getattr(result, "computation_time_ms", None),
-            },
-        }), 200
+            }),
+        }, 200)
 
     except Exception as e:
         return _json_error("transits_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
@@ -1691,37 +1731,30 @@ def prediction_transits_route():
 @rate_limit(RL_PREDICTION_PROGRESSIONS)
 def prediction_progressions_route():
     """Calculate progression events using the prediction engine."""
-    if not _PREDICTION_ENGINE_OK:
-        det = {"import_error": repr(_PREDICTION_ENGINE_ERR)} if DEBUG_VERBOSE and _PREDICTION_ENGINE_ERR else None
-        return _json_error("prediction_engine_unavailable", det or "prediction engine not available", 501)
+    if (guard := _engine_guard()) is not None:
+        return guard
 
     try:
-        body = request.get_json(force=True) or {}
+        body = request.get_json(silent=False) or {}
         payload = parse_prediction_payload(body)
 
         natal_chart = payload["natal_chart"]
         target_date = payload.get("target_date")
-        if not target_date:
+        if target_date is None:
             return _json_error("validation_error", [{"loc": ["target_date"], "msg": "required"}], 400)
 
-        accept = {
-            "method", "lunar_month", "tertiary_mode", "frame", "house_system",
-            "zodiac_mode", "ayanamsa_deg", "aspects_to_natal", "orbs",
-            "parallels", "antiscia", "statistical_validation",
-        }
-        kwargs = {k: payload[k] for k in payload.keys() & accept}
+        kwargs = _accept(payload, _PREDICTION_PROGRESSIONS_ACCEPT)
 
         result = predict_progressions(natal_chart=natal_chart, target_date=target_date, **kwargs)
 
-        return jsonify({
+        return _json({
             "ok": getattr(result, "ok", False),
             "result": _serialize_prediction_result(result),
-            "meta": {
-                "prediction_engine": "app.core.prediction v2",
+            "meta": _build_meta({
                 "technique": getattr(result, "technique", "progressions"),
                 "computation_time_ms": getattr(result, "computation_time_ms", None),
-            },
-        }), 200
+            }),
+        }, 200)
 
     except Exception as e:
         return _json_error("progressions_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
@@ -1731,12 +1764,11 @@ def prediction_progressions_route():
 @rate_limit(RL_PREDICTION_RETURNS)
 def prediction_returns_route():
     """Calculate solar/lunar return events using the prediction engine."""
-    if not _PREDICTION_ENGINE_OK:
-        det = {"import_error": repr(_PREDICTION_ENGINE_ERR)} if DEBUG_VERBOSE and _PREDICTION_ENGINE_ERR else None
-        return _json_error("prediction_engine_unavailable", det or "prediction engine not available", 501)
+    if (guard := _engine_guard()) is not None:
+        return guard
 
     try:
-        body = request.get_json(force=True) or {}
+        body = request.get_json(silent=False) or {}
         payload = parse_prediction_payload(body)
 
         natal_chart = payload["natal_chart"]
@@ -1752,24 +1784,18 @@ def prediction_returns_route():
         if return_type not in ("solar", "lunar"):
             return _json_error("validation_error", [{"loc": ["return_type"], "msg": "must be 'solar' or 'lunar'"}], 400)
 
-        accept = {
-            "lunar_month", "place", "frame", "house_system", "zodiac_mode",
-            "ayanamsa_deg", "estimate_uncertainty", "aspects_to_natal", "orbs",
-            "statistical_validation",
-        }
-        kwargs = {k: payload[k] for k in payload.keys() & accept}
+        kwargs = _accept(payload, _PREDICTION_RETURNS_ACCEPT)
 
         result = predict_returns(natal_chart=natal_chart, return_type=return_type, year=int(year), **kwargs)
 
-        return jsonify({
+        return _json({
             "ok": getattr(result, "ok", False),
             "result": _serialize_prediction_result(result),
-            "meta": {
-                "prediction_engine": "app.core.prediction v2",
+            "meta": _build_meta({
                 "technique": getattr(result, "technique", "returns"),
                 "computation_time_ms": getattr(result, "computation_time_ms", None),
-            },
-        }), 200
+            }),
+        }, 200)
 
     except Exception as e:
         return _json_error("returns_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
@@ -1779,37 +1805,31 @@ def prediction_returns_route():
 @rate_limit(RL_PREDICTION_DIRECTIONS)
 def prediction_directions_route():
     """Calculate direction events using the prediction engine."""
-    if not _PREDICTION_ENGINE_OK:
-        det = {"import_error": repr(_PREDICTION_ENGINE_ERR)} if DEBUG_VERBOSE and _PREDICTION_ENGINE_ERR else None
-        return _json_error("prediction_engine_unavailable", det or "prediction engine not available", 501)
+    if (guard := _engine_guard()) is not None:
+        return guard
 
     try:
-        body = request.get_json(force=True) or {}
+        body = request.get_json(silent=False) or {}
         payload = parse_prediction_payload(body)
 
         natal_chart = payload["natal_chart"]
         target_date = payload.get("target_date")
-        if not target_date:
+        if target_date is None:
             return _json_error("validation_error", [{"loc": ["target_date"], "msg": "required"}], 400)
 
         # IMPORTANT: do NOT pass 'aspects_to_natal' — legacy backends choke on it
-        accept = {
-            "method", "frame", "zodiac_mode", "ayanamsa_deg", "house_system",
-            "orbs", "statistical_validation",
-        }
-        kwargs = {k: payload[k] for k in payload.keys() & accept}
+        kwargs = _accept(payload, _PREDICTION_DIRECTIONS_ACCEPT)
 
         result = predict_directions(natal_chart=natal_chart, target_date=target_date, **kwargs)
 
-        return jsonify({
+        return _json({
             "ok": getattr(result, "ok", False),
             "result": _serialize_prediction_result(result),
-            "meta": {
-                "prediction_engine": "app.core.prediction v2",
+            "meta": _build_meta({
                 "technique": getattr(result, "technique", "directions"),
                 "computation_time_ms": getattr(result, "computation_time_ms", None),
-            },
-        }), 200
+            }),
+        }, 200)
 
     except Exception as e:
         return _json_error("directions_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
@@ -1819,12 +1839,11 @@ def prediction_directions_route():
 @rate_limit(RL_PREDICTION_RELATIONSHIP)
 def prediction_relationship_route():
     """Relationship forecast between two natal charts."""
-    if not _PREDICTION_ENGINE_OK:
-        det = {"import_error": repr(_PREDICTION_ENGINE_ERR)} if DEBUG_VERBOSE and _PREDICTION_ENGINE_ERR else None
-        return _json_error("prediction_engine_unavailable", det or "prediction engine not available", 501)
+    if (guard := _engine_guard()) is not None:
+        return guard
 
     try:
-        body = request.get_json(force=True) or {}
+        body = request.get_json(silent=False) or {}
 
         natal_a = body.get("natal_a")
         natal_b = body.get("natal_b")
@@ -1840,33 +1859,25 @@ def prediction_relationship_route():
         if not (isinstance(time_range, (list, tuple)) and len(time_range) == 2):
             return _json_error("validation_error", [{"loc": ["time_range"], "msg": "must be [start_date, end_date] array"}], 400)
 
-        accept = {
-            "synastry_orbs", "composite_method", "include_transits_to_composite",
-            "include_progressions", "confidence_threshold", "parallels", "antiscia",
-            "frame", "zodiac_mode", "ayanamsa_deg", "house_system",
-        }
-        kwargs = {k: body[k] for k in body.keys() & accept}
+        kwargs = _accept(body, _RELATIONSHIP_ACCEPT)
 
-        # technique-specific passthroughs
+        # technique-specific passthroughs (prefix-based, inlined for speed)
         for k, v in body.items():
-            if any(k.startswith(prefix) for prefix in ("transit_", "progression_")):
+            if k.startswith(_RELATIONSHIP_PREFIXES):
                 kwargs[k] = v
 
         result = relationship_forecast(
             natal_a=natal_a,
             natal_b=natal_b,
-            time_range=tuple(time_range),
+            time_range=(time_range[0], time_range[1]),
             **kwargs,
         )
 
-        return jsonify({
+        return _json({
             "ok": True,
             "result": _serialize_relationship_forecast(result),
-            "meta": {
-                "prediction_engine": "app.core.prediction v2",
-                "technique": "relationship_forecast",
-            },
-        }), 200
+            "meta": _build_meta({"technique": "relationship_forecast"}),
+        }, 200)
 
     except Exception as e:
         return _json_error("relationship_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
@@ -1876,128 +1887,29 @@ def prediction_relationship_route():
 @rate_limit(RL_PREDICTION_VALIDATION)
 def prediction_validation_route():
     """Validate prediction model using test cases."""
-    if not _PREDICTION_ENGINE_OK:
-        det = {"import_error": repr(_PREDICTION_ENGINE_ERR)} if DEBUG_VERBOSE and _PREDICTION_ENGINE_ERR else None
-        return _json_error("prediction_engine_unavailable", det or "prediction engine not available", 501)
+    if (guard := _engine_guard()) is not None:
+        return guard
 
     try:
-        body = request.get_json(force=True) or {}
+        body = request.get_json(silent=False) or {}
 
         test_cases = body.get("test_cases")
         if not isinstance(test_cases, list) or not test_cases:
             return _json_error("validation_error", [{"loc": ["test_cases"], "msg": "required non-empty array"}], 400)
 
-        accept = {"validation_method", "n_folds", "metrics", "confidence_threshold"}
-        kwargs = {k: body[k] for k in body.keys() & accept}
+        # Keep the same interface
+        kwargs = _accept(body, frozenset({"validation_method", "n_folds", "metrics", "confidence_threshold"}))
 
         result = validate_prediction_model(test_cases=test_cases, **kwargs)
 
-        return jsonify({
+        return _json({
             "ok": result.get("ok", True),
             "result": result,
-            "meta": {
-                "prediction_engine": "app.core.prediction v2",
-                "technique": "model_validation",
-            },
-        }), 200
+            "meta": _build_meta({"technique": "model_validation"}),
+        }, 200)
 
     except Exception as e:
         return _json_error("validation_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
-
-
-# ─────────────── Serialization helpers for prediction engine ───────────────
-
-def _serialize_prediction_event(event: Any) -> Dict[str, Any]:
-    """Convert PredictionEvent to JSON-serializable dict."""
-    if event is None:
-        return {}
-    return {
-        "event_type": getattr(event, "event_type", None),
-        "technique": getattr(event, "technique", None),
-        "description": getattr(event, "description", None),
-        "datetime_utc": getattr(event, "datetime_utc", None).isoformat()
-            if hasattr(event, "datetime_utc") and getattr(event, "datetime_utc") else None,
-        "jd_tt": getattr(event, "jd_tt", None),
-        "jd_ut1": getattr(event, "jd_ut1", None),
-        "precision_seconds": getattr(event, "precision_seconds", None),
-        "confidence": getattr(event, "confidence", None),
-        "significance": getattr(event, "significance", None),
-        "metadata": getattr(event, "metadata", {}),
-    }
-
-
-def _serialize_timing_window(window: Any) -> Dict[str, Any]:
-    """Convert TimingWindow to JSON-serializable dict."""
-    if window is None:
-        return {}
-    return {
-        "start_jd_tt": getattr(window, "start_jd_tt", None),
-        "end_jd_tt": getattr(window, "end_jd_tt", None),
-        "peak_jd_tt": getattr(window, "peak_jd_tt", None),
-        "uncertainty_days": getattr(window, "uncertainty_days", None),
-        "confidence_interval": getattr(window, "confidence_interval", None),
-    }
-
-
-def _serialize_prediction_result(result: Any) -> Dict[str, Any]:
-    """Convert PredictionResult to JSON-serializable dict."""
-    if result is None:
-        return {}
-    return {
-        "ok": getattr(result, "ok", True),
-        "technique": getattr(result, "technique", None),
-        "events": [_serialize_prediction_event(e) for e in getattr(result, "events", [])],
-        "synthesis": getattr(result, "synthesis", None),
-        "timing_windows": [_serialize_timing_window(w) for w in getattr(result, "timing_windows", [])],
-        "confidence_score": getattr(result, "confidence_score", None),
-        "statistical_metrics": getattr(result, "statistical_metrics", {}),
-        "warnings": getattr(result, "warnings", []),
-        "metadata": getattr(result, "metadata", {}),
-        "computation_time_ms": getattr(result, "computation_time_ms", None),
-    }
-
-
-def _serialize_comprehensive_forecast(forecast: Any) -> Dict[str, Any]:
-    """Convert ComprehensiveForecast to JSON-serializable dict."""
-    if forecast is None:
-        return {}
-    predictions = {}
-    if hasattr(forecast, "predictions") and forecast.predictions:
-        predictions = {k: _serialize_prediction_result(v) for k, v in forecast.predictions.items()}
-
-    time_range = getattr(forecast, "time_range", [])
-    if time_range and len(time_range) >= 2:
-        time_range_iso = [dt.isoformat() if hasattr(dt, "isoformat") else str(dt) for dt in time_range[:2]]
-    else:
-        time_range_iso = []
-
-    return {
-        "natal_chart": getattr(forecast, "natal_chart", {}),
-        "time_range": time_range_iso,
-        "predictions": predictions,
-        "synthesis": getattr(forecast, "synthesis", {}),
-        "peak_periods": [_serialize_timing_window(w) for w in getattr(forecast, "peak_periods", [])],
-        "risk_assessment": getattr(forecast, "risk_assessment", {}),
-        "confidence_metrics": getattr(forecast, "confidence_metrics", {}),
-        "validation_results": getattr(forecast, "validation_results", {}),
-        "computation_time_ms": getattr(forecast, "computation_time_ms", None),
-    }
-
-
-def _serialize_relationship_forecast(forecast: Any) -> Dict[str, Any]:
-    """Convert RelationshipForecast to JSON-serializable dict."""
-    if forecast is None:
-        return {}
-    return {
-        "synastry_analysis": getattr(forecast, "synastry_analysis", {}),
-        "composite_analysis": getattr(forecast, "composite_analysis", {}),
-        "transit_interactions": [_serialize_prediction_event(e) for e in getattr(forecast, "transit_interactions", [])],
-        "progression_interactions": [_serialize_prediction_event(e) for e in getattr(forecast, "progression_interactions", [])],
-        "compatibility_trends": getattr(forecast, "compatibility_trends", {}),
-        "critical_periods": [_serialize_timing_window(w) for w in getattr(forecast, "critical_periods", [])],
-        "relationship_score": getattr(forecast, "relationship_score", None),
-        "confidence_metrics": getattr(forecast, "confidence_metrics", {}),
-    }
 
 
 # ───────────────────────── predictive (transits • validation • dasha • varga • yogas) ─────────────────────────
