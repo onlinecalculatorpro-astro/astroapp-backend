@@ -1968,21 +1968,21 @@ class _CountingAdapter:
         self.calls += 1
         return self._base.ecliptic_longitudes(jd_tt, names, **obs)
 
-# ───────────────────────── /predictive/transits ─────────────────────────
 from typing import Any, Dict, List, Tuple, Optional
 import os, time, math, threading
-from flask import request, jsonify, make_response
 from enum import Enum
 from datetime import date, datetime
+from flask import request, jsonify, make_response
 
-# External deps assumed to exist in your app:
+# External app symbols expected to exist:
 # - api (Flask Blueprint), rate_limit, RL_PREDICTIVE
 # - _json_error, DEBUG_VERBOSE, ValidationError
 # - parse_frame, parse_latlon, _compute_timescales_from_local, _call_compute_chart, _wrap360
 # - _ALL_ASPECTS, _MAJOR_ASPECTS
 # - app.core.predictive as pred  (must expose TransitEngine)
+
 from app.core.ephemeris_adapter import EphemerisAdapter, Config as EphemConfig
-from app.core import predictive as pred  # provides TransitEngine
+from app.core import predictive as pred  # TransitEngine
 
 # ───────────────────────── JSON safety ─────────────────────────
 
@@ -1995,17 +1995,13 @@ except Exception:
 def _json_safe(x: Any) -> Any:
     """Recursively convert common non-JSON types to JSON-safe primitives."""
     if x is None or isinstance(x, (bool, int, float, str)):
-        # Normalize NaN/Inf to None to avoid JSON issues
         if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
             return None
         return x
-
     if isinstance(x, (datetime, date)):
         return x.isoformat()
-
     if isinstance(x, Enum):
         return x.name.lower()
-
     if _HAS_NP:
         if isinstance(x, (_np.floating,)):
             v = float(x)
@@ -2014,30 +2010,22 @@ def _json_safe(x: Any) -> Any:
             return int(x)
         if isinstance(x, (_np.ndarray,)):
             return [_json_safe(v) for v in x.tolist()]
-
     if isinstance(x, (list, tuple)):
         return [_json_safe(v) for v in x]
-
     if isinstance(x, set):
-        # deterministic order for stability
         return [_json_safe(v) for v in sorted(x, key=lambda y: str(y))]
-
     if isinstance(x, dict):
         return {str(k): _json_safe(v) for k, v in x.items()}
-
-    # Fallback: stringification (last resort)
     return str(x)
 
-# ───────────────────────── Ephemeris adapter (shared) ─────────────────────────
+# ───────────────────────── Shared ephemeris adapter ─────────────────────────
 
 _GLOBAL_ADAPTERS: Dict[str, EphemerisAdapter] = {}
 _ADAPTER_LOCK = threading.Lock()
 
 def _norm_frame_key(frame: Optional[str]) -> str:
     s = (frame or "ecliptic-of-date").strip().lower()
-    if s in ("ecliptic-j2000", "j2000", "ecl-j2000"):
-        return "ecliptic-j2000"
-    return "ecliptic-of-date"
+    return "ecliptic-j2000" if s in ("ecliptic-j2000", "j2000", "ecl-j2000") else "ecliptic-of-date"
 
 def get_shared_adapter(frame: str = "ecliptic-of-date") -> EphemerisAdapter:
     """Get or create a shared EphemerisAdapter instance (per frame) for performance."""
@@ -2056,7 +2044,7 @@ _PRED_SEM_TIMEOUT_S = float(os.getenv("PREDICTIVE_SEM_TIMEOUT_S", "25"))
 _PRED_SEM = threading.Semaphore(_PRED_MAX_CONC)
 
 def _busy():
-    resp = _json_error("server_busy", "try again shortly", 429)
+    resp = _json_error("server_busy", {"msg": "try again shortly"}, 429)
     resp.headers["Retry-After"] = "2"
     return resp
 
@@ -2083,15 +2071,14 @@ def _split_dt(s: Any, fallback_time: str) -> Tuple[str, str]:
 
 def _parse_time_range_like(body: Dict[str, Any]) -> Tuple[float, float]:
     """
-    Accepts any of:
+    Accepts:
       - jd_start_tt & jd_end_tt (floats)
-      - time_range: [start, end] where each item can be ISO date or full ISO datetime
-      - legacy date/time + place_tz/timezone fields
-    Returns (jd0, jd1) in TT; raises ValidationError-compatible shape on problems.
+      - time_range: [start, end] (each ISO date or ISO datetime)
+      - legacy date/time + place_tz/timezone
+    Returns (jd0, jd1) in TT.
     """
     # direct JDs
-    jd0 = body.get("jd_start_tt")
-    jd1 = body.get("jd_end_tt")
+    jd0, jd1 = body.get("jd_start_tt"), body.get("jd_end_tt")
     if isinstance(jd0, (int, float)) and isinstance(jd1, (int, float)):
         jd0f, jd1f = float(jd0), float(jd1)
         if not (math.isfinite(jd0f) and math.isfinite(jd1f) and jd1f > jd0f):
@@ -2130,7 +2117,7 @@ def _parse_time_range_like(body: Dict[str, Any]) -> Tuple[float, float]:
         jd0f, jd1f = float(ts0["jd_tt"]), float(ts1["jd_tt"])
     else:
         jd0f = float(ts0["jd_tt"])
-        jd1f = jd0f + 1.0  # default: 24h window
+        jd1f = jd0f + 1.0  # default 24h window
 
     if not (math.isfinite(jd0f) and math.isfinite(jd1f) and jd1f > jd0f):
         raise ValidationError([{"loc": ["jd_start_tt", "jd_end_tt"], "msg": "invalid range"}])
@@ -2139,7 +2126,7 @@ def _parse_time_range_like(body: Dict[str, Any]) -> Tuple[float, float]:
 def _parse_step_minutes(v: Any, *, default_min: float) -> Any:
     """
     Accept numeric minutes (>0) or "auto"/0/None → "auto".
-    Returns either float minutes or the string "auto" (engine understands both).
+    Returns float or the string "auto".
     """
     if v is None:
         return "auto" if default_min <= 0 else default_min
@@ -2150,6 +2137,42 @@ def _parse_step_minutes(v: Any, *, default_min: float) -> Any:
         return "auto" if f <= 0 else f
     except Exception:
         return default_min
+
+# ───────────────────────── Aspects normalization ─────────────────────────
+
+_MAJOR_NAMES = ["conjunction", "opposition", "square", "trine, sextile".split(", ")[-1]]  # fix split quirk
+# Actually define correctly:
+_MAJOR_NAMES = ["conjunction", "opposition", "square", "trine", "sextile"]
+
+_MINOR_NAMES = [
+    "quincunx","semisextile","semisquare","sesquisquare","quintile","biquintile"
+]
+
+def _normalize_aspects(x: Any, *, include_minors: bool) -> List[str]:
+    """
+    Accepts list/tuple/set/str or dict {name:angle} or list of dicts with 'name'.
+    Falls back to major/minor defaults by flag.
+    """
+    if x is None:
+        return (_MAJOR_NAMES + _MINOR_NAMES) if include_minors else list(_MAJOR_NAMES)
+
+    if isinstance(x, dict):
+        return [str(k) for k in x.keys()]
+
+    if isinstance(x, (list, tuple, set)):
+        out: List[str] = []
+        for a in x:
+            if isinstance(a, str):
+                out.append(a.strip().lower())
+            elif isinstance(a, dict) and "name" in a:
+                out.append(str(a["name"]).strip().lower())
+        return out if out else ((_MAJOR_NAMES + _MINOR_NAMES) if include_minors else list(_MAJOR_NAMES))
+
+    if isinstance(x, str):
+        return [x.strip().lower()]
+
+    # Fallback to defaults
+    return (_MAJOR_NAMES + _MINOR_NAMES) if include_minors else list(_MAJOR_NAMES)
 
 # ───────────────────────── Route: /api/predictive/transits ─────────────────────────
 
@@ -2164,7 +2187,7 @@ def predictive_transits():
     try:
         body = request.get_json(force=True) or {}
     except Exception as e:
-        return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
+        return _json_error("bad_request", {"phase": "read_json", "msg": str(e) if DEBUG_VERBOSE else None}, 400)
 
     if not _take_gate():
         return _busy()
@@ -2175,18 +2198,17 @@ def predictive_transits():
         try:
             jd0, jd1 = _parse_time_range_like(body)
         except ValidationError as e:
-            return _json_error("validation_error", e.errors(), 400)
+            return _json_error("validation_error", {"phase": "parse_window", "errors": e.errors()}, 400)
         except Exception as e:
-            return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
+            return _json_error("timescales_error", {"phase": "parse_window", "msg": str(e) if DEBUG_VERBOSE else None}, 400)
 
         # -------- movers / targets --------
         raw_movers = body.get("movers") or ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn"]
         if not (isinstance(raw_movers, list) and all(isinstance(x, str) and x.strip() for x in raw_movers)):
-            return _json_error("validation_error", [{"loc": ["movers"], "msg": "must be a list of names"}], 400)
-
+            return _json_error("validation_error", {"phase": "parse_movers", "errors":[{"loc":["movers"],"msg":"must be a list of names"}]}, 400)
         movers = list(dict.fromkeys(m.strip() for m in raw_movers if isinstance(m, str) and m.strip()))
 
-        # targets_longitudes: direct map (preferred, fastest path)
+        # Direct targets (fast path)
         targets: Dict[str, float] = {}
         raw_targets = body.get("targets_longitudes")
         if isinstance(raw_targets, dict):
@@ -2194,47 +2216,33 @@ def predictive_transits():
                 try:
                     targets[str(k)] = _wrap360(float(v))
                 except (ValueError, TypeError):
-                    # skip invalid entries
-                    continue
+                    continue  # skip invalid entries
 
-        # Or build targets from a chart payload (only if no direct targets)
+        # Or build from chart if not provided
         if not targets and isinstance(body.get("targets_chart"), dict):
             targ = dict(body["targets_chart"])
             tz_nat = targ.get("place_tz") or targ.get("timezone") or "UTC"
             try:
-                ts_nat = _compute_timescales_from_local(
-                    targ["date"], targ.get("time", "00:00:00"), tz_nat, payload=targ
-                )
+                ts_nat = _compute_timescales_from_local(targ["date"], targ.get("time", "00:00:00"), tz_nat, payload=targ)
             except Exception as e:
-                return _json_error("validation_error", [{"loc": ["targets_chart"], "msg": str(e)}], 400)
+                return _json_error("validation_error", {"phase": "targets_chart_timescales", "msg": str(e)}, 400)
 
             try:
                 ch = _call_compute_chart(targ, ts_nat)
             except Exception as e:
-                return _json_error("chart_internal", str(e) if DEBUG_VERBOSE else "chart_failed", 500)
+                return _json_error("chart_internal", {"phase": "targets_chart_compute", "msg": str(e) if DEBUG_VERBOSE else "chart_failed"}, 500)
 
             for row_list in (ch.get("bodies", []), ch.get("points", [])):
                 for row in (row_list or []):
-                    if (
-                        isinstance(row, dict)
-                        and "name" in row
-                        and isinstance(row.get("longitude_deg"), (int, float))
-                    ):
+                    if isinstance(row, dict) and "name" in row and isinstance(row.get("longitude_deg"), (int, float)):
                         targets[str(row["name"])] = _wrap360(float(row["longitude_deg"]))
 
         if not targets:
-            return _json_error(
-                "validation_error",
-                [{"loc": ["targets_longitudes|targets_chart"], "msg": "no targets to scan"}],
-                400,
-            )
+            return _json_error("validation_error", {"phase": "targets_missing", "errors":[{"loc":["targets_longitudes|targets_chart"],"msg":"no targets to scan"}]}, 400)
 
         # -------- engine options --------
-        lat_raw = body.get("latitude")
-        lon_raw = body.get("longitude")
-        topocentric = bool(body.get("topocentric")) or (
-            isinstance(lat_raw, (int, float)) and isinstance(lon_raw, (int, float))
-        )
+        lat_raw, lon_raw = body.get("latitude"), body.get("longitude")
+        topocentric = bool(body.get("topocentric")) or (isinstance(lat_raw, (int, float)) and isinstance(lon_raw, (int, float)))
         lat = float(lat_raw) if isinstance(lat_raw, (int, float)) else None
         lon = float(lon_raw) if isinstance(lon_raw, (int, float)) else None
         elev = float(body.get("elevation_m")) if isinstance(body.get("elevation_m"), (int, float)) else None
@@ -2246,18 +2254,17 @@ def predictive_transits():
             try:
                 lat, lon = parse_latlon(lat, lon)
             except ValidationError as e:
-                return _json_error("validation_error", e.errors(), 400)
+                return _json_error("validation_error", {"phase":"parse_latlon","errors": e.errors()}, 400)
+
+        include_minors = bool(body.get("include_minors", False))
+        aspects = _normalize_aspects(body.get("aspects"), include_minors=include_minors)
 
         include_antiscia = bool(body.get("include_antiscia", False))
         antiscia_orb_deg = float(body.get("antiscia_orb_deg", 2.0))
-        include_minors = bool(body.get("include_minors", False))
 
-        # sidereal options (thread through to engine)
+        # Sidereal threading
         zodiac_mode = (body.get("zodiac_mode") or "tropical").strip().lower()
         ayanamsa_deg = float(body.get("ayanamsa_deg", 0.0))
-
-        # aspect set (precomputed)
-        aspects = _ALL_ASPECTS if include_minors else _MAJOR_ASPECTS
 
         # -------- run engine with shared adapter --------
         try:
@@ -2270,7 +2277,6 @@ def predictive_transits():
                 longitude=lon,
                 elevation_m=elev,
             )
-            # Thread sidereal into engine (no API change)
             eng.sidereal_mode = zodiac_mode.startswith("sidereal")
             eng.ayanamsa_deg = ayanamsa_deg
 
@@ -2279,33 +2285,27 @@ def predictive_transits():
                 jd_end_tt=float(jd1),
                 movers=movers,
                 targets=targets,
-                aspects=aspects,
-                step_minutes=step_arg,  # supports "auto"
+                aspects=aspects,               # list[str] guaranteed
+                step_minutes=step_arg,         # float or "auto"
                 include_antiscia=include_antiscia,
                 antiscia_orb_deg=antiscia_orb_deg,
             )
         except Exception as e:
-            return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+            return _json_error("predictive_internal", {"phase":"engine_scan","msg": str(e) if DEBUG_VERBOSE else None}, 500)
 
         # -------- build JSON-safe response --------
         def _event_to_dict(e: Any) -> Dict[str, Any]:
-            # Dataclass-like or object: prefer __dict__
             if hasattr(e, "__dict__"):
                 d = dict(e.__dict__)
             elif isinstance(e, dict):
                 d = dict(e)
             else:
-                # fallback: grab public attrs
                 d = {k: getattr(e, k) for k in dir(e) if not k.startswith("_") and not callable(getattr(e, k))}
-            # Normalize known tricky fields
-            if "kind" in d:
-                d["kind"] = _json_safe(d["kind"])
-            if "meta" in d:
-                d["meta"] = _json_safe(d["meta"])
-            for k in ("jd_tt", "jd_ut1", "separation_deg", "delta_deg"):
+            # normalize tricky fields
+            for k in ("kind", "meta", "jd_tt", "jd_ut1", "separation_deg", "delta_deg"):
                 if k in d:
                     d[k] = _json_safe(d[k])
-            # Ensure everything else is safe
+            # ensure primitives only
             return _json_safe(d)
 
         out = [_event_to_dict(e) for e in (events or [])]
