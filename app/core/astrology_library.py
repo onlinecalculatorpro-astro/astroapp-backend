@@ -1,29 +1,25 @@
-# app/core/astrology_library_enhanced.py
+# western_vedic_astrology_library.py
 # -*- coding: utf-8 -*-
 """
-Enhanced Astrology Knowledge Library - Comprehensive Traditional Systems Integration
+Comprehensive Western/Vedic Astrology Integration Library
 
-This library incorporates authentic traditional astrological knowledge from:
-- Western/Hellenistic astrology (Ptolemaic, Medieval, Renaissance)
-- Vedic/Jyotish astrology (Parashari & Jaimini systems)
-- Arabic/Persian astrological traditions
-- Classical dignities, lots/parts, and sophisticated timing techniques
+This library provides authentic integration of Western (Tropical) and Vedic (Sidereal) 
+astrological systems, using traditional knowledge from both cultures while referencing
+Arabic, Persian, and Hellenistic sources for enhanced understanding.
 
-Based on research from classical sources including:
-- Ptolemy's Tetrabiblos
-- Paulus Alexandrinus & Olympiodorus
-- Al-Biruni, Abu Ma'shar, Bonatti
-- Brihat Parashara Hora Shastra
-- William Lilly's Christian Astrology
+Key Features:
+- Dual zodiac support (Tropical/Sidereal with accurate ayanamsa)
+- Complete planetary dignity systems for both traditions
+- Western aspects + Vedic Drishti (aspects) integration  
+- House systems: Western (Placidus, Equal) + Vedic (Whole Sign/Bhava)
+- Traditional timing techniques from both systems
+- Comprehensive orb systems and strength calculations
+- Cultural authenticity with practical modern application
 
-What's Enhanced vs Prior Version:
-- Complete essential & accidental dignities system
-- Arabic parts/lots (97+ traditional formulas)
-- Vedic aspects & house systems with drishti
-- Sectarian considerations & planetary joys
-- Traditional strength scoring & almuten calculation
-- Fixed stars & lunar mansions
-- Comprehensive orb systems by technique & tradition
+Sources Integrated:
+Western: Ptolemy, Lilly, modern evolutionary astrology
+Vedic: Brihat Parashara Hora Shastra, Jaimini, classical texts
+Reference: Arabic (Al-Biruni, Abu Ma'shar), Hellenistic (Paulus Alexandrinus)
 """
 
 from __future__ import annotations
@@ -31,71 +27,67 @@ import math
 from typing import Any, Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass
 from enum import Enum
+from datetime import datetime, timezone
 
 # -----------------------------------------------------------------------------
-# Core System & Tradition Enums
+# Core System Configuration
 # -----------------------------------------------------------------------------
 
-class AstroTradition(Enum):
+class AstroSystem(Enum):
     WESTERN_TROPICAL = "western_tropical"
-    VEDIC_SIDEREAL = "vedic_sidereal" 
-    ARABIC_MEDIEVAL = "arabic_medieval"
-    HELLENISTIC = "hellenistic"
+    VEDIC_SIDEREAL = "vedic_sidereal"
+    DUAL_MODE = "dual_mode"  # Calculate both systems
 
-class Sect(Enum):
-    DIURNAL = "diurnal"   # Day births (Sun above horizon)
-    NOCTURNAL = "nocturnal"  # Night births (Sun below horizon)
+class ZodiacType(Enum):
+    TROPICAL = "tropical"      # Fixed to seasons (Western)
+    SIDEREAL = "sidereal"     # Fixed to stars (Vedic)
 
 class HouseSystem(Enum):
-    WHOLE_SIGN = "whole_sign"
+    # Western Systems
     PLACIDUS = "placidus"
     EQUAL = "equal"
+    WHOLE_SIGN = "whole_sign"
     PORPHYRY = "porphyry"
-    REGIOMONTANUS = "regiomontanus"
-    VEDIC_WHOLE_SIGN = "vedic_whole_sign"
+    KOCH = "koch"
+    
+    # Vedic Systems  
+    VEDIC_WHOLE_SIGN = "vedic_whole_sign"  # Rashi chart
+    BHAVA = "bhava"                        # Cusp-based houses
+    
+class AspectSystem(Enum):
+    WESTERN_ASPECTS = "western_aspects"    # Degree-based with orbs
+    VEDIC_DRISHTI = "vedic_drishti"       # House-based, fixed
+    COMBINED = "combined"                  # Both systems
 
-# -----------------------------------------------------------------------------
-# Canonical name maps & helpers (enhanced)
-# -----------------------------------------------------------------------------
-
-ALIASES: Dict[str, str] = {
-    # Nodes & points
-    "nn": "north node", "sn": "south node", "rahu": "north node", "ketu": "south node",
-    "true node": "north node", "mean node": "north node", "dragon head": "north node",
-    "dragon tail": "south node", "caput draconis": "north node", "cauda draconis": "south node",
-    
-    # Angles
-    "asc": "ascendant", "ascendent": "ascendant", "rising": "ascendant",
-    "mc": "midheaven", "medium coeli": "midheaven", "zenith": "midheaven",
-    "ic": "imum coeli", "nadir": "imum coeli", "anti-mc": "imum coeli",
-    "dsc": "descendant", "desc": "descendant", "setting": "descendant",
-    
-    # Classical planets (traditional names)
-    "sol": "sun", "luna": "moon", "mercury": "mercury", "venus": "venus",
-    "mars": "mars", "jupiter": "jupiter", "saturn": "saturn",
-    "benefics": ["venus", "jupiter"], "malefics": ["mars", "saturn"],
-    "luminaries": ["sun", "moon"], "lights": ["sun", "moon"],
-    
-    # Vedic names
-    "surya": "sun", "chandra": "moon", "budha": "mercury", "shukra": "venus",
-    "mangala": "mars", "guru": "jupiter", "brihaspati": "jupiter", "shani": "saturn",
-    
-    # Modern planets
-    "uranus": "uranus", "neptune": "neptune", "pluto": "pluto",
-    
-    # Parts/Lots
-    "pof": "part of fortune", "pos": "part of spirit", "fortuna": "part of fortune",
+# Ayanamsa (Precession correction) - Using Lahiri
+AYANAMSA_EPOCHS = {
+    2000.0: 23.85,  # Lahiri ayanamsa for epoch 2000.0
+    2025.0: 24.18   # Current approximate value
 }
 
-def canon(name: Optional[str]) -> str:
-    """Enhanced canonical name normalization."""
-    if not name:
-        return ""
-    n = name.strip().lower().replace("-", " ").replace("_", " ")
-    return ALIASES.get(n, n)
+def calculate_ayanamsa(year: float) -> float:
+    """Calculate Lahiri ayanamsa for given year."""
+    # Linear interpolation for intermediate years
+    base_year = 2000.0
+    base_ayanamsa = 23.85
+    annual_increase = 0.0139  # degrees per year (approximate)
+    
+    return base_ayanamsa + (year - base_year) * annual_increase
+
+def tropical_to_sidereal(tropical_longitude: float, year: float = 2025.0) -> float:
+    """Convert tropical longitude to sidereal."""
+    ayanamsa = calculate_ayanamsa(year)
+    sidereal = tropical_longitude - ayanamsa
+    return sidereal % 360.0
+
+def sidereal_to_tropical(sidereal_longitude: float, year: float = 2025.0) -> float:
+    """Convert sidereal longitude to tropical."""
+    ayanamsa = calculate_ayanamsa(year)
+    tropical = sidereal_longitude + ayanamsa
+    return tropical % 360.0
 
 # -----------------------------------------------------------------------------
-# Enhanced Signs with Traditional Attributes
+# Enhanced Signs with Dual System Support
 # -----------------------------------------------------------------------------
 
 SIGNS: List[str] = [
@@ -103,605 +95,704 @@ SIGNS: List[str] = [
     "libra", "scorpio", "sagittarius", "capricorn", "aquarius", "pisces"
 ]
 
-SIGN_ATTRIBUTES: Dict[str, Dict[str, Any]] = {
-    "aries": {
-        "element": "fire", "modality": "cardinal", "polarity": "positive",
-        "season": "spring", "ruling_planet": "mars", "exaltation": "sun",
-        "detriment": "venus", "fall": "saturn",
-        "vedic_ruler": "mars", "nature": "movable",
-        "body_parts": ["head", "brain", "eyes"], "temperament": "hot_dry",
-        "keywords": ["initiative", "courage", "leadership", "impulsiveness"]
-    },
-    "taurus": {
-        "element": "earth", "modality": "fixed", "polarity": "negative", 
-        "season": "spring", "ruling_planet": "venus", "exaltation": "moon",
-        "detriment": "mars", "fall": "none",
-        "vedic_ruler": "venus", "nature": "fixed",
-        "body_parts": ["neck", "throat", "thyroid"], "temperament": "cold_dry",
-        "keywords": ["stability", "material", "sensuality", "persistence"]
-    },
-    "gemini": {
-        "element": "air", "modality": "mutable", "polarity": "positive",
-        "season": "spring", "ruling_planet": "mercury", "exaltation": "north node",
-        "detriment": "jupiter", "fall": "none",
-        "vedic_ruler": "mercury", "nature": "dual",
-        "body_parts": ["arms", "hands", "lungs"], "temperament": "hot_moist",
-        "keywords": ["communication", "learning", "versatility", "curiosity"]
-    },
-    "cancer": {
-        "element": "water", "modality": "cardinal", "polarity": "negative",
-        "season": "summer", "ruling_planet": "moon", "exaltation": "jupiter",
-        "detriment": "saturn", "fall": "mars",
-        "vedic_ruler": "moon", "nature": "movable", 
-        "body_parts": ["chest", "stomach", "breasts"], "temperament": "cold_moist",
-        "keywords": ["nurturing", "emotional", "protective", "intuitive"]
-    },
-    "leo": {
-        "element": "fire", "modality": "fixed", "polarity": "positive",
-        "season": "summer", "ruling_planet": "sun", "exaltation": "none",
-        "detriment": "saturn", "fall": "none",
-        "vedic_ruler": "sun", "nature": "fixed",
-        "body_parts": ["heart", "spine", "back"], "temperament": "hot_dry",
-        "keywords": ["creativity", "leadership", "drama", "confidence"]
-    },
-    "virgo": {
-        "element": "earth", "modality": "mutable", "polarity": "negative",
-        "season": "summer", "ruling_planet": "mercury", "exaltation": "mercury",
-        "detriment": "jupiter", "fall": "venus",
-        "vedic_ruler": "mercury", "nature": "dual",
-        "body_parts": ["digestive system", "intestines"], "temperament": "cold_dry",
-        "keywords": ["analysis", "service", "perfection", "health"]
-    },
-    "libra": {
-        "element": "air", "modality": "cardinal", "polarity": "positive",
-        "season": "autumn", "ruling_planet": "venus", "exaltation": "saturn",
-        "detriment": "mars", "fall": "sun",
-        "vedic_ruler": "venus", "nature": "movable",
-        "body_parts": ["kidneys", "lower back"], "temperament": "hot_moist",
-        "keywords": ["balance", "harmony", "relationships", "justice"]
-    },
-    "scorpio": {
-        "element": "water", "modality": "fixed", "polarity": "negative",
-        "season": "autumn", "ruling_planet": "mars", "exaltation": "none",
-        "detriment": "venus", "fall": "moon",
-        "vedic_ruler": "mars", "modern_ruler": "pluto", "nature": "fixed",
-        "body_parts": ["reproductive organs", "bladder"], "temperament": "cold_moist",
-        "keywords": ["transformation", "intensity", "secrets", "power"]
-    },
-    "sagittarius": {
-        "element": "fire", "modality": "mutable", "polarity": "positive",
-        "season": "autumn", "ruling_planet": "jupiter", "exaltation": "south node",
-        "detriment": "mercury", "fall": "none",
-        "vedic_ruler": "jupiter", "nature": "dual",
-        "body_parts": ["hips", "thighs", "liver"], "temperament": "hot_dry",
-        "keywords": ["philosophy", "travel", "teaching", "expansion"]
-    },
-    "capricorn": {
-        "element": "earth", "modality": "cardinal", "polarity": "negative",
-        "season": "winter", "ruling_planet": "saturn", "exaltation": "mars",
-        "detriment": "moon", "fall": "jupiter",
-        "vedic_ruler": "saturn", "nature": "movable",
-        "body_parts": ["bones", "knees", "skin"], "temperament": "cold_dry",
-        "keywords": ["structure", "ambition", "discipline", "authority"]
-    },
-    "aquarius": {
-        "element": "air", "modality": "fixed", "polarity": "positive",
-        "season": "winter", "ruling_planet": "saturn", "exaltation": "none",
-        "detriment": "sun", "fall": "none",
-        "vedic_ruler": "saturn", "modern_ruler": "uranus", "nature": "fixed",
-        "body_parts": ["ankles", "circulatory system"], "temperament": "hot_moist",
-        "keywords": ["innovation", "freedom", "groups", "idealism"]
-    },
-    "pisces": {
-        "element": "water", "modality": "mutable", "polarity": "negative",
-        "season": "winter", "ruling_planet": "jupiter", "exaltation": "venus",
-        "detriment": "mercury", "fall": "mercury",
-        "vedic_ruler": "jupiter", "modern_ruler": "neptune", "nature": "dual",
-        "body_parts": ["feet", "lymphatic system"], "temperament": "cold_moist",
-        "keywords": ["spirituality", "compassion", "dreams", "dissolution"]
-    }
-}
+VEDIC_SIGN_NAMES: List[str] = [
+    "mesha", "vrishabha", "mithuna", "karka", "simha", "kanya",
+    "tula", "vrischika", "dhanus", "makara", "kumbha", "meena"
+]
 
-# Traditional Triplicities (Day/Night rulers)
-TRIPLICITIES: Dict[str, Dict[str, str]] = {
-    "fire": {"day": "sun", "night": "jupiter", "participating": "saturn"},
-    "earth": {"day": "venus", "night": "moon", "participating": "mars"}, 
-    "air": {"day": "saturn", "night": "mercury", "participating": "jupiter"},
-    "water": {"day": "venus", "night": "mars", "participating": "moon"}
-}
+@dataclass
+class SignData:
+    """Comprehensive sign data for both Western and Vedic systems."""
+    name: str
+    vedic_name: str
+    element: str
+    modality: str           # Western: cardinal, fixed, mutable
+    vedic_nature: str       # Vedic: movable, fixed, dual
+    polarity: str          # positive/masculine, negative/feminine
+    season: str            # Western seasonal association
+    body_parts: List[str]
+    
+    # Rulership - Western
+    western_ruler: str
+    western_exaltation: Optional[str]
+    western_exaltation_degree: Optional[int]
+    western_detriment: List[str]
+    western_fall: Optional[str]
+    western_fall_degree: Optional[int]
+    
+    # Rulership - Vedic (same as Western in most cases)
+    vedic_ruler: str
+    vedic_exaltation: Optional[str] 
+    vedic_exaltation_degree: Optional[int]
+    vedic_debilitation: Optional[str]
+    vedic_debilitation_degree: Optional[int]
+    
+    # Qualities
+    temperament: str       # Hot/Cold, Dry/Moist combinations
+    keywords: List[str]
 
-# Egyptian Terms/Bounds (Traditional)
-EGYPTIAN_TERMS: Dict[str, List[Dict[str, Any]]] = {
-    "aries": [
-        {"planet": "jupiter", "start": 0, "end": 6},
-        {"planet": "venus", "start": 6, "end": 12},
-        {"planet": "mercury", "start": 12, "end": 20},
-        {"planet": "mars", "start": 20, "end": 25},
-        {"planet": "saturn", "start": 25, "end": 30}
-    ],
-    "taurus": [
-        {"planet": "venus", "start": 0, "end": 8},
-        {"planet": "mercury", "start": 8, "end": 14},
-        {"planet": "jupiter", "start": 14, "end": 22},
-        {"planet": "saturn", "start": 22, "end": 27},
-        {"planet": "mars", "start": 27, "end": 30}
-    ],
-    # ... (continuing for all signs - truncated for space)
-}
-
-# Decans/Faces (Traditional Chaldean Order)
-CHALDEAN_DECANS: Dict[str, List[str]] = {
-    "aries": ["mars", "sun", "venus"],
-    "taurus": ["mercury", "moon", "saturn"],
-    "gemini": ["jupiter", "mars", "sun"],
-    "cancer": ["venus", "mercury", "moon"],
-    "leo": ["saturn", "jupiter", "mars"],
-    "virgo": ["sun", "venus", "mercury"],
-    "libra": ["moon", "saturn", "jupiter"],
-    "scorpio": ["mars", "sun", "venus"],
-    "sagittarius": ["mercury", "moon", "saturn"],
-    "capricorn": ["jupiter", "mars", "sun"],
-    "aquarius": ["venus", "mercury", "moon"],
-    "pisces": ["saturn", "jupiter", "mars"]
-}
-
-# -----------------------------------------------------------------------------
-# Enhanced Houses - Western & Vedic Integration
-# -----------------------------------------------------------------------------
-
-WESTERN_HOUSES: Dict[int, Dict[str, Any]] = {
-    1: {
-        "name": "First House", "title": "Self / Ascendant", "alias": "Ascendant",
-        "cusp": {"angle": "ASC", "is_major": True}, "quadrant": 1, "house_type": "angular",
-        "themes": ["identity", "appearance", "vitality", "life approach", "body", "temperament"],
-        "life_areas": {"self": 1.0, "health": 0.8, "career": 0.3, "relationships": 0.2, "spiritual": 0.2},
-        "planetary_joy": "mercury", "traditional_ruler": "aries/mars",
-        "natural_significator": "sun", "body_parts": ["head", "face", "brain"],
-        "vedic_significations": ["self", "personality", "health", "longevity", "fame"]
-    },
-    2: {
-        "name": "Second House", "title": "Resources / Values", "alias": None,
-        "cusp": {"angle": None, "is_major": False}, "quadrant": 1, "house_type": "succedent",
-        "themes": ["money", "possessions", "values", "self-worth", "talents", "resources"],
-        "life_areas": {"career": 0.8, "self": 0.5, "relationships": 0.2, "health": 0.3, "spiritual": 0.2},
-        "planetary_joy": None, "traditional_ruler": "taurus/venus",
-        "natural_significator": "jupiter", "body_parts": ["neck", "throat", "mouth"],
-        "vedic_significations": ["wealth", "family", "speech", "food", "education"]
-    },
-    3: {
-        "name": "Third House", "title": "Communication / Siblings", "alias": None,
-        "cusp": {"angle": None, "is_major": False}, "quadrant": 2, "house_type": "cadent",
-        "themes": ["communication", "siblings", "short travel", "learning", "courage", "neighbors"],
-        "life_areas": {"self": 0.5, "career": 0.6, "relationships": 0.6, "health": 0.2, "spiritual": 0.2},
-        "planetary_joy": "moon", "traditional_ruler": "gemini/mercury",
-        "natural_significator": "mars", "body_parts": ["arms", "hands", "shoulders"],
-        "vedic_significations": ["siblings", "courage", "short journeys", "communications", "skills"]
-    },
-    4: {
-        "name": "Fourth House", "title": "Home / Roots", "alias": "Imum Coeli",
-        "cusp": {"angle": "IC", "is_major": True}, "quadrant": 2, "house_type": "angular",
-        "themes": ["home", "family", "ancestry", "inner security", "foundations", "real estate"],
-        "life_areas": {"self": 0.6, "relationships": 0.7, "career": 0.3, "health": 0.3, "spiritual": 0.3},
-        "planetary_joy": None, "traditional_ruler": "cancer/moon",
-        "natural_significator": "moon", "body_parts": ["chest", "stomach", "lungs"],
-        "vedic_significations": ["mother", "home", "property", "vehicles", "happiness", "education"]
-    },
-    5: {
-        "name": "Fifth House", "title": "Creativity / Children", "alias": None,
-        "cusp": {"angle": None, "is_major": False}, "quadrant": 2, "house_type": "succedent",
-        "themes": ["children", "creativity", "romance", "speculation", "entertainment", "sports"],
-        "life_areas": {"relationships": 0.8, "self": 0.6, "career": 0.4, "health": 0.2, "spiritual": 0.3},
-        "planetary_joy": "venus", "traditional_ruler": "leo/sun",
-        "natural_significator": "jupiter", "body_parts": ["heart", "stomach", "spine"],
-        "vedic_significations": ["children", "intelligence", "creativity", "romance", "speculation", "mantra"]
-    },
-    6: {
-        "name": "Sixth House", "title": "Service / Health", "alias": None,
-        "cusp": {"angle": None, "is_major": False}, "quadrant": 3, "house_type": "cadent",
-        "themes": ["health", "service", "work", "enemies", "debts", "illness", "daily routine"],
-        "life_areas": {"health": 1.0, "career": 0.7, "self": 0.4, "relationships": 0.3, "spiritual": 0.2},
-        "planetary_joy": "mars", "traditional_ruler": "virgo/mercury",
-        "natural_significator": "mars", "body_parts": ["intestines", "abdomen"],
-        "vedic_significations": ["enemies", "disease", "debts", "obstacles", "service", "daily work"]
-    },
-    7: {
-        "name": "Seventh House", "title": "Partnerships", "alias": "Descendant",
-        "cusp": {"angle": "DSC", "is_major": True}, "quadrant": 3, "house_type": "angular",
-        "themes": ["marriage", "partnerships", "contracts", "open enemies", "others", "cooperation"],
-        "life_areas": {"relationships": 1.0, "self": 0.4, "career": 0.5, "health": 0.2, "spiritual": 0.2},
-        "planetary_joy": None, "traditional_ruler": "libra/venus",
-        "natural_significator": "venus", "body_parts": ["kidneys", "lower back"],
-        "vedic_significations": ["spouse", "marriage", "business partners", "travel", "death"]
-    },
-    8: {
-        "name": "Eighth House", "title": "Transformation / Death", "alias": None,
-        "cusp": {"angle": None, "is_major": False}, "quadrant": 3, "house_type": "succedent",
-        "themes": ["death", "transformation", "occult", "others' money", "inheritance", "secrets"],
-        "life_areas": {"relationships": 0.6, "self": 0.7, "career": 0.3, "health": 0.4, "spiritual": 0.8},
-        "planetary_joy": "saturn", "traditional_ruler": "scorpio/mars",
-        "natural_significator": "saturn", "body_parts": ["reproductive organs", "pelvis"],
-        "vedic_significations": ["longevity", "transformation", "occult", "inheritance", "research"]
-    },
-    9: {
-        "name": "Ninth House", "title": "Philosophy / Higher Learning", "alias": None,
-        "cusp": {"angle": None, "is_major": False}, "quadrant": 4, "house_type": "cadent",
-        "themes": ["philosophy", "religion", "higher education", "long travel", "publishing", "law"],
-        "life_areas": {"spiritual": 0.9, "career": 0.7, "self": 0.5, "relationships": 0.3, "health": 0.2},
-        "planetary_joy": "sun", "traditional_ruler": "sagittarius/jupiter",
-        "natural_significator": "jupiter", "body_parts": ["hips", "thighs"],
-        "vedic_significations": ["father", "dharma", "guru", "fortune", "long journeys", "higher learning"]
-    },
-    10: {
-        "name": "Tenth House", "title": "Career / Status", "alias": "Midheaven",
-        "cusp": {"angle": "MC", "is_major": True}, "quadrant": 4, "house_type": "angular",
-        "themes": ["career", "reputation", "status", "authority", "government", "honor"],
-        "life_areas": {"career": 1.0, "self": 0.6, "relationships": 0.3, "health": 0.2, "spiritual": 0.3},
-        "planetary_joy": "jupiter", "traditional_ruler": "capricorn/saturn",
-        "natural_significator": "sun", "body_parts": ["knees", "bones"],
-        "vedic_significations": ["career", "status", "father", "government", "honor", "authority"]
-    },
-    11: {
-        "name": "Eleventh House", "title": "Friends / Hopes", "alias": None,
-        "cusp": {"angle": None, "is_major": False}, "quadrant": 4, "house_type": "succedent",
-        "themes": ["friends", "groups", "hopes", "gains", "social causes", "income from career"],
-        "life_areas": {"relationships": 0.8, "career": 0.6, "self": 0.4, "health": 0.2, "spiritual": 0.3},
-        "planetary_joy": None, "traditional_ruler": "aquarius/saturn",
-        "natural_significator": "jupiter", "body_parts": ["ankles", "calves"],
-        "vedic_significations": ["gains", "friends", "elder siblings", "income", "fulfillment of desires"]
-    },
-    12: {
-        "name": "Twelfth House", "title": "Hidden / Subconscious", "alias": None,
-        "cusp": {"angle": None, "is_major": False}, "quadrant": 4, "house_type": "cadent",
-        "themes": ["subconscious", "hidden enemies", "institutions", "spirituality", "loss", "moksha"],
-        "life_areas": {"spiritual": 1.0, "health": 0.6, "self": 0.4, "relationships": 0.3, "career": 0.2},
-        "planetary_joy": None, "traditional_ruler": "pisces/jupiter",
-        "natural_significator": "saturn", "body_parts": ["feet", "left eye"],
-        "vedic_significations": ["losses", "expenses", "foreign lands", "spirituality", "liberation", "bed pleasures"]
-    }
-}
-
-# Vedic House Classifications
-VEDIC_HOUSE_TYPES: Dict[str, List[int]] = {
-    "kendra": [1, 4, 7, 10],    # Angular houses (most powerful)
-    "trikona": [1, 5, 9],       # Trinal houses (most auspicious)
-    "upachaya": [3, 6, 10, 11], # Growing houses (improve with time)
-    "dusthana": [6, 8, 12],     # Difficult houses (6=disease, 8=death, 12=loss)
-    "kama": [3, 7, 11],         # Desire houses
-    "artha": [2, 6, 10],        # Material/career houses
-    "dharma": [1, 5, 9],        # Spiritual/purpose houses  
-    "moksha": [4, 8, 12]        # Liberation houses
+SIGN_DATABASE: Dict[str, SignData] = {
+    "aries": SignData(
+        name="Aries", vedic_name="Mesha", element="fire", 
+        modality="cardinal", vedic_nature="movable", polarity="positive", season="spring",
+        body_parts=["head", "brain", "face", "eyes"],
+        western_ruler="mars", western_exaltation="sun", western_exaltation_degree=19,
+        western_detriment=["venus"], western_fall="saturn", western_fall_degree=21,
+        vedic_ruler="mars", vedic_exaltation="sun", vedic_exaltation_degree=10,
+        vedic_debilitation="saturn", vedic_debilitation_degree=20,
+        temperament="hot_dry", 
+        keywords=["initiative", "leadership", "courage", "impulsiveness", "pioneering"]
+    ),
+    
+    "taurus": SignData(
+        name="Taurus", vedic_name="Vrishabha", element="earth",
+        modality="fixed", vedic_nature="fixed", polarity="negative", season="spring", 
+        body_parts=["neck", "throat", "thyroid", "voice"],
+        western_ruler="venus", western_exaltation="moon", western_exaltation_degree=3,
+        western_detriment=["mars"], western_fall=None, western_fall_degree=None,
+        vedic_ruler="venus", vedic_exaltation="moon", vedic_exaltation_degree=3,
+        vedic_debilitation=None, vedic_debilitation_degree=None,
+        temperament="cold_dry",
+        keywords=["stability", "material", "sensuality", "persistence", "values"]
+    ),
+    
+    "gemini": SignData(
+        name="Gemini", vedic_name="Mithuna", element="air",
+        modality="mutable", vedic_nature="dual", polarity="positive", season="spring",
+        body_parts=["arms", "hands", "shoulders", "lungs"],
+        western_ruler="mercury", western_exaltation=None, western_exaltation_degree=None,
+        western_detriment=["jupiter"], western_fall=None, western_fall_degree=None,
+        vedic_ruler="mercury", vedic_exaltation=None, vedic_exaltation_degree=None,
+        vedic_debilitation=None, vedic_debilitation_degree=None,
+        temperament="hot_moist",
+        keywords=["communication", "versatility", "learning", "curiosity", "duality"]
+    ),
+    
+    "cancer": SignData(
+        name="Cancer", vedic_name="Karka", element="water",
+        modality="cardinal", vedic_nature="movable", polarity="negative", season="summer",
+        body_parts=["chest", "stomach", "breasts", "ribcage"],
+        western_ruler="moon", western_exaltation="jupiter", western_exaltation_degree=15,
+        western_detriment=["saturn"], western_fall="mars", western_fall_degree=28,
+        vedic_ruler="moon", vedic_exaltation="jupiter", vedic_exaltation_degree=5,
+        vedic_debilitation="mars", vedic_debilitation_degree=28,
+        temperament="cold_moist",
+        keywords=["nurturing", "emotional", "protective", "intuitive", "home"]
+    ),
+    
+    "leo": SignData(
+        name="Leo", vedic_name="Simha", element="fire",
+        modality="fixed", vedic_nature="fixed", polarity="positive", season="summer",
+        body_parts=["heart", "spine", "back", "upper back"],
+        western_ruler="sun", western_exaltation=None, western_exaltation_degree=None,
+        western_detriment=["saturn"], western_fall=None, western_fall_degree=None,
+        vedic_ruler="sun", vedic_exaltation=None, vedic_exaltation_degree=None,
+        vedic_debilitation=None, vedic_debilitation_degree=None,
+        temperament="hot_dry",
+        keywords=["creativity", "leadership", "drama", "confidence", "authority"]
+    ),
+    
+    "virgo": SignData(
+        name="Virgo", vedic_name="Kanya", element="earth", 
+        modality="mutable", vedic_nature="dual", polarity="negative", season="late_summer",
+        body_parts=["digestive_system", "intestines", "abdomen"],
+        western_ruler="mercury", western_exaltation="mercury", western_exaltation_degree=15,
+        western_detriment=["jupiter"], western_fall="venus", western_fall_degree=27,
+        vedic_ruler="mercury", vedic_exaltation="mercury", vedic_exaltation_degree=15,
+        vedic_debilitation="venus", vedic_debilitation_degree=27,
+        temperament="cold_dry",
+        keywords=["analysis", "service", "perfection", "health", "discrimination"]
+    ),
+    
+    "libra": SignData(
+        name="Libra", vedic_name="Tula", element="air",
+        modality="cardinal", vedic_nature="movable", polarity="positive", season="autumn",
+        body_parts=["kidneys", "lower_back", "adrenals"],
+        western_ruler="venus", western_exaltation="saturn", western_exaltation_degree=21,
+        western_detriment=["mars"], western_fall="sun", western_fall_degree=19,
+        vedic_ruler="venus", vedic_exaltation="saturn", vedic_exaltation_degree=20,
+        vedic_debilitation="sun", vedic_debilitation_degree=10,
+        temperament="hot_moist",
+        keywords=["balance", "harmony", "relationships", "justice", "diplomacy"]
+    ),
+    
+    "scorpio": SignData(
+        name="Scorpio", vedic_name="Vrischika", element="water",
+        modality="fixed", vedic_nature="fixed", polarity="negative", season="autumn", 
+        body_parts=["reproductive_organs", "bladder", "rectum"],
+        western_ruler="mars", western_exaltation=None, western_exaltation_degree=None,
+        western_detriment=["venus"], western_fall="moon", western_fall_degree=3,
+        vedic_ruler="mars", vedic_exaltation=None, vedic_exaltation_degree=None,
+        vedic_debilitation="moon", vedic_debilitation_degree=3,
+        temperament="cold_moist",
+        keywords=["transformation", "intensity", "secrets", "power", "depth"]
+    ),
+    
+    "sagittarius": SignData(
+        name="Sagittarius", vedic_name="Dhanus", element="fire",
+        modality="mutable", vedic_nature="dual", polarity="positive", season="autumn",
+        body_parts=["hips", "thighs", "liver", "sciatic_nerve"],
+        western_ruler="jupiter", western_exaltation=None, western_exaltation_degree=None,
+        western_detriment=["mercury"], western_fall=None, western_fall_degree=None,
+        vedic_ruler="jupiter", vedic_exaltation=None, vedic_exaltation_degree=None,
+        vedic_debilitation=None, vedic_debilitation_degree=None,
+        temperament="hot_dry",
+        keywords=["philosophy", "expansion", "teaching", "truth", "adventure"]
+    ),
+    
+    "capricorn": SignData(
+        name="Capricorn", vedic_name="Makara", element="earth",
+        modality="cardinal", vedic_nature="movable", polarity="negative", season="winter",
+        body_parts=["bones", "knees", "skin", "teeth"],
+        western_ruler="saturn", western_exaltation="mars", western_exaltation_degree=28,
+        western_detriment=["moon"], western_fall="jupiter", western_fall_degree=15,
+        vedic_ruler="saturn", vedic_exaltation="mars", vedic_exaltation_degree=28,
+        vedic_debilitation="jupiter", vedic_debilitation_degree=5,
+        temperament="cold_dry",
+        keywords=["structure", "ambition", "discipline", "authority", "achievement"]
+    ),
+    
+    "aquarius": SignData(
+        name="Aquarius", vedic_name="Kumbha", element="air",
+        modality="fixed", vedic_nature="fixed", polarity="positive", season="winter",
+        body_parts=["ankles", "calves", "circulatory_system"],
+        western_ruler="saturn", western_exaltation=None, western_exaltation_degree=None,
+        western_detriment=["sun"], western_fall=None, western_fall_degree=None,
+        vedic_ruler="saturn", vedic_exaltation=None, vedic_exaltation_degree=None,
+        vedic_debilitation=None, vedic_debilitation_degree=None,
+        temperament="hot_moist",
+        keywords=["innovation", "freedom", "groups", "idealism", "humanitarian"]
+    ),
+    
+    "pisces": SignData(
+        name="Pisces", vedic_name="Meena", element="water",
+        modality="mutable", vedic_nature="dual", polarity="negative", season="winter",
+        body_parts=["feet", "lymphatic_system", "immune_system"],
+        western_ruler="jupiter", western_exaltation="venus", western_exaltation_degree=27,
+        western_detriment=["mercury"], western_fall="mercury", western_fall_degree=15,
+        vedic_ruler="jupiter", vedic_exaltation="venus", vedic_exaltation_degree=27,
+        vedic_debilitation="mercury", vedic_debilitation_degree=15,
+        temperament="cold_moist",
+        keywords=["spirituality", "compassion", "dreams", "intuition", "dissolution"]
+    )
 }
 
 # -----------------------------------------------------------------------------
-# Enhanced Planets with Complete Traditional Data
+# Comprehensive House Systems (Western + Vedic)
 # -----------------------------------------------------------------------------
 
 @dataclass
-class PlanetaryData:
-    """Complete planetary data structure."""
+class HouseData:
+    """House data supporting both Western and Vedic interpretations."""
+    number: int
     name: str
     vedic_name: str
-    class_type: str  # luminary, personal, social, outer, node, angle
-    gender: str      # masculine, feminine, neutral
-    sect: str        # diurnal, nocturnal, neutral
-    element: str     # hot, cold, moist, dry combinations
-    nature: str      # benefic, malefic, neutral, mixed
+    western_title: str
+    vedic_title: str
     
-    # Physical & psychological domains
-    domains: List[str]
-    keywords: List[str]
+    # House classifications
+    western_type: str        # angular, succedent, cadent
+    vedic_type: List[str]    # kendra, trikona, upachaya, dusthana, etc.
+    
+    # Traditional associations
+    natural_sign: str        # Traditional sign association
+    natural_ruler: str       # Traditional planetary ruler
+    planetary_joy: Optional[str]  # Planet that has joy in this house
+    
+    # Life themes
+    western_themes: List[str]
+    vedic_themes: List[str]
+    shared_themes: List[str]
+    
+    # Significators
+    natural_karaka: str      # Vedic natural significator
     body_parts: List[str]
     
-    # Dignities & debilities
-    domicile: List[str]        # Own signs
-    exaltation: Optional[str]  # Exaltation sign
-    exaltation_degree: Optional[int]  # Exact degree of exaltation
-    detriment: List[str]       # Signs of exile
-    fall: Optional[str]        # Fall sign
-    fall_degree: Optional[int] # Exact degree of fall
+    # Strength factors
+    life_areas: Dict[str, float]
+
+HOUSE_DATABASE: Dict[int, HouseData] = {
+    1: HouseData(
+        number=1, name="First House", vedic_name="Tanu Bhava",
+        western_title="Self/Personality", vedic_title="Self/Body/Appearance",
+        western_type="angular", vedic_type=["kendra", "trikona", "dharma"],
+        natural_sign="aries", natural_ruler="mars", planetary_joy="mercury",
+        western_themes=["identity", "appearance", "first impressions", "vitality"],
+        vedic_themes=["self", "body", "health", "personality", "general_life_force"],
+        shared_themes=["self", "vitality", "appearance", "life_approach"],
+        natural_karaka="sun", body_parts=["head", "brain", "face"],
+        life_areas={"self": 1.0, "health": 0.8, "career": 0.3, "relationships": 0.2, "spiritual": 0.3}
+    ),
     
-    # Vedic specific
+    2: HouseData(
+        number=2, name="Second House", vedic_name="Dhana Bhava", 
+        western_title="Money/Values", vedic_title="Wealth/Family/Speech",
+        western_type="succedent", vedic_type=["artha"],
+        natural_sign="taurus", natural_ruler="venus", planetary_joy=None,
+        western_themes=["possessions", "values", "self_worth", "resources"],
+        vedic_themes=["wealth", "family", "speech", "food", "early_education"],
+        shared_themes=["resources", "values", "material_security"],
+        natural_karaka="jupiter", body_parts=["face", "neck", "throat"],
+        life_areas={"career": 0.8, "self": 0.5, "relationships": 0.4, "health": 0.3, "spiritual": 0.2}
+    ),
+    
+    3: HouseData(
+        number=3, name="Third House", vedic_name="Sahaja Bhava",
+        western_title="Communication/Siblings", vedic_title="Courage/Siblings/Arts",
+        western_type="cadent", vedic_type=["upachaya", "kama"],
+        natural_sign="gemini", natural_ruler="mercury", planetary_joy="moon",
+        western_themes=["communication", "learning", "short_trips", "neighbors"],
+        vedic_themes=["courage", "siblings", "arts", "skills", "short_journeys"],
+        shared_themes=["communication", "siblings", "skills", "short_travel"],
+        natural_karaka="mars", body_parts=["shoulders", "arms", "hands"],
+        life_areas={"self": 0.6, "career": 0.6, "relationships": 0.6, "health": 0.3, "spiritual": 0.2}
+    ),
+    
+    4: HouseData(
+        number=4, name="Fourth House", vedic_name="Sukha Bhava",
+        western_title="Home/Family", vedic_title="Home/Mother/Happiness",
+        western_type="angular", vedic_type=["kendra", "moksha"],
+        natural_sign="cancer", natural_ruler="moon", planetary_joy=None,
+        western_themes=["home", "family", "roots", "real_estate", "endings"],
+        vedic_themes=["mother", "home", "property", "vehicles", "happiness", "education"],
+        shared_themes=["home", "family", "emotional_security", "property"],
+        natural_karaka="moon", body_parts=["chest", "heart", "lungs"],
+        life_areas={"self": 0.6, "relationships": 0.7, "career": 0.4, "health": 0.4, "spiritual": 0.4}
+    ),
+    
+    5: HouseData(
+        number=5, name="Fifth House", vedic_name="Putra Bhava",
+        western_title="Creativity/Children", vedic_title="Children/Intelligence/Dharma",
+        western_type="succedent", vedic_type=["trikona", "dharma"], 
+        natural_sign="leo", natural_ruler="sun", planetary_joy="venus",
+        western_themes=["children", "creativity", "romance", "speculation", "fun"],
+        vedic_themes=["children", "intelligence", "creativity", "dharma", "mantra", "speculation"],
+        shared_themes=["children", "creativity", "intelligence", "romance"],
+        natural_karaka="jupiter", body_parts=["stomach", "upper_abdomen"],
+        life_areas={"relationships": 0.8, "self": 0.6, "spiritual": 0.7, "career": 0.4, "health": 0.3}
+    ),
+    
+    6: HouseData(
+        number=6, name="Sixth House", vedic_name="Ripu Bhava",
+        western_title="Health/Service", vedic_title="Enemies/Disease/Service", 
+        western_type="cadent", vedic_type=["dusthana", "upachaya", "artha"],
+        natural_sign="virgo", natural_ruler="mercury", planetary_joy="mars",
+        western_themes=["health", "daily_work", "service", "habits", "pets"],
+        vedic_themes=["enemies", "disease", "debts", "service", "daily_work", "obstacles"],
+        shared_themes=["health", "service", "daily_routine", "obstacles"],
+        natural_karaka="mars", body_parts=["intestines", "lower_abdomen"],
+        life_areas={"health": 1.0, "career": 0.7, "self": 0.4, "relationships": 0.3, "spiritual": 0.2}
+    ),
+    
+    7: HouseData(
+        number=7, name="Seventh House", vedic_name="Kalatra Bhava",
+        western_title="Partnerships/Marriage", vedic_title="Marriage/Business/Travel",
+        western_type="angular", vedic_type=["kendra", "kama"],
+        natural_sign="libra", natural_ruler="venus", planetary_joy=None,
+        western_themes=["marriage", "partnerships", "open_enemies", "contracts"],
+        vedic_themes=["spouse", "marriage", "business_partners", "travel", "death"],
+        shared_themes=["marriage", "partnerships", "contracts", "others"],
+        natural_karaka="venus", body_parts=["kidneys", "lower_back"],
+        life_areas={"relationships": 1.0, "self": 0.4, "career": 0.5, "health": 0.3, "spiritual": 0.2}
+    ),
+    
+    8: HouseData(
+        number=8, name="Eighth House", vedic_name="Ayu Bhava",
+        western_title="Transformation/Death", vedic_title="Longevity/Transformation/Occult",
+        western_type="succedent", vedic_type=["dusthana", "moksha"],
+        natural_sign="scorpio", natural_ruler="mars", planetary_joy="saturn",
+        western_themes=["death", "transformation", "others_money", "occult", "crisis"],
+        vedic_themes=["longevity", "transformation", "occult", "inheritance", "research", "secrets"],
+        shared_themes=["transformation", "occult", "inheritance", "crisis"],
+        natural_karaka="saturn", body_parts=["reproductive_organs", "rectum"],
+        life_areas={"spiritual": 0.8, "self": 0.7, "relationships": 0.6, "health": 0.5, "career": 0.3}
+    ),
+    
+    9: HouseData(
+        number=9, name="Ninth House", vedic_name="Dharma Bhava",
+        western_title="Philosophy/Higher Learning", vedic_title="Father/Dharma/Fortune",
+        western_type="cadent", vedic_type=["trikona", "dharma"],
+        natural_sign="sagittarius", natural_ruler="jupiter", planetary_joy="sun",
+        western_themes=["philosophy", "higher_education", "long_travel", "publishing"],
+        vedic_themes=["father", "dharma", "guru", "fortune", "higher_learning", "pilgrimage"],
+        shared_themes=["philosophy", "higher_learning", "spirituality", "long_travel"],
+        natural_karaka="jupiter", body_parts=["hips", "thighs"],
+        life_areas={"spiritual": 0.9, "career": 0.6, "self": 0.5, "relationships": 0.3, "health": 0.2}
+    ),
+    
+    10: HouseData(
+        number=10, name="Tenth House", vedic_name="Karma Bhava",
+        western_title="Career/Reputation", vedic_title="Career/Status/Father",
+        western_type="angular", vedic_type=["kendra", "upachaya", "artha"],
+        natural_sign="capricorn", natural_ruler="saturn", planetary_joy="jupiter",
+        western_themes=["career", "reputation", "status", "authority", "public_image"],
+        vedic_themes=["career", "status", "government", "authority", "fame", "father"],
+        shared_themes=["career", "status", "authority", "reputation"],
+        natural_karaka="sun", body_parts=["knees", "bones"],
+        life_areas={"career": 1.0, "self": 0.6, "relationships": 0.3, "health": 0.2, "spiritual": 0.3}
+    ),
+    
+    11: HouseData(
+        number=11, name="Eleventh House", vedic_name="Labha Bhava",
+        western_title="Friends/Hopes", vedic_title="Gains/Friends/Elder Siblings",
+        western_type="succedent", vedic_type=["upachaya", "kama"],
+        natural_sign="aquarius", natural_ruler="saturn", planetary_joy=None,
+        western_themes=["friends", "groups", "hopes", "social_causes", "income"],
+        vedic_themes=["gains", "friends", "elder_siblings", "income", "desires", "networks"],
+        shared_themes=["friends", "gains", "income", "social_networks"],
+        natural_karaka="jupiter", body_parts=["ankles", "calves"],
+        life_areas={"relationships": 0.8, "career": 0.7, "self": 0.4, "health": 0.2, "spiritual": 0.3}
+    ),
+    
+    12: HouseData(
+        number=12, name="Twelfth House", vedic_name="Vyaya Bhava",
+        western_title="Subconscious/Hidden", vedic_title="Losses/Liberation/Foreign",
+        western_type="cadent", vedic_type=["dusthana", "moksha"],
+        natural_sign="pisces", natural_ruler="jupiter", planetary_joy=None,
+        western_themes=["subconscious", "hidden_enemies", "institutions", "sacrifice"],
+        vedic_themes=["losses", "expenses", "liberation", "foreign_lands", "bed_pleasures", "moksha"],
+        shared_themes=["spirituality", "hidden", "sacrifice", "liberation"],
+        natural_karaka="saturn", body_parts=["feet", "left_eye"],
+        life_areas={"spiritual": 1.0, "health": 0.6, "self": 0.4, "relationships": 0.3, "career": 0.2}
+    )
+}
+
+# Vedic House Classifications
+VEDIC_HOUSE_GROUPS: Dict[str, List[int]] = {
+    "kendra": [1, 4, 7, 10],        # Angular - Most powerful
+    "trikona": [1, 5, 9],           # Trinal - Most auspicious
+    "upachaya": [3, 6, 10, 11],     # Growing - Improve with time
+    "dusthana": [6, 8, 12],         # Difficult - 6=enemies, 8=death, 12=loss
+    "dharma": [1, 5, 9],            # Life purpose/righteousness
+    "artha": [2, 6, 10],            # Material/wealth
+    "kama": [3, 7, 11],             # Desires/relationships
+    "moksha": [4, 8, 12]            # Liberation/spirituality
+}
+
+# -----------------------------------------------------------------------------
+# Enhanced Planetary System (Western + Vedic Integration)
+# -----------------------------------------------------------------------------
+
+@dataclass
+class PlanetData:
+    """Complete planetary data for both Western and Vedic systems."""
+    name: str
+    vedic_name: str
+    symbol: str
+    
+    # Classification
+    class_type: str          # luminary, personal, social, outer, node
+    vedic_class: str         # graha, chaya_graha (shadow planet)
+    gender: str              # masculine, feminine, neuter
+    nature: str              # benefic, malefic, neutral
+    vedic_nature: str        # saumya (benefic), krura (malefic)
+    
+    # Physical properties
+    element: str             # hot, cold, dry, moist combinations
+    body_parts: List[str]
+    
+    # Domains & keywords
+    western_domains: List[str]
+    vedic_domains: List[str]
+    shared_keywords: List[str]
+    
+    # Dignities - Western
+    western_domicile: List[str]
+    western_exaltation: Optional[str]
+    western_exaltation_degree: Optional[int]
+    western_detriment: List[str] 
+    western_fall: Optional[str]
+    western_fall_degree: Optional[int]
+    
+    # Dignities - Vedic
+    vedic_own_signs: List[str]
+    vedic_exaltation: Optional[str]
+    vedic_exaltation_degree: Optional[int]
+    vedic_debilitation: Optional[str]
+    vedic_debilitation_degree: Optional[int]
+    vedic_moolatrikona: Optional[str]  # Special dignity in Vedic
+    
+    # Vedic relationships
     vedic_friends: List[str]
     vedic_enemies: List[str]
     vedic_neutrals: List[str]
     
-    # Life area influences
-    life_areas: Dict[str, float]
-    
     # Motion & behavior
-    average_daily_motion: float  # degrees per day
-    retrograde_frequency: str    # never, rare, periodic, frequent
-    combustion_distance: float   # degrees from Sun for combustion
+    average_daily_motion: float
+    retrograde_frequency: str
+    combustion_distance: float
+    
+    # Aspects - Vedic special aspects (beyond standard 7th house)
+    vedic_special_aspects: List[int]
+    
+    # Maturation age in Vedic astrology
+    vedic_maturation_age: int
+    
+    # Life areas influence
+    life_areas: Dict[str, float]
 
-ENHANCED_PLANETS: Dict[str, PlanetaryData] = {
-    "sun": PlanetaryData(
-        name="Sun", vedic_name="Surya", class_type="luminary", 
-        gender="masculine", sect="diurnal", element="hot_dry", nature="benefic",
-        domains=["identity", "vitality", "authority", "father", "government", "leadership"],
-        keywords=["ego", "will", "creative force", "nobility", "consciousness"],
-        body_parts=["heart", "spine", "right eye (male)", "circulation"],
-        domicile=["leo"], exaltation="aries", exaltation_degree=19,
-        detriment=["aquarius"], fall="libra", fall_degree=19,
-        vedic_friends=["moon", "mars", "jupiter"],
-        vedic_enemies=["venus", "saturn"], vedic_neutrals=["mercury"],
-        life_areas={"self": 0.9, "career": 0.8, "relationships": 0.3, "health": 0.6, "spiritual": 0.5},
-        average_daily_motion=1.0, retrograde_frequency="never", combustion_distance=0.0
+PLANET_DATABASE: Dict[str, PlanetData] = {
+    "sun": PlanetData(
+        name="Sun", vedic_name="Surya", symbol="☉",
+        class_type="luminary", vedic_class="graha", gender="masculine", 
+        nature="benefic", vedic_nature="krura_but_gentle",
+        element="hot_dry",
+        body_parts=["heart", "spine", "right_eye_male", "circulation"],
+        western_domains=["identity", "ego", "vitality", "authority", "creativity"],
+        vedic_domains=["soul", "father", "government", "authority", "health", "fame"],
+        shared_keywords=["self", "leadership", "vitality", "authority", "consciousness"],
+        western_domicile=["leo"], western_exaltation="aries", western_exaltation_degree=19,
+        western_detriment=["aquarius"], western_fall="libra", western_fall_degree=19,
+        vedic_own_signs=["leo"], vedic_exaltation="aries", vedic_exaltation_degree=10,
+        vedic_debilitation="libra", vedic_debilitation_degree=10, vedic_moolatrikona="leo",
+        vedic_friends=["moon", "mars", "jupiter"], vedic_enemies=["venus", "saturn"],
+        vedic_neutrals=["mercury"],
+        average_daily_motion=1.0, retrograde_frequency="never", combustion_distance=0.0,
+        vedic_special_aspects=[], vedic_maturation_age=22,
+        life_areas={"self": 0.9, "career": 0.8, "relationships": 0.3, "health": 0.6, "spiritual": 0.5}
     ),
     
-    "moon": PlanetaryData(
-        name="Moon", vedic_name="Chandra", class_type="luminary",
-        gender="feminine", sect="nocturnal", element="cold_moist", nature="benefic",
-        domains=["emotions", "mind", "mother", "public", "home", "nurturing", "memory"],
-        keywords=["feelings", "instinct", "receptivity", "fluctuation", "care"],
-        body_parts=["stomach", "breasts", "left eye (male)", "lymphatic system"],
-        domicile=["cancer"], exaltation="taurus", exaltation_degree=3,
-        detriment=["capricorn"], fall="scorpio", fall_degree=3,
+    "moon": PlanetData(
+        name="Moon", vedic_name="Chandra", symbol="☽",
+        class_type="luminary", vedic_class="graha", gender="feminine",
+        nature="benefic", vedic_nature="saumya", 
+        element="cold_moist",
+        body_parts=["mind", "breasts", "stomach", "left_eye_male", "blood"],
+        western_domains=["emotions", "subconscious", "habits", "mother", "public"],
+        vedic_domains=["mind", "mother", "emotions", "travel", "water", "popularity"],
+        shared_keywords=["emotions", "mind", "mother", "nurturing", "change"],
+        western_domicile=["cancer"], western_exaltation="taurus", western_exaltation_degree=3,
+        western_detriment=["capricorn"], western_fall="scorpio", western_fall_degree=3,
+        vedic_own_signs=["cancer"], vedic_exaltation="taurus", vedic_exaltation_degree=3,
+        vedic_debilitation="scorpio", vedic_debilitation_degree=3, vedic_moolatrikona="taurus",
         vedic_friends=["sun", "mercury"], vedic_enemies=[], vedic_neutrals=["mars", "jupiter", "venus", "saturn"],
-        life_areas={"self": 0.6, "health": 0.7, "relationships": 0.7, "spiritual": 0.4, "career": 0.3},
-        average_daily_motion=13.2, retrograde_frequency="never", combustion_distance=12.0
+        average_daily_motion=13.2, retrograde_frequency="never", combustion_distance=12.0,
+        vedic_special_aspects=[], vedic_maturation_age=24,
+        life_areas={"self": 0.6, "health": 0.7, "relationships": 0.7, "spiritual": 0.4, "career": 0.4}
     ),
-
-    "mercury": PlanetaryData(
-        name="Mercury", vedic_name="Budha", class_type="personal",
-        gender="neutral", sect="neutral", element="cold_dry", nature="neutral",
-        domains=["communication", "intellect", "commerce", "learning", "travel", "adaptability"],
-        keywords=["mind", "speech", "cleverness", "versatility", "connection"],
-        body_parts=["nervous system", "hands", "lungs", "tongue"],
-        domicile=["gemini", "virgo"], exaltation="virgo", exaltation_degree=15,
-        detriment=["sagittarius", "pisces"], fall="pisces", fall_degree=15,
+    
+    "mercury": PlanetData(
+        name="Mercury", vedic_name="Budha", symbol="☿",
+        class_type="personal", vedic_class="graha", gender="neuter",
+        nature="neutral", vedic_nature="saumya",
+        element="variable",
+        body_parts=["nervous_system", "skin", "hands", "speech"],
+        western_domains=["communication", "intellect", "travel", "commerce", "adaptability"],
+        vedic_domains=["intelligence", "speech", "learning", "business", "mathematics"],
+        shared_keywords=["communication", "intelligence", "learning", "adaptability"],
+        western_domicile=["gemini", "virgo"], western_exaltation="virgo", western_exaltation_degree=15,
+        western_detriment=["sagittarius", "pisces"], western_fall="pisces", western_fall_degree=15,
+        vedic_own_signs=["gemini", "virgo"], vedic_exaltation="virgo", vedic_exaltation_degree=15,
+        vedic_debilitation="pisces", vedic_debilitation_degree=15, vedic_moolatrikona="virgo",
         vedic_friends=["sun", "venus"], vedic_enemies=["moon"], vedic_neutrals=["mars", "jupiter", "saturn"],
-        life_areas={"self": 0.5, "career": 0.7, "relationships": 0.5, "health": 0.3, "spiritual": 0.2},
-        average_daily_motion=1.4, retrograde_frequency="periodic", combustion_distance=14.0
+        average_daily_motion=1.4, retrograde_frequency="periodic", combustion_distance=14.0,
+        vedic_special_aspects=[], vedic_maturation_age=32,
+        life_areas={"self": 0.5, "career": 0.7, "relationships": 0.5, "health": 0.3, "spiritual": 0.3}
     ),
-
-    "venus": PlanetaryData(
-        name="Venus", vedic_name="Shukra", class_type="personal", 
-        gender="feminine", sect="nocturnal", element="cold_moist", nature="benefic",
-        domains=["love", "beauty", "relationships", "arts", "pleasure", "values", "harmony"],
-        keywords=["attraction", "enjoyment", "refinement", "diplomacy", "affection"],
-        body_parts=["kidneys", "throat", "reproductive system", "skin"],
-        domicile=["taurus", "libra"], exaltation="pisces", exaltation_degree=27,
-        detriment=["scorpio", "aries"], fall="virgo", fall_degree=27,
+    
+    "venus": PlanetData(
+        name="Venus", vedic_name="Shukra", symbol="♀",
+        class_type="personal", vedic_class="graha", gender="feminine",
+        nature="benefic", vedic_nature="saumya",
+        element="cold_moist",
+        body_parts=["reproductive_system", "kidneys", "throat", "face"],
+        western_domains=["love", "beauty", "values", "relationships", "arts", "pleasure"],
+        vedic_domains=["spouse", "luxury", "vehicles", "arts", "beauty", "wealth"],
+        shared_keywords=["love", "beauty", "relationships", "harmony", "values"],
+        western_domicile=["taurus", "libra"], western_exaltation="pisces", western_exaltation_degree=27,
+        western_detriment=["scorpio", "aries"], western_fall="virgo", western_fall_degree=27,
+        vedic_own_signs=["taurus", "libra"], vedic_exaltation="pisces", vedic_exaltation_degree=27,
+        vedic_debilitation="virgo", vedic_debilitation_degree=27, vedic_moolatrikona="libra",
         vedic_friends=["mercury", "saturn"], vedic_enemies=["sun", "moon"], vedic_neutrals=["mars", "jupiter"],
-        life_areas={"relationships": 0.9, "self": 0.5, "career": 0.5, "health": 0.3, "spiritual": 0.2},
-        average_daily_motion=1.2, retrograde_frequency="periodic", combustion_distance=10.0
+        average_daily_motion=1.2, retrograde_frequency="periodic", combustion_distance=10.0,
+        vedic_special_aspects=[], vedic_maturation_age=25,
+        life_areas={"relationships": 0.9, "self": 0.5, "career": 0.5, "health": 0.3, "spiritual": 0.2}
     ),
-
-    "mars": PlanetaryData(
-        name="Mars", vedic_name="Mangala", class_type="personal",
-        gender="masculine", sect="nocturnal", element="hot_dry", nature="malefic",
-        domains=["action", "energy", "conflict", "surgery", "sports", "courage", "anger"],
-        keywords=["drive", "assertion", "cutting", "passion", "war"],
-        body_parts=["muscles", "blood", "head", "reproductive organs"],
-        domicile=["aries", "scorpio"], exaltation="capricorn", exaltation_degree=28,
-        detriment=["libra", "taurus"], fall="cancer", fall_degree=28,
+    
+    "mars": PlanetData(
+        name="Mars", vedic_name="Mangala", symbol="♂",
+        class_type="personal", vedic_class="graha", gender="masculine",
+        nature="malefic", vedic_nature="krura",
+        element="hot_dry",
+        body_parts=["muscles", "blood", "bone_marrow", "genitals"],
+        western_domains=["energy", "action", "desire", "conflict", "courage", "sexuality"],
+        vedic_domains=["strength", "courage", "siblings", "property", "accidents", "surgery"],
+        shared_keywords=["energy", "courage", "action", "conflict", "strength"],
+        western_domicile=["aries", "scorpio"], western_exaltation="capricorn", western_exaltation_degree=28,
+        western_detriment=["libra", "taurus"], western_fall="cancer", western_fall_degree=28,
+        vedic_own_signs=["aries", "scorpio"], vedic_exaltation="capricorn", vedic_exaltation_degree=28,
+        vedic_debilitation="cancer", vedic_debilitation_degree=28, vedic_moolatrikona="aries",
         vedic_friends=["sun", "moon", "jupiter"], vedic_enemies=["mercury"], vedic_neutrals=["venus", "saturn"],
-        life_areas={"self": 0.7, "relationships": 0.5, "career": 0.7, "health": 0.6, "spiritual": 0.2},
-        average_daily_motion=0.7, retrograde_frequency="periodic", combustion_distance=17.0
+        average_daily_motion=0.7, retrograde_frequency="periodic", combustion_distance=17.0,
+        vedic_special_aspects=[4, 8], vedic_maturation_age=28,  # Aspects 4th and 8th from itself
+        life_areas={"self": 0.7, "relationships": 0.5, "career": 0.7, "health": 0.6, "spiritual": 0.2}
     ),
-
-    "jupiter": PlanetaryData(
-        name="Jupiter", vedic_name="Guru", class_type="social",
-        gender="masculine", sect="diurnal", element="hot_moist", nature="benefic",
-        domains=["wisdom", "expansion", "teaching", "law", "philosophy", "spirituality", "growth"],
-        keywords=["abundance", "knowledge", "optimism", "justice", "higher mind"],
-        body_parts=["liver", "hips", "thighs", "adipose tissue"],
-        domicile=["sagittarius", "pisces"], exaltation="cancer", exaltation_degree=5,
-        detriment=["gemini", "virgo"], fall="capricorn", fall_degree=5,
+    
+    "jupiter": PlanetData(
+        name="Jupiter", vedic_name="Guru", symbol="♃",
+        class_type="social", vedic_class="graha", gender="masculine",
+        nature="benefic", vedic_nature="saumya",
+        element="hot_moist",
+        body_parts=["liver", "fat", "hips", "thighs", "pancreas"],
+        western_domains=["expansion", "wisdom", "teaching", "philosophy", "growth", "optimism"],
+        vedic_domains=["wisdom", "guru", "children", "wealth", "dharma", "husband"],
+        shared_keywords=["wisdom", "expansion", "teaching", "growth", "spirituality"],
+        western_domicile=["sagittarius", "pisces"], western_exaltation="cancer", western_exaltation_degree=5,
+        western_detriment=["gemini", "virgo"], western_fall="capricorn", western_fall_degree=5,
+        vedic_own_signs=["sagittarius", "pisces"], vedic_exaltation="cancer", vedic_exaltation_degree=5,
+        vedic_debilitation="capricorn", vedic_debilitation_degree=5, vedic_moolatrikona="sagittarius",
         vedic_friends=["sun", "moon", "mars"], vedic_enemies=["mercury", "venus"], vedic_neutrals=["saturn"],
-        life_areas={"spiritual": 0.9, "career": 0.7, "self": 0.6, "relationships": 0.5, "health": 0.4},
-        average_daily_motion=0.08, retrograde_frequency="periodic", combustion_distance=11.0
+        average_daily_motion=0.08, retrograde_frequency="periodic", combustion_distance=11.0,
+        vedic_special_aspects=[5, 9], vedic_maturation_age=16,  # Aspects 5th and 9th from itself
+        life_areas={"spiritual": 0.9, "career": 0.7, "self": 0.6, "relationships": 0.5, "health": 0.4}
     ),
-
-    "saturn": PlanetaryData(
-        name="Saturn", vedic_name="Shani", class_type="social",
-        gender="masculine", sect="diurnal", element="cold_dry", nature="malefic",
-        domains=["limitation", "discipline", "time", "karma", "structure", "authority", "delay"],
-        keywords=["restriction", "responsibility", "perseverance", "maturity", "tradition"],
-        body_parts=["bones", "skin", "knees", "teeth"],
-        domicile=["capricorn", "aquarius"], exaltation="libra", exaltation_degree=20,
-        detriment=["cancer", "leo"], fall="aries", fall_degree=20,
+    
+    "saturn": PlanetData(
+        name="Saturn", vedic_name="Shani", symbol="♄",
+        class_type="social", vedic_class="graha", gender="neuter",
+        nature="malefic", vedic_nature="krura",
+        element="cold_dry",
+        body_parts=["bones", "teeth", "hair", "nails", "joints"],
+        western_domains=["limitation", "discipline", "time", "karma", "responsibility", "structure"],
+        vedic_domains=["longevity", "obstacles", "delays", "discipline", "servants", "old_age"],
+        shared_keywords=["discipline", "limitation", "time", "karma", "responsibility"],
+        western_domicile=["capricorn", "aquarius"], western_exaltation="libra", western_exaltation_degree=20,
+        western_detriment=["cancer", "leo"], western_fall="aries", western_fall_degree=20,
+        vedic_own_signs=["capricorn", "aquarius"], vedic_exaltation="libra", vedic_exaltation_degree=20,
+        vedic_debilitation="aries", vedic_debilitation_degree=20, vedic_moolatrikona="aquarius",
         vedic_friends=["mercury", "venus"], vedic_enemies=["sun", "moon", "mars"], vedic_neutrals=["jupiter"],
-        life_areas={"career": 0.8, "self": 0.7, "relationships": 0.4, "health": 0.5, "spiritual": 0.6},
-        average_daily_motion=0.03, retrograde_frequency="periodic", combustion_distance=15.0
+        average_daily_motion=0.03, retrograde_frequency="periodic", combustion_distance=15.0,
+        vedic_special_aspects=[3, 10], vedic_maturation_age=36,  # Aspects 3rd and 10th from itself
+        life_areas={"career": 0.8, "self": 0.7, "relationships": 0.4, "health": 0.5, "spiritual": 0.6}
     ),
-
-    # Outer planets (Western)
-    "uranus": PlanetaryData(
-        name="Uranus", vedic_name="", class_type="outer",
-        gender="masculine", sect="diurnal", element="hot_dry", nature="neutral",
-        domains=["revolution", "innovation", "technology", "freedom", "eccentricity"],
-        keywords=["sudden change", "originality", "independence", "rebellion"],
-        body_parts=["nervous system", "ankles", "circulation"],
-        domicile=["aquarius"], exaltation="scorpio", exaltation_degree=None,
-        detriment=["leo"], fall="taurus", fall_degree=None,
-        vedic_friends=[], vedic_enemies=[], vedic_neutrals=[],
-        life_areas={"self": 0.6, "career": 0.5, "relationships": 0.3, "health": 0.2, "spiritual": 0.4},
-        average_daily_motion=0.004, retrograde_frequency="frequent", combustion_distance=0.0
+    
+    "north_node": PlanetData(
+        name="North Node", vedic_name="Rahu", symbol="☊",
+        class_type="node", vedic_class="chaya_graha", gender="neuter",
+        nature="malefic", vedic_nature="krura",
+        element="hot_dry",
+        body_parts=["nervous_system", "head_region"],
+        western_domains=["future_karma", "soul_growth", "life_purpose", "what_to_develop"],
+        vedic_domains=["materialism", "illusion", "foreign", "sudden_events", "obsession"],
+        shared_keywords=["growth", "ambition", "future", "material_desire"],
+        western_domicile=[], western_exaltation="taurus", western_exaltation_degree=None,
+        western_detriment=[], western_fall="scorpio", western_fall_degree=None,
+        vedic_own_signs=[], vedic_exaltation="taurus", vedic_exaltation_degree=None,
+        vedic_debilitation="scorpio", vedic_debilitation_degree=None, vedic_moolatrikona=None,
+        vedic_friends=["venus", "saturn"], vedic_enemies=["sun", "moon", "mars"], 
+        vedic_neutrals=["mercury", "jupiter"],
+        average_daily_motion=-0.05, retrograde_frequency="always", combustion_distance=0.0,
+        vedic_special_aspects=[5, 9], vedic_maturation_age=48,  # Some traditions give special aspects
+        life_areas={"self": 0.6, "career": 0.7, "spiritual": 0.5, "relationships": 0.4, "health": 0.3}
     ),
-
-    "neptune": PlanetaryData(
-        name="Neptune", vedic_name="", class_type="outer", 
-        gender="feminine", sect="nocturnal", element="cold_moist", nature="neutral",
-        domains=["spirituality", "illusion", "dreams", "compassion", "dissolution"],
-        keywords=["mysticism", "deception", "inspiration", "sacrifice"],
-        body_parts=["pineal gland", "feet", "immune system"],
-        domicile=["pisces"], exaltation="cancer", exaltation_degree=None,
-        detriment=["virgo"], fall="capricorn", fall_degree=None,
-        vedic_friends=[], vedic_enemies=[], vedic_neutrals=[],
-        life_areas={"spiritual": 0.8, "relationships": 0.4, "self": 0.4, "health": 0.3, "career": 0.2},
-        average_daily_motion=0.002, retrograde_frequency="frequent", combustion_distance=0.0
-    ),
-
-    "pluto": PlanetaryData(
-        name="Pluto", vedic_name="", class_type="outer",
-        gender="masculine", sect="nocturnal", element="hot_dry", nature="neutral",
-        domains=["transformation", "power", "death", "rebirth", "the unconscious"],
-        keywords=["regeneration", "intensity", "compulsion", "hidden forces"],
-        body_parts=["reproductive system", "elimination organs"],
-        domicile=["scorpio"], exaltation="leo", exaltation_degree=None,
-        detriment=["taurus"], fall="aquarius", fall_degree=None,
-        vedic_friends=[], vedic_enemies=[], vedic_neutrals=[],
-        life_areas={"self": 0.7, "career": 0.6, "relationships": 0.6, "spiritual": 0.6, "health": 0.4},
-        average_daily_motion=0.0006, retrograde_frequency="frequent", combustion_distance=0.0
-    ),
-
-    # Lunar Nodes
-    "north node": PlanetaryData(
-        name="North Node", vedic_name="Rahu", class_type="node",
-        gender="neutral", sect="neutral", element="hot_dry", nature="malefic",
-        domains=["ambition", "obsession", "foreign", "unconventional", "materialism"],
-        keywords=["desire", "craving", "illusion", "smoke", "maya"],
-        body_parts=["head region", "nervous disorders"],
-        domicile=["aquarius", "gemini"], exaltation="taurus", exaltation_degree=None,
-        detriment=["leo", "sagittarius"], fall="scorpio", fall_degree=None,
-        vedic_friends=["venus", "saturn"], vedic_enemies=["sun", "moon", "mars"], vedic_neutrals=["mercury", "jupiter"],
-        life_areas={"self": 0.6, "career": 0.7, "spiritual": 0.5, "relationships": 0.4, "health": 0.3},
-        average_daily_motion=-0.05, retrograde_frequency="always", combustion_distance=0.0
-    ),
-
-    "south node": PlanetaryData(
-        name="South Node", vedic_name="Ketu", class_type="node", 
-        gender="neutral", sect="neutral", element="hot_dry", nature="malefic",
-        domains=["spirituality", "detachment", "liberation", "past karma", "mysticism"],
-        keywords=["release", "dissolution", "flag", "moksha", "headless"],
-        body_parts=["lower extremities", "elimination"],
-        domicile=["scorpio", "pisces"], exaltation="sagittarius", exaltation_degree=None,
-        detriment=["taurus", "virgo"], fall="gemini", fall_degree=None,
-        vedic_friends=["mars", "jupiter"], vedic_enemies=["sun", "moon"], vedic_neutrals=["mercury", "venus", "saturn"],
-        life_areas={"spiritual": 0.8, "self": 0.5, "health": 0.4, "relationships": 0.3, "career": 0.2},
-        average_daily_motion=-0.05, retrograde_frequency="always", combustion_distance=0.0
-    ),
-
-    # Angles (calculated points)
-    "ascendant": PlanetaryData(
-        name="Ascendant", vedic_name="Lagna", class_type="angle",
-        gender="neutral", sect="neutral", element="variable", nature="neutral",
-        domains=["self", "body", "appearance", "vitality", "life path"],
-        keywords=["identity", "mask", "rising", "horizon", "emergence"],
-        body_parts=["entire body", "general health"],
-        domicile=[], exaltation=None, exaltation_degree=None,
-        detriment=[], fall=None, fall_degree=None,
-        vedic_friends=[], vedic_enemies=[], vedic_neutrals=[],
-        life_areas={"self": 1.0, "health": 0.8, "career": 0.2, "relationships": 0.2, "spiritual": 0.2},
-        average_daily_motion=1440.0, retrograde_frequency="never", combustion_distance=0.0
-    ),
-
-    "midheaven": PlanetaryData(
-        name="Midheaven", vedic_name="Madhya Lagna", class_type="angle",
-        gender="neutral", sect="diurnal", element="variable", nature="neutral",
-        domains=["career", "reputation", "status", "authority", "public image"],
-        keywords=["zenith", "culmination", "achievement", "calling"],
-        body_parts=["reputation", "honor"],
-        domicile=[], exaltation=None, exaltation_degree=None,
-        detriment=[], fall=None, fall_degree=None,
-        vedic_friends=[], vedic_enemies=[], vedic_neutrals=[],
-        life_areas={"career": 1.0, "self": 0.5, "relationships": 0.2, "health": 0.1, "spiritual": 0.3},
-        average_daily_motion=1440.0, retrograde_frequency="never", combustion_distance=0.0
+    
+    "south_node": PlanetData(
+        name="South Node", vedic_name="Ketu", symbol="☋",
+        class_type="node", vedic_class="chaya_graha", gender="neuter", 
+        nature="malefic", vedic_nature="krura_but_spiritual",
+        element="hot_dry",
+        body_parts=["lower_extremities", "elimination"],
+        western_domains=["past_karma", "talents", "what_to_release", "spiritual_gifts"],
+        vedic_domains=["spirituality", "moksha", "detachment", "research", "occult"],
+        shared_keywords=["spirituality", "detachment", "past", "release"],
+        western_domicile=[], western_exaltation="scorpio", western_exaltation_degree=None,
+        western_detriment=[], western_fall="taurus", western_fall_degree=None,
+        vedic_own_signs=[], vedic_exaltation="scorpio", vedic_exaltation_degree=None,
+        vedic_debilitation="taurus", vedic_debilitation_degree=None, vedic_moolatrikona=None,
+        vedic_friends=["mars", "jupiter"], vedic_enemies=["sun", "moon"],
+        vedic_neutrals=["mercury", "venus", "saturn"],
+        average_daily_motion=-0.05, retrograde_frequency="always", combustion_distance=0.0,
+        vedic_special_aspects=[5, 9], vedic_maturation_age=48,  # Some traditions give special aspects
+        life_areas={"spiritual": 0.8, "self": 0.5, "health": 0.4, "relationships": 0.3, "career": 0.2}
     )
-}
-
-# Planetary Joys (Traditional house preferences)
-PLANETARY_JOYS: Dict[str, int] = {
-    "mercury": 1,    # Joy in 1st house
-    "moon": 3,       # Joy in 3rd house  
-    "venus": 5,      # Joy in 5th house
-    "mars": 6,       # Joy in 6th house
-    "sun": 9,        # Joy in 9th house
-    "jupiter": 11,   # Joy in 11th house
-    "saturn": 12     # Joy in 12th house
-}
-
-# Vedic Aspects (Drishti) - Fixed aspect system
-VEDIC_ASPECTS: Dict[str, List[int]] = {
-    # All planets aspect 7th house from themselves
-    "sun": [7],
-    "moon": [7], 
-    "mercury": [7],
-    "venus": [7],
-    "mars": [4, 7, 8],      # Special aspects
-    "jupiter": [5, 7, 9],   # Special aspects  
-    "saturn": [3, 7, 10],   # Special aspects
-    "rahu": [5, 7, 9],      # Some traditions
-    "ketu": [5, 7, 9],      # Some traditions
+    
+    # Note: Outer planets (Uranus, Neptune, Pluto) are primarily Western
+    # but can be included for modern Western astrology integration
 }
 
 # -----------------------------------------------------------------------------
-# Enhanced Aspects with Traditional Orbs
+# Aspect Systems (Western + Vedic Integration)
 # -----------------------------------------------------------------------------
 
-ASPECTS: Dict[str, Dict[str, Any]] = {
+# Western Aspects (Degree-based with orbs)
+WESTERN_ASPECTS: Dict[str, Dict[str, Any]] = {
     "conjunction": {
-        "angle": 0, "polarity": 0.0, "tone": "fusion", "strength": "major",
-        "desc": "Unity of energies; outcome depends on planets and their condition",
-        "keywords": ["blend", "emphasis", "focus", "concentration"]
+        "angle": 0, "polarity": 0.0, "strength": "major", "nature": "neutral",
+        "description": "Unity and fusion of planetary energies",
+        "keywords": ["fusion", "emphasis", "blend", "focus"]
     },
     "opposition": {
-        "angle": 180, "polarity": -0.6, "tone": "tension", "strength": "major",
-        "desc": "Awareness through polarization; projection and negotiation needed",
+        "angle": 180, "polarity": -0.6, "strength": "major", "nature": "dynamic",
+        "description": "Awareness through separation and projection",
         "keywords": ["separation", "awareness", "projection", "balance"]
     },
     "square": {
-        "angle": 90, "polarity": -0.7, "tone": "challenge", "strength": "major",
-        "desc": "Dynamic tension requiring action; catalyst for growth",
-        "keywords": ["obstacle", "action", "crisis", "development"]
+        "angle": 90, "polarity": -0.7, "strength": "major", "nature": "challenging",
+        "description": "Dynamic tension requiring action and growth",
+        "keywords": ["challenge", "action", "crisis", "growth"]
     },
     "trine": {
-        "angle": 120, "polarity": 0.7, "tone": "harmony", "strength": "major",
-        "desc": "Natural flow and talent; easy expression of energies",
-        "keywords": ["ease", "talent", "flow", "support"]
+        "angle": 120, "polarity": 0.7, "strength": "major", "nature": "harmonious",
+        "description": "Natural flow and ease of expression",
+        "keywords": ["harmony", "ease", "talent", "support"]
     },
     "sextile": {
-        "angle": 60, "polarity": 0.4, "tone": "opportunity", "strength": "major",
-        "desc": "Supportive connection requiring some effort to activate",
-        "keywords": ["opportunity", "cooperation", "skill", "potential"]
+        "angle": 60, "polarity": 0.4, "strength": "major", "nature": "supportive",
+        "description": "Opportunities requiring conscious activation",
+        "keywords": ["opportunity", "cooperation", "potential", "skill"]
     },
     "quincunx": {
-        "angle": 150, "polarity": -0.2, "tone": "adjustment", "strength": "minor",
-        "desc": "Awkward connection requiring adaptation and adjustment",
-        "keywords": ["adjustment", "strain", "adaptation", "redirect"]
+        "angle": 150, "polarity": -0.2, "strength": "minor", "nature": "adjusting",
+        "description": "Adjustment and redirection needed",
+        "keywords": ["adjustment", "redirect", "health", "service"]
     },
-    "semi-square": {
-        "angle": 45, "polarity": -0.3, "tone": "irritation", "strength": "minor",
-        "desc": "Minor friction creating restlessness and small corrections",
-        "keywords": ["irritation", "restless", "minor crisis", "adjustment"]
+    "semi_square": {
+        "angle": 45, "polarity": -0.3, "strength": "minor", "nature": "irritating", 
+        "description": "Minor friction and restlessness",
+        "keywords": ["irritation", "restless", "minor_crisis"]
     },
     "sesquiquadrate": {
-        "angle": 135, "polarity": -0.4, "tone": "strain", "strength": "minor",
-        "desc": "Building pressure requiring release and resolution",
-        "keywords": ["pressure", "release", "culmination", "resolution"]
+        "angle": 135, "polarity": -0.4, "strength": "minor", "nature": "building",
+        "description": "Building pressure seeking release",
+        "keywords": ["pressure", "release", "culmination"]
     },
-    "semi-sextile": {
-        "angle": 30, "polarity": 0.1, "tone": "link", "strength": "minor",
-        "desc": "Subtle connection between different but adjacent energies",
-        "keywords": ["connection", "link", "growth", "development"]
-    },
-    "quintile": {
-        "angle": 72, "polarity": 0.5, "tone": "creative", "strength": "minor",
-        "desc": "Creative and spiritual expression; artistic talents",
-        "keywords": ["creativity", "talent", "spiritual", "expression"]
-    },
-    "biquintile": {
-        "angle": 144, "polarity": 0.4, "tone": "creative", "strength": "minor", 
-        "desc": "Refined creative expression; mastery through effort",
-        "keywords": ["refinement", "mastery", "creative skill", "discipline"]
+    "semi_sextile": {
+        "angle": 30, "polarity": 0.1, "strength": "minor", "nature": "connecting",
+        "description": "Subtle connection and growth link",
+        "keywords": ["connection", "growth", "development"]
     }
 }
 
-# Traditional Orbs by Technique and Planet Type
-TRADITIONAL_ORBS: Dict[str, Dict[str, Dict[str, float]]] = {
+# Vedic Aspects (Drishti) - House-based, no orbs
+VEDIC_DRISHTI: Dict[str, List[int]] = {
+    "sun": [7],           # All planets aspect 7th house
+    "moon": [7],
+    "mercury": [7],
+    "venus": [7],
+    "mars": [4, 7, 8],    # Mars has special aspects to 4th, 7th, 8th
+    "jupiter": [5, 7, 9], # Jupiter aspects 5th, 7th, 9th
+    "saturn": [3, 7, 10], # Saturn aspects 3rd, 7th, 10th
+    "north_node": [5, 7, 9],  # Rahu (some traditions)
+    "south_node": [5, 7, 9]   # Ketu (some traditions)
+}
+
+# Orb Systems
+WESTERN_ORBS: Dict[str, Dict[str, Dict[str, float]]] = {
     "natal": {
-        "luminaries": {  # Sun & Moon
-            "conjunction": 10.0, "opposition": 10.0, "square": 10.0, 
-            "trine": 10.0, "sextile": 6.0, "quincunx": 3.0
+        "luminaries": {  # Sun & Moon get wider orbs
+            "conjunction": 10.0, "opposition": 10.0, "square": 10.0,
+            "trine": 10.0, "sextile": 6.0, "quincunx": 3.0,
+            "semi_square": 3.0, "sesquiquadrate": 3.0, "semi_sextile": 3.0
         },
-        "planets": {  # Mercury through Saturn
+        "personal": {  # Mercury, Venus, Mars
             "conjunction": 8.0, "opposition": 8.0, "square": 8.0,
-            "trine": 8.0, "sextile": 6.0, "quincunx": 3.0  
+            "trine": 8.0, "sextile": 6.0, "quincunx": 3.0,
+            "semi_square": 2.0, "sesquiquadrate": 2.0, "semi_sextile": 2.0
         },
-        "outer": {  # Uranus, Neptune, Pluto
-            "conjunction": 6.0, "opposition": 6.0, "square": 6.0,
-            "trine": 6.0, "sextile": 4.0, "quincunx": 2.0
+        "social": {  # Jupiter, Saturn
+            "conjunction": 8.0, "opposition": 8.0, "square": 8.0,
+            "trine": 8.0, "sextile": 6.0, "quincunx": 3.0,
+            "semi_square": 2.0, "sesquiquadrate": 2.0, "semi_sextile": 2.0
         }
     },
     "transit": {
@@ -709,708 +800,717 @@ TRADITIONAL_ORBS: Dict[str, Dict[str, Dict[str, float]]] = {
             "conjunction": 8.0, "opposition": 8.0, "square": 8.0,
             "trine": 8.0, "sextile": 4.0, "quincunx": 2.0
         },
-        "planets": {
+        "personal": {
             "conjunction": 6.0, "opposition": 6.0, "square": 6.0,
             "trine": 6.0, "sextile": 4.0, "quincunx": 2.0
         },
-        "outer": {
-            "conjunction": 4.0, "opposition": 4.0, "square": 4.0,
-            "trine": 4.0, "sextile": 2.0, "quincunx": 1.0
+        "social": {
+            "conjunction": 6.0, "opposition": 6.0, "square": 6.0,
+            "trine": 6.0, "sextile": 4.0, "quincunx": 2.0
         }
     },
     "progression": {
-        "default": {
+        "all": {
             "conjunction": 1.0, "opposition": 1.0, "square": 1.0,
             "trine": 1.0, "sextile": 1.0, "quincunx": 0.5
         }
-    },
-    "vedic": {
-        "default": {
-            "conjunction": 15.0,  # Same sign conjunction
-            "aspects": 0.0        # House-based, no orbs
-        }
     }
 }
 
-# -----------------------------------------------------------------------------
-# Arabic Parts/Lots (Traditional Formulas)
-# -----------------------------------------------------------------------------
-
-@dataclass  
-class ArabicPart:
-    """Arabic Part/Lot definition with traditional formula."""
-    name: str
-    traditional_names: List[str]
-    formula_day: str      # Formula for day births
-    formula_night: str    # Formula for night births (often reversed)
-    source: str          # Historical source
-    significance: str    # What it represents
-    house_themes: List[str]  # Related life themes
-
-# Core Hermetic Lots (Paulus Alexandrinus tradition)
-HERMETIC_LOTS: Dict[str, ArabicPart] = {
-    "part of fortune": ArabicPart(
-        name="Part of Fortune",
-        traditional_names=["Fortuna", "Lot of Fortune", "Pars Fortunae"],
-        formula_day="ASC + Moon - Sun", 
-        formula_night="ASC + Sun - Moon",
-        source="Paulus Alexandrinus, 4th century",
-        significance="Material success, health, body, general fortune",
-        house_themes=["health", "wealth", "material success", "vitality"]
-    ),
-    "part of spirit": ArabicPart(
-        name="Part of Spirit",
-        traditional_names=["Lot of Spirit", "Pars Spiritus"],
-        formula_day="ASC + Sun - Moon",
-        formula_night="ASC + Moon - Sun", 
-        source="Paulus Alexandrinus, 4th century",
-        significance="Spiritual development, character, soul's purpose",
-        house_themes=["spirituality", "character", "soul purpose", "motivation"]
-    ),
-    "part of eros": ArabicPart(
-        name="Part of Eros", 
-        traditional_names=["Lot of Eros", "Lot of Love"],
-        formula_day="ASC + Venus - Sun",
-        formula_night="ASC + Venus - Sun",
-        source="Paulus Alexandrinus, 4th century",
-        significance="Sexual desire, passionate love, attraction",
-        house_themes=["romance", "sexual desire", "passion", "attraction"]
-    ),
-    "part of necessity": ArabicPart(
-        name="Part of Necessity",
-        traditional_names=["Lot of Necessity", "Lot of Constraint"],
-        formula_day="ASC + Mercury - Sun",
-        formula_night="ASC + Mercury - Sun", 
-        source="Paulus Alexandrinus, 4th century",
-        significance="Constraints, limitations, what must be done",
-        house_themes=["necessity", "constraints", "obligations", "fate"]
-    ),
-    "part of courage": ArabicPart(
-        name="Part of Courage",
-        traditional_names=["Lot of Courage", "Lot of Boldness"],
-        formula_day="ASC + Mars - Sun",
-        formula_night="ASC + Mars - Sun",
-        source="Paulus Alexandrinus, 4th century", 
-        significance="Courage, daring, military prowess, bravery",
-        house_themes=["courage", "bravery", "military", "competition"]
-    ),
-    "part of victory": ArabicPart(
-        name="Part of Victory",
-        traditional_names=["Lot of Victory", "Lot of Conquest"], 
-        formula_day="ASC + Jupiter - Sun",
-        formula_night="ASC + Jupiter - Sun",
-        source="Paulus Alexandrinus, 4th century",
-        significance="Success, victory, achievement, honor",
-        house_themes=["victory", "success", "achievement", "honor"]
-    ),
-    "part of nemesis": ArabicPart(
-        name="Part of Nemesis",
-        traditional_names=["Lot of Nemesis", "Lot of Retribution"],
-        formula_day="ASC + Saturn - Sun", 
-        formula_night="ASC + Saturn - Sun",
-        source="Paulus Alexandrinus, 4th century",
-        significance="Retribution, karma, divine justice, downfall",
-        house_themes=["karma", "justice", "retribution", "consequences"]
-    )
-}
-
-# Extended Arabic Parts (Medieval additions)
-EXTENDED_ARABIC_PARTS: Dict[str, ArabicPart] = {
-    "part of marriage": ArabicPart(
-        name="Part of Marriage",
-        traditional_names=["Lot of Marriage", "Lot of Union"],
-        formula_day="ASC + Venus - Jupiter",
-        formula_night="ASC + Venus - Jupiter",
-        source="Al-Biruni, Bonatti",
-        significance="Marriage partnerships, committed relationships",
-        house_themes=["marriage", "partnership", "commitment", "union"]
-    ),
-    "part of children": ArabicPart(
-        name="Part of Children", 
-        traditional_names=["Lot of Children", "Lot of Offspring"],
-        formula_day="ASC + Jupiter - Sun",
-        formula_night="ASC + Jupiter - Moon",
-        source="Medieval Arabic tradition",
-        significance="Children, fertility, creative offspring",
-        house_themes=["children", "fertility", "creativity", "offspring"]
-    ),
-    "part of death": ArabicPart(
-        name="Part of Death",
-        traditional_names=["Lot of Death", "Lot of Endings"],
-        formula_day="ASC + 8th house cusp - Moon", 
-        formula_night="ASC + 8th house cusp - Sun",
-        source="Bonatti, medieval tradition",
-        significance="Death, endings, transformation, crisis",
-        house_themes=["death", "transformation", "endings", "crisis"]
-    ),
-    "part of inheritance": ArabicPart(
-        name="Part of Inheritance",
-        traditional_names=["Lot of Inheritance", "Lot of Legacy"],
-        formula_day="ASC + Saturn - Jupiter",
-        formula_night="ASC + Saturn - Jupiter", 
-        source="Medieval Arabic",
-        significance="Inheritance, legacies, ancestral wealth",
-        house_themes=["inheritance", "legacy", "ancestral wealth", "tradition"]
-    ),
-    "part of travel": ArabicPart(
-        name="Part of Travel",
-        traditional_names=["Lot of Travel", "Lot of Journeys"],
-        formula_day="ASC + 9th house cusp - 9th house ruler",
-        formula_night="ASC + 9th house cusp - 9th house ruler",
-        source="Arabic medieval tradition",
-        significance="Long distance travel, journeys, pilgrimage", 
-        house_themes=["travel", "journeys", "foreign lands", "pilgrimage"]
-    ),
-    "part of profession": ArabicPart(
-        name="Part of Profession",
-        traditional_names=["Lot of Profession", "Lot of Trade"],
-        formula_day="ASC + Mercury - Venus",
-        formula_night="ASC + Mercury - Venus",
-        source="Al-Biruni",
-        significance="Professional work, trade, business success",
-        house_themes=["profession", "trade", "business", "career"]
-    ),
-    "part of friends": ArabicPart(
-        name="Part of Friends", 
-        traditional_names=["Lot of Friends", "Lot of Allies"],
-        formula_day="ASC + Moon - Mercury",
-        formula_night="ASC + Mercury - Moon",
-        source="Medieval tradition",
-        significance="Friendships, allies, social connections",
-        house_themes=["friends", "allies", "social connections", "networking"]
-    ),
-    "part of enemies": ArabicPart(
-        name="Part of Enemies",
-        traditional_names=["Lot of Enemies", "Lot of Opposition"],
-        formula_day="ASC + 12th house cusp - 12th house ruler",
-        formula_night="ASC + 12th house cusp - 12th house ruler", 
-        source="Medieval tradition",
-        significance="Hidden enemies, opposition, secret obstacles",
-        house_themes=["enemies", "opposition", "obstacles", "hidden threats"]
-    ),
-    "part of reputation": ArabicPart(
-        name="Part of Reputation",
-        traditional_names=["Lot of Reputation", "Lot of Honor"],
-        formula_day="ASC + Sun - Mercury",
-        formula_night="ASC + Mercury - Sun",
-        source="Arabic tradition",
-        significance="Public reputation, honor, recognition",
-        house_themes=["reputation", "honor", "recognition", "fame"]
-    )
+# Vedic orbs (mainly for conjunctions within signs)
+VEDIC_ORBS: Dict[str, float] = {
+    "conjunction": 15.0,  # Same sign conjunction
+    "close_conjunction": 5.0,  # Very tight conjunction
+    "exact_conjunction": 1.0   # Near-exact conjunction
 }
 
 # -----------------------------------------------------------------------------
-# Essential & Accidental Dignities (Complete Traditional System)
+# Dignity and Strength Assessment
 # -----------------------------------------------------------------------------
 
-class DignityType(Enum):
-    # Essential Dignities
-    DOMICILE = "domicile"           # +5 points
-    EXALTATION = "exaltation"       # +4 points  
-    TRIPLICITY = "triplicity"       # +3 points
-    TERM = "term"                   # +2 points
-    FACE = "face"                   # +1 point
+class DignityLevel(Enum):
+    # Essential Dignities (sign-based)
+    OWN_SIGN = "own_sign"           # Swakshetra
+    EXALTATION = "exaltation"       # Uttcha
+    MOOLATRIKONA = "moolatrikona"   # Special Vedic dignity
+    FRIENDLY = "friendly"           # Friend's sign
+    NEUTRAL = "neutral"             # Neutral sign
+    ENEMY = "enemy"                 # Enemy's sign
+    DEBILITATION = "debilitation"   # Neecha
     
-    # Essential Debilities
-    DETRIMENT = "detriment"         # -5 points
-    FALL = "fall"                   # -4 points
-    PEREGRINE = "peregrine"         # No essential dignity
+    # Accidental Dignities (placement-based)
+    ANGULAR = "angular"             # Kendra houses
+    SUCCEDENT = "succedent"         # 2,5,8,11 houses
+    CADENT = "cadent"              # 3,6,9,12 houses
     
-    # Accidental Dignities  
-    ANGULAR = "angular"             # +5 points (houses 1,4,7,10)
-    SUCCEDENT = "succedent"         # +4 points (houses 2,5,8,11)
-    CADENT = "cadent"              # +2 points (houses 3,6,9,12)
-    ORIENTAL = "oriental"           # +2 points (rising before Sun)
-    OCCIDENTAL = "occidental"       # +2 points (setting after Sun)
-    SWIFT = "swift"                # +2 points (faster than average)
-    DIRECT = "direct"              # +4 points (direct motion)
+    # Special conditions
+    COMBUST = "combust"            # Too close to Sun
+    RETROGRADE = "retrograde"      # Backward motion
     
-    # Accidental Debilities
-    COMBUST = "combust"            # -5 points (within combustion range of Sun)
-    UNDER_BEAMS = "under_beams"    # -4 points (within 15° of Sun)
-    RETROGRADE = "retrograde"      # -5 points (retrograde motion)
-    SLOW = "slow"                  # -2 points (slower than average)
+class StrengthAssessment(Enum):
+    EXALTED = "exalted"           # Very strong
+    STRONG = "strong"             # Well-placed 
+    MODERATE = "moderate"         # Average condition
+    WEAK = "weak"                # Poorly placed
+    DEBILITATED = "debilitated"   # Very weak
 
 @dataclass
-class PlanetaryCondition:
-    """Complete planetary condition assessment."""
+class PlanetaryStrength:
+    """Comprehensive planetary strength assessment for both systems."""
     planet: str
-    longitude: float
+    longitude_tropical: float
+    longitude_sidereal: float
+    
+    # Sign positions
+    tropical_sign: str
+    sidereal_sign: str
     house: int
-    sign: str
     
-    # Essential dignities
-    essential_dignities: List[DignityType]
-    essential_score: int
+    # Western strength factors
+    western_dignities: List[DignityLevel]
+    western_strength_score: float
     
-    # Accidental dignities  
-    accidental_dignities: List[DignityType]
-    accidental_score: int
+    # Vedic strength factors  
+    vedic_dignities: List[DignityLevel]
+    vedic_strength_score: float
     
     # Combined assessment
-    total_score: int
-    overall_condition: str  # "very strong", "strong", "moderate", "weak", "very weak"
+    overall_assessment: StrengthAssessment
     
-    # Additional factors
+    # Special conditions
     is_combust: bool
-    is_cazimi: bool        # Within 17 minutes of Sun (very powerful)
     is_retrograde: bool
-    phase_with_sun: str    # For Moon: "new", "waxing", "full", "waning"
+    vedic_friendship_with_house_lord: str
 
-def assess_planetary_condition(planet: str, longitude: float, house: int, 
-                             sign: str, sun_longitude: float,
-                             chart_sect: Sect) -> PlanetaryCondition:
-    """Assess complete planetary condition using traditional methods."""
+def assess_planetary_strength(
+    planet: str,
+    tropical_longitude: float,
+    sidereal_longitude: float, 
+    house: int,
+    house_lord: str,
+    sun_longitude: float,
+    system: AstroSystem = AstroSystem.DUAL_MODE
+) -> PlanetaryStrength:
+    """Comprehensive strength assessment for both Western and Vedic systems."""
     
-    essential_dignities = []
-    accidental_dignities = []
-    
-    planet_data = ENHANCED_PLANETS.get(canon(planet))
+    planet_data = PLANET_DATABASE.get(planet)
     if not planet_data:
-        return PlanetaryCondition(planet, longitude, house, sign, [], 0, [], 0, 0, "unknown", False, False, False, "")
+        return None
     
-    # Essential Dignities Assessment
-    if sign in planet_data.domicile:
-        essential_dignities.append(DignityType.DOMICILE)
-    if sign == planet_data.exaltation:
-        essential_dignities.append(DignityType.EXALTATION)
-    if sign in planet_data.detriment:
-        essential_dignities.append(DignityType.DETRIMENT)  
-    if sign == planet_data.fall:
-        essential_dignities.append(DignityType.FALL)
-        
-    # Triplicity assessment
-    sign_element = SIGN_ATTRIBUTES[sign]["element"]
-    triplicity_rulers = TRIPLICITIES[sign_element]
-    sect_ruler = triplicity_rulers["day"] if chart_sect == Sect.DIURNAL else triplicity_rulers["night"]
-    if planet == sect_ruler:
-        essential_dignities.append(DignityType.TRIPLICITY)
-        
-    # Term assessment (simplified - would need full degree calculation)
-    # Face assessment (simplified - would need full decan calculation)
+    tropical_sign = get_sign_from_longitude(tropical_longitude)
+    sidereal_sign = get_sign_from_longitude(sidereal_longitude)
     
-    # Accidental Dignities Assessment
-    if house in [1, 4, 7, 10]:
-        accidental_dignities.append(DignityType.ANGULAR)
-    elif house in [2, 5, 8, 11]:
-        accidental_dignities.append(DignityType.SUCCEDENT) 
+    western_dignities = []
+    vedic_dignities = []
+    western_score = 0.0
+    vedic_score = 0.0
+    
+    # Western dignity assessment
+    if system in [AstroSystem.WESTERN_TROPICAL, AstroSystem.DUAL_MODE]:
+        if tropical_sign in planet_data.western_domicile:
+            western_dignities.append(DignityLevel.OWN_SIGN)
+            western_score += 5.0
+            
+        if tropical_sign == planet_data.western_exaltation:
+            western_dignities.append(DignityLevel.EXALTATION)
+            western_score += 4.0
+            
+        if tropical_sign in planet_data.western_detriment:
+            western_dignities.append(DignityLevel.ENEMY)
+            western_score -= 5.0
+            
+        if tropical_sign == planet_data.western_fall:
+            western_dignities.append(DignityLevel.DEBILITATION)
+            western_score -= 4.0
+    
+    # Vedic dignity assessment
+    if system in [AstroSystem.VEDIC_SIDEREAL, AstroSystem.DUAL_MODE]:
+        if sidereal_sign in planet_data.vedic_own_signs:
+            vedic_dignities.append(DignityLevel.OWN_SIGN)
+            vedic_score += 5.0
+            
+        if sidereal_sign == planet_data.vedic_exaltation:
+            vedic_dignities.append(DignityLevel.EXALTATION)
+            vedic_score += 4.0
+            
+        if sidereal_sign == planet_data.vedic_moolatrikona:
+            vedic_dignities.append(DignityLevel.MOOLATRIKONA)
+            vedic_score += 3.0
+            
+        if sidereal_sign == planet_data.vedic_debilitation:
+            vedic_dignities.append(DignityLevel.DEBILITATION)
+            vedic_score -= 4.0
+            
+        # Vedic friendship assessment
+        house_lord_data = PLANET_DATABASE.get(house_lord)
+        friendship = "neutral"
+        if house_lord in planet_data.vedic_friends:
+            friendship = "friend"
+            vedic_score += 1.0
+        elif house_lord in planet_data.vedic_enemies:
+            friendship = "enemy" 
+            vedic_score -= 1.0
+    
+    # House strength (both systems)
+    house_data = HOUSE_DATABASE.get(house)
+    if house_data:
+        if house_data.western_type == "angular":
+            western_dignities.append(DignityLevel.ANGULAR)
+            western_score += 2.0
+            
+        if house in VEDIC_HOUSE_GROUPS["kendra"]:
+            vedic_dignities.append(DignityLevel.ANGULAR)
+            vedic_score += 2.0
+    
+    # Combustion check
+    sun_distance = abs(tropical_longitude - sun_longitude)
+    is_combust = sun_distance <= planet_data.combustion_distance
+    if is_combust:
+        western_score -= 5.0
+        vedic_score -= 5.0
+    
+    # Overall assessment
+    avg_score = (western_score + vedic_score) / 2
+    if avg_score >= 8:
+        assessment = StrengthAssessment.EXALTED
+    elif avg_score >= 4:
+        assessment = StrengthAssessment.STRONG
+    elif avg_score >= -2:
+        assessment = StrengthAssessment.MODERATE
+    elif avg_score >= -6:
+        assessment = StrengthAssessment.WEAK
     else:
-        accidental_dignities.append(DignityType.CADENT)
-        
-    # Combustion assessment
-    sun_distance = abs(longitude - sun_longitude)
-    if sun_distance <= planet_data.combustion_distance:
-        accidental_dignities.append(DignityType.COMBUST)
-        is_combust = True
-        is_cazimi = sun_distance <= 0.28  # 17 arcminutes
-    elif sun_distance <= 15.0:
-        accidental_dignities.append(DignityType.UNDER_BEAMS)
-        is_combust = False
-        is_cazimi = False
-    else:
-        is_combust = False
-        is_cazimi = False
-        
-    # Calculate scores
-    dignity_points = {
-        DignityType.DOMICILE: 5, DignityType.EXALTATION: 4, DignityType.TRIPLICITY: 3,
-        DignityType.TERM: 2, DignityType.FACE: 1,
-        DignityType.DETRIMENT: -5, DignityType.FALL: -4,
-        DignityType.ANGULAR: 5, DignityType.SUCCEDENT: 4, DignityType.CADENT: 2,
-        DignityType.COMBUST: -5, DignityType.UNDER_BEAMS: -4,
-        DignityType.RETROGRADE: -5, DignityType.DIRECT: 4
-    }
+        assessment = StrengthAssessment.DEBILITATED
     
-    essential_score = sum(dignity_points.get(d, 0) for d in essential_dignities)
-    accidental_score = sum(dignity_points.get(d, 0) for d in accidental_dignities)
-    total_score = essential_score + accidental_score
-    
-    # Overall condition assessment
-    if total_score >= 15:
-        condition = "very strong"
-    elif total_score >= 7:
-        condition = "strong" 
-    elif total_score >= 0:
-        condition = "moderate"
-    elif total_score >= -7:
-        condition = "weak"
-    else:
-        condition = "very weak"
-        
-    return PlanetaryCondition(
-        planet=planet, longitude=longitude, house=house, sign=sign,
-        essential_dignities=essential_dignities, essential_score=essential_score,
-        accidental_dignities=accidental_dignities, accidental_score=accidental_score,
-        total_score=total_score, overall_condition=condition,
-        is_combust=is_combust, is_cazimi=is_cazimi, is_retrograde=False,
-        phase_with_sun=""
+    return PlanetaryStrength(
+        planet=planet,
+        longitude_tropical=tropical_longitude,
+        longitude_sidereal=sidereal_longitude,
+        tropical_sign=tropical_sign,
+        sidereal_sign=sidereal_sign,
+        house=house,
+        western_dignities=western_dignities,
+        western_strength_score=western_score,
+        vedic_dignities=vedic_dignities,
+        vedic_strength_score=vedic_score,
+        overall_assessment=assessment,
+        is_combust=is_combust,
+        is_retrograde=False,  # Would need motion data
+        vedic_friendship_with_house_lord=friendship if system != AstroSystem.WESTERN_TROPICAL else "n/a"
     )
 
 # -----------------------------------------------------------------------------
-# Fixed Stars (Traditional Influences)
+# Traditional Timing Techniques
+# -----------------------------------------------------------------------------
+
+TIMING_TECHNIQUES: Dict[str, Dict[str, Any]] = {
+    # Western Techniques
+    "transits": {
+        "system": "western",
+        "description": "Current planetary positions activating natal chart",
+        "duration": "days to years depending on planet",
+        "focus": "external events and triggers",
+        "orbs": "standard western orbs"
+    },
+    "progressions": {
+        "system": "western", 
+        "description": "Symbolic advancement of natal planets (1 day = 1 year)",
+        "duration": "months to years",
+        "focus": "internal psychological development",
+        "orbs": "tight (1 degree or less)"
+    },
+    "solar_returns": {
+        "system": "western",
+        "description": "Annual chart when Sun returns to natal position", 
+        "duration": "one year",
+        "focus": "yearly themes and emphasis",
+        "notes": "relocate to current residence"
+    },
+    "lunar_returns": {
+        "system": "western",
+        "description": "Monthly chart when Moon returns to natal position",
+        "duration": "approximately 28 days", 
+        "focus": "monthly emotional themes",
+        "notes": "good for short-term planning"
+    },
+    
+    # Vedic Techniques  
+    "dasha": {
+        "system": "vedic",
+        "description": "Planetary period system showing life phases",
+        "duration": "varies by dasha system (Vimshottari: 120 years total)",
+        "focus": "karmic unfoldment and major life themes",
+        "types": ["Vimshottari", "Ashtottari", "Yogini", "Chara"]
+    },
+    "transits_vedic": {
+        "system": "vedic",
+        "description": "Current sidereal positions with house-based aspects",
+        "duration": "days to years",
+        "focus": "triggering dasha results and natal promises", 
+        "orbs": "house-based aspects, some conjunction orbs"
+    },
+    "varshphal": {
+        "system": "vedic",
+        "description": "Vedic annual chart (similar to solar return)",
+        "duration": "one year",
+        "focus": "yearly predictions and themes",
+        "notes": "uses sidereal zodiac and special calculation methods"
+    },
+    "prashna": {
+        "system": "vedic", 
+        "description": "Horary/question chart using Vedic principles",
+        "duration": "specific to question",
+        "focus": "answering specific queries",
+        "notes": "strict traditional rules and dignity assessment"
+    },
+    
+    # Shared/Integrated
+    "eclipses": {
+        "system": "both",
+        "description": "Lunar and solar eclipses activating sensitive points",
+        "duration": "6 months activation period",
+        "focus": "major life changes and shifts",
+        "notes": "especially significant if hitting natal planets/angles"
+    },
+    "planetary_returns": {
+        "system": "both",
+        "description": "When planets return to natal positions",
+        "duration": "varies by planet (Mercury: 88 days to Saturn: 29 years)",
+        "focus": "cyclical themes and renewals",
+        "notes": "Jupiter return (12 years) and Saturn return (29 years) most significant"
+    }
+}
+
+# Vimshottari Dasha Periods (120-year cycle)
+VIMSHOTTARI_DASHA: Dict[str, int] = {
+    "ketu": 7,
+    "venus": 20,
+    "sun": 6,
+    "moon": 10,
+    "mars": 7,
+    "north_node": 18,  # Rahu
+    "jupiter": 16,
+    "saturn": 19,
+    "mercury": 17
+}
+
+def calculate_dasha_sequence(birth_moon_longitude: float) -> List[Dict[str, Any]]:
+    """Calculate Vimshottari Dasha sequence from birth Moon position."""
+    # Simplified calculation - full implementation would need nakshatra calculation
+    
+    # 27 Nakshatras, each 13°20' (800')
+    nakshatra_index = int(birth_moon_longitude * 60 / 800) % 27
+    
+    # Dasha lords by nakshatra (simplified mapping)
+    nakshatra_lords = [
+        "ketu", "venus", "sun", "moon", "mars", "north_node", "jupiter", "saturn", "mercury"
+    ] * 3  # Repeat pattern for all 27 nakshatras
+    
+    starting_lord = nakshatra_lords[nakshatra_index]
+    
+    # Create sequence starting from birth dasha lord
+    planets = list(VIMSHOTTARI_DASHA.keys())
+    start_index = planets.index(starting_lord)
+    
+    sequence = []
+    age = 0
+    
+    for i in range(9):  # Complete 120-year cycle
+        planet_index = (start_index + i) % 9
+        planet = planets[planet_index]
+        duration = VIMSHOTTARI_DASHA[planet]
+        
+        sequence.append({
+            "planet": planet,
+            "start_age": age,
+            "end_age": age + duration,
+            "duration_years": duration
+        })
+        age += duration
+    
+    return sequence
+
+# -----------------------------------------------------------------------------
+# Calculation Utilities  
+# -----------------------------------------------------------------------------
+
+def get_sign_from_longitude(longitude: float) -> str:
+    """Get zodiac sign from longitude."""
+    sign_index = int((longitude % 360) / 30)
+    return SIGNS[sign_index]
+
+def calculate_house_cusps(ascendant: float, latitude: float, 
+                         system: HouseSystem = HouseSystem.WHOLE_SIGN) -> Dict[int, float]:
+    """Calculate house cusps for different house systems."""
+    
+    cusps = {}
+    
+    if system in [HouseSystem.WHOLE_SIGN, HouseSystem.VEDIC_WHOLE_SIGN]:
+        # Whole sign houses - each house is exactly 30 degrees
+        for house in range(1, 13):
+            cusps[house] = (ascendant + (house - 1) * 30) % 360
+            
+    elif system == HouseSystem.EQUAL:
+        # Equal houses - divide circle equally from ASC
+        for house in range(1, 13):
+            cusps[house] = (ascendant + (house - 1) * 30) % 360
+            
+    else:
+        # For Placidus, Koch, etc. - simplified calculation
+        # Full implementation would require complex trigonometry
+        for house in range(1, 13):
+            cusps[house] = (ascendant + (house - 1) * 30) % 360
+    
+    return cusps
+
+def find_aspects_western(planet1_long: float, planet2_long: float,
+                        planet1_type: str, planet2_type: str,
+                        technique: str = "natal") -> List[Dict[str, Any]]:
+    """Find Western aspects between two planets."""
+    
+    separation = abs(planet1_long - planet2_long)
+    if separation > 180:
+        separation = 360 - separation
+    
+    aspects_found = []
+    
+    # Get appropriate orbs
+    orb_table = WESTERN_ORBS.get(technique, WESTERN_ORBS["natal"])
+    planet_orbs = orb_table.get(planet1_type, orb_table.get("personal", {}))
+    
+    for aspect_name, aspect_data in WESTERN_ASPECTS.items():
+        aspect_angle = aspect_data["angle"]
+        max_orb = planet_orbs.get(aspect_name, 0)
+        
+        if abs(separation - aspect_angle) <= max_orb:
+            orb = abs(separation - aspect_angle)
+            aspects_found.append({
+                "aspect": aspect_name,
+                "orb": orb,
+                "separating_angle": separation,
+                "exact_angle": aspect_angle,
+                "strength": aspect_data["strength"],
+                "nature": aspect_data["nature"],
+                "applying": separation < aspect_angle  # Simplified
+            })
+    
+    return aspects_found
+
+def find_aspects_vedic(planet1_house: int, planet2_house: int,
+                      planet1_name: str) -> List[Dict[str, Any]]:
+    """Find Vedic aspects (Drishti) from planet1 to planet2."""
+    
+    aspects_found = []
+    
+    # Get special aspects for this planet
+    special_aspects = VEDIC_DRISHTI.get(planet1_name, [7])  # Default 7th house aspect
+    
+    for aspect_house in special_aspects:
+        target_house = (planet1_house + aspect_house - 1) % 12
+        if target_house == 0:
+            target_house = 12
+            
+        if target_house == planet2_house:
+            aspects_found.append({
+                "aspect": f"{aspect_house}th_house_aspect",
+                "aspect_house": aspect_house,
+                "strength": "full" if aspect_house == 7 else "special",
+                "nature": "influence"
+            })
+    
+    return aspects_found
+
+# -----------------------------------------------------------------------------
+# High-Level Chart Analysis
 # -----------------------------------------------------------------------------
 
 @dataclass
-class FixedStar:
-    """Fixed star data with traditional influences."""
-    name: str
-    longitude_2000: float  # Tropical longitude for epoch 2000.0
-    magnitude: float
-    constellation: str
-    nature: List[str]      # Planetary natures (Mars-like, Venus-Mercury, etc.)
-    influence: str         # Traditional interpretation
-    orb: float            # Conjunction orb (typically 1-2 degrees)
+class ChartAnalysis:
+    """Comprehensive chart analysis combining Western and Vedic systems."""
+    
+    # Chart data
+    system: AstroSystem
+    tropical_planets: Dict[str, float]
+    sidereal_planets: Dict[str, float]
+    house_cusps: Dict[int, float]
+    house_system: HouseSystem
+    
+    # Planetary strengths
+    planetary_strengths: Dict[str, PlanetaryStrength]
+    
+    # Aspects
+    western_aspects: List[Dict[str, Any]]
+    vedic_aspects: List[Dict[str, Any]]
+    
+    # Chart patterns and configurations
+    chart_patterns: List[str]
+    dominant_elements: Dict[str, int]
+    dominant_modalities: Dict[str, int]
+    
+    # Overall assessment
+    chart_strength: str
+    primary_focus_areas: List[str]
+    
+    # Timing
+    current_dasha: Optional[Dict[str, Any]]
+    significant_transits: List[Dict[str, Any]]
 
-MAJOR_FIXED_STARS: Dict[str, FixedStar] = {
-    "regulus": FixedStar(
-        name="Regulus", longitude_2000=149.5, magnitude=1.4, constellation="Leo",
-        nature=["Mars", "Jupiter"], 
-        influence="Royal star - success, honor, wealth, power if well-aspected",
-        orb=2.0
-    ),
-    "spica": FixedStar(
-        name="Spica", longitude_2000=203.5, magnitude=1.0, constellation="Virgo", 
-        nature=["Venus", "Mars"],
-        influence="Gifts, talents, artistic ability, protection, success in sciences",
-        orb=2.0
-    ),
-    "antares": FixedStar(
-        name="Antares", longitude_2000=249.5, magnitude=1.1, constellation="Scorpius",
-        nature=["Mars", "Jupiter"],
-        influence="Destructive if afflicted, courage, military success, but rash actions",
-        orb=2.0
-    ),
-    "fomalhaut": FixedStar(
-        name="Fomalhaut", longitude_2000=3.5, magnitude=1.2, constellation="Piscis Austrinus",
-        nature=["Venus", "Mercury"], 
-        influence="Idealism, inspiration, but danger from water, changes of fortune",
-        orb=2.0
-    ),
-    "aldebaran": FixedStar(
-        name="Aldebaran", longitude_2000=69.5, magnitude=0.9, constellation="Taurus",
-        nature=["Mars"],
-        influence="Military honor, wealth, but with tendency to anger and violence",
-        orb=2.0
-    ),
-    "algol": FixedStar(
-        name="Algol", longitude_2000=56.3, magnitude=2.1, constellation="Perseus", 
-        nature=["Saturn", "Jupiter"],
-        influence="Most evil star - violence, beheading, losing one's head, extreme misfortune",
-        orb=1.5
-    ),
-    "sirius": FixedStar(
-        name="Sirius", longitude_2000=104.0, magnitude=-1.5, constellation="Canis Major",
-        nature=["Jupiter", "Mars"],
-        influence="Fame, honor, wealth, passion, resentment, success in business",
-        orb=2.0
+def create_integrated_chart_analysis(
+    tropical_planets: Dict[str, float],
+    ascendant_tropical: float,
+    birth_datetime: datetime,
+    latitude: float = 0.0,
+    longitude: float = 0.0,
+    system: AstroSystem = AstroSystem.DUAL_MODE,
+    house_system: HouseSystem = HouseSystem.WHOLE_SIGN
+) -> ChartAnalysis:
+    """Create comprehensive chart analysis integrating Western and Vedic systems."""
+    
+    # Convert to sidereal
+    birth_year = birth_datetime.year + birth_datetime.timetuple().tm_yday / 365.25
+    sidereal_planets = {}
+    for planet, trop_long in tropical_planets.items():
+        sidereal_planets[planet] = tropical_to_sidereal(trop_long, birth_year)
+    
+    ascendant_sidereal = tropical_to_sidereal(ascendant_tropical, birth_year)
+    
+    # Calculate house cusps
+    house_cusps = calculate_house_cusps(
+        ascendant_tropical if system == AstroSystem.WESTERN_TROPICAL else ascendant_sidereal,
+        latitude, house_system
     )
-}
-
-# -----------------------------------------------------------------------------
-# Lunar Mansions (Traditional Systems)
-# -----------------------------------------------------------------------------
-
-@dataclass 
-class LunarMansion:
-    """Lunar mansion with traditional attributes."""
-    number: int
-    arabic_name: str
-    sanskrit_name: str
-    longitude_start: float
-    longitude_end: float
-    ruling_planet: str
-    nature: str           # fortunate, unfortunate, neutral
-    influence: str        # Traditional interpretation
-    activities: List[str] # Recommended activities
-
-# Arabic Lunar Mansions (Manzil)
-ARABIC_LUNAR_MANSIONS: Dict[int, LunarMansion] = {
-    1: LunarMansion(
-        1, "Al-Sharatain", "Ashwini", 0.0, 12.857,
-        "mars", "fortunate", 
-        "New beginnings, journeys, healing, military ventures",
-        ["starting journeys", "medical treatments", "military actions"]
-    ),
-    2: LunarMansion(
-        2, "Al-Butain", "Bharani", 12.857, 25.714,
-        "sun", "neutral",
-        "Building, sowing, planting, but not for journeys",
-        ["construction", "agriculture", "permanent foundations"] 
-    ),
-    # ... (continuing for all 28 mansions - truncated for space)
-}
-
-# -----------------------------------------------------------------------------
-# Enhanced Techniques & Timing Methods  
-# -----------------------------------------------------------------------------
-
-TECHNIQUES: Dict[str, Dict[str, Any]] = {
-    "natal": {
-        "frame": "Birth chart foundation; core personality structure and potential",
-        "orbs": "standard", "tradition": "all systems",
-        "notes": ["Primary chart for all interpretation", "Use complete dignity assessment"]
-    },
-    "transit": {
-        "frame": "External triggers; current planetary activations of natal chart", 
-        "duration_hint": "days to months depending on planet",
-        "orbs": "tight", "tradition": "western/vedic",
-        "notes": ["Outer planets most significant", "Fast planets trigger longer cycles"]
-    },
-    "progression": {
-        "frame": "Internal psychological unfolding; symbolic evolution of consciousness",
-        "duration_hint": "months to years", "orbs": "very tight",
-        "tradition": "western", "notes": ["Secondary progressions most common", "Solar arc alternative method"]
-    },
-    "solar_return": {
-        "frame": "Annual rebirth; yearly themes and focus areas",
-        "duration_hint": "one solar year", "tradition": "western",
-        "notes": ["Relocate to residence location", "Integrate with natal chart"]
-    },
-    "lunar_return": {
-        "frame": "Monthly emotional/instinctive themes; lunar cycle activation", 
-        "duration_hint": "one lunar month", "tradition": "western",
-        "notes": ["Emotional tone of the month", "Triggers natal Moon themes"]
-    },
-    "profection": {
-        "frame": "Annual house activation; traditional time-lord technique",
-        "duration_hint": "one year per house", "tradition": "hellenistic",
-        "notes": ["Start from 1st house at birth", "House ruler becomes time-lord"]
-    },
-    "firdaria": {
-        "frame": "Planetary periods; major life chapter themes",
-        "duration_hint": "7-15 years per period", "tradition": "arabic/persian", 
-        "notes": ["Sequence: Moon, Mercury, Venus, Sun, Mars, Jupiter, Saturn", "Sub-periods within"]
-    },
-    "dasha": {
-        "frame": "Vedic planetary periods; karmic unfoldment timing",
-        "duration_hint": "varies by system", "tradition": "vedic",
-        "notes": ["Vimshottari most common (120 year cycle)", "Mahadasha-Antardasha structure"]
-    },
-    "directions": {
-        "frame": "Primary directions; life-arc milestone timing",  
-        "duration_hint": "months to years", "tradition": "traditional western",
-        "notes": ["1 degree = 1 year traditional", "Requires accurate birth time"]
-    },
-    "horary": {
-        "frame": "Divination chart for specific questions; moment of inquiry",
-        "duration_hint": "specific to question", "tradition": "traditional western",
-        "notes": ["Complete dignity assessment crucial", "Strict traditional rules"]
-    },
-    "electional": {
-        "frame": "Optimal timing selection; choosing auspicious moments",
-        "tradition": "traditional western/vedic", 
-        "notes": ["Avoid void-of-course Moon", "Consider lunar mansions", "Planetary hours"]
-    },
-    "mundane": {
-        "frame": "World events; collective/political/natural phenomena",
-        "tradition": "all systems",
-        "notes": ["Ingress charts", "Eclipse cycles", "Great conjunctions", "National charts"]
-    }
-}
-
-# -----------------------------------------------------------------------------
-# Calculation Utilities
-# -----------------------------------------------------------------------------
-
-def calculate_arabic_part(part_name: str, ascendant: float, 
-                         planets: Dict[str, float], 
-                         houses: Dict[int, float],
-                         is_day_birth: bool = True) -> Optional[float]:
-    """Calculate Arabic Part using traditional formulas."""
     
-    # Get part definition
-    part = HERMETIC_LOTS.get(part_name) or EXTENDED_ARABIC_PARTS.get(part_name)
-    if not part:
-        return None
+    # Assess planetary strengths
+    planetary_strengths = {}
+    sun_tropical = tropical_planets.get("sun", 0)
+    
+    for planet, trop_long in tropical_planets.items():
+        house = find_planet_house(trop_long, house_cusps)
+        house_lord = find_house_lord(house, house_cusps, tropical_planets)
         
-    formula = part.formula_day if is_day_birth else part.formula_night
-    
-    # Parse and evaluate formula
-    # This is simplified - full implementation would need proper formula parser
-    try:
-        if part_name == "part of fortune":
-            if is_day_birth:
-                result = ascendant + planets.get("moon", 0) - planets.get("sun", 0)
-            else:
-                result = ascendant + planets.get("sun", 0) - planets.get("moon", 0)
-        elif part_name == "part of spirit":
-            if is_day_birth:
-                result = ascendant + planets.get("sun", 0) - planets.get("moon", 0) 
-            else:
-                result = ascendant + planets.get("moon", 0) - planets.get("sun", 0)
-        else:
-            # Generic calculation for other parts
-            result = ascendant  # Would need full parser for complex formulas
-            
-        # Normalize to 0-360 range
-        return result % 360.0
-        
-    except Exception:
-        return None
-
-def calculate_sect(sun_longitude: float, ascendant: float) -> Sect:
-    """Determine chart sect (day or night birth)."""
-    # Check if Sun is above horizon (diurnal) or below (nocturnal)
-    sun_house_position = ((sun_longitude - ascendant) % 360) / 30
-    
-    # Houses 1-6 are above horizon (day), 7-12 below (night) 
-    if 0 <= sun_house_position < 6:
-        return Sect.DIURNAL
-    else:
-        return Sect.NOCTURNAL
-
-def get_planet_in_term(sign: str, degree: float) -> Optional[str]:
-    """Get the planet ruling the Egyptian term/bound for given position."""
-    terms = EGYPTIAN_TERMS.get(sign, [])
-    for term in terms:
-        if term["start"] <= degree < term["end"]:
-            return term["planet"]
-    return None
-
-def get_decan_ruler(sign: str, degree: float, is_day: bool = True) -> Optional[str]:
-    """Get the decan/face ruler for given position."""
-    decans = CHALDEAN_DECANS.get(sign, [])
-    decan_index = int(degree // 10)  # Each decan is 10 degrees
-    
-    if 0 <= decan_index < len(decans):
-        return decans[decan_index]
-    return None
-
-# -----------------------------------------------------------------------------
-# High-Level Integration Functions
-# -----------------------------------------------------------------------------
-
-def create_comprehensive_chart_analysis(
-    planets: Dict[str, float],
-    houses: Dict[int, float], 
-    ascendant: float,
-    tradition: AstroTradition = AstroTradition.WESTERN_TROPICAL
-) -> Dict[str, Any]:
-    """Create comprehensive chart analysis integrating all traditional techniques."""
-    
-    # Determine sect
-    sun_longitude = planets.get("sun", 0)
-    chart_sect = calculate_sect(sun_longitude, ascendant)
-    
-    # Assess planetary conditions
-    planetary_conditions = {}
-    for planet_name, longitude in planets.items():
-        house = determine_house(longitude, houses)
-        sign = determine_sign(longitude)
-        condition = assess_planetary_condition(
-            planet_name, longitude, house, sign, sun_longitude, chart_sect
+        strength = assess_planetary_strength(
+            planet, trop_long, sidereal_planets[planet], 
+            house, house_lord, sun_tropical, system
         )
-        planetary_conditions[planet_name] = condition
+        if strength:
+            planetary_strengths[planet] = strength
     
-    # Calculate Arabic Parts
-    arabic_parts = {}
-    is_day_birth = chart_sect == Sect.DIURNAL
+    # Find aspects
+    western_aspects = []
+    vedic_aspects = []
     
-    for part_name in list(HERMETIC_LOTS.keys()) + list(EXTENDED_ARABIC_PARTS.keys()):
-        part_longitude = calculate_arabic_part(part_name, ascendant, planets, houses, is_day_birth)
-        if part_longitude is not None:
-            arabic_parts[part_name] = {
-                "longitude": part_longitude,
-                "sign": determine_sign(part_longitude),
-                "house": determine_house(part_longitude, houses)
-            }
+    planet_list = list(tropical_planets.keys())
+    for i, planet1 in enumerate(planet_list):
+        for planet2 in planet_list[i+1:]:
+            
+            # Western aspects
+            if system in [AstroSystem.WESTERN_TROPICAL, AstroSystem.DUAL_MODE]:
+                p1_data = PLANET_DATABASE.get(planet1)
+                p2_data = PLANET_DATABASE.get(planet2)
+                if p1_data and p2_data:
+                    aspects = find_aspects_western(
+                        tropical_planets[planet1], tropical_planets[planet2],
+                        p1_data.class_type, p2_data.class_type
+                    )
+                    for aspect in aspects:
+                        aspect.update({"planet1": planet1, "planet2": planet2})
+                        western_aspects.append(aspect)
+            
+            # Vedic aspects
+            if system in [AstroSystem.VEDIC_SIDEREAL, AstroSystem.DUAL_MODE]:
+                p1_house = find_planet_house(sidereal_planets[planet1], house_cusps)
+                p2_house = find_planet_house(sidereal_planets[planet2], house_cusps)
+                
+                # Check both directions
+                aspects1 = find_aspects_vedic(p1_house, p2_house, planet1)
+                aspects2 = find_aspects_vedic(p2_house, p1_house, planet2)
+                
+                for aspect in aspects1:
+                    aspect.update({"from_planet": planet1, "to_planet": planet2})
+                    vedic_aspects.append(aspect)
+                    
+                for aspect in aspects2:
+                    aspect.update({"from_planet": planet2, "to_planet": planet1})
+                    vedic_aspects.append(aspect)
     
-    # Fixed star influences
-    fixed_star_influences = []
-    for star_name, star in MAJOR_FIXED_STARS.items():
-        for planet_name, planet_long in planets.items():
-            separation = abs(planet_long - star.longitude_2000)
-            if separation <= star.orb:
-                fixed_star_influences.append({
-                    "star": star_name,
-                    "planet": planet_name, 
-                    "separation": separation,
-                    "influence": star.influence
-                })
+    # Analyze chart patterns and dominance
+    chart_patterns = analyze_chart_patterns(tropical_planets, western_aspects)
+    dominant_elements = calculate_elemental_dominance(tropical_planets)
+    dominant_modalities = calculate_modal_dominance(tropical_planets)
     
-    return {
-        "tradition": tradition.value,
-        "sect": chart_sect.value,
-        "planetary_conditions": planetary_conditions,
-        "arabic_parts": arabic_parts, 
-        "fixed_star_influences": fixed_star_influences,
-        "house_system": HouseSystem.WHOLE_SIGN.value,
-        "overall_assessment": generate_overall_assessment(planetary_conditions)
-    }
+    # Overall chart strength
+    strength_scores = [ps.western_strength_score + ps.vedic_strength_score 
+                      for ps in planetary_strengths.values()]
+    avg_strength = sum(strength_scores) / len(strength_scores) if strength_scores else 0
+    
+    if avg_strength >= 6:
+        chart_strength = "strong"
+    elif avg_strength >= 0:
+        chart_strength = "moderate"
+    else:
+        chart_strength = "challenged"
+    
+    # Primary focus areas (based on strongest houses and planets)
+    focus_areas = determine_focus_areas(planetary_strengths, house_cusps)
+    
+    # Current dasha (if Vedic system)
+    current_dasha = None
+    if system in [AstroSystem.VEDIC_SIDEREAL, AstroSystem.DUAL_MODE]:
+        moon_longitude = sidereal_planets.get("moon", 0)
+        dasha_sequence = calculate_dasha_sequence(moon_longitude)
+        # Would need current age to determine current dasha
+    
+    return ChartAnalysis(
+        system=system,
+        tropical_planets=tropical_planets,
+        sidereal_planets=sidereal_planets,
+        house_cusps=house_cusps,
+        house_system=house_system,
+        planetary_strengths=planetary_strengths,
+        western_aspects=western_aspects,
+        vedic_aspects=vedic_aspects,
+        chart_patterns=chart_patterns,
+        dominant_elements=dominant_elements,
+        dominant_modalities=dominant_modalities,
+        chart_strength=chart_strength,
+        primary_focus_areas=focus_areas,
+        current_dasha=current_dasha,
+        significant_transits=[]
+    )
 
-def determine_house(longitude: float, houses: Dict[int, float]) -> int:
-    """Determine which house a longitude falls in."""
-    # Simplified whole sign house determination
-    # Full implementation would handle various house systems
-    house_size = 30.0  # degrees per house in whole sign
-    house_num = int((longitude % 360) // house_size) + 1
-    return house_num if house_num <= 12 else 1
+def find_planet_house(planet_longitude: float, house_cusps: Dict[int, float]) -> int:
+    """Find which house a planet occupies."""
+    # Simplified whole sign approach
+    for house in range(1, 13):
+        cusp = house_cusps[house]
+        next_cusp = house_cusps.get(house + 1, house_cusps[1])
+        if house == 12:
+            next_cusp = house_cusps[1] + 360
+            
+        if cusp <= planet_longitude < next_cusp or (house == 12 and planet_longitude >= cusp):
+            return house
+    return 1
 
-def determine_sign(longitude: float) -> str:
-    """Determine zodiac sign for given longitude."""
-    sign_index = int((longitude % 360) // 30)
-    return SIGNS[sign_index]
+def find_house_lord(house: int, house_cusps: Dict[int, float], 
+                   planets: Dict[str, float]) -> str:
+    """Find the ruling planet of a house."""
+    house_cusp = house_cusps[house]
+    house_sign = get_sign_from_longitude(house_cusp)
+    sign_data = SIGN_DATABASE.get(house_sign)
+    return sign_data.western_ruler if sign_data else "sun"
 
-def generate_overall_assessment(conditions: Dict[str, PlanetaryCondition]) -> Dict[str, Any]:
-    """Generate overall chart strength assessment."""
+def analyze_chart_patterns(planets: Dict[str, float], aspects: List[Dict[str, Any]]) -> List[str]:
+    """Analyze major chart patterns like stelliums, grand trines, etc."""
+    patterns = []
     
-    # Count strong vs weak planets
-    strong_planets = [p for p in conditions.values() if p.total_score >= 7]
-    weak_planets = [p for p in conditions.values() if p.total_score <= -3]
+    # Look for stelliums (3+ planets in same sign)
+    sign_counts = {}
+    for planet, longitude in planets.items():
+        sign = get_sign_from_longitude(longitude)
+        sign_counts[sign] = sign_counts.get(sign, 0) + 1
     
-    # Assess key areas
-    luminaries_condition = "moderate"
-    if conditions.get("sun") and conditions.get("moon"):
-        sun_score = conditions["sun"].total_score
-        moon_score = conditions["moon"].total_score
-        if sun_score >= 5 and moon_score >= 5:
-            luminaries_condition = "strong"
-        elif sun_score <= -3 or moon_score <= -3:
-            luminaries_condition = "challenged"
+    for sign, count in sign_counts.items():
+        if count >= 3:
+            patterns.append(f"stellium_in_{sign}")
     
-    return {
-        "strong_planets": len(strong_planets),
-        "weak_planets": len(weak_planets), 
-        "luminaries_condition": luminaries_condition,
-        "overall_strength": "strong" if len(strong_planets) > len(weak_planets) else "moderate",
-        "dignified_planets": [p.planet for p in strong_planets],
-        "challenged_planets": [p.planet for p in weak_planets]
-    }
+    # Look for grand trines, T-squares, etc. (simplified)
+    trine_aspects = [a for a in aspects if a.get("aspect") == "trine"]
+    square_aspects = [a for a in aspects if a.get("aspect") == "square"]
+    
+    if len(trine_aspects) >= 3:
+        patterns.append("grand_trine_potential")
+    
+    if len(square_aspects) >= 2:
+        patterns.append("t_square_potential")
+    
+    return patterns
+
+def calculate_elemental_dominance(planets: Dict[str, float]) -> Dict[str, int]:
+    """Calculate elemental emphasis in chart."""
+    elements = {"fire": 0, "earth": 0, "air": 0, "water": 0}
+    
+    for planet, longitude in planets.items():
+        sign = get_sign_from_longitude(longitude)
+        sign_data = SIGN_DATABASE.get(sign)
+        if sign_data:
+            elements[sign_data.element] += 1
+    
+    return elements
+
+def calculate_modal_dominance(planets: Dict[str, float]) -> Dict[str, int]:
+    """Calculate modal emphasis in chart."""
+    modalities = {"cardinal": 0, "fixed": 0, "mutable": 0}
+    
+    for planet, longitude in planets.items():
+        sign = get_sign_from_longitude(longitude)
+        sign_data = SIGN_DATABASE.get(sign)
+        if sign_data:
+            modalities[sign_data.modality] += 1
+    
+    return modalities
+
+def determine_focus_areas(strengths: Dict[str, PlanetaryStrength], 
+                         house_cusps: Dict[int, float]) -> List[str]:
+    """Determine primary life focus areas based on planetary strengths."""
+    
+    focus_areas = []
+    
+    # Check for strong planets in angular houses
+    for planet, strength in strengths.items():
+        if strength.overall_assessment in [StrengthAssessment.EXALTED, StrengthAssessment.STRONG]:
+            house_data = HOUSE_DATABASE.get(strength.house)
+            if house_data and house_data.western_type == "angular":
+                focus_areas.extend(house_data.shared_themes)
+    
+    # Remove duplicates and return top themes
+    return list(set(focus_areas))[:5]
 
 # -----------------------------------------------------------------------------
 # Self-Test & Demo
 # -----------------------------------------------------------------------------
 
 def _self_test() -> None:
-    """Test enhanced library functions."""
+    """Test the integrated library."""
     
-    # Test planetary condition assessment
-    condition = assess_planetary_condition(
-        "jupiter", 95.0, 5, "cancer", 120.0, Sect.DIURNAL
+    # Test coordinate conversion
+    tropical_long = 150.0  # 0° Virgo
+    sidereal_long = tropical_to_sidereal(tropical_long, 2025.0)
+    assert 125.0 < sidereal_long < 127.0  # Should be around 126° (Leo)
+    
+    # Test planetary strength assessment  
+    strength = assess_planetary_strength(
+        "jupiter", 95.0, 71.0, 5, "sun", 120.0, AstroSystem.DUAL_MODE
     )
-    assert condition.overall_condition in ["very strong", "strong"]
-    assert DignityType.EXALTATION in condition.essential_dignities
+    assert strength.overall_assessment in [StrengthAssessment.EXALTED, StrengthAssessment.STRONG]
     
-    # Test Arabic part calculation
-    planets = {"sun": 120.0, "moon": 45.0}
-    pof = calculate_arabic_part("part of fortune", 0.0, planets, {}, True)
-    assert pof == 285.0  # ASC(0) + Moon(45) - Sun(120) + 360 = 285
+    # Test aspect finding
+    aspects = find_aspects_western(0.0, 120.0, "luminary", "social", "natal")
+    assert len(aspects) > 0
+    assert aspects[0]["aspect"] == "trine"
     
-    print("Enhanced astrology library self-test passed!")
+    print("Western/Vedic integrated library self-test passed!")
 
 if __name__ == "__main__":
     _self_test()
     
-    # Demo comprehensive analysis
-    demo_planets = {
+    # Demo integrated analysis
+    sample_planets = {
         "sun": 150.0, "moon": 45.0, "mercury": 140.0,
-        "venus": 160.0, "mars": 200.0, "jupiter": 95.0, "saturn": 300.0
+        "venus": 160.0, "mars": 200.0, "jupiter": 95.0, 
+        "saturn": 300.0, "north_node": 120.0, "south_node": 300.0
     }
-    demo_houses = {i: (i-1)*30 for i in range(1, 13)}
     
-    analysis = create_comprehensive_chart_analysis(
-        demo_planets, demo_houses, 0.0, AstroTradition.WESTERN_TROPICAL
+    sample_datetime = datetime(1990, 6, 15, 14, 30, tzinfo=timezone.utc)
+    
+    analysis = create_integrated_chart_analysis(
+        sample_planets, 0.0, sample_datetime, 40.0, -74.0,
+        AstroSystem.DUAL_MODE, HouseSystem.WHOLE_SIGN
     )
     
-    import json
-    print(json.dumps(analysis, indent=2, default=str))
+    print(f"Chart Analysis Complete:")
+    print(f"System: {analysis.system.value}")
+    print(f"Chart Strength: {analysis.chart_strength}")
+    print(f"Focus Areas: {analysis.primary_focus_areas}")
+    print(f"Western Aspects: {len(analysis.western_aspects)}")
+    print(f"Vedic Aspects: {len(analysis.vedic_aspects)}")
+    print(f"Dominant Elements: {analysis.dominant_elements}")
