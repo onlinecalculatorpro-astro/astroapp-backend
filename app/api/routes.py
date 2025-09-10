@@ -1015,9 +1015,55 @@ def timescales_endpoint():
         return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
 
 # ───────────────────────── endpoints ─────────────────────────
+from time import perf_counter
+
+MAJORS = ("Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn","Uranus","Neptune","Pluto")
+
+def _extract_positions_from_chart(chart: dict) -> dict:
+    """
+    Normalize planet longitudes from various chart shapes into:
+      { "Sun": deg, "Moon": deg, ... }
+    Returns {} if nothing recognizable is found.
+    """
+    if not isinstance(chart, dict):
+        return {}
+
+    # 1) Direct dict
+    if isinstance(chart.get("positions"), dict):
+        return {str(k): float(v) for k, v in chart["positions"].items() if v is not None}
+
+    # 2) 'planets' as dict or list
+    planets = chart.get("planets")
+    if isinstance(planets, dict):
+        return {str(k): float(v) for k, v in planets.items() if v is not None}
+    if isinstance(planets, list):
+        out = {}
+        for item in planets:
+            if not isinstance(item, dict): continue
+            name = item.get("name") or item.get("body")
+            lon  = item.get("lon")  or item.get("longitude")
+            if name is not None and lon is not None:
+                out[str(name)] = float(lon)
+        if out: return out
+
+    # 3) Generic 'rows' list of dicts
+    rows = chart.get("rows")
+    if isinstance(rows, list):
+        out = {}
+        for r in rows:
+            if not isinstance(r, dict): continue
+            name = r.get("name") or r.get("body")
+            lon  = r.get("lon")  or r.get("longitude")
+            if name is not None and lon is not None:
+                out[str(name)] = float(lon)
+        if out: return out
+
+    return {}
+
 @api.post("/api/calculate")
 @rate_limit(RL_CALCULATE)
 def calculate():
+    t0 = perf_counter()  # ---- start timing
     try:
         body = request.get_json(force=True) or {}
         payload = parse_chart_payload(body)
@@ -1034,6 +1080,9 @@ def calculate():
 
     want_houses = _want_houses(body)
     payload["houses"] = bool(want_houses)
+
+    # Sensible default: compute majors if caller didn't specify
+    payload.setdefault("bodies", list(MAJORS))
 
     tz_name = payload.get("place_tz") or payload.get("timezone") or "UTC"
     try:
@@ -1095,7 +1144,7 @@ def calculate():
     }
     meta.update(_snapshot_ephemeris_meta(chart.get("meta")))
 
-    # Calculate aspects if requested
+    # Aspects
     aspects_result = None
     if body.get("aspects", False):
         try:
@@ -1104,12 +1153,24 @@ def calculate():
             if DEBUG_VERBOSE:
                 aspects_result = {"error": str(e)}
 
-    resp = {"ok": True, "timescales": ts, "chart": chart, "meta": meta}
+    # ---- NEW: normalize positions to top-level for clients/tests
+    positions = _extract_positions_from_chart(chart)
+
+    resp = {
+        "ok": True,
+        "timescales": ts,
+        "chart": chart,
+        "meta": meta,
+        "positions": positions,       # <— add this line
+    }
     if want_houses:
         resp["houses"] = houses
     if aspects_result:
         resp["aspects"] = aspects_result
-    return jsonify(resp), 200
+
+    ms = (perf_counter() - t0) * 1000.0  # ---- end timing
+    # return with timing header so your test suite can report server time
+    return jsonify(resp), 200, {"X-Compute-Time-ms": f"{ms:.0f}"}
 
 @api.post("/api/report")
 @rate_limit(RL_REPORT)
