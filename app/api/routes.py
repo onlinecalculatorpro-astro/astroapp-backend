@@ -4145,16 +4145,7 @@ def returns_scan_route():
 @api.post("/api/parans")
 @rate_limit(RL_PARANS)
 def parans_route():
-    """
-    /api/parans — compute local parans.
-
-    Error mapping:
-      • place latitude/longitude invalid  -> parans_value_error (400)
-      • other validation issues           -> validation_error (400)
-      • timescale build user issues       -> validation_error (400)
-      • unexpected timescale failures     -> timescales_error (400)
-      • engine/runtime faults             -> parans_internal (500)
-    """
+    from time import perf_counter
     t0 = perf_counter()
 
     if _parans_compute is None:
@@ -4168,22 +4159,43 @@ def parans_route():
     except ValidationError as e:
         errs = e.errors()
 
-        # Detect coordinate-related errors coming from validator
+        # Robustly detect coordinate-related errors (range or type),
+        # regardless of how `loc` is shaped by the validator.
+        def _normalize_loc(loc):
+            if loc is None:
+                return []
+            if isinstance(loc, (list, tuple)):
+                return [str(x) for x in loc]
+            return [str(loc)]
+
+        def _dot(loc_parts):
+            return ".".join(loc_parts) if loc_parts else ""
+
         def _is_coord_error(details):
             for d in details:
-                loc = d.get("loc")
-                parts = []
-                if isinstance(loc, (list, tuple)):
-                    for p in loc:
-                        parts.append(str(p))
-                elif loc is not None:
-                    parts.append(str(loc))
-                # Match either exact dotted locs or any element mentioning them
-                if any(p in ("place.latitude", "place.longitude") for p in parts):
-                    return True
-                # Extra safety: look at messages
+                loc_parts = _normalize_loc(d.get("loc"))
+                dot = _dot(loc_parts).lower()
                 msg = str(d.get("msg", "")).lower()
-                if "latitude" in msg or "longitude" in msg:
+
+                # Accept any of these shapes:
+                #   "place.latitude" / "place.longitude"
+                #   ["place","latitude"] / ["place","longitude"]
+                #   ["place.latitude", "place.longitude"] (pair)
+                #   plain "latitude"/"longitude" (just in case)
+                loc_tokens = set(x.lower() for x in loc_parts)
+
+                hit_loc = (
+                    "place.latitude" in dot or
+                    "place.longitude" in dot or
+                    ({"place", "latitude"}.issubset(loc_tokens)) or
+                    ({"place", "longitude"}.issubset(loc_tokens)) or
+                    "latitude" in loc_tokens or
+                    "longitude" in loc_tokens
+                )
+
+                hit_msg = ("latitude" in msg) or ("longitude" in msg)
+
+                if hit_loc or hit_msg:
                     return True
             return False
 
@@ -4195,22 +4207,19 @@ def parans_route():
 
     # ---------- Resolve timescales when strict JDs not supplied ----------
     subject = payload.get("subject") or {}
-    place   = payload.get("place") or {}
+    place = payload.get("place") or {}
 
     jd_tt_ref = payload.get("jd_tt_ref")
     jd_ut1_ref = payload.get("jd_ut1_ref")
 
     if jd_tt_ref is None or jd_ut1_ref is None:
         try:
-            ts = _compute_timescales_from_local(
-                subject["date"], subject["time"], subject["place_tz"], payload=subject
-            )
+            ts = _compute_timescales_from_local(subject["date"], subject["time"], subject["place_tz"], payload=subject)
             jd_tt_ref = float(ts["jd_tt"])
             jd_ut1_ref = float(ts["jd_ut1"])
         except ValidationError as e:
             return _json_error("validation_error", e.errors(), 400)
         except (KeyError, TypeError, ValueError) as e:
-            # Bad subject values after validator (should be rare)
             return _json_error("validation_error", str(e), 400)
         except Exception as e:
             return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
@@ -4237,7 +4246,6 @@ def parans_route():
         "validation": payload.get("validation", "basic"),
     }
 
-    # Filter to engine signature (future-proof)
     try:
         import inspect
         sig = inspect.signature(_parans_compute)
@@ -4248,7 +4256,6 @@ def parans_route():
     try:
         result = _parans_compute(**paran_kwargs)
     except ValueError as e:
-        # Engine-level value problems (e.g., numeric ranges inside solver)
         return _json_error("parans_value_error", str(e), 400)
     except (TypeError, RuntimeError) as e:
         det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
@@ -4270,7 +4277,7 @@ def parans_route():
             return _json_error("parans_value_error", error_details, 400)
         return _json_error("parans_internal", error_details if DEBUG_VERBOSE else None, 500)
 
-    # Enrich meta (non-fatal if snapshot fails)
+    # Enrich meta (best-effort)
     meta = dict(result.get("meta", {}))
     try:
         meta.update(_snapshot_ephemeris_meta(meta))
