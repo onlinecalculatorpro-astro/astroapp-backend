@@ -1016,14 +1016,23 @@ def timescales_endpoint():
 
 # ───────────────────────── endpoints ─────────────────────────
 from time import perf_counter
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
+
+# Optional ephemeris fallback
+try:
+    from app.core.ephemeris_adapter import EphemerisAdapter  # same adapter your returns module uses
+except Exception as _e:
+    EphemerisAdapter = None
+    _EPH_FALLBACK_ERR = _e
 
 MAJORS = ("Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn","Uranus","Neptune","Pluto")
+
+# ---------- robust helpers ----------
 
 def _coerce_float(v: Any) -> Optional[float]:
     try:
         x = float(v)
-        if x != x or x == float("inf") or x == float("-inf"):  # NaN / inf guard
+        if x != x or x in (float("inf"), float("-inf")):
             return None
         return x
     except Exception:
@@ -1032,18 +1041,33 @@ def _coerce_float(v: Any) -> Optional[float]:
 def _canon_name(name: Any) -> Optional[str]:
     if not isinstance(name, str):
         return None
-    # Canonicalize majors (case-insensitive); otherwise keep original
     n = name.strip()
     for m in MAJORS:
         if n.lower() == m.lower():
             return m
     return n or None
 
+def _find_lon_in_dict(d: Dict[str, Any]) -> Optional[float]:
+    """Search common longitude keys, including nested 'ecliptic' objects."""
+    if not isinstance(d, dict):
+        return None
+    # direct candidates
+    for k in ("lon", "longitude", "lon_deg", "lambda", "lam", "ecl_lon", "ecliptic_lon"):
+        if k in d:
+            v = _coerce_float(d[k])
+            if v is not None:
+                return v
+    # nested ecliptic containers
+    ecl = d.get("ecliptic")
+    if isinstance(ecl, dict):
+        for k in ("lon", "longitude", "lon_deg", "lambda", "lam"):
+            if k in ecl:
+                v = _coerce_float(ecl[k])
+                if v is not None:
+                    return v
+    return None
+
 def _rows_to_positions(rows: Any) -> Dict[str, float]:
-    """
-    Accepts a list of dict rows with keys like:
-      name/body, lon/longitude, (optionally nested under 'ecliptic')
-    """
     out: Dict[str, float] = {}
     if not isinstance(rows, list):
         return out
@@ -1051,22 +1075,12 @@ def _rows_to_positions(rows: Any) -> Dict[str, float]:
         if not isinstance(r, dict):
             continue
         name = _canon_name(r.get("name") or r.get("body"))
-        # try direct lon keys
-        lon = r.get("lon")
-        if lon is None: lon = r.get("longitude")
-        # try nested ecliptic
-        if lon is None and isinstance(r.get("ecliptic"), dict):
-            lon = r["ecliptic"].get("lon") or r["ecliptic"].get("longitude")
-        lon_f = _coerce_float(lon)
-        if name and lon_f is not None:
-            out[name] = float(lon_f)
+        lon = _find_lon_in_dict(r)
+        if name and lon is not None:
+            out[name] = float(lon)
     return out
 
 def _mapping_to_positions(mp: Any) -> Dict[str, float]:
-    """
-    Accepts dict-like maps:
-      { "Sun": deg, ... } or { "Sun": { "lon": deg } }
-    """
     out: Dict[str, float] = {}
     if not isinstance(mp, dict):
         return out
@@ -1075,44 +1089,37 @@ def _mapping_to_positions(mp: Any) -> Dict[str, float]:
         if not name:
             continue
         if isinstance(v, (int, float, str)):
-            lon_f = _coerce_float(v)
+            lon = _coerce_float(v)
         elif isinstance(v, dict):
-            lon_f = _coerce_float(v.get("lon") or v.get("longitude"))
+            lon = _find_lon_in_dict(v)
         else:
-            lon_f = None
-        if lon_f is not None:
-            out[name] = float(lon_f)
+            lon = None
+        if lon is not None:
+            out[name] = float(lon)
     return out
 
 def _extract_positions_from_chart(chart: Dict[str, Any]) -> Dict[str, float]:
     """
-    Normalize planet longitudes from various chart shapes into:
-      { "Sun": deg, "Moon": deg, ... }
-    Tries several common schemas and returns {} if nothing is found.
+    Normalize planet longitudes into: { "Sun": deg, "Moon": deg, ... }
+    Handles multiple chart shapes; returns {} if nothing found.
     """
     if not isinstance(chart, dict):
         return {}
 
-    # 1) Preferred direct dicts
-    if isinstance(chart.get("positions"), dict):
-        out = _mapping_to_positions(chart["positions"])
-        if out: return out
+    # 1) Preferred dicts
+    for key in ("positions", "planets"):
+        if isinstance(chart.get(key), dict):
+            out = _mapping_to_positions(chart[key])
+            if out: return out
 
-    if isinstance(chart.get("planets"), dict):
-        out = _mapping_to_positions(chart["planets"])
-        if out: return out
+    # 2) Lists
+    for key in ("planets", "rows"):
+        if isinstance(chart.get(key), list):
+            out = _rows_to_positions(chart[key])
+            if out: return out
 
-    # 2) Lists of rows
-    if isinstance(chart.get("planets"), list):
-        out = _rows_to_positions(chart["planets"])
-        if out: return out
-
-    if isinstance(chart.get("rows"), list):
-        out = _rows_to_positions(chart["rows"])
-        if out: return out
-
-    # 3) Other common nests
-    ephem = chart.get("ephemeris") or {}
+    # 3) Common nested container
+    ephem = chart.get("ephemeris")
     if isinstance(ephem, dict):
         if isinstance(ephem.get("positions"), dict):
             out = _mapping_to_positions(ephem["positions"])
@@ -1123,20 +1130,101 @@ def _extract_positions_from_chart(chart: Dict[str, Any]) -> Dict[str, float]:
 
     return {}
 
+def _ayanamsa_from(chart: Dict[str, Any], payload: Dict[str, Any]) -> float:
+    # Prefer chart/meta if your engine writes it there; else payload; else 0.0
+    try:
+        # reuse your existing helper if available
+        ay = _extract_ayanamsa_from_chart(chart)  # type: ignore[name-defined]
+        if isinstance(ay, (int, float)):
+            return float(ay)
+    except Exception:
+        pass
+    ay = payload.get("ayanamsa")
+    return float(ay) if isinstance(ay, (int, float)) else 0.0
+
+def _snapshot_ephemeris_fallback(
+    jd_tt: float,
+    payload: Dict[str, Any],
+    chart: Dict[str, Any],
+) -> Dict[str, float]:
+    """
+    Use EphemerisAdapter directly if the chart didn’t provide positions (or Sun).
+    """
+    if EphemerisAdapter is None:
+        return {}
+
+    bodies: List[str] = list(payload.get("bodies") or MAJORS)
+    # frame: prefer ecliptic-of-date for calculate endpoint
+    frame = "ecliptic-of-date"
+    try:
+        adapter = EphemerisAdapter(frame=frame)
+    except Exception:
+        return {}
+
+    # topocentric if place present
+    lat = payload.get("latitude"); lon = payload.get("longitude")
+    elev = payload.get("elev_m") or payload.get("elevation_m") or 0.0
+    topocentric = isinstance(lat, (int, float)) and isinstance(lon, (int, float))
+
+    kwargs = {"jd_tt": float(jd_tt), "bodies": bodies}
+    if topocentric:
+        kwargs.update({"topocentric": True, "latitude": float(lat), "longitude": float(lon), "elevation_m": float(elev)})
+    else:
+        kwargs["topocentric"] = False
+
+    rows: List[Dict[str, Any]] = []
+    # Prefer velocities method (usually faster to parse, consistent)
+    for method_name in ("ecliptic_longitudes_and_velocities", "ecliptic_longitudes"):
+        if not hasattr(adapter, method_name):
+            continue
+        try:
+            method = getattr(adapter, method_name)
+            res = method(**kwargs)
+            # Normalize result to rows
+            if isinstance(res, dict):
+                if isinstance(res.get("results"), list):
+                    rows = [r for r in res["results"] if isinstance(r, dict)]
+                else:
+                    # flat dict mapping name->lon or name->{lon:...}
+                    rows = [{"name": k, **(v if isinstance(v, dict) else {"lon": v})} for k, v in res.items()]
+            elif isinstance(res, list):
+                rows = [r for r in res if isinstance(r, dict)]
+            if rows:
+                break
+        except Exception:
+            continue
+
+    positions = _rows_to_positions(rows)
+
+    # Sidereal correction if requested
+    mode = (payload.get("mode") or "tropical").lower()
+    if mode == "sidereal" and positions:
+        ay = _ayanamsa_from(chart, payload)
+        if ay:
+            # shift longitudes by -ayanamsa, wrap 0..360
+            out = {}
+            for k, v in positions.items():
+                x = (v - ay) % 360.0
+                out[k] = 0.0 if abs(x) < 1e-12 else x
+            positions = out
+
+    return positions
+
+# ---------- endpoint ----------
+
 @api.post("/api/calculate")
 @rate_limit(RL_CALCULATE)
 def calculate():
-    t0 = perf_counter()  # ---- start timing
+    t0 = perf_counter()
     try:
         body = request.get_json(force=True) or {}
         payload = parse_chart_payload(body)
 
-        # Optional house system override passthrough
         hs = str(body.get("house_system", "")).strip()
         if hs:
             payload["house_system"] = hs
 
-        # Whitelist passthroughs
+        # passthroughs
         for k in ("bodies", "points", "ayanamsa", "topocentric", "elevation_m", "elev_m", "dut1", "houses"):
             if k in body:
                 payload[k] = body[k]
@@ -1148,7 +1236,7 @@ def calculate():
     want_houses = _want_houses(body)
     payload["houses"] = bool(want_houses)
 
-    # Sensible default: compute majors if caller didn't specify
+    # ensure majors unless caller specified
     payload.setdefault("bodies", list(MAJORS))
 
     tz_name = payload.get("place_tz") or payload.get("timezone") or "UTC"
@@ -1157,7 +1245,7 @@ def calculate():
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
 
-    # Compute core chart
+    # compute chart
     try:
         chart = _call_compute_chart(payload, ts)
     except Exception as e:
@@ -1171,7 +1259,7 @@ def calculate():
         if DEBUG_VERBOSE:
             chart["error"] = str(e)
 
-    # Houses (optional)
+    # optional houses
     houses: Optional[Dict[str, Any]] = None
     if want_houses:
         try:
@@ -1185,21 +1273,18 @@ def calculate():
         except Exception as e:
             return _json_error("houses_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
-        # Sidereal rotation for houses, if needed
         mode = (payload.get("mode") or "tropical").lower()
         if mode == "sidereal":
-            ay = _extract_ayanamsa_from_chart(chart)
+            ay = _ayanamsa_from(chart, payload)
             if isinstance(ay, (int, float)) and isinstance(houses, dict):
                 def rot(v: Optional[float]) -> Optional[float]:
                     if v is None:
                         return None
                     x = (float(v) - float(ay)) % 360.0
                     return 0.0 if abs(x) < 1e-12 else x
-
                 for k in ("asc", "asc_deg", "mc", "mc_deg", "vertex", "eastpoint"):
                     if isinstance(houses.get(k), (int, float)):
                         houses[k] = rot(houses[k])
-
                 if isinstance(houses.get("cusps"), list):
                     houses["cusps"] = [rot(c) for c in houses["cusps"]]
                 if isinstance(houses.get("cusps_deg"), list):
@@ -1207,7 +1292,7 @@ def calculate():
 
         houses = _recompute_houses_angles_if_needed(houses, ts, payload, chart)
 
-    # Meta
+    # meta
     meta = {
         "timescales": ts,
         "timescales_locked": True,
@@ -1216,8 +1301,21 @@ def calculate():
         "houses_requested": bool(want_houses),
     }
     meta.update(_snapshot_ephemeris_meta(chart.get("meta")))
+    warnings = meta.setdefault("warnings", [])
 
-    # Aspects (optional)
+    # normalize positions (from chart), then guarantee via fallback if Sun missing
+    positions = _extract_positions_from_chart(chart)
+    if not positions or "Sun" not in positions:
+        snap = _snapshot_ephemeris_fallback(ts["jd_tt"], payload, chart)
+        if snap:
+            # merge, prefer chart values when present
+            for k, v in snap.items():
+                positions.setdefault(k, v)
+            warnings.append("positions_fallback_ephemeris")
+        else:
+            warnings.append("positions_missing_and_no_fallback")
+
+    # aspects (optional)
     aspects_result = None
     if body.get("aspects", False):
         try:
@@ -1226,22 +1324,20 @@ def calculate():
             if DEBUG_VERBOSE:
                 aspects_result = {"error": str(e)}
 
-    # Normalize positions to top-level for clients/tests
-    positions = _extract_positions_from_chart(chart)
-
+    # response
     resp = {
         "ok": True,
         "timescales": ts,
         "chart": chart,
         "meta": meta,
-        "positions": positions,  # <-- stable place for majors (incl. Sun)
+        "positions": positions,   # <-- stable place for majors (incl. Sun)
     }
     if want_houses:
         resp["houses"] = houses
     if aspects_result:
         resp["aspects"] = aspects_result
 
-    ms = (perf_counter() - t0) * 1000.0  # ---- end timing
+    ms = (perf_counter() - t0) * 1000.0
     return jsonify(resp), 200, {"X-Compute-Time-ms": f"{ms:.0f}"}
 
 @api.post("/api/report")
