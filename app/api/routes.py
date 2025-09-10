@@ -1537,19 +1537,29 @@ def aspects():
 def _returns_available() -> bool:
     return _returns_mod is not None
 
-# ───────────────────────── PREDICTION ENGINE API (Flask, Robust Import) ─────────────────────────
-# Key points:
-# - Built for Flask, no extra files.
-# - Robust import: attempts multiple paths for parse_prediction_payload, never breaks route load.
-# - If import fails, defines a dummy fallback that always raises ValidationError.
-# - Retains optimized JSON helpers and consistent engine guard.
+# ───────────────────────── PREDICTION ENGINE API (Flask • Robust • Fast) ─────────────────────────
+# - Drop-in replacement for the API layer block.
+# - No new files. Public routes, inputs, and outputs preserved.
+# - Fixes 500-on-validation by providing a local Validation shim when validator import fails.
+# - Uses precise 503 when engine is unavailable.
+# - Optional orjson fast-path for responses.
+# - DRY helpers (_engine_guard, _build_meta, _accept).
+#
+# Assumes these already exist in your app context:
+#   api, rate_limit, RL_PREDICTION_*, _json_error, _snapshot_ephemeris_meta,
+#   _CHART_ENGINE_NAME, _HOUSES_KIND, _PREDICTION_ENGINE_OK, _PREDICTION_ENGINE_ERR,
+#   predict_transits, predict_progressions, predict_returns, predict_directions,
+#   comprehensive_forecast, relationship_forecast, validate_prediction_model,
+#   _serialize_prediction_result, _serialize_comprehensive_forecast, _serialize_relationship_forecast
+#
+# Place this entire block where your API routes live.
 
 from typing import Any, Dict, Optional
 from flask import Response, request, jsonify
 
-# ----------------------- Fast JSON -----------------------
+# ───────────────────────── Fast JSON (optional orjson) ─────────────────────────
 try:
-    import orjson
+    import orjson  # if present, we use it; otherwise fallback to jsonify
     _FAST_JSON = True
 except Exception:
     _FAST_JSON = False
@@ -1561,48 +1571,73 @@ def _json(payload: Dict[str, Any], status: int = 200) -> Response:
     resp.status_code = status
     return resp
 
-# ----------------------- ValidationError fallback -----------------------
+# ───────────────────────── Validation compatibility shim ───────────────────────
+# Goal: never 500 on user input errors, even if validator module is missing or Pydantic version differs.
+
+# Prefer Pydantic's ValidationError if available; otherwise provide a minimal one with .errors()
 try:
-    from pydantic import ValidationError
+    from pydantic import ValidationError as _PydValidationError  # v1 or v2
 except Exception:
-    class ValidationError(Exception):
-        def __init__(self, details):
-            super().__init__("validation_error")
-            self._details = details
-        def errors(self):
-            return self._details
+    _PydValidationError = None
 
-# ----------------------- Robust validator import -----------------------
-parse_prediction_payload = None
-_VALIDATOR_ERR = None
+class _MinimalValidationError(Exception):
+    def __init__(self, errors):
+        super().__init__("validation_error")
+        self._errors = errors
+    def errors(self):
+        return self._errors
+
+# Treat either Pydantic's or the local error as a "validation" exception in route handlers
+_VALIDATION_EXC = (_MinimalValidationError,) if _PydValidationError is None else (_PydValidationError, _MinimalValidationError)
+
+# Robust import for your real validator.parse_prediction_payload()
+_parse_prediction_payload = None
 try:
-    from validator import parse_prediction_payload as _ppp
-    parse_prediction_payload = _ppp
-except Exception as e1:
-    _VALIDATOR_ERR = e1
+    from validator import parse_prediction_payload as _ppp  # common root
+    _parse_prediction_payload = _ppp
+except Exception:
     try:
-        from app.api.validator import parse_prediction_payload as _ppp
-        parse_prediction_payload = _ppp
-    except Exception as e2:
-        _VALIDATOR_ERR = e2
+        from app.api.validator import parse_prediction_payload as _ppp  # inside app/api/
+        _parse_prediction_payload = _ppp
+    except Exception:
         try:
-            from app.core.validator import parse_prediction_payload as _ppp
-            parse_prediction_payload = _ppp
-        except Exception as e3:
-            _VALIDATOR_ERR = e3
+            from app.core.validator import parse_prediction_payload as _ppp  # inside app/core/
+            _parse_prediction_payload = _ppp
+        except Exception:
+            _parse_prediction_payload = None  # final fallback enabled below
 
-if parse_prediction_payload is None:
-    def parse_prediction_payload(_body: Dict[str, Any]) -> Dict[str, Any]:
-        raise ValidationError([{"loc": [], "msg": "validator import failed", "type": "import_error"}])
+def parse_prediction_payload(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Fallback-compatible wrapper. Uses your real validator if import succeeded; otherwise minimal checks."""
+    if _parse_prediction_payload is not None:
+        return _parse_prediction_payload(body)
 
-# ----------------------- Engine guard -----------------------
+    # Minimal fallback to ensure 400 (not 500) on typical mistakes
+    if not isinstance(body, dict):
+        raise _MinimalValidationError([{"loc": [], "msg": "payload must be an object", "type": "type_error.dict"}])
+
+    if "natal_chart" in body and not isinstance(body.get("natal_chart"), dict):
+        raise _MinimalValidationError([{"loc": ["natal_chart"], "msg": "required object", "type": "value_error"}])
+
+    if "time_range" in body:
+        tr = body.get("time_range")
+        if not (isinstance(tr, (list, tuple)) and len(tr) == 2):
+            raise _MinimalValidationError([{"loc": ["time_range"], "msg": "must be [start_date, end_date]", "type": "value_error"}])
+
+    if "target_date" in body:
+        td = body.get("target_date")
+        if not isinstance(td, (str, int, float)):
+            raise _MinimalValidationError([{"loc": ["target_date"], "msg": "must be ISO string or numeric JD", "type": "value_error"}])
+
+    return body
+
+# ───────────────────────── Small utilities ─────────────────────────────────────
 def _engine_guard() -> Optional[Response]:
+    """Return a 503 Response if the prediction engine is unavailable; else None."""
     if not _PREDICTION_ENGINE_OK:
-        det = {"import_error": repr(_PREDICTION_ENGINE_ERR)} if (DEBUG_VERBOSE and _PREDICTION_ENGINE_ERR) else None
+        det = {"import_error": repr(_PREDICTION_ENGINE_ERR)} if (globals().get("DEBUG_VERBOSE") and _PREDICTION_ENGINE_ERR) else None
         return _json_error("prediction_engine_unavailable", det or "prediction engine not available", 503)
     return None
 
-# ----------------------- Meta builder -----------------------
 def _build_meta(extra: Dict[str, Any] = None) -> Dict[str, Any]:
     meta = {
         "prediction_engine": "app.core.prediction v2",
@@ -1614,32 +1649,118 @@ def _build_meta(extra: Dict[str, Any] = None) -> Dict[str, Any]:
         meta.update(extra)
     return meta
 
-# ----------------------- Accept filter -----------------------
 def _accept(payload: Dict[str, Any], accept_keys: "frozenset[str]") -> Dict[str, Any]:
+    """Fast kwargs filter."""
     return {k: payload[k] for k in payload if k in accept_keys}
 
-# ----------------------- Routes -----------------------
-# (Place your @api.post("/api/prediction/...") routes here, using parse_prediction_payload as before.)
-# Example:
-@api.post("/api/prediction/transits")
-@rate_limit(RL_PREDICTION_TRANSITS)
-def prediction_transits_route():
+# ───────────────────────── Accept sets ─────────────────────────────────────────
+_PREDICTION_TRANSITS_ACCEPT = frozenset({
+    "transiting_bodies", "natal_bodies", "orbs", "aspects", "include_aspects_to",
+    "include_house_cusps", "frame", "zodiac_mode", "ayanamsa_deg", "exact_timing",
+    "statistical_validation", "confidence_threshold",
+})
+
+_PREDICTION_PROGRESSIONS_ACCEPT = frozenset({
+    "method", "lunar_month", "tertiary_mode", "frame", "house_system",
+    "zodiac_mode", "ayanamsa_deg", "aspects_to_natal", "orbs",
+    "parallels", "antiscia", "statistical_validation",
+})
+
+_PREDICTION_RETURNS_ACCEPT = frozenset({
+    "lunar_month", "place", "frame", "house_system", "zodiac_mode",
+    "ayanamsa_deg", "estimate_uncertainty", "aspects_to_natal", "orbs",
+    "statistical_validation",
+})
+
+# IMPORTANT: Do NOT include 'aspects_to_natal' for directions (legacy backends choke on it)
+_PREDICTION_DIRECTIONS_ACCEPT = frozenset({
+    "method", "frame", "zodiac_mode", "ayanamsa_deg", "house_system",
+    "orbs", "statistical_validation",
+})
+
+_RELATIONSHIP_ACCEPT = frozenset({
+    "synastry_orbs", "composite_method", "include_transits_to_composite",
+    "include_progressions", "confidence_threshold", "parallels", "antiscia",
+    "frame", "zodiac_mode", "ayanamsa_deg", "house_system",
+})
+_RELATIONSHIP_PREFIXES = ("transit_", "progression_")
+
+# ───────────────────────── Routes ──────────────────────────────────────────────
+
+@api.post("/api/prediction/forecast")
+@rate_limit(RL_PREDICTION_FORECAST)
+def prediction_comprehensive_forecast_route():
+    """Comprehensive astrological forecast using the prediction engine."""
     if (guard := _engine_guard()) is not None:
         return guard
     try:
         body = request.get_json(silent=False) or {}
         payload = parse_prediction_payload(body)
+    except _VALIDATION_EXC as e:
+        return _json_error("validation_error", e.errors(), 400)
+    except Exception as e:
+        return _json_error("bad_request", str(e) if globals().get("DEBUG_VERBOSE") else None, 400)
+
+    try:
         natal_chart = payload["natal_chart"]
         tr = payload.get("time_range")
         if not tr or not (isinstance(tr, (list, tuple)) and len(tr) == 2):
             return _json_error("validation_error", [{"loc": ["time_range"], "msg": "required"}], 400)
         time_range = (tr[0], tr[1])
-        kwargs = _accept(payload, frozenset({
-            "transiting_bodies","natal_bodies","orbs","aspects","include_aspects_to",
-            "include_house_cusps","frame","zodiac_mode","ayanamsa_deg","exact_timing",
-            "statistical_validation","confidence_threshold",
-        }))
+
+        techniques = payload.get("techniques")
+        confidence_threshold = float(payload.get("confidence_threshold", 0.2))
+        synthesis_method = payload.get("synthesis_method", "weighted_consensus")
+        statistical_validation = bool(payload.get("statistical_validation", False))
+        include_vedic = bool(payload.get("include_vedic", False))
+        peak_window_days = int(payload.get("peak_window_days", 14))
+
+        # Prefix-based passthrough
+        tk_kwargs = {k: v for k, v in payload.items()
+                     if k.startswith("transit_") or k.startswith("progression_") or
+                        k.startswith("return_") or k.startswith("vedic_")}
+
+        forecast = comprehensive_forecast(
+            natal_chart=natal_chart,
+            time_range=time_range,
+            techniques=techniques,
+            confidence_threshold=confidence_threshold,
+            synthesis_method=synthesis_method,
+            statistical_validation=statistical_validation,
+            include_vedic=include_vedic,
+            peak_window_days=peak_window_days,
+            **tk_kwargs,
+        )
+
+        return _json({
+            "ok": True,
+            "forecast": _serialize_comprehensive_forecast(forecast),
+            "meta": _build_meta({"computation_time_ms": getattr(forecast, "computation_time_ms", None)}),
+        }, 200)
+
+    except Exception as e:
+        return _json_error("prediction_internal", str(e) if globals().get("DEBUG_VERBOSE") else "internal_error", 500)
+
+
+@api.post("/api/prediction/transits")
+@rate_limit(RL_PREDICTION_TRANSITS)
+def prediction_transits_route():
+    """Calculate transit events using the prediction engine."""
+    if (guard := _engine_guard()) is not None:
+        return guard
+    try:
+        body = request.get_json(silent=False) or {}
+        payload = parse_prediction_payload(body)
+
+        natal_chart = payload["natal_chart"]
+        tr = payload.get("time_range")
+        if not tr or not (isinstance(tr, (list, tuple)) and len(tr) == 2):
+            return _json_error("validation_error", [{"loc": ["time_range"], "msg": "required"}], 400)
+        time_range = (tr[0], tr[1])
+
+        kwargs = _accept(payload, _PREDICTION_TRANSITS_ACCEPT)
         result = predict_transits(natal_chart=natal_chart, time_range=time_range, **kwargs)
+
         return _json({
             "ok": getattr(result, "ok", False),
             "result": _serialize_prediction_result(result),
@@ -1648,10 +1769,193 @@ def prediction_transits_route():
                 "computation_time_ms": getattr(result, "computation_time_ms", None),
             }),
         }, 200)
-    except ValidationError as e:
+
+    except _VALIDATION_EXC as e:
         return _json_error("validation_error", e.errors(), 400)
     except Exception as e:
-        return _json_error("transits_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+        return _json_error("transits_internal", str(e) if globals().get("DEBUG_VERBOSE") else "internal_error", 500)
+
+
+@api.post("/api/prediction/progressions")
+@rate_limit(RL_PREDICTION_PROGRESSIONS)
+def prediction_progressions_route():
+    """Calculate progression events using the prediction engine."""
+    if (guard := _engine_guard()) is not None:
+        return guard
+    try:
+        body = request.get_json(silent=False) or {}
+        payload = parse_prediction_payload(body)
+
+        natal_chart = payload["natal_chart"]
+        target_date = payload.get("target_date")
+        if target_date is None:
+            return _json_error("validation_error", [{"loc": ["target_date"], "msg": "required"}], 400)
+
+        kwargs = _accept(payload, _PREDICTION_PROGRESSIONS_ACCEPT)
+        result = predict_progressions(natal_chart=natal_chart, target_date=target_date, **kwargs)
+
+        return _json({
+            "ok": getattr(result, "ok", False),
+            "result": _serialize_prediction_result(result),
+            "meta": _build_meta({
+                "technique": getattr(result, "technique", "progressions"),
+                "computation_time_ms": getattr(result, "computation_time_ms", None),
+            }),
+        }, 200)
+
+    except _VALIDATION_EXC as e:
+        return _json_error("validation_error", e.errors(), 400)
+    except Exception as e:
+        return _json_error("progressions_internal", str(e) if globals().get("DEBUG_VERBOSE") else "internal_error", 500)
+
+
+@api.post("/api/prediction/returns")
+@rate_limit(RL_PREDICTION_RETURNS)
+def prediction_returns_route():
+    """Calculate solar/lunar return events using the prediction engine."""
+    if (guard := _engine_guard()) is not None:
+        return guard
+    try:
+        body = request.get_json(silent=False) or {}
+        payload = parse_prediction_payload(body)
+
+        natal_chart = payload["natal_chart"]
+        return_type = payload.get("return_type")
+        year = payload.get("year")
+
+        if not return_type or not year:
+            return _json_error("validation_error", [
+                {"loc": ["return_type"], "msg": "required"},
+                {"loc": ["year"], "msg": "required"},
+            ], 400)
+
+        if return_type not in ("solar", "lunar"):
+            return _json_error("validation_error", [{"loc": ["return_type"], "msg": "must be 'solar' or 'lunar'"}], 400)
+
+        kwargs = _accept(payload, _PREDICTION_RETURNS_ACCEPT)
+        result = predict_returns(natal_chart=natal_chart, return_type=return_type, year=int(year), **kwargs)
+
+        return _json({
+            "ok": getattr(result, "ok", False),
+            "result": _serialize_prediction_result(result),
+            "meta": _build_meta({
+                "technique": getattr(result, "technique", "returns"),
+                "computation_time_ms": getattr(result, "computation_time_ms", None),
+            }),
+        }, 200)
+
+    except _VALIDATION_EXC as e:
+        return _json_error("validation_error", e.errors(), 400)
+    except Exception as e:
+        return _json_error("returns_internal", str(e) if globals().get("DEBUG_VERBOSE") else "internal_error", 500)
+
+
+@api.post("/api/prediction/directions")
+@rate_limit(RL_PREDICTION_DIRECTIONS)
+def prediction_directions_route():
+    """Calculate direction events using the prediction engine."""
+    if (guard := _engine_guard()) is not None:
+        return guard
+    try:
+        body = request.get_json(silent=False) or {}
+        payload = parse_prediction_payload(body)
+
+        natal_chart = payload["natal_chart"]
+        target_date = payload.get("target_date")
+        if target_date is None:
+            return _json_error("validation_error", [{"loc": ["target_date"], "msg": "required"}], 400)
+
+        kwargs = _accept(payload, _PREDICTION_DIRECTIONS_ACCEPT)  # aspects_to_natal intentionally excluded
+        result = predict_directions(natal_chart=natal_chart, target_date=target_date, **kwargs)
+
+        return _json({
+            "ok": getattr(result, "ok", False),
+            "result": _serialize_prediction_result(result),
+            "meta": _build_meta({
+                "technique": getattr(result, "technique", "directions"),
+                "computation_time_ms": getattr(result, "computation_time_ms", None),
+            }),
+        }, 200)
+
+    except _VALIDATION_EXC as e:
+        return _json_error("validation_error", e.errors(), 400)
+    except Exception as e:
+        return _json_error("directions_internal", str(e) if globals().get("DEBUG_VERBOSE") else "internal_error", 500)
+
+
+@api.post("/api/prediction/relationship")
+@rate_limit(RL_PREDICTION_RELATIONSHIP)
+def prediction_relationship_route():
+    """Relationship forecast between two natal charts."""
+    if (guard := _engine_guard()) is not None:
+        return guard
+    try:
+        body = request.get_json(silent=False) or {}
+
+        natal_a = body.get("natal_a")
+        natal_b = body.get("natal_b")
+        time_range = body.get("time_range")
+
+        if not natal_a or not natal_b or not time_range:
+            return _json_error("validation_error", [
+                {"loc": ["natal_a"], "msg": "required"},
+                {"loc": ["natal_b"], "msg": "required"},
+                {"loc": ["time_range"], "msg": "required"},
+            ], 400)
+
+        if not (isinstance(time_range, (list, tuple)) and len(time_range) == 2):
+            return _json_error("validation_error", [{"loc": ["time_range"], "msg": "must be [start_date, end_date] array"}], 400)
+
+        kwargs = _accept(body, _RELATIONSHIP_ACCEPT)
+        # technique-specific passthroughs
+        for k, v in body.items():
+            if k.startswith(_RELATIONSHIP_PREFIXES):
+                kwargs[k] = v
+
+        result = relationship_forecast(
+            natal_a=natal_a,
+            natal_b=natal_b,
+            time_range=(time_range[0], time_range[1]),
+            **kwargs,
+        )
+
+        return _json({
+            "ok": True,
+            "result": _serialize_relationship_forecast(result),
+            "meta": _build_meta({"technique": "relationship_forecast"}),
+        }, 200)
+
+    except _VALIDATION_EXC as e:
+        return _json_error("validation_error", e.errors(), 400)
+    except Exception as e:
+        return _json_error("relationship_internal", str(e) if globals().get("DEBUG_VERBOSE") else "internal_error", 500)
+
+
+@api.post("/api/prediction/validate")
+@rate_limit(RL_PREDICTION_VALIDATION)
+def prediction_validation_route():
+    """Validate prediction model using test cases."""
+    if (guard := _engine_guard()) is not None:
+        return guard
+    try:
+        body = request.get_json(silent=False) or {}
+        test_cases = body.get("test_cases")
+        if not isinstance(test_cases, list) or not test_cases:
+            return _json_error("validation_error", [{"loc": ["test_cases"], "msg": "required non-empty array"}], 400)
+
+        kwargs = _accept(body, frozenset({"validation_method", "n_folds", "metrics", "confidence_threshold"}))
+        result = validate_prediction_model(test_cases=test_cases, **kwargs)
+
+        return _json({
+            "ok": result.get("ok", True),
+            "result": result,
+            "meta": _build_meta({"technique": "model_validation"}),
+        }, 200)
+
+    except _VALIDATION_EXC as e:
+        return _json_error("validation_error", e.errors(), 400)
+    except Exception as e:
+        return _json_error("validation_internal", str(e) if globals().get("DEBUG_VERBOSE") else "internal_error", 500)
 
 
 # ───────────────────────── predictive (transits • validation • dasha • varga • yogas) ─────────────────────────
