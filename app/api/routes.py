@@ -4283,36 +4283,30 @@ def parans_route():
     return jsonify(resp), 200, {"X-Compute-Time-ms": f"{ms:.0f}"}
 
 
-# ───────────────────────── SYNASTRY & COMPOSITE ─────────────────────────
+# ───────────────────────── SYNASTRY & COMPOSITE (DIAGNOSTIC VERSION) ─────────────────────────
 @api.post("/api/synastry")
 @rate_limit(RL_SYNASTRY)
 def synastry_route():
     """
     Compute synastry between two natal charts.
-    
-    Body:
-      natal_a: { date, time, place_tz, latitude?, longitude?, elev_m? }
-      natal_b: { date, time, place_tz, latitude?, longitude?, elev_m? }
-      jd_tt_a?, jd_ut1_a?, jd_tt_b?, jd_ut1_b?: strict timescales (optional)
-      place_a?, place_b?: coordinate overrides (optional)
-      frame?: "ecliptic-of-date" | "ecliptic-j2000"
-      zodiac_mode?: "tropical" | "sidereal"
-      ayanamsa_deg?: float
-      house_system?: string
-      orbs?: {aspect: orb_deg, ...}
-      parallels?: bool (default true)
-      antiscia?: bool (default true)
     """
+    print("=== SYNASTRY ROUTE DEBUG ===")
+    
     if _synastry_compute is None:
+        print("ERROR: _synastry_compute is None")
         det = {"import_error": repr(_SYNASTRY_IMPORT_ERROR)} if DEBUG_VERBOSE and _SYNASTRY_IMPORT_ERROR else None
         return _json_error("synastry_unavailable", det or "synastry engine not wired", 501)
 
     try:
         body = request.get_json(force=True) or {}
+        print(f"Raw request body: {body}")
         payload = parse_synastry_payload(body)
+        print(f"Parsed payload: {payload}")
     except ValidationError as e:
+        print(f"Validation error: {e.errors()}")
         return _json_error("validation_error", e.errors(), 400)
     except Exception as e:
+        print(f"Parse exception: {type(e).__name__}: {e}")
         return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
 
     # Build arguments for synastry computation
@@ -4331,64 +4325,58 @@ def synastry_route():
     for field in ("jd_tt_a", "jd_ut1_a", "jd_tt_b", "jd_ut1_b", "place_a", "place_b", "orbs"):
         if field in payload:
             synastry_kwargs[field] = payload[field]
+            print(f"Added optional field: {field} = {payload[field]}")
 
-    # Safe parameter filtering - only remove if compute function explicitly rejects
+    print(f"Built synastry_kwargs: {list(synastry_kwargs.keys())}")
+
+    # Check function signature
     try:
         import inspect
-        synastry_params = set(inspect.signature(_synastry_compute).parameters.keys())
-        
-        # Check if function uses **kwargs - if so, pass everything
         sig = inspect.signature(_synastry_compute)
+        synastry_params = set(sig.parameters.keys())
+        print(f"Function accepts parameters: {synastry_params}")
+        
+        # Check for **kwargs
         has_kwargs = any(param.kind == param.VAR_KEYWORD for param in sig.parameters.values())
+        print(f"Function has **kwargs: {has_kwargs}")
         
         if has_kwargs:
-            # Function accepts **kwargs, pass all parameters
             filtered_kwargs = synastry_kwargs
+            print("Using all parameters (function has **kwargs)")
         else:
-            # Function has fixed parameters, filter carefully
             filtered_kwargs = {k: v for k, v in synastry_kwargs.items() if k in synastry_params}
+            filtered_out = set(synastry_kwargs.keys()) - synastry_params
+            if filtered_out:
+                print(f"FILTERED OUT: {filtered_out}")
+            print(f"Final parameters: {list(filtered_kwargs.keys())}")
             
-            # Log filtered parameters for debugging
-            if DEBUG_VERBOSE:
-                filtered_out = set(synastry_kwargs.keys()) - synastry_params
-                if filtered_out:
-                    print(f"Synastry: Filtered out parameters: {filtered_out}")
-                    
     except Exception as e:
-        # If inspection fails, pass all parameters and let function handle it
-        if DEBUG_VERBOSE:
-            print(f"Synastry: Parameter inspection failed: {e}")
+        print(f"Signature inspection failed: {e}")
         filtered_kwargs = synastry_kwargs
 
     # Call synastry computation
+    print(f"Calling _synastry_compute with: {list(filtered_kwargs.keys())}")
     try:
         result = _synastry_compute(**filtered_kwargs)
-    except TypeError as e:
-        # Handle parameter mismatch more gracefully
-        error_msg = str(e)
-        if "unexpected keyword argument" in error_msg:
-            # Extract the problematic parameter and retry without it
-            import re
-            match = re.search(r"unexpected keyword argument '(\w+)'", error_msg)
-            if match:
-                bad_param = match.group(1)
-                filtered_kwargs_retry = {k: v for k, v in filtered_kwargs.items() if k != bad_param}
-                if DEBUG_VERBOSE:
-                    print(f"Synastry: Retrying without parameter: {bad_param}")
-                try:
-                    result = _synastry_compute(**filtered_kwargs_retry)
-                except Exception as retry_e:
-                    det = {"type": "TypeError", "message": str(retry_e), "original_error": error_msg} if DEBUG_VERBOSE else None
-                    return _json_error("synastry_internal", det or "parameter_error", 500)
-            else:
-                det = {"type": "TypeError", "message": error_msg} if DEBUG_VERBOSE else None
-                return _json_error("synastry_internal", det or "parameter_error", 500)
-        else:
-            det = {"type": "TypeError", "message": error_msg} if DEBUG_VERBOSE else None
-            return _json_error("synastry_internal", det or "internal_error", 500)
+        print(f"Compute succeeded. Result keys: {list(result.keys()) if isinstance(result, dict) else type(result)}")
+        
+        # Check result structure
+        if isinstance(result, dict):
+            if 'aspects' in result:
+                aspect_count = sum(len(v) if isinstance(v, list) else 0 for v in result['aspects'].values())
+                print(f"Found {aspect_count} aspects")
+            if 'scores' in result:
+                print(f"Scores: {result['scores']}")
+        
     except ValueError as e:
+        print(f"ValueError in compute: {e}")
         return _json_error("synastry_value_error", str(e), 400)
+    except TypeError as e:
+        print(f"TypeError in compute: {e}")
+        det = {"type": "TypeError", "message": str(e)} if DEBUG_VERBOSE else None
+        return _json_error("synastry_internal", det or "internal_error", 500)
     except Exception as e:
+        print(f"Other exception in compute: {type(e).__name__}: {e}")
         det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
         return _json_error("synastry_internal", det or "internal_error", 500)
 
@@ -4396,8 +4384,8 @@ def synastry_route():
     meta = dict(result.get("meta", {}))
     try:
         meta.update(_snapshot_ephemeris_meta(meta))
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Meta enrichment failed: {e}")
 
     # Structure response
     resp = {
@@ -4409,6 +4397,9 @@ def synastry_route():
         "scores": result.get("scores", {}),
         "warnings": list(meta.get("warnings", [])),
     }
+    
+    print(f"Final response structure: {list(resp.keys())}")
+    print("=== END SYNASTRY DEBUG ===")
 
     return jsonify(resp), 200
 
@@ -4417,28 +4408,24 @@ def synastry_route():
 def composite_route():
     """
     Compute composite chart between two natal charts.
-    
-    Body:
-      natal_a: { date, time, place_tz, latitude?, longitude?, elev_m? }
-      natal_b: { date, time, place_tz, latitude?, longitude?, elev_m? }
-      method?: "midpoint" | "davison" (default midpoint)
-      jd_tt_ref?, jd_ut1_ref?: reference timescales (optional)
-      place_ref?: reference place for davison method (optional)
-      frame?: "ecliptic-of-date" | "ecliptic-j2000"
-      house_system?: string
-      ayanamsa_deg?: float
-      zodiac_mode?: "tropical" | "sidereal"
     """
+    print("=== COMPOSITE ROUTE DEBUG ===")
+    
     if _composite_compute is None:
+        print("ERROR: _composite_compute is None")
         det = {"import_error": repr(_SYNASTRY_IMPORT_ERROR)} if DEBUG_VERBOSE and _SYNASTRY_IMPORT_ERROR else None
         return _json_error("composite_unavailable", det or "composite engine not wired", 501)
 
     try:
         body = request.get_json(force=True) or {}
+        print(f"Raw request body: {body}")
         payload = parse_composite_payload(body)
+        print(f"Parsed payload: {payload}")
     except ValidationError as e:
+        print(f"Validation error: {e.errors()}")
         return _json_error("validation_error", e.errors(), 400)
     except Exception as e:
+        print(f"Parse exception: {type(e).__name__}: {e}")
         return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
 
     # Build arguments
@@ -4456,59 +4443,44 @@ def composite_route():
     for field in ("jd_tt_ref", "jd_ut1_ref", "place_ref"):
         if field in payload:
             composite_kwargs[field] = payload[field]
+            print(f"Added optional field: {field} = {payload[field]}")
 
-    # Safe parameter filtering
+    print(f"Built composite_kwargs: {list(composite_kwargs.keys())}")
+
+    # Check function signature
     try:
         import inspect
-        composite_params = set(inspect.signature(_composite_compute).parameters.keys())
-        
-        # Check if function uses **kwargs
         sig = inspect.signature(_composite_compute)
+        composite_params = set(sig.parameters.keys())
+        print(f"Function accepts parameters: {composite_params}")
+        
         has_kwargs = any(param.kind == param.VAR_KEYWORD for param in sig.parameters.values())
+        print(f"Function has **kwargs: {has_kwargs}")
         
         if has_kwargs:
             filtered_kwargs = composite_kwargs
+            print("Using all parameters (function has **kwargs)")
         else:
             filtered_kwargs = {k: v for k, v in composite_kwargs.items() if k in composite_params}
+            filtered_out = set(composite_kwargs.keys()) - composite_params
+            if filtered_out:
+                print(f"FILTERED OUT: {filtered_out}")
+            print(f"Final parameters: {list(filtered_kwargs.keys())}")
             
-            if DEBUG_VERBOSE:
-                filtered_out = set(composite_kwargs.keys()) - composite_params
-                if filtered_out:
-                    print(f"Composite: Filtered out parameters: {filtered_out}")
-                    
     except Exception as e:
-        if DEBUG_VERBOSE:
-            print(f"Composite: Parameter inspection failed: {e}")
+        print(f"Signature inspection failed: {e}")
         filtered_kwargs = composite_kwargs
 
     # Call composite computation
+    print(f"Calling _composite_compute with: {list(filtered_kwargs.keys())}")
     try:
         result = _composite_compute(**filtered_kwargs)
-    except TypeError as e:
-        # Handle parameter mismatch gracefully
-        error_msg = str(e)
-        if "unexpected keyword argument" in error_msg:
-            import re
-            match = re.search(r"unexpected keyword argument '(\w+)'", error_msg)
-            if match:
-                bad_param = match.group(1)
-                filtered_kwargs_retry = {k: v for k, v in filtered_kwargs.items() if k != bad_param}
-                if DEBUG_VERBOSE:
-                    print(f"Composite: Retrying without parameter: {bad_param}")
-                try:
-                    result = _composite_compute(**filtered_kwargs_retry)
-                except Exception as retry_e:
-                    det = {"type": "TypeError", "message": str(retry_e), "original_error": error_msg} if DEBUG_VERBOSE else None
-                    return _json_error("composite_internal", det or "parameter_error", 500)
-            else:
-                det = {"type": "TypeError", "message": error_msg} if DEBUG_VERBOSE else None
-                return _json_error("composite_internal", det or "parameter_error", 500)
-        else:
-            det = {"type": "TypeError", "message": error_msg} if DEBUG_VERBOSE else None
-            return _json_error("composite_internal", det or "internal_error", 500)
+        print(f"Compute succeeded. Result keys: {list(result.keys()) if isinstance(result, dict) else type(result)}")
     except ValueError as e:
+        print(f"ValueError in compute: {e}")
         return _json_error("composite_value_error", str(e), 400)
     except Exception as e:
+        print(f"Exception in compute: {type(e).__name__}: {e}")
         det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
         return _json_error("composite_internal", det or "internal_error", 500)
 
@@ -4516,8 +4488,8 @@ def composite_route():
     meta = dict(result.get("meta", {}))
     try:
         meta.update(_snapshot_ephemeris_meta(meta))
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Meta enrichment failed: {e}")
 
     # Structure response
     resp = {
@@ -4529,31 +4501,36 @@ def composite_route():
         "mc": result.get("mc"),
         "cusps": result.get("cusps"),
     }
+    
+    print(f"Final response structure: {list(resp.keys())}")
+    print("=== END COMPOSITE DEBUG ===")
 
     return jsonify(resp), 200
 
+# Add the synastry/report route with similar debugging...
 @api.post("/api/synastry/report")
 @rate_limit(RL_SYNASTRY)
 def synastry_report_route():
     """
     Comprehensive synastry report (synastry + composite + metrics).
-    
-    Body: combines synastry and composite parameters
-      natal_a, natal_b: natal chart data
-      composite_method?: "midpoint" | "davison"
-      composite_place_ref?: reference place
-      ... all synastry parameters ...
     """
+    print("=== SYNASTRY REPORT DEBUG ===")
+    
     if _synastry_report_compute is None:
+        print("ERROR: _synastry_report_compute is None")
         det = {"import_error": repr(_SYNASTRY_IMPORT_ERROR)} if DEBUG_VERBOSE and _SYNASTRY_IMPORT_ERROR else None
         return _json_error("synastry_report_unavailable", det or "synastry report engine not wired", 501)
 
     try:
         body = request.get_json(force=True) or {}
+        print(f"Raw request body: {body}")
         payload = parse_synastry_report_payload(body)
+        print(f"Parsed payload keys: {list(payload.keys())}")
     except ValidationError as e:
+        print(f"Validation error: {e.errors()}")
         return _json_error("validation_error", e.errors(), 400)
     except Exception as e:
+        print(f"Parse exception: {type(e).__name__}: {e}")
         return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
 
     # Build arguments
@@ -4577,59 +4554,23 @@ def synastry_report_route():
     for field in optional_fields:
         if field in payload:
             report_kwargs[field] = payload[field]
+            print(f"Added optional field: {field}")
 
-    # Safe parameter filtering
-    try:
-        import inspect
-        report_params = set(inspect.signature(_synastry_report_compute).parameters.keys())
-        
-        # Check if function uses **kwargs
-        sig = inspect.signature(_synastry_report_compute)
-        has_kwargs = any(param.kind == param.VAR_KEYWORD for param in sig.parameters.values())
-        
-        if has_kwargs:
-            filtered_kwargs = report_kwargs
-        else:
-            filtered_kwargs = {k: v for k, v in report_kwargs.items() if k in report_params}
-            
-            if DEBUG_VERBOSE:
-                filtered_out = set(report_kwargs.keys()) - report_params
-                if filtered_out:
-                    print(f"Report: Filtered out parameters: {filtered_out}")
-                    
-    except Exception as e:
-        if DEBUG_VERBOSE:
-            print(f"Report: Parameter inspection failed: {e}")
-        filtered_kwargs = report_kwargs
+    print(f"Built report_kwargs: {list(report_kwargs.keys())}")
+
+    # No filtering for now - pass everything
+    filtered_kwargs = report_kwargs
 
     # Call report computation
+    print(f"Calling _synastry_report_compute with: {list(filtered_kwargs.keys())}")
     try:
         result = _synastry_report_compute(**filtered_kwargs)
-    except TypeError as e:
-        # Handle parameter mismatch gracefully
-        error_msg = str(e)
-        if "unexpected keyword argument" in error_msg:
-            import re
-            match = re.search(r"unexpected keyword argument '(\w+)'", error_msg)
-            if match:
-                bad_param = match.group(1)
-                filtered_kwargs_retry = {k: v for k, v in filtered_kwargs.items() if k != bad_param}
-                if DEBUG_VERBOSE:
-                    print(f"Report: Retrying without parameter: {bad_param}")
-                try:
-                    result = _synastry_report_compute(**filtered_kwargs_retry)
-                except Exception as retry_e:
-                    det = {"type": "TypeError", "message": str(retry_e), "original_error": error_msg} if DEBUG_VERBOSE else None
-                    return _json_error("synastry_report_internal", det or "parameter_error", 500)
-            else:
-                det = {"type": "TypeError", "message": error_msg} if DEBUG_VERBOSE else None
-                return _json_error("synastry_report_internal", det or "parameter_error", 500)
-        else:
-            det = {"type": "TypeError", "message": error_msg} if DEBUG_VERBOSE else None
-            return _json_error("synastry_report_internal", det or "internal_error", 500)
+        print(f"Compute succeeded. Result keys: {list(result.keys()) if isinstance(result, dict) else type(result)}")
     except ValueError as e:
+        print(f"ValueError in compute: {e}")
         return _json_error("synastry_report_value_error", str(e), 400)
     except Exception as e:
+        print(f"Exception in compute: {type(e).__name__}: {e}")
         det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
         return _json_error("synastry_report_internal", det or "internal_error", 500)
 
@@ -4652,9 +4593,11 @@ def synastry_report_route():
         "metrics": result.get("metrics", {}),
         "warnings": list(meta.get("warnings", [])),
     }
+    
+    print(f"Final response structure: {list(resp.keys())}")
+    print("=== END SYNASTRY REPORT DEBUG ===")
 
     return jsonify(resp), 200
-
 # ───────────────────────── RELOCATION & ASTROCARTOGRAPHY ─────────────────────────
 @api.post("/api/relocation")
 @rate_limit(RL_RELOCATION)
