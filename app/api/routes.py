@@ -4332,22 +4332,62 @@ def synastry_route():
         if field in payload:
             synastry_kwargs[field] = payload[field]
 
-    # Filter arguments to match function signature
+    # Safe parameter filtering - only remove if compute function explicitly rejects
     try:
         import inspect
         synastry_params = set(inspect.signature(_synastry_compute).parameters.keys())
-        filtered_kwargs = {k: v for k, v in synastry_kwargs.items() if k in synastry_params}
-    except Exception:
+        
+        # Check if function uses **kwargs - if so, pass everything
+        sig = inspect.signature(_synastry_compute)
+        has_kwargs = any(param.kind == param.VAR_KEYWORD for param in sig.parameters.values())
+        
+        if has_kwargs:
+            # Function accepts **kwargs, pass all parameters
+            filtered_kwargs = synastry_kwargs
+        else:
+            # Function has fixed parameters, filter carefully
+            filtered_kwargs = {k: v for k, v in synastry_kwargs.items() if k in synastry_params}
+            
+            # Log filtered parameters for debugging
+            if DEBUG_VERBOSE:
+                filtered_out = set(synastry_kwargs.keys()) - synastry_params
+                if filtered_out:
+                    print(f"Synastry: Filtered out parameters: {filtered_out}")
+                    
+    except Exception as e:
+        # If inspection fails, pass all parameters and let function handle it
+        if DEBUG_VERBOSE:
+            print(f"Synastry: Parameter inspection failed: {e}")
         filtered_kwargs = synastry_kwargs
 
     # Call synastry computation
     try:
         result = _synastry_compute(**filtered_kwargs)
+    except TypeError as e:
+        # Handle parameter mismatch more gracefully
+        error_msg = str(e)
+        if "unexpected keyword argument" in error_msg:
+            # Extract the problematic parameter and retry without it
+            import re
+            match = re.search(r"unexpected keyword argument '(\w+)'", error_msg)
+            if match:
+                bad_param = match.group(1)
+                filtered_kwargs_retry = {k: v for k, v in filtered_kwargs.items() if k != bad_param}
+                if DEBUG_VERBOSE:
+                    print(f"Synastry: Retrying without parameter: {bad_param}")
+                try:
+                    result = _synastry_compute(**filtered_kwargs_retry)
+                except Exception as retry_e:
+                    det = {"type": "TypeError", "message": str(retry_e), "original_error": error_msg} if DEBUG_VERBOSE else None
+                    return _json_error("synastry_internal", det or "parameter_error", 500)
+            else:
+                det = {"type": "TypeError", "message": error_msg} if DEBUG_VERBOSE else None
+                return _json_error("synastry_internal", det or "parameter_error", 500)
+        else:
+            det = {"type": "TypeError", "message": error_msg} if DEBUG_VERBOSE else None
+            return _json_error("synastry_internal", det or "internal_error", 500)
     except ValueError as e:
         return _json_error("synastry_value_error", str(e), 400)
-    except TypeError as e:
-        det = {"type": "TypeError", "message": str(e)} if DEBUG_VERBOSE else None
-        return _json_error("synastry_internal", det or "internal_error", 500)
     except Exception as e:
         det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
         return _json_error("synastry_internal", det or "internal_error", 500)
@@ -4417,17 +4457,55 @@ def composite_route():
         if field in payload:
             composite_kwargs[field] = payload[field]
 
-    # Filter arguments
+    # Safe parameter filtering
     try:
         import inspect
         composite_params = set(inspect.signature(_composite_compute).parameters.keys())
-        filtered_kwargs = {k: v for k, v in composite_kwargs.items() if k in composite_params}
-    except Exception:
+        
+        # Check if function uses **kwargs
+        sig = inspect.signature(_composite_compute)
+        has_kwargs = any(param.kind == param.VAR_KEYWORD for param in sig.parameters.values())
+        
+        if has_kwargs:
+            filtered_kwargs = composite_kwargs
+        else:
+            filtered_kwargs = {k: v for k, v in composite_kwargs.items() if k in composite_params}
+            
+            if DEBUG_VERBOSE:
+                filtered_out = set(composite_kwargs.keys()) - composite_params
+                if filtered_out:
+                    print(f"Composite: Filtered out parameters: {filtered_out}")
+                    
+    except Exception as e:
+        if DEBUG_VERBOSE:
+            print(f"Composite: Parameter inspection failed: {e}")
         filtered_kwargs = composite_kwargs
 
     # Call composite computation
     try:
         result = _composite_compute(**filtered_kwargs)
+    except TypeError as e:
+        # Handle parameter mismatch gracefully
+        error_msg = str(e)
+        if "unexpected keyword argument" in error_msg:
+            import re
+            match = re.search(r"unexpected keyword argument '(\w+)'", error_msg)
+            if match:
+                bad_param = match.group(1)
+                filtered_kwargs_retry = {k: v for k, v in filtered_kwargs.items() if k != bad_param}
+                if DEBUG_VERBOSE:
+                    print(f"Composite: Retrying without parameter: {bad_param}")
+                try:
+                    result = _composite_compute(**filtered_kwargs_retry)
+                except Exception as retry_e:
+                    det = {"type": "TypeError", "message": str(retry_e), "original_error": error_msg} if DEBUG_VERBOSE else None
+                    return _json_error("composite_internal", det or "parameter_error", 500)
+            else:
+                det = {"type": "TypeError", "message": error_msg} if DEBUG_VERBOSE else None
+                return _json_error("composite_internal", det or "parameter_error", 500)
+        else:
+            det = {"type": "TypeError", "message": error_msg} if DEBUG_VERBOSE else None
+            return _json_error("composite_internal", det or "internal_error", 500)
     except ValueError as e:
         return _json_error("composite_value_error", str(e), 400)
     except Exception as e:
@@ -4500,17 +4578,55 @@ def synastry_report_route():
         if field in payload:
             report_kwargs[field] = payload[field]
 
-    # Filter arguments
+    # Safe parameter filtering
     try:
         import inspect
         report_params = set(inspect.signature(_synastry_report_compute).parameters.keys())
-        filtered_kwargs = {k: v for k, v in report_kwargs.items() if k in report_params}
-    except Exception:
+        
+        # Check if function uses **kwargs
+        sig = inspect.signature(_synastry_report_compute)
+        has_kwargs = any(param.kind == param.VAR_KEYWORD for param in sig.parameters.values())
+        
+        if has_kwargs:
+            filtered_kwargs = report_kwargs
+        else:
+            filtered_kwargs = {k: v for k, v in report_kwargs.items() if k in report_params}
+            
+            if DEBUG_VERBOSE:
+                filtered_out = set(report_kwargs.keys()) - report_params
+                if filtered_out:
+                    print(f"Report: Filtered out parameters: {filtered_out}")
+                    
+    except Exception as e:
+        if DEBUG_VERBOSE:
+            print(f"Report: Parameter inspection failed: {e}")
         filtered_kwargs = report_kwargs
 
     # Call report computation
     try:
         result = _synastry_report_compute(**filtered_kwargs)
+    except TypeError as e:
+        # Handle parameter mismatch gracefully
+        error_msg = str(e)
+        if "unexpected keyword argument" in error_msg:
+            import re
+            match = re.search(r"unexpected keyword argument '(\w+)'", error_msg)
+            if match:
+                bad_param = match.group(1)
+                filtered_kwargs_retry = {k: v for k, v in filtered_kwargs.items() if k != bad_param}
+                if DEBUG_VERBOSE:
+                    print(f"Report: Retrying without parameter: {bad_param}")
+                try:
+                    result = _synastry_report_compute(**filtered_kwargs_retry)
+                except Exception as retry_e:
+                    det = {"type": "TypeError", "message": str(retry_e), "original_error": error_msg} if DEBUG_VERBOSE else None
+                    return _json_error("synastry_report_internal", det or "parameter_error", 500)
+            else:
+                det = {"type": "TypeError", "message": error_msg} if DEBUG_VERBOSE else None
+                return _json_error("synastry_report_internal", det or "parameter_error", 500)
+        else:
+            det = {"type": "TypeError", "message": error_msg} if DEBUG_VERBOSE else None
+            return _json_error("synastry_report_internal", det or "internal_error", 500)
     except ValueError as e:
         return _json_error("synastry_report_value_error", str(e), 400)
     except Exception as e:
