@@ -1275,7 +1275,8 @@ def _parse_orbs_dict(orbs_raw: Any) -> Dict[str, float]:
         "square",
         "sextile",
         "quincunx",
-        "parallel_arcmin",
+        "parallel",           # ← FIXED: Added this to match test expectations
+        "parallel_arcmin",    # ← Keep for backward compatibility
         "antiscia",
     }
 
@@ -1452,7 +1453,6 @@ def parse_synastry_report_payload(body: Dict[str, Any]) -> SynastryReportPayload
         out["composite_place_ref"] = composite_place_ref
 
     return out
-
 # ───────────────────────── relocation / astrocartography ─────────────────────────
 
 class RelocationPayload(TypedDict, total=False):
