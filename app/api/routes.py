@@ -3231,7 +3231,21 @@ def progressions_route():
     Progressions: secondary / minor / tertiary.
     Validates payload, normalizes aliases, fills natal JDs if missing,
     filters kwargs to the engine's signature, and returns enriched meta.
+
+    Notes:
+    - Adds numeric epoch scalars for determinism checks:
+        * epoch_seconds  (jd_tt * 86400)
+        * epoch_jd_tt    (jd_tt)
+      and returns these alongside the original epoch object under `epoch_detail`.
+      For compatibility with external test suites expecting a number in `epoch`,
+      we set `epoch` to `epoch_seconds` when available.
+    - Adds mover/target/aspect aliases in `aspects_to_natal` so schema-agnostic
+      loggers can display readable samples.
     """
+    from dataclasses import is_dataclass, asdict
+    from flask import request, jsonify, make_response
+    from time import perf_counter
+
     if compute_progressions is None:
         return _json_error("progressions_unavailable", "progressions engine not wired", 501)
 
@@ -3284,6 +3298,8 @@ def progressions_route():
                 else:
                     out[key] = fixed
         return out
+
+    t0 = perf_counter()
 
     # ---- parse & validate body ------------------------------------------------
     try:
@@ -3396,18 +3412,59 @@ def progressions_route():
     except Exception:
         pass
 
+    # ---- compat helpers --------------------------------------------------------
+    def _epoch_scalars(ep: Any) -> Tuple[Optional[float], Optional[float]]:
+        """Return (epoch_jd_tt, epoch_seconds) if available, else (None, None)."""
+        try:
+            jd_tt = float((ep or {}).get("jd_tt"))
+            return jd_tt, jd_tt * 86400.0
+        except Exception:
+            return None, None
+
+    def _augment_aspects(lst: Any) -> Any:
+        """Add common aliases so generic loggers can display names/orbs."""
+        if not isinstance(lst, list):
+            return lst
+        out = []
+        for a in lst:
+            if not isinstance(a, dict):
+                out.append(a); continue
+            b = dict(a)
+            b.setdefault("mover_name", b.get("prog"))
+            b.setdefault("target_name", b.get("natal"))
+            b.setdefault("aspect", b.get("type"))
+            if "orb_deg" not in b and "orb" in b and isinstance(b["orb"], (int, float)):
+                b["orb_deg"] = float(b["orb"])
+            out.append(b)
+        return out
+
+    epoch_obj = result.get("epoch") or {}
+    epoch_jd_tt, epoch_seconds = _epoch_scalars(epoch_obj)
+
+    aspects_out = _augment_aspects(result.get("aspects_to_natal") or [])
+
     # ---- response -------------------------------------------------------------
-    resp = {
+    resp_body = {
         "ok": True,
         "mapping": (meta.get("mapping") if isinstance(meta.get("mapping"), dict) else None),
         "meta": meta,
         "warnings": list((meta.get("warnings") or [])),
-        "epoch": result.get("epoch"),
+        # Provide numeric epoch for determinism tests; keep full object under epoch_detail.
+        "epoch": (epoch_seconds if epoch_seconds is not None else epoch_obj),
+        "epoch_detail": (epoch_obj if epoch_seconds is not None else None),
+        "epoch_seconds": epoch_seconds,
+        "epoch_jd_tt": epoch_jd_tt,
         "positions": result.get("positions"),
         "houses": result.get("houses"),
-        "aspects_to_natal": result.get("aspects_to_natal") or [],
+        "aspects_to_natal": aspects_out,
     }
-    return jsonify(resp), 200
+
+    resp = make_response(jsonify(resp_body), 200)
+    try:
+        resp.headers["X-Compute-Time-ms"] = str(int((perf_counter() - t0) * 1000))
+    except Exception:
+        pass
+    return resp
 
 # ───────────────────────── RETURNS (rewritten) ─────────────────────────
 def _returns_pick_fn(kind: str) -> Optional[Any]:
