@@ -1969,29 +1969,134 @@ class _CountingAdapter:
         return self._base.ecliptic_longitudes(jd_tt, names, **obs)
 
 # ───────────────────────── /predictive/transits ─────────────────────────
+from typing import Any, Dict, List, Tuple, Optional
+import os, time, math, threading
+from flask import request, jsonify
+
+# Global adapter for performance optimization (per-frame cache)
+from app.core.ephemeris_adapter import EphemerisAdapter, Config as EphemConfig
+
+_GLOBAL_ADAPTERS: Dict[str, EphemerisAdapter] = {}
+_ADAPTER_LOCK = threading.Lock()
+
+def _norm_frame_key(frame: Optional[str]) -> str:
+    s = (frame or "ecliptic-of-date").strip().lower()
+    return "ecliptic-j2000" if s in ("ecliptic-j2000", "j2000", "ecl-j2000") else "ecliptic-of-date"
+
+def get_shared_adapter(frame: str = "ecliptic-of-date") -> EphemerisAdapter:
+    """Get or create a shared EphemerisAdapter instance (per frame) for performance."""
+    key = _norm_frame_key(frame)
+    with _ADAPTER_LOCK:
+        ep = _GLOBAL_ADAPTERS.get(key)
+        if ep is None:
+            ep = EphemerisAdapter(EphemConfig(frame=key, compute_velocity_default=False))
+            _GLOBAL_ADAPTERS[key] = ep
+        return ep
+
+# small concurrency gate to avoid 429s under burst load from the same pod
+_PRED_MAX_CONC = int(os.getenv("PREDICTIVE_MAX_CONCURRENCY", "2"))
+_PRED_SEM_TIMEOUT_S = float(os.getenv("PREDICTIVE_SEM_TIMEOUT_S", "25"))
+_PRED_SEM = threading.Semaphore(_PRED_MAX_CONC)
+
+def _busy():
+    resp = _json_error("server_busy", "try again shortly", 429)
+    resp.headers["Retry-After"] = "2"
+    return resp
+
+def _take_gate():
+    return _PRED_SEM.acquire(timeout=_PRED_SEM_TIMEOUT_S)
+
+def _give_gate():
+    try:
+        _PRED_SEM.release()
+    except Exception:
+        pass
+
+def _split_dt(s: str, fallback: str) -> Tuple[str, str]:
+    """Split 'YYYY-MM-DD[ T]HH:MM:SS' into (date, time) with sensible fallbacks."""
+    s = (s or "").strip().replace("T", " ")
+    if len(s) <= 10:
+        return s[:10], fallback
+    return s[:10], (s[11:19] or fallback)
+
+def _parse_time_range_like(body: Dict[str, Any]) -> Tuple[float, float]:
+    """
+    Accepts any of:
+    - jd_start_tt & jd_end_tt (floats)
+    - time_range: [start, end] where each item can be ISO date or full ISO datetime
+    - date*_*/time*_* + place_tz / timezone (old shape)
+    Returns (jd0, jd1) in TT, raises ValidationError-compatible dict on problems.
+    """
+    # direct JDs
+    jd0 = body.get("jd_start_tt")
+    jd1 = body.get("jd_end_tt")
+    if isinstance(jd0, (int, float)) and isinstance(jd1, (int, float)):
+        jd0f, jd1f = float(jd0), float(jd1)
+        if not (math.isfinite(jd0f) and math.isfinite(jd1f) and jd1f > jd0f):
+            raise ValidationError([{"loc": ["jd_start_tt", "jd_end_tt"], "msg": "invalid range"}])
+        return jd0f, jd1f
+
+    # time_range: ["YYYY-MM-DD" | ISO, "YYYY-MM-DD" | ISO]
+    tr = body.get("time_range")
+    if isinstance(tr, (list, tuple)) and len(tr) == 2:
+        tz = body.get("place_tz") or body.get("timezone") or "UTC"
+        s0, s1 = tr[0], tr[1]
+        if not (isinstance(s0, str) and isinstance(s1, str)):
+            raise ValidationError([{"loc": ["time_range"], "msg": "items must be strings"}])
+        d0, t0 = _split_dt(s0, "00:00:00")
+        d1, t1 = _split_dt(s1, "23:59:59")
+        ts0 = _compute_timescales_from_local(d0, t0, tz, payload=body)
+        ts1 = _compute_timescales_from_local(d1, t1, tz, payload=body)
+        jd0f, jd1f = float(ts0["jd_tt"]), float(ts1["jd_tt"])
+        if jd1f <= jd0f:
+            raise ValidationError([{"loc": ["time_range"], "msg": "end must be after start"}])
+        return jd0f, jd1f
+
+    # legacy civil fields
+    date0 = body.get("date_start") or body.get("date")
+    time0 = body.get("time_start") or body.get("time") or "00:00:00"
+    date1 = body.get("date_end")
+    time1 = body.get("time_end") or "23:59:59"
+    tz = body.get("place_tz") or body.get("timezone") or "UTC"
+
+    if not (isinstance(date0, str) and isinstance(time0, str)):
+        raise ValidationError([{"loc": ["date_start/time_start"], "msg": "required"}])
+
+    ts0 = _compute_timescales_from_local(date0, time0, tz, payload=body)
+    if isinstance(date1, str):
+        ts1 = _compute_timescales_from_local(date1, time1, tz, payload=body)
+        jd0f, jd1f = float(ts0["jd_tt"]), float(ts1["jd_tt"])
+    else:
+        jd0f = float(ts0["jd_tt"])
+        jd1f = jd0f + 1.0  # default 24h window
+
+    if not (math.isfinite(jd0f) and math.isfinite(jd1f) and jd1f > jd0f):
+        raise ValidationError([{"loc": ["jd_start_tt", "jd_end_tt"], "msg": "invalid range"}])
+    return jd0f, jd1f
+
+def _parse_step_minutes(v: Any, *, default_min: float) -> Any:
+    """
+    Accept numeric minutes (>0) or "auto"/0/None → "auto".
+    Returns either float minutes or the string "auto" (engine understands both).
+    """
+    if v is None:
+        return "auto" if default_min <= 0 else default_min
+    if isinstance(v, str) and v.strip().lower() == "auto":
+        return "auto"
+    try:
+        f = float(v)
+        return "auto" if f <= 0 else f
+    except Exception:
+        return default_min
+
 @api.post("/api/predictive/transits")
 @rate_limit(RL_PREDICTIVE)
 def predictive_transits():
     """
-    Scan transits (moving bodies vs target longitudes).
-
-    Inputs:
-      • Time window: {date_start,time_start,date_end,time_end,timezone} OR jd_start_tt/jd_end_tt
-      • movers: ["Sun","Moon",...]  (array of strings; deduped/trimmed)
-      • targets_longitudes: {"Sun": 123.45, ...}  (fast path)
-      • targets_chart: {date,time,place_tz[, ...]}  (fallback)
-          - Default performance behavior: ONLY natal bodies are harvested.
-          - To also include angles/points: set include_target_points=true (alias: include_points).
-          - To restrict which items are harvested: provide target_names: ["Sun","Moon",...]
-      • frame, topocentric + (latitude,longitude[,elevation_m]), zodiac_mode, ayanamsa_deg
-      • include_minors, include_antiscia, antiscia_orb_deg, step_minutes (number or "auto")
-
-    Response headers:
-      • X-Compute-Time-ms — wall time (ms)
-      • X-Adapter-Calls   — ephemeris adapter call count during this request
-      • X-Targets         — #targets scanned
+    Scan transits (moving bodies vs target longitudes) with robust refinement.
+    Accepts either a direct targets map or a 'targets_chart' (natal chart params).
+    Also accepts 'time_range' in addition to jd/date fields.
     """
-    # ---------- request body ----------
     try:
         body = request.get_json(force=True) or {}
     except Exception as e:
@@ -2000,27 +2105,10 @@ def predictive_transits():
     if not _take_gate():
         return _busy()
 
-    t_wall = time.perf_counter()
-    adapter_calls = 0
-
-    # tiny local helper (robust wrap)
-    def _wrap360(x: float) -> float:
-        v = float(x) % 360.0
-        return v + 360.0 if v < 0.0 else v
-
-    # lightweight counting proxy for perf visibility
-    class _CountingAdapter:
-        def __init__(self, base):
-            self._base = base
-            self.calls = 0
-        def __getattr__(self, name):
-            return getattr(self._base, name)
-        def ecliptic_longitudes(self, *args, **kwargs):
-            self.calls += 1
-            return self._base.ecliptic_longitudes(*args, **kwargs)
+    t0 = time.perf_counter()
 
     try:
-        # ---------- time window ----------
+        # -------- time window (jd_tt) --------
         try:
             jd0, jd1 = _parse_time_range_like(body)
         except ValidationError as e:
@@ -2028,118 +2116,67 @@ def predictive_transits():
         except Exception as e:
             return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
 
-        # ---------- movers ----------
+        # -------- movers / targets --------
         raw_movers = body.get("movers") or ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn"]
-        if not isinstance(raw_movers, list):
-            return _json_error("validation_error", [{"loc": ["movers"], "msg": "must be an array of strings"}], 400)
-        for m in raw_movers:
-            if not isinstance(m, str):
-                return _json_error("validation_error", [{"loc": ["movers"], "msg": "all movers must be strings"}], 400)
-        movers = list(dict.fromkeys(s.strip() for s in raw_movers if isinstance(s, str) and s.strip()))
-        if not movers:
-            return _json_error("validation_error", [{"loc": ["movers"], "msg": "cannot be empty after trimming"}], 400)
+        if not (isinstance(raw_movers, list) and all(isinstance(x, str) and x for x in raw_movers)):
+            return _json_error("validation_error", [{"loc":["movers"],"msg":"must be a list of names"}], 400)
 
-        # ---------- targets (prefer direct map; else harvest from chart) ----------
+        movers = list(dict.fromkeys(m.strip() for m in raw_movers if m))
+
+        # targets_longitudes: direct map (preferred, fastest path)
         targets: Dict[str, float] = {}
-
-        # fast path
         raw_targets = body.get("targets_longitudes")
         if isinstance(raw_targets, dict):
             for k, v in raw_targets.items():
                 try:
-                    name = str(k).strip()
-                    val = float(v)
-                    if name and math.isfinite(val):
-                        targets[name] = _wrap360(val)
+                    targets[str(k)] = _wrap360(float(v))
                 except Exception:
-                    # ignore bad entry
                     pass
 
-        # fallback: build from targets_chart
+        # Or build targets from a chart payload (e.g., natal)
         if not targets and isinstance(body.get("targets_chart"), dict):
             targ = dict(body["targets_chart"])
-            if "date" not in targ:
-                return _json_error("validation_error", [{"loc": ["targets_chart", "date"], "msg": "required"}], 400)
-
             tz_nat = targ.get("place_tz") or targ.get("timezone") or "UTC"
             try:
                 ts_nat = _compute_timescales_from_local(targ["date"], targ.get("time", "00:00:00"), tz_nat, payload=targ)
-            except ValidationError as e:
-                return _json_error("validation_error", e.errors(), 400)
             except Exception as e:
-                return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
+                return _json_error("validation_error", [{"loc":["targets_chart"], "msg": str(e)}], 400)
 
             try:
                 ch = _call_compute_chart(targ, ts_nat)
             except Exception as e:
                 return _json_error("chart_internal", str(e) if DEBUG_VERBOSE else "chart_failed", 500)
 
-            # selection controls
-            include_target_points = bool(body.get("include_target_points") or body.get("include_points"))
-            target_names = set(
-                s.strip() for s in (body.get("target_names") or [])
-                if isinstance(s, str) and s.strip()
-            )
-
-            def _harvest(rows):
-                for row in (rows or []):
-                    if not isinstance(row, dict):
-                        continue
-                    nm = str(row.get("name") or "").strip()
-                    lon = row.get("longitude_deg")
-                    if not (nm and isinstance(lon, (int, float)) and math.isfinite(float(lon))):
-                        continue
-                    if target_names and nm not in target_names:
-                        continue
-                    targets[nm] = _wrap360(float(lon))
-
-            # default: only bodies; optionally include points/angles
-            _harvest(ch.get("bodies"))
-            if include_target_points:
-                _harvest(ch.get("points"))
+            for row in (ch.get("bodies") or []) + (ch.get("points") or []):
+                if isinstance(row, dict) and "name" in row and isinstance(row.get("longitude_deg"), (int, float)):
+                    targets[str(row["name"])] = _wrap360(float(row["longitude_deg"]))
 
         if not targets:
-            return _json_error(
-                "validation_error",
-                [{"loc": ["targets_longitudes|targets_chart"], "msg": "no valid targets to scan"}],
-                400,
-            )
+            return _json_error("validation_error", [{"loc":["targets_longitudes|targets_chart"],"msg":"no targets to scan"}], 400)
 
-        # ---------- engine options ----------
+        # -------- engine options --------
+        topocentric = bool(body.get("topocentric")) or (
+            isinstance(body.get("latitude"), (int,float)) and isinstance(body.get("longitude"), (int,float))
+        )
+        lat = float(body.get("latitude")) if isinstance(body.get("latitude"), (int,float)) else None
+        lon = float(body.get("longitude")) if isinstance(body.get("longitude"), (int,float)) else None
+        elev = float(body.get("elevation_m")) if isinstance(body.get("elevation_m"), (int,float)) else None
         frame = parse_frame(body.get("frame"))
+        step_arg = _parse_step_minutes(body.get("step_minutes"), default_min=30.0)
 
-        # topocentric rules: explicit true requires coords; coords imply true
-        topocentric_flag = bool(body.get("topocentric"))
-        lat = body.get("latitude"); lon = body.get("longitude"); elev = body.get("elevation_m")
-        has_latlon = isinstance(lat, (int, float)) and isinstance(lon, (int, float))
-        if topocentric_flag and not has_latlon:
-            return _json_error(
-                "validation_error",
-                [{"loc": ["latitude", "longitude"], "msg": "required when topocentric=true"}],
-                400,
-            )
-        topocentric = topocentric_flag or has_latlon
-
-        lat_f = lon_f = elev_f = None
-        if has_latlon:
+        if topocentric and (lat is not None or lon is not None):
             try:
-                lat_f, lon_f = parse_latlon(lat, lon)
+                lat, lon = parse_latlon(lat, lon)
             except ValidationError as e:
                 return _json_error("validation_error", e.errors(), 400)
-        if elev is not None:
-            try:
-                elev_f = float(elev)
-            except Exception:
-                return _json_error("validation_error", [{"loc": ["elevation_m"], "msg": "must be a number"}], 400)
 
-        step_arg = _parse_step_minutes(body.get("step_minutes"), default_min=60.0)  # supports "auto"
-
-        zodiac_mode = (body.get("zodiac_mode") or "tropical").strip().lower()
-        ayanamsa_deg = float(body.get("ayanamsa_deg", 0.0))
-
-        include_minors   = bool(body.get("include_minors", False))
         include_antiscia = bool(body.get("include_antiscia", False))
         antiscia_orb_deg = float(body.get("antiscia_orb_deg", 2.0))
+        include_minors = bool(body.get("include_minors", False))
+
+        # sidereal options (thread through to engine)
+        zodiac_mode = (body.get("zodiac_mode") or "tropical").lower()
+        ayanamsa_deg = float(body.get("ayanamsa_deg", 0.0))
 
         # aspect set
         from app.core import predictive as pred
@@ -2147,81 +2184,68 @@ def predictive_transits():
         if include_minors:
             aspects += list(pred.MINOR_ASPECTS)
 
-        # ---------- run engine ----------
+        # -------- run engine with shared adapter --------
         try:
-            base_adapter = get_shared_adapter(frame)
-            counting_adapter = _CountingAdapter(base_adapter)
-
+            shared_adapter = get_shared_adapter(frame)
             eng = pred.TransitEngine(
-                ephem=counting_adapter,
+                ephem=shared_adapter,
                 frame=frame,
                 topocentric=topocentric,
-                latitude=lat_f,
-                longitude=lon_f,
-                elevation_m=elev_f,
+                latitude=lat,
+                longitude=lon,
+                elevation_m=elev
             )
+
+            # thread sidereal into engine (no API change)
             eng.sidereal_mode = zodiac_mode.startswith("sidereal")
             eng.ayanamsa_deg = ayanamsa_deg
 
             events = eng.scan_aspects(
                 jd_start_tt=float(jd0),
                 jd_end_tt=float(jd1),
-                movers=movers,
+                movers=[str(m) for m in movers],
                 targets=targets,
                 aspects=aspects,
-                step_minutes=step_arg,          # number or "auto"
+                step_minutes=step_arg,  # supports "auto"
                 include_antiscia=include_antiscia,
                 antiscia_orb_deg=antiscia_orb_deg,
             )
-            adapter_calls = counting_adapter.calls
-        except ValidationError as e:
-            return _json_error("validation_error", e.errors(), 400)
         except Exception as e:
             return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
-        # ---------- shape response ----------
-        out = [{
-            "jd_tt": float(e.jd_tt),
-            "body": e.body,
-            "target": e.target,
-            "aspect": e.aspect,
-            "kind": e.kind,
-            "separation_deg": float(e.separation_deg),
-            "applying": bool(e.applying),
-            "exact": bool(e.exact),
-            "meta": e.meta if isinstance(e.meta, dict) else None,
-        } for e in (events or [])]
+        out = [
+            {
+                "jd_tt": e.jd_tt,
+                "body": e.body,
+                "target": e.target,
+                "aspect": e.aspect,
+                "kind": e.kind,
+                "separation_deg": e.separation_deg,
+                "applying": e.applying,
+                "exact": e.exact,
+                "meta": e.meta,
+            }
+            for e in events
+        ]
 
         resp = jsonify({
             "ok": True,
             "window": {
                 "jd_start_tt": float(jd0),
                 "jd_end_tt": float(jd1),
-                "step_minutes": (step_arg if isinstance(step_arg, (int, float)) else "auto"),
+                "step_minutes": (step_arg if isinstance(step_arg, float) else "auto"),
             },
-            "engine": {
-                "frame": frame,
-                "topocentric": topocentric,
-                "zodiac_mode": zodiac_mode,
-                "ayanamsa_deg": ayanamsa_deg,
-            },
-            "movers": movers,
+            "engine": {"frame": frame, "topocentric": topocentric, "zodiac_mode": zodiac_mode, "ayanamsa_deg": ayanamsa_deg},
             "targets": targets,
-            "results": out,
+            "movers": movers,
+            "results": out
         })
         resp.status_code = 200
-        resp.headers["X-Compute-Time-ms"] = f"{(time.perf_counter() - t_wall) * 1000:.0f}"
-        resp.headers["X-Adapter-Calls"] = str(int(adapter_calls))
-        resp.headers["X-Targets"] = str(len(targets))
+        resp.headers["X-Compute-Time-ms"] = f"{(time.perf_counter() - t0)*1000:.0f}"
         return resp
 
-    except ValidationError as e:
-        return _json_error("validation_error", e.errors(), 400)
-    except Exception as e:
-        return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
     finally:
         _give_gate()
-
 # ───────────────────────── /predictive/ingresses ─────────────────────────
 @api.post("/api/predictive/ingresses")
 @rate_limit(RL_PREDICTIVE)
@@ -2479,7 +2503,7 @@ def predictive_stations():
     t_wall = time.perf_counter()
 
     try:
-        # window
+        # ── window ────────────────────────────────────────────────────────────
         try:
             jd0, jd1 = _parse_time_range_like(body)
         except ValidationError as e:
@@ -2487,14 +2511,14 @@ def predictive_stations():
         except Exception as e:
             return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
 
-        # inputs
+        # ── inputs ───────────────────────────────────────────────────────────
         raw_movers = body.get("movers") or ["Mercury","Venus","Mars","Jupiter","Saturn","Uranus","Neptune","Pluto"]
         movers = [str(m).strip() for m in raw_movers if m and str(m).strip()]
         if not movers:
-            return _json_error("validation_error", [{"msg":"movers cannot be empty"}], 400)
+            return _json_error("validation_error", [{"msg": "movers cannot be empty"}], 400)
 
         frame = parse_frame(body.get("frame"))
-        base_adapter = get_shared_adapter(frame)
+        shared_adapter = get_shared_adapter(frame)
 
         obs = dict(
             topocentric=bool(body.get("topocentric")),
@@ -2504,50 +2528,106 @@ def predictive_stations():
         )
 
         zodiac_mode = (body.get("zodiac_mode") or "tropical").lower()
-        sidereal = zodiac_mode.startswith("sidereal")
         ayanamsa_deg = float(body.get("ayanamsa_deg", 0.0))
+        sidereal = zodiac_mode.startswith("sidereal")
+        ay = float(ayanamsa_deg if sidereal else 0.0)
 
         step_arg = _parse_step_minutes(body.get("step_minutes"), default_min=60.0)
 
-        # per-request ephemeris with memo
-        E = _PerRequestEphem(base_adapter, obs, sidereal=sidereal, ay_deg=ayanamsa_deg)
+        # ── helpers ──────────────────────────────────────────────────────────
+        TAU = 360.0
+
+        def _norm360(x: float) -> float:
+            r = x % TAU
+            return r + TAU if r < 0.0 else r
+
+        def _wrap180(x: float) -> float:
+            v = ((x + 180.0) % 360.0) - 180.0
+            return 180.0 if v == -180.0 else v
+
+        def _nir(lon_trop: float) -> float:
+            return _norm360(float(lon_trop) - ay)
+
+        # per-request caches
+        lon_cache: dict[tuple[str, float], float] = {}   # (body, round(jd,6))
+        spd_cache: dict[tuple[str, float, float], float] = {}  # (body, round(jd,6), h)
+
+        def _k(jd: float) -> float:
+            # ~0.0864 s bucket
+            return round(float(jd), 6)
+
+        def _lon_map(jd_tt: float, names: list[str]) -> dict[str, float]:
+            rows = shared_adapter.ecliptic_longitudes(jd_tt, names, **obs).get("results", [])
+            out: dict[str, float] = {}
+            for row in rows or []:
+                nm = row["name"]
+                lon = float(row["longitude"])
+                if sidereal:
+                    lon = _nir(lon)
+                out[nm] = lon
+                lon_cache[(nm, _k(jd_tt))] = lon
+            return out
+
+        def _lon_one(jd_tt: float, body: str) -> float | None:
+            kk = (body, _k(jd_tt))
+            if kk in lon_cache:
+                return lon_cache[kk]
+            rows = shared_adapter.ecliptic_longitudes(jd_tt, [body], **obs).get("results", [])
+            if not rows:
+                return None
+            lon = float(rows[0]["longitude"])
+            if sidereal:
+                lon = _nir(lon)
+            lon_cache[kk] = lon
+            return lon
 
         def _auto_step_minutes(names: list[str]) -> float:
-            # Stations are slow; coarse is fine; refinement guarantees exactness
+            # Stations are slow; coarser is fine; refinement finds exact t
             caps = []
             for m in names:
                 n = (m or "").lower()
-                if n in ("mercury", "venus"): caps.append(90)
+                if n in ("mercury", "venus"): caps.append(90)   # inner planets: still coarse; refine later
                 elif n in ("mars",):           caps.append(180)
                 else:                          caps.append(360)
             return float(max(30, min(caps) if caps else 180))
 
         # central-difference speed (deg/day) with wrap
         def _speed(body: str, t: float, h: float, lo: float, hi: float) -> float:
+            key = (body, _k(t), h)
+            if key in spd_cache:
+                return spd_cache[key]
             t_m = max(lo, t - h); t_p = min(hi, t + h)
-            if t_p - t_m < 1e-9:
+            if t_p - t_m < 1e-9:  # widen a bit if degenerate
                 t_m = max(lo, t - 2*h); t_p = min(hi, t + 2*h)
-            la = E.one(t_m, body); lb = E.one(t_p, body)
+            la = _lon_one(t_m, body); lb = _lon_one(t_p, body)
             if la is None or lb is None:
-                return float("nan")
-            diff = _wrap180(float(lb) - float(la))
-            dt = (t_p - t_m)
-            return diff / dt if dt > 0.0 else float("nan")
+                v = float("nan")
+            else:
+                diff = _wrap180(float(lb) - float(la))
+                dt = (t_p - t_m)
+                v = diff / dt if dt > 0.0 else float("nan")
+            spd_cache[key] = v
+            return v
 
         # Quadratic (parabolic) refine using three samples around mid
         def _refine_parabolic(body: str, a: float, b: float, h: float, lo: float, hi: float) -> float | None:
             m = 0.5*(a+b)
+            # sample speeds at a, m, b
             s_a = _speed(body, a, h, lo, hi)
             s_m = _speed(body, m, h, lo, hi)
             s_b = _speed(body, b, h, lo, hi)
             if not (math.isfinite(s_a) and math.isfinite(s_m) and math.isfinite(s_b)):
                 return None
+            # fit parabola through (a,s_a), (m,s_m), (b,s_b)
+            # x' ∈ { -1,0,1 } after mapping t ∈ {a,m,b} to x' = (t - m)/(b-a)/0.5
+            # The vertex (zero) x0' = (s_a - s_b) / (2*(s_a - 2*s_m + s_b)) (if denom ≠ 0)
             denom = (s_a - 2*s_m + s_b)
             if abs(denom) < 1e-12:
                 return None
-            x0p = (s_a - s_b) / (2.0 * denom)  # vertex in [-1.5,1.5] window
+            x0p = (s_a - s_b) / (2.0 * denom)
             if -1.5 <= x0p <= 1.5:
-                return max(lo, min(hi, m + x0p * (b - a) * 0.5))
+                t0 = m + x0p * (b - a) * 0.5
+                return max(lo, min(hi, t0))
             return None
 
         # Brent–Dekker fallback on s(t)
@@ -2557,7 +2637,7 @@ def predictive_stations():
                 return None
             if fa == 0.0: return a
             if fb == 0.0: return b
-            # bracket if needed
+            # ensure bracket by bisection if needed
             if fa * fb > 0.0:
                 aa, bb = a, b
                 for _ in range(32):
@@ -2583,10 +2663,12 @@ def predictive_stations():
                 tol = tol_days
                 if abs(b-a) <= tol:
                     return b
+                # inverse quadratic / secant
                 if fa != fc and fb != fc:
                     s = (a*fb*fc)/((fa-fb)*(fa-fc)) + (b*fa*fc)/((fb-fa)*(fb-fc)) + (c*fa*fb)/((fc-fa)*(fc-fb))
                 else:
                     s = b - fb*(b-a)/(fb-fa)
+                # acceptability checks; else bisection
                 cond = not ((3*a + b)/4 < s < b if a < b else b < s < (3*a + b)/4)
                 cond |= (e and abs(s-b) >= abs(e)/2)
                 cond |= (not e and abs(s-b) >= abs(d)/2)
@@ -2608,16 +2690,19 @@ def predictive_stations():
                     a, b = b, a; fa, fb = fb, fa
             return b
 
-        # scan
-        step_minutes = _auto_step_minutes(movers) if isinstance(step_arg, str) else (
-            float(step_arg) if float(step_arg) > 0.0 else _auto_step_minutes(movers)
-        )
+        # ── scan ──────────────────────────────────────────────────────────────
+        if isinstance(step_arg, str):
+            step_minutes = _auto_step_minutes(movers)
+        else:
+            step_minutes = float(step_arg) if float(step_arg) > 0.0 else _auto_step_minutes(movers)
         dt = float(step_minutes) / (24.0 * 60.0)
+
+        # derivative half-stencil (tie to dt, clamp to ≤ 30m)
         h = min(0.5*dt, 30.0/(24.0*60.0)) or (15.0/(24.0*60.0))
 
-        # warm cache at boundaries (batched)
-        _ = E.map(float(jd0), movers)
-        _ = E.map(float(jd1), movers)
+        # warm caches at boundaries (batched)
+        _ = _lon_map(float(jd0), movers)
+        _ = _lon_map(float(jd1), movers)
 
         events: list[dict[str, object]] = []
         dedupe: set[tuple[str, int]] = set()
@@ -2625,8 +2710,9 @@ def predictive_stations():
         t = float(jd0)
         while t < jd1 - 1e-12:
             t_next = min(t + dt, jd1)
-            _ = E.map(t, movers)
-            _ = E.map(t_next, movers)
+            # warm at step endpoints (batched)
+            _ = _lon_map(t, movers)
+            _ = _lon_map(t_next, movers)
 
             for body in movers:
                 s0 = _speed(body, t, h, jd0, jd1)
@@ -2634,26 +2720,27 @@ def predictive_stations():
                 if not (math.isfinite(s0) and math.isfinite(s1)):
                     continue
 
-                # coarse detection: sign change or near-zero
+                # coarse detection: sign change or near zero at either end
                 if not ((s0 == 0.0) or (s1 == 0.0) or (s0*s1 < 0.0) or (min(abs(s0),abs(s1)) <= 0.05)):
                     continue
 
-                # parabolic refine then Brent fallback
+                # parabolic refine first (cheap), then Brent fallback
                 t_star = _refine_parabolic(body, t, t_next, h, jd0, jd1)
                 if t_star is None:
                     t_star = _refine_zero_brent(body, t, t_next, s0, s1, h=h, lo=jd0, hi=jd1, tol_days=1e-6)
                 if t_star is None or not (t - 1e-9 <= t_star <= t_next + 1e-9):
+                    # fallback to minimum |s| among {t, mid, t_next}
                     mid = 0.5*(t + t_next)
                     sm = _speed(body, mid, h, jd0, jd1)
                     if not math.isfinite(sm):
                         continue
                     t_star = min([(abs(s0), t), (abs(sm), mid), (abs(s1), t_next)], key=lambda x: x[0])[1]
 
-                lon_star = E.one(t_star, body)
+                lon_star = _lon_one(t_star, body)
                 if lon_star is None:
                     continue
 
-                # SR/SD classification
+                # determine SR / SD (direction change)
                 eps = max(1.0/(24.0*60.0), 0.25*h)  # ≥ 1 minute
                 sb = _speed(body, max(jd0, t_star - eps), h, jd0, jd1)
                 sa = _speed(body, min(jd1, t_star + eps), h, jd0, jd1)
@@ -2701,7 +2788,6 @@ def predictive_stations():
         })
         resp.status_code = 200
         resp.headers["X-Compute-Time-ms"] = f"{(time.perf_counter() - t_wall)*1000:.0f}"
-        resp.headers["X-Adapter-Calls"] = str(int(E.calls))
         return resp
 
     except ValidationError as e:
