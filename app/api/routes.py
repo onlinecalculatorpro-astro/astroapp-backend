@@ -3325,7 +3325,7 @@ def progressions_route():
         "jd_ut1_natal": payload.get("jd_ut1_natal"),
         "place": (place_clean or None) if isinstance(payload.get("place"), dict) and place_clean else None,
         "frame": payload.get("frame", "ecliptic-of-date"),
-        "house_system": payload.get("house_system", "placidus"),
+        "house_system": payload.get("house_system", "none"),
         "zodiac_mode": payload.get("zodiac_mode", "tropical"),
         "ayanamsa_deg": payload.get("ayanamsa_deg", 0.0),
         "lunar_month": payload.get("lunar_month", "synodic"),
