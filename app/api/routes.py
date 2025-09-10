@@ -4152,66 +4152,61 @@ def parans_route():
         det = {"import_error": repr(_PARANS_IMPORT_ERROR)} if DEBUG_VERBOSE and _PARANS_IMPORT_ERROR else None
         return _json_error("parans_unavailable", det or "parans engine not wired", 501)
 
-    # ---------- Parse & map validation errors ----------
+    # ---------- parse payload ----------
     try:
         body = request.get_json(force=True) or {}
         payload = parse_parans_payload(body)
     except ValidationError as e:
         errs = e.errors()
 
-        # Robustly detect coordinate-related errors (range or type),
-        # regardless of how `loc` is shaped by the validator.
-        def _normalize_loc(loc):
+        def _norm_loc(loc):
+            # loc can be "place.latitude", ["place","latitude"], ["place.latitude"], etc.
             if loc is None:
                 return []
             if isinstance(loc, (list, tuple)):
-                return [str(x) for x in loc]
-            return [str(loc)]
-
-        def _dot(loc_parts):
-            return ".".join(loc_parts) if loc_parts else ""
+                parts = []
+                for x in loc:
+                    s = str(x)
+                    parts.extend(s.split("."))  # split dotted entries too
+                return [p.strip() for p in parts if p is not None and str(p).strip()]
+            return [p.strip() for p in str(loc).split(".") if p.strip()]
 
         def _is_coord_error(details):
             for d in details:
-                loc_parts = _normalize_loc(d.get("loc"))
-                dot = _dot(loc_parts).lower()
-                msg = str(d.get("msg", "")).lower()
+                loc_parts = [s.lower() for s in _norm_loc(d.get("loc"))]
+                dot = ".".join(loc_parts)
+                msg = (str(d.get("msg", "")) or "").lower()
+                typ = (str(d.get("type", "")) or "").lower()
 
-                # Accept any of these shapes:
-                #   "place.latitude" / "place.longitude"
-                #   ["place","latitude"] / ["place","longitude"]
-                #   ["place.latitude", "place.longitude"] (pair)
-                #   plain "latitude"/"longitude" (just in case)
-                loc_tokens = set(x.lower() for x in loc_parts)
-
-                hit_loc = (
-                    "place.latitude" in dot or
-                    "place.longitude" in dot or
-                    ({"place", "latitude"}.issubset(loc_tokens)) or
-                    ({"place", "longitude"}.issubset(loc_tokens)) or
-                    "latitude" in loc_tokens or
-                    "longitude" in loc_tokens
-                )
-
-                hit_msg = ("latitude" in msg) or ("longitude" in msg)
-
-                if hit_loc or hit_msg:
+                # hit if any of these are true:
+                if (
+                    # explicit locs
+                    dot in ("place.latitude", "place.longitude")
+                    or (len(loc_parts) >= 2 and loc_parts[0] == "place" and loc_parts[1] in ("latitude","longitude"))
+                    or ("latitude" in loc_parts) or ("longitude" in loc_parts)
+                    # message mentions lat/lon
+                    or ("latitude" in msg) or ("longitude" in msg)
+                    # type complaints for numbers on place fields
+                    or (("float" in typ or "number" in msg) and ("place" in loc_parts or dot.startswith("place")))
+                ):
                     return True
             return False
 
+        # Map all coordinate issues to parans_value_error
         if _is_coord_error(errs):
             return _json_error("parans_value_error", errs, 400)
+
+        # everything else stays as generic validation_error
         return _json_error("validation_error", errs, 400)
     except Exception as e:
         return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
 
-    # ---------- Resolve timescales when strict JDs not supplied ----------
+    # ---------- resolve timescales if strict not provided ----------
     subject = payload.get("subject") or {}
     place = payload.get("place") or {}
 
     jd_tt_ref = payload.get("jd_tt_ref")
     jd_ut1_ref = payload.get("jd_ut1_ref")
-
     if jd_tt_ref is None or jd_ut1_ref is None:
         try:
             ts = _compute_timescales_from_local(subject["date"], subject["time"], subject["place_tz"], payload=subject)
@@ -4219,12 +4214,10 @@ def parans_route():
             jd_ut1_ref = float(ts["jd_ut1"])
         except ValidationError as e:
             return _json_error("validation_error", e.errors(), 400)
-        except (KeyError, TypeError, ValueError) as e:
-            return _json_error("validation_error", str(e), 400)
         except Exception as e:
             return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
 
-    # ---------- Call engine ----------
+    # ---------- call engine ----------
     paran_kwargs = {
         "subject": subject,
         "place": place,
@@ -4264,20 +4257,14 @@ def parans_route():
         det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
         return _json_error("parans_internal", det or "internal_error", 500)
 
-    # ---------- Normalize engine result ----------
+    # ---------- normalize engine result ----------
     if not isinstance(result, dict) or not result.get("ok", False):
-        error_details = result.get("details") if isinstance(result, dict) else None
-        error_type = result.get("error", "parans_failed") if isinstance(result, dict) else "parans_failed"
+        details = result.get("details") if isinstance(result, dict) else None
+        etype = result.get("error", "parans_failed") if isinstance(result, dict) else "parans_failed"
+        if etype in ("validation_error", "timescales_error", "parans_calculation_failed", "parans_value_error"):
+            return _json_error(etype, details, 400)
+        return _json_error("parans_internal", details if DEBUG_VERBOSE else None, 500)
 
-        if error_type == "validation_error":
-            return _json_error("validation_error", error_details, 400)
-        if error_type in ("timescales_error", "parans_calculation_failed"):
-            return _json_error(error_type, error_details, 400)
-        if error_type == "parans_value_error":
-            return _json_error("parans_value_error", error_details, 400)
-        return _json_error("parans_internal", error_details if DEBUG_VERBOSE else None, 500)
-
-    # Enrich meta (best-effort)
     meta = dict(result.get("meta", {}))
     try:
         meta.update(_snapshot_ephemeris_meta(meta))
