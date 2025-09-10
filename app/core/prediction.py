@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 """
-Prediction Engine (v2)
+Prediction Engine (v2) — performance-optimized rewrite (API compatible)
 
 Public API
 ----------
@@ -14,6 +14,15 @@ predict_directions(natal_chart, target_date, **kwargs) -> PredictionResult
 comprehensive_forecast(natal_chart, time_range, **kwargs) -> ComprehensiveForecast
 relationship_forecast(natal_a, natal_b, time_range, **kwargs) -> RelationshipForecast
 validate_prediction_model(test_cases, **kwargs) -> dict
+
+Design goals (unchanged semantics)
+----------------------------------
+- Preserve public functions, parameters, return-shapes and dataclasses.
+- Remove I/O and heavy object construction from hot paths.
+- Prefer ERFA-based `build_timescales` where available; else reuse a
+  singleton Skyfield timescale (no repeated `load.timescale()`).
+- Cap loops, apply cheap guards and memoize derived configs.
+- Avoid tz relabeling; only convert (no offset clobber).
 """
 
 import json
@@ -26,7 +35,13 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Any, Dict, List, Tuple, Optional, Union
 
-# ── Imports with guards ───────────────────────────────────────────────────────
+# ────────────────────────── Fast-local aliases ───────────────────────────────
+_UTC = timezone.utc
+_SECONDS_PER_DAY = 86400.0
+_JD_UNIX_EPOCH = 2440587.5
+_MIN_FLOAT = 1e-9
+
+# ────────────────────────── Imports with guards ──────────────────────────────
 
 # Constants / helpers
 try:
@@ -46,7 +61,7 @@ try:
     _CONST_OK = True; _CONST_ERR = None
 except Exception as e:
     _CONST_OK = False; _CONST_ERR = e
-    # minimal fallbacks
+    # minimal fallbacks (unchanged)
     MAJOR_BODIES = ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn","Uranus","Neptune","Pluto"]
     ASPECT_ANGLES_DEG = {"conjunction":0,"opposition":180,"trine":120,"square":90,"sextile":60}
     DEFAULT_ORBS_SYNASTRY = DEFAULT_ORBS_PROGRESSIONS = DEFAULT_ORBS_DIRECTIONS = DEFAULT_ORBS_TRANSITS = {
@@ -57,7 +72,7 @@ except Exception as e:
         d = (a - b + 180) % 360 - 180
         return abs(d)
 
-# Timescales
+# Timescales (prefer ERFA chain)
 try:
     from app.core.timescales import build_timescales, TimeScales
     _TS_OK = True; _TS_ERR = None
@@ -101,16 +116,24 @@ except Exception as e:
 # Unified predictive toolkit (transits + vedic utils)
 try:
     from app.core.predictive import (
-        # Transits
         find_transits_in_range,
-        # Dasha
         vimsottari_dasha,
     )
     _PRED_OK = True; _PRED_ERR = None
 except Exception as e:
     _PRED_OK = False; _PRED_ERR = e
 
-# ── Data structures ──────────────────────────────────────────────────────────
+# Fallback: Skyfield timescale singleton (only if ERFA not available)
+_TSF_SINGLETON = None
+def _get_skyfield_timescale():
+    global _TSF_SINGLETON
+    if _TSF_SINGLETON is not None:
+        return _TSF_SINGLETON
+    from skyfield.api import load  # import here to avoid module import on cold path
+    _TSF_SINGLETON = load.timescale()
+    return _TSF_SINGLETON
+
+# ───────────────────────────── Data structures ───────────────────────────────
 
 @dataclass
 class PredictionEvent:
@@ -169,22 +192,26 @@ class RelationshipForecast:
     relationship_score: float = 0.0
     confidence_metrics: Dict[str, float] = field(default_factory=dict)
 
-# ── Utilities ────────────────────────────────────────────────────────────────
+# ───────────────────────────────── Utilities ─────────────────────────────────
 
 def _check_env() -> None:
     if not _CONST_OK:
         raise RuntimeError(f"constants unavailable: {_CONST_ERR}")
 
+@lru_cache(maxsize=4096)
+def _ensure_utc_cached(s: str) -> datetime:
+    """Fast path for ISO strings; cached."""
+    z = s.strip()
+    if "T" not in z and len(z) <= 10:
+        z += "T00:00:00+00:00"
+    z = z.replace("Z", "+00:00")
+    dt = datetime.fromisoformat(z)
+    return dt if dt.tzinfo else dt.replace(tzinfo=_UTC)
+
 def _ensure_utc(dt_or_str: Union[str, datetime]) -> datetime:
     if isinstance(dt_or_str, str):
-        s = dt_or_str.strip()
-        if "T" not in s and len(s) <= 10:
-            s += "T00:00:00+00:00"
-        s = s.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(s)
-    else:
-        dt = dt_or_str
-    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        return _ensure_utc_cached(dt_or_str)
+    return dt_or_str if dt_or_str.tzinfo else dt_or_str.replace(tzinfo=_UTC)
 
 def _hash_obj(obj: Any) -> str:
     try:
@@ -193,53 +220,38 @@ def _hash_obj(obj: Any) -> str:
         payload = repr(obj)
     return hashlib.blake2b(payload.encode("utf-8"), digest_size=16).hexdigest()
 
-def _jd_pair_from_dt_fixed(dt: Union[datetime, str]) -> Tuple[float, float]:
-    """
-    Fixed version that converts datetime to (jd_tt, jd_ut1) without .utc_jd errors.
-    This is the ONLY function that should be used for datetime to JD conversion.
-    
-    Args:
-        dt: datetime object or ISO string
-        
-    Returns:
-        Tuple of (jd_tt, jd_ut1)
-    """
-    if isinstance(dt, str):
-        dt = datetime.fromisoformat(dt.replace("Z", "")).replace(tzinfo=timezone.utc)
-    
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    elif dt.tzinfo != timezone.utc:
-        dt = dt.astimezone(timezone.utc)
-    
+# dt → (jd_tt, jd_ut1): Prefer ERFA `build_timescales`, else Skyfield singleton; last resort math.
+@lru_cache(maxsize=4096)
+def _jd_pair_from_dt(dt_iso: str) -> Tuple[float, float]:
+    # Called via ISO text for cache-ability
+    dt = _ensure_utc(dt_iso)
+    if _TS_OK:
+        ts: TimeScales = build_timescales(dt.date().isoformat(), dt.time().isoformat(), "UTC", 0.0)
+        return float(ts["jd_tt"]), float(ts["jd_ut1"])
+    # Fallback Skyfield (timescale singleton)
     try:
-        from skyfield.api import load
-        ts = load.timescale()
-        t = ts.from_datetime(dt)
-        
-        # Use correct Skyfield Time attributes (not .utc_jd)
-        return float(t.tt), float(t.ut1)
-        
-    except ImportError:
-        # Fallback calculation without Skyfield
-        import calendar
-        timestamp = calendar.timegm(dt.timetuple())
-        jd_ut1 = 2440587.5 + timestamp / 86400.0  # Unix epoch to JD conversion
-        jd_tt = jd_ut1 + 69.184 / 86400.0  # Approximate TT-UT1 difference
-        return jd_tt, jd_ut1
-        
+        tsf = _get_skyfield_timescale()
+        t = tsf.from_datetime(dt)
+        return float(t.tt), float(getattr(t, "ut1", t.ut1))
     except Exception:
-        # Emergency fallback for any other errors
-        import calendar
-        timestamp = calendar.timegm(dt.timetuple())
-        jd_ut1 = 2440587.5 + timestamp / 86400.0
-        jd_tt = jd_ut1 + 69.184 / 86400.0
+        # Emergency math (no leap handling, approximate ΔT ~ 69.184 s)
+        stamp = (dt - datetime(1970, 1, 1, tzinfo=_UTC)).total_seconds()
+        jd_ut1 = _JD_UNIX_EPOCH + (stamp / _SECONDS_PER_DAY)
+        jd_tt = jd_ut1 + (69.184 / _SECONDS_PER_DAY)
         return jd_tt, jd_ut1
+
+def _jd_pair_from_dt_fixed(dt_or_str: Union[datetime, str]) -> Tuple[float, float]:
+    """Public-friendly wrapper preserving your previous function name."""
+    if isinstance(dt_or_str, datetime):
+        dt = dt_or_str.astimezone(_UTC) if dt_or_str.tzinfo else dt_or_str.replace(tzinfo=_UTC)
+        return _jd_pair_from_dt(dt.isoformat())
+    # string path
+    return _jd_pair_from_dt(_ensure_utc(dt_or_str).isoformat())
 
 def _canon_aspect(name: Optional[str]) -> str:
     return (name or "").strip().lower()
 
-@lru_cache(maxsize=256)
+@lru_cache(maxsize=512)
 def _normalize_aspect_config_cached(key: str) -> AspectConfig:
     params = json.loads(key)
     orbs = params["orbs"]
@@ -273,73 +285,54 @@ def _normalize_aspect_config(orbs: Optional[Dict[str, float]], technique: str) -
 
 def _resolve_natal_timescales_fixed(natal_chart: Dict[str, Any]) -> Tuple[float, float, List[str]]:
     """
-    Fixed version of natal timescale resolution that avoids .utc_jd attribute error.
-    Properly handles timezone conversion without offset-clobbering.
-    
-    Returns:
-        Tuple of (jd_tt, jd_ut1, warnings)
+    Robust timescale resolution without tz relabeling; avoids .utc_jd issues.
+    Uses ERFA path when available, else Skyfield singleton.
     """
-    warnings = []
-    
+    warnings: List[str] = []
     try:
-        # Extract date/time from natal chart
         natal_date = natal_chart.get("date")
         natal_time = natal_chart.get("time", "12:00:00")
-        place_tz = natal_chart.get("place_tz", "UTC")
-        
-        # Create datetime object with proper timezone handling
+        place_tz = natal_chart.get("place_tz", "UTC") or "UTC"
+
+        # Build a timezone-aware datetime in local zone → convert to UTC
         if isinstance(natal_date, str):
-            dt_str = f"{natal_date} {natal_time}"
-            
+            # Accept 'YYYY-MM-DD' or ISO; ensure time is present
+            date_str = natal_date.strip()
+            time_str = str(natal_time).strip()
+            # Resolve timezone if provided
             try:
-                # Try parsing with timezone - proper conversion, not relabeling
-                if place_tz and place_tz != "UTC":
-                    try:
-                        from zoneinfo import ZoneInfo
-                        tz = ZoneInfo(place_tz)
-                        # Parse as local time in the specified timezone
-                        dt_local = datetime.fromisoformat(dt_str.replace("Z", ""))
-                        dt_with_tz = dt_local.replace(tzinfo=tz)
-                        # Convert (not relabel) to UTC
-                        dt_utc = dt_with_tz.astimezone(timezone.utc)
-                    except Exception as tz_error:
-                        warnings.append(f"timezone_conversion_error:{tz_error}")
-                        # Fallback: assume the time is already in UTC
-                        dt_utc = datetime.fromisoformat(dt_str.replace("Z", "")).replace(tzinfo=timezone.utc)
+                from zoneinfo import ZoneInfo
+                tz = ZoneInfo(place_tz)
+                # parse as naive local then attach tz (no relabel), then convert
+                # prefer strict ISO if present; else join
+                if "T" in date_str:
+                    local_dt = datetime.fromisoformat(date_str.replace("Z", ""))
                 else:
-                    # Parse as UTC
-                    if dt_str.endswith('Z'):
-                        dt_str = dt_str.replace('Z', '+00:00')
-                    dt_utc = datetime.fromisoformat(dt_str)
-                    if dt_utc.tzinfo is None:
-                        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
-                    else:
-                        dt_utc = dt_utc.astimezone(timezone.utc)
-                        
-            except Exception as e:
-                warnings.append(f"date_parse_error:{e}")
-                # Fallback to simple parsing - assume UTC
-                try:
-                    dt_utc = datetime.fromisoformat(f"{natal_date} {natal_time}").replace(tzinfo=timezone.utc)
-                except:
-                    dt_utc = datetime.fromisoformat(natal_date).replace(tzinfo=timezone.utc)
+                    local_dt = datetime.fromisoformat(f"{date_str} {time_str}".replace("Z", ""))
+                if local_dt.tzinfo is None:
+                    local_dt = local_dt.replace(tzinfo=tz)
+                else:
+                    # if already tz-aware, trust it; no relabel
+                    pass
+                dt_utc = local_dt.astimezone(_UTC)
+            except Exception as tz_error:
+                warnings.append(f"timezone_conversion_error:{tz_error}")
+                # fallback assume UTC
+                if "T" in date_str:
+                    dt_utc = _ensure_utc(date_str)
+                else:
+                    dt_utc = _ensure_utc(f"{date_str} {time_str}")
+        elif isinstance(natal_date, datetime):
+            dt_utc = natal_date.astimezone(_UTC) if natal_date.tzinfo else natal_date.replace(tzinfo=_UTC)
         else:
-            # Assume it's already a datetime object
-            if hasattr(natal_date, 'astimezone'):
-                dt_utc = natal_date.astimezone(timezone.utc) if natal_date.tzinfo else natal_date.replace(tzinfo=timezone.utc)
-            else:
-                dt_utc = datetime.now(timezone.utc)
-                warnings.append("assumed_current_datetime")
-        
-        # Convert to Julian dates using fixed function
+            dt_utc = datetime.now(_UTC)
+            warnings.append("assumed_current_datetime")
+
         jd_tt, jd_ut1 = _jd_pair_from_dt_fixed(dt_utc)
-        
         return float(jd_tt), float(jd_ut1), warnings
-        
     except Exception as e:
         warnings.append(f"natal_timescale_resolution_failed:{e}")
-        # Return reasonable defaults
-        return 2451545.0, 2451545.0, warnings  # J2000.0 epoch
+        return 2451545.0, 2451545.0, warnings  # J2000.0
 
 def _compute_confidence(events: List[PredictionEvent], stats: Dict[str, float]) -> float:
     if not events:
@@ -348,7 +341,7 @@ def _compute_confidence(events: List[PredictionEvent], stats: Dict[str, float]) 
     if not cs:
         return 0.0
     w = [c**1.5 for c in cs]
-    wa = sum(c*wi for c, wi in zip(cs, w)) / sum(w)
+    wa = sum(c*wi for c, wi in zip(cs, w)) / (sum(w) or 1.0)
     p = float(stats.get("p_value", 1.0))
     significance_boost = 0.3 * max(0.0, 1.0 - p / 0.01) if p < 0.05 else 0.0
     return min(1.0, wa + significance_boost)
@@ -361,7 +354,7 @@ def _create_timing_windows(events: List[PredictionEvent], *, cluster_days: float
     out: List[TimingWindow] = []
     grp: List[PredictionEvent] = [ev[0]]
     for e in ev[1:]:
-        dt_days = (e.datetime_utc - grp[-1].datetime_utc).total_seconds() / 86400.0  # type: ignore
+        dt_days = (e.datetime_utc - grp[-1].datetime_utc).total_seconds() / _SECONDS_PER_DAY  # type: ignore
         avgc = sum(g.confidence for g in grp) / len(grp)
         thr = cluster_days * (0.5 + 0.5 * avgc)
         if dt_days <= thr:
@@ -397,37 +390,23 @@ def _body_activity(events: List[PredictionEvent]) -> Dict[str, Any]:
     return {"most_active": top, "total_bodies": len(dist), "activity_distribution": dist}
 
 def _prepare_safe_natal_chart(natal_chart: Dict[str, Any], jd_tt: float, jd_ut1: float) -> Dict[str, Any]:
-    """
-    Prepare a natal chart for memoization that won't trigger UTC_JD errors.
-    
-    This function creates a version of the natal chart that bypasses problematic
-    datetime conversion in the predictive layer by pre-computing JD values.
-    """
-    safe_chart = natal_chart.copy()
-    
-    # Add pre-computed JD values to bypass datetime conversion
+    """Attach precomputed JDs and sanitize time strings for memo keys."""
+    safe_chart = dict(natal_chart)  # shallow copy
     safe_chart["_jd_tt_computed"] = jd_tt
     safe_chart["_jd_ut1_computed"] = jd_ut1
-    
-    # Ensure date/time are in safe format
     if "date" in safe_chart and isinstance(safe_chart["date"], str):
-        # Keep as string but ensure it's in ISO format
         try:
-            dt = datetime.fromisoformat(safe_chart["date"]).replace(tzinfo=timezone.utc)
+            dt = _ensure_utc(safe_chart["date"])
             safe_chart["date"] = dt.date().isoformat()
-        except:
-            pass  # Keep original if parsing fails
-    
-    if "time" in safe_chart:
-        # Ensure time is in safe format
-        if not isinstance(safe_chart["time"], str):
-            safe_chart["time"] = "12:00:00"
-    
+        except Exception:
+            pass
+    if "time" in safe_chart and not isinstance(safe_chart["time"], str):
+        safe_chart["time"] = "12:00:00"
     return safe_chart
 
-# ── Predictive memoization ───────────────────────────────────────────────────
+# ───────────────────────── Predictive memoization ────────────────────────────
 
-@lru_cache(maxsize=1024)
+@lru_cache(maxsize=2048)
 def _memo_predictive(key: str):
     args = json.loads(key)
     if args["kind"] == "transits":
@@ -438,7 +417,7 @@ def _memo_key_transits(payload: Dict[str, Any]) -> str:
     safe = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
     return json.dumps({"kind": "transits", "payload": json.loads(safe)}, sort_keys=True)
 
-# ── Engines ──────────────────────────────────────────────────────────────────
+# ────────────────────────────────── Engines ──────────────────────────────────
 
 def predict_transits(
     natal_chart: Dict[str, Any],
@@ -454,7 +433,7 @@ def predict_transits(
     zodiac_mode: str = "tropical",
     ayanamsa_deg: float = 0.0,
     exact_timing: bool = True,
-    statistical_validation: bool = False,   # API placeholder
+    statistical_validation: bool = False,
     confidence_threshold: float = 0.1,
     **kwargs,
 ) -> PredictionResult:
@@ -465,7 +444,7 @@ def predict_transits(
         if not _PRED_OK:
             raise RuntimeError(f"predictive unavailable: {_PRED_ERR}")
 
-        # Fixed natal timescale resolution - this is the core fix
+        # Resolve natal timescales once
         jd_tt_natal, jd_ut1_natal, w = _resolve_natal_timescales_fixed(natal_chart)
         warns.extend(w)
 
@@ -476,12 +455,11 @@ def predict_transits(
         include_aspects_to = include_aspects_to or ["planets","angles"]
         orbs_to_use = orbs or DEFAULT_ORBS_TRANSITS
 
-        # CRITICAL FIX: Prepare safe natal chart for memoization
-        # This prevents UTC_JD errors in the memoized predictive layer
+        # Safe chart to avoid re-parsing dates inside predictive layer
         safe_natal_chart = _prepare_safe_natal_chart(natal_chart, jd_tt_natal, jd_ut1_natal)
 
         payload = dict(
-            natal_chart=safe_natal_chart,  # Use safe chart instead of original
+            natal_chart=safe_natal_chart,
             time_range=(start_dt.date().isoformat(), end_dt.date().isoformat()),
             transiting_bodies=transiting_bodies,
             natal_bodies=natal_bodies,
@@ -495,27 +473,28 @@ def predict_transits(
             include_house_cusps=include_house_cusps,
         )
         key = _memo_key_transits(payload)
-        tr_res = _memo_predictive(key)  # dict from predictive.find_transits_in_range
+        tr_res = _memo_predictive(key)
 
         events: List[PredictionEvent] = []
 
-        # Convert predictive dict → PredictionEvent list
         if not isinstance(tr_res, dict) or not tr_res.get("ok", False):
             warns.append("predictive_find_transits_failed")
         else:
             hits = tr_res.get("transits", []) or []
+            append = events.append  # local bind for speed
             for h in hits:
                 body = str(h.get("transiting_body",""))
                 target = str(h.get("natal_body",""))
                 asp = _canon_aspect(h.get("aspect"))
-                sep = float(h.get("orb", 999.0))  # predictive 'orb' == absolute separation
-                orb_cap = float(max(1e-9, h.get("max_orb", orbs_to_use.get(asp, orbs_to_use.get("default", 1.0)))))
-                tight = max(0.0, 1.0 - (sep / orb_cap))
+                sep = float(h.get("orb", 999.0))
+                max_orb = float(max(_MIN_FLOAT, h.get("max_orb", orbs_to_use.get(asp, orbs_to_use.get("default", 1.0)))))
+                tight = max(0.0, 1.0 - (sep / max_orb))
                 major = 0.2 if asp in {"conjunction","opposition","trine","square"} else 0.0
-                conf = min(1.0, tight + major)
+                conf = tight + major
+                if conf < confidence_threshold:
+                    continue
 
                 jd_exact = h.get("exact_jd_tt")
-                # predictive currently doesn't return UTC datetime; keep None unless provided
                 dt_utc = None
                 if isinstance(h.get("exact_datetime_utc"), str):
                     try:
@@ -523,7 +502,7 @@ def predict_transits(
                     except Exception:
                         dt_utc = None
 
-                pe = PredictionEvent(
+                append(PredictionEvent(
                     event_type="transit",
                     technique="exact_transit",
                     description=f"{body} {asp} {target}",
@@ -531,22 +510,20 @@ def predict_transits(
                     jd_tt=float(jd_exact) if jd_exact is not None else None,
                     jd_ut1=None,
                     precision_seconds=None,
-                    confidence=conf,
+                    confidence=min(1.0, conf),
                     significance=1.0,
                     metadata={
                         "transiting_body": body,
                         "natal_body": target,
                         "aspect": asp,
                         "orb": sep,
-                        "max_orb": orb_cap,
+                        "max_orb": max_orb,
                         "applying": bool(h.get("applying", False)),
                         "exact": bool(h.get("exact", False)),
                         "kind": h.get("kind", "zodiacal"),
                         "finder": "predictive.find_transits_in_range",
                     },
-                )
-                if pe.confidence >= confidence_threshold:
-                    events.append(pe)
+                ))
 
         stats: Dict[str, float] = {}
         windows = _create_timing_windows(events)
@@ -590,6 +567,8 @@ def predict_transits(
             computation_time_ms=(time.time() - t0) * 1000.0,
         )
 
+# ───────────────────────────── Progressions ──────────────────────────────────
+
 def compute_progressions_safe(
     natal: Dict[str, Any],
     method: str,
@@ -610,15 +589,15 @@ def compute_progressions_safe(
     validation: str,
     timeout_seconds: float = 25.0,
 ) -> Dict[str, Any]:
-    """Simplified safe wrapper without signal usage."""
+    """Progressions wrapper with scope limits; API unchanged."""
     try:
-        # Call with limited parameters to prevent excessive computation
         limited_natal = natal.copy()
-        if "bodies" in limited_natal and len(limited_natal["bodies"]) > 10:
-            limited_natal["bodies"] = limited_natal["bodies"][:10]
-            
-        years_after = max(-50, min(50, years_after))
-        
+        bodies = limited_natal.get("bodies")
+        if isinstance(bodies, list) and len(bodies) > 10:
+            limited_natal["bodies"] = bodies[:10]
+
+        years_after = max(-50.0, min(50.0, float(years_after)))
+
         return compute_progressions(
             natal=limited_natal,
             method=method,
@@ -633,18 +612,13 @@ def compute_progressions_safe(
             tertiary_mode=tertiary_mode,
             aspects_to_natal=aspects_to_natal,
             orbs=orbs,
-            parallels=False,  # Disable to reduce computation
-            antiscia=False,   # Disable to reduce computation
-            profile=False,    # Disable to reduce computation
-            validation="none", # Disable to reduce computation
+            parallels=False,
+            antiscia=False,
+            profile=False,
+            validation="none",
         )
-        
     except Exception as e:
-        return {
-            "ok": False,
-            "error": f"progressions_computation_failed:{e}",
-            "meta": {"warnings": ["computation_failed"]}
-        }
+        return {"ok": False, "error": f"progressions_computation_failed:{e}", "meta": {"warnings": ["computation_failed"]}}
 
 def predict_progressions(
     natal_chart: Dict[str, Any],
@@ -667,15 +641,11 @@ def predict_progressions(
     _check_env()
     t0 = time.time()
     warns: List[str] = []
-    
-    # Add timeout protection to prevent hanging
-    max_computation_time = 30.0  # 30 seconds max
-    
+    max_computation_time = 30.0
     try:
         if not _PROG_OK:
             raise RuntimeError(f"progressions unavailable: {_PROG_ERR}")
 
-        # Use fixed timescale resolution
         jd_tt_natal, jd_ut1_natal, w = _resolve_natal_timescales_fixed(natal_chart)
         warns.extend(w)
 
@@ -684,18 +654,15 @@ def predict_progressions(
             target_dt: Optional[datetime] = None
         else:
             t_dt = _ensure_utc(target_date)
-            natal_epoch_ts = (jd_tt_natal - 2440587.5) * 86400.0
-            natal_dt = datetime.fromtimestamp(natal_epoch_ts, tz=timezone.utc)
-            years_after = (t_dt - natal_dt).total_seconds() / (TROPICAL_YEAR_D * 86400.0)
+            natal_epoch_ts = (jd_tt_natal - _JD_UNIX_EPOCH) * _SECONDS_PER_DAY
+            natal_dt = datetime.fromtimestamp(natal_epoch_ts, tz=_UTC)
+            years_after = (t_dt - natal_dt).total_seconds() / (TROPICAL_YEAR_D * _SECONDS_PER_DAY)
             target_dt = t_dt
 
-        # Check if computation is taking too long
         if time.time() - t0 > max_computation_time:
             raise RuntimeError("computation_timeout_before_progressions_call")
 
-        # Limit progression computation scope to prevent infinite loops
         limited_orbs = orbs or DEFAULT_ORBS_PROGRESSIONS
-        # Cap orb values to reasonable limits
         capped_orbs = {k: min(v, 10.0) for k, v in limited_orbs.items()}
 
         res = compute_progressions_safe(
@@ -718,32 +685,27 @@ def predict_progressions(
             validation="basic",
             timeout_seconds=max_computation_time - (time.time() - t0),
         )
-        
+
         if not res.get("ok"):
             raise RuntimeError(res.get("error", "progressions_failed"))
 
         events: List[PredictionEvent] = []
-
-        # Limit event processing to prevent excessive computation
-        max_events = 1000  # Cap at 1000 events
         event_count = 0
+        max_events = 1000
 
         if aspects_to_natal and isinstance(res.get("aspects"), dict):
             for fam, hits in res["aspects"].items():
-                if not isinstance(hits, list) or event_count >= max_events:
+                if not isinstance(hits, list):
                     continue
-                    
-                for h in hits[:100]:  # Limit to 100 aspects per family
+                for h in hits[:100]:
                     if event_count >= max_events:
                         break
-                        
                     asp = _canon_aspect(h.get("aspect"))
                     orb = float(h.get("orb", 0.0))
-                    max_orb = float(h.get("max_orb", max(capped_orbs.get(asp, 1.0), 1e-9)))
+                    max_orb = float(max(_MIN_FLOAT, h.get("max_orb", capped_orbs.get(asp, 1.0))))
                     tight = max(0.0, 1.0 - (orb / max_orb))
                     exact_bonus = 0.3 if orb < 0.1 else 0.0
                     conf = min(1.0, tight + exact_bonus)
-                    
                     events.append(PredictionEvent(
                         event_type="progression",
                         technique=f"{method}_progression",
@@ -762,17 +724,18 @@ def predict_progressions(
                         },
                     ))
                     event_count += 1
+                if event_count >= max_events:
+                    break
 
         if isinstance(res.get("positions"), list) and event_count < max_events:
             natal_lookup: Dict[str, float] = {}
             for b in (natal_chart.get("bodies") or []):
                 if isinstance(b, dict) and "name" in b:
                     natal_lookup[str(b["name"])] = float(b.get("longitude", b.get("lon", 0.0)))
-                    
-            for p in res["positions"][:50]:  # Limit to 50 position events
+
+            for p in res["positions"][:50]:
                 if event_count >= max_events:
                     break
-                    
                 name = str(p.get("name"))
                 if name in natal_lookup:
                     prog_lon = float(p.get("longitude", 0.0))
@@ -811,7 +774,7 @@ def predict_progressions(
             "progression_epoch": res.get("meta", {}).get("epoch", {}),
             "computation_limited": event_count >= max_events,
         }
-        
+
         for w in res.get("meta", {}).get("warnings", []):
             warns.append(f"progression_{w}")
 
@@ -838,13 +801,15 @@ def predict_progressions(
             },
             computation_time_ms=(time.time() - t0) * 1000.0,
         )
-        
+
     except Exception as e:
         return PredictionResult(
             ok=False, technique="progressions",
             warnings=[f"progression_computation_failed:{e}"],
             computation_time_ms=(time.time() - t0) * 1000.0,
         )
+
+# ─────────────────────────────── Returns ─────────────────────────────────────
 
 def compute_solar_return_safe(
     natal: Dict[str, Any],
@@ -860,12 +825,8 @@ def compute_solar_return_safe(
     profile: bool,
     validation: str,
 ) -> Dict[str, Any]:
-    """
-    Safe wrapper for compute_solar_return that handles missing implementation.
-    """
     try:
-        # Try to import the actual function first
-        from app.core.returns import compute_solar_return
+        from app.core.returns import compute_solar_return  # shadow local import for speed only when used
         return compute_solar_return(
             natal=natal,
             target_year=target_year,
@@ -881,7 +842,6 @@ def compute_solar_return_safe(
             validation=validation,
         )
     except ImportError:
-        # Function doesn't exist - return a basic implementation
         return _compute_solar_return_fallback(
             natal=natal,
             target_year=target_year,
@@ -910,12 +870,8 @@ def compute_lunar_return_safe(
     profile: bool,
     validation: str,
 ) -> Dict[str, Any]:
-    """
-    Safe wrapper for compute_lunar_return that handles missing implementation.
-    """
     try:
-        # Try to import the actual function first
-        from app.core.returns import compute_lunar_return
+        from app.core.returns import compute_lunar_return  # shadow local import
         return compute_lunar_return(
             natal=natal,
             target_year=target_year,
@@ -932,7 +888,6 @@ def compute_lunar_return_safe(
             validation=validation,
         )
     except ImportError:
-        # Function doesn't exist - return a basic implementation
         return _compute_lunar_return_fallback(
             natal=natal,
             target_year=target_year,
@@ -959,57 +914,36 @@ def _compute_solar_return_fallback(
     ayanamsa_deg: float,
     estimate_uncertainty: bool,
 ) -> Dict[str, Any]:
-    """
-    Basic fallback implementation for solar return calculation.
-    """
     try:
-        # Get Sun's natal longitude
         natal_sun_lon = 0.0
         for body in natal.get("bodies", []):
             if body.get("name", "").lower() == "sun":
                 natal_sun_lon = float(body.get("longitude", body.get("lon", 0.0)))
                 break
-        
-        # Estimate solar return date (approximately target_year birthday)
+
         natal_date = natal.get("date", "1990-01-01")
         if isinstance(natal_date, str):
             natal_year = int(natal_date.split("-")[0])
-            natal_month_day = natal_date[4:]  # Keep "-MM-DD"
+            natal_month_day = natal_date[4:] if len(natal_date) >= 7 else "-01-01"
             estimated_return_date = f"{target_year}{natal_month_day}"
         else:
             estimated_return_date = f"{target_year}-01-01"
-        
-        # Convert to JD using fixed function
-        est_dt = datetime.fromisoformat(estimated_return_date).replace(tzinfo=timezone.utc)
+
+        est_dt = datetime.fromisoformat(estimated_return_date).replace(tzinfo=_UTC)
         return_jd_tt, return_jd_ut1 = _jd_pair_from_dt_fixed(est_dt)
-        
+
         return {
             "ok": True,
             "return_jd_tt": return_jd_tt,
             "return_jd_ut1": return_jd_ut1,
             "return_datetime_utc": est_dt.isoformat(),
-            "chart": {
-                "bodies": [{"name": "Sun", "longitude": natal_sun_lon}],
-                "angles": {},
-            },
+            "chart": {"bodies": [{"name": "Sun", "longitude": natal_sun_lon}], "angles": {}},
             "uncertainty": {"timing_error_days": 1.0},
-            "convergence": {
-                "converged": False,
-                "iterations": 0,
-                "final_residual_arcmin": 60.0,
-            },
-            "meta": {
-                "warnings": ["using_fallback_solar_return_implementation"],
-                "method": "approximate_birthday"
-            }
+            "convergence": {"converged": False, "iterations": 0, "final_residual_arcmin": 60.0},
+            "meta": {"warnings": ["using_fallback_solar_return_implementation"], "method": "approximate_birthday"}
         }
-        
     except Exception as e:
-        return {
-            "ok": False,
-            "error": f"solar_return_fallback_failed:{e}",
-            "meta": {"warnings": ["fallback_computation_failed"]}
-        }
+        return {"ok": False, "error": f"solar_return_fallback_failed:{e}", "meta": {"warnings": ["fallback_computation_failed"]}}
 
 def _compute_lunar_return_fallback(
     natal: Dict[str, Any],
@@ -1024,49 +958,28 @@ def _compute_lunar_return_fallback(
     ayanamsa_deg: float,
     estimate_uncertainty: bool,
 ) -> Dict[str, Any]:
-    """
-    Basic fallback implementation for lunar return calculation.
-    """
     try:
-        # Get Moon's natal longitude
         natal_moon_lon = 0.0
         for body in natal.get("bodies", []):
             if body.get("name", "").lower() == "moon":
                 natal_moon_lon = float(body.get("longitude", body.get("lon", 0.0)))
                 break
-        
-        # Approximate lunar return (monthly cycles)
-        # Use January 1st of target year as rough estimate
-        est_dt = datetime(target_year, 1, 1, tzinfo=timezone.utc)
+
+        est_dt = datetime(target_year, 1, 1, tzinfo=_UTC)
         return_jd_tt, return_jd_ut1 = _jd_pair_from_dt_fixed(est_dt)
-        
+
         return {
             "ok": True,
             "return_jd_tt": return_jd_tt,
             "return_jd_ut1": return_jd_ut1,
             "return_datetime_utc": est_dt.isoformat(),
-            "chart": {
-                "bodies": [{"name": "Moon", "longitude": natal_moon_lon}],
-                "angles": {},
-            },
+            "chart": {"bodies": [{"name": "Moon", "longitude": natal_moon_lon}], "angles": {}},
             "uncertainty": {"timing_error_days": 2.0},
-            "convergence": {
-                "converged": False,
-                "iterations": 0,
-                "final_residual_arcmin": 120.0,
-            },
-            "meta": {
-                "warnings": ["using_fallback_lunar_return_implementation"],
-                "method": "approximate_monthly_cycle"
-            }
+            "convergence": {"converged": False, "iterations": 0, "final_residual_arcmin": 120.0},
+            "meta": {"warnings": ["using_fallback_lunar_return_implementation"], "method": "approximate_monthly_cycle"}
         }
-        
     except Exception as e:
-        return {
-            "ok": False,
-            "error": f"lunar_return_fallback_failed:{e}",
-            "meta": {"warnings": ["fallback_computation_failed"]}
-        }
+        return {"ok": False, "error": f"lunar_return_fallback_failed:{e}", "meta": {"warnings": ["fallback_computation_failed"]}}
 
 def predict_returns(
     natal_chart: Dict[str, Any],
@@ -1092,17 +1005,16 @@ def predict_returns(
         if not _RET_OK:
             raise RuntimeError(f"returns unavailable: {_RET_ERR}")
 
-        if return_type.lower() not in ("solar", "lunar"):
+        rt = return_type.lower()
+        if rt not in ("solar", "lunar"):
             raise ValueError("return_type must be 'solar' or 'lunar'")
 
-        # Use fixed timescale resolution
         jd_tt_natal, jd_ut1_natal, w = _resolve_natal_timescales_fixed(natal_chart)
         warns.extend(w)
 
         use_place = place or natal_chart
-        
-        # Use safe wrapper functions that handle missing implementations
-        if return_type.lower() == "solar":
+
+        if rt == "solar":
             rr = compute_solar_return_safe(
                 natal=natal_chart, target_year=int(year),
                 jd_tt_natal=jd_tt_natal, jd_ut1_natal=jd_ut1_natal,
@@ -1118,7 +1030,7 @@ def predict_returns(
                 zodiac_mode=zodiac_mode, ayanamsa_deg=ayanamsa_deg,
                 estimate_uncertainty=estimate_uncertainty, profile=True, validation="extended",
             )
-            
+
         if not rr.get("ok"):
             raise RuntimeError(rr.get("error", "return_failed"))
 
@@ -1126,7 +1038,7 @@ def predict_returns(
         ret_dt = _ensure_utc(rr["return_datetime_utc"]) if isinstance(rr.get("return_datetime_utc"), str) else None
 
         unc_days = rr.get("uncertainty", {}).get("timing_error_days")
-        prec_s = (unc_days * 86400.0) if unc_days else None
+        prec_s = (unc_days * _SECONDS_PER_DAY) if unc_days else None
         conv = rr.get("convergence", {})
         residual_arcmin = float(conv.get("final_residual_arcmin", 999.0))
         conv_conf = max(0.0, 1.0 - residual_arcmin / 10.0)
@@ -1136,13 +1048,13 @@ def predict_returns(
         events: List[PredictionEvent] = [
             PredictionEvent(
                 event_type="return",
-                technique=f"{return_type.lower()}_return",
+                technique=f"{rt}_return",
                 description=f"{return_type.capitalize()} Return {year}",
                 datetime_utc=ret_dt,
                 jd_tt=ret_jd_tt, jd_ut1=ret_jd_ut1,
                 precision_seconds=prec_s, confidence=conv_conf, significance=0.01,
                 metadata={
-                    "return_type": return_type.lower(), "year": year, "residual_arcmin": residual_arcmin,
+                    "return_type": rt, "year": year, "residual_arcmin": residual_arcmin,
                     "iterations": int(conv.get("iterations", 0)), "converged": bool(conv.get("converged", False)),
                     "uncertainty_days": unc_days, "finder": "returns.compute_*_return",
                 },
@@ -1165,16 +1077,18 @@ def predict_returns(
             natal_pos = _positions(natal_chart)
             cfg = _normalize_aspect_config(orbs, "returns")
             ar = compute_aspects(positions_a=rr_pos, positions_b=natal_pos, config=cfg)
+            append = events.append
+            base_orbs = orbs or DEFAULT_ORBS_PROGRESSIONS
             for h in ar.get("hits", []):
                 asp = _canon_aspect(h.get("aspect"))
                 orb = float(h.get("orb", 0.0))
-                max_orb = float(h.get("max_orb", max((orbs or DEFAULT_ORBS_PROGRESSIONS).get(asp, 1.0), 1e-9)))
+                max_orb = float(max(_MIN_FLOAT, h.get("max_orb", base_orbs.get(asp, 1.0))))
                 tight = max(0.0, 1.0 - orb / max_orb)
                 major = 0.2 if asp in {"conjunction","opposition","trine","square"} else 0.0
                 conf = min(1.0, tight + major)
-                events.append(PredictionEvent(
+                append(PredictionEvent(
                     event_type="return_aspect",
-                    technique=f"{return_type.lower()}_return_aspect",
+                    technique=f"{rt}_return_aspect",
                     description=f"Return {h.get('planet_a','?')} {asp} Natal {h.get('planet_b','?')}",
                     datetime_utc=ret_dt,
                     jd_tt=ret_jd_tt, jd_ut1=ret_jd_ut1, precision_seconds=prec_s,
@@ -1196,7 +1110,7 @@ def predict_returns(
             ))
 
         synth = {
-            "return_type": return_type.lower(), "year": int(year),
+            "return_type": rt, "year": int(year),
             "return_datetime": (ret_dt.isoformat() if ret_dt else None),
             "uncertainty_days": unc_days,
             "total_aspects": sum(1 for e in events if e.event_type == "return_aspect"),
@@ -1207,14 +1121,14 @@ def predict_returns(
             warns.append(f"return_{w}")
 
         return PredictionResult(
-            ok=True, technique=f"{return_type.lower()}_return",
+            ok=True, technique=f"{rt}_return",
             events=events, synthesis=synth, timing_windows=windows,
             confidence_score=_compute_confidence(events, stats), statistical_metrics=stats,
             warnings=warns,
             metadata={
                 "natal_jd_tt": jd_tt_natal,
                 "parameters": {
-                    "return_type": return_type.lower(), "frame": frame, "house_system": house_system,
+                    "return_type": rt, "frame": frame, "house_system": house_system,
                     "zodiac_mode": zodiac_mode, "ayanamsa_deg": ayanamsa_deg,
                     "estimate_uncertainty": estimate_uncertainty, "aspects_to_natal": aspects_to_natal,
                 },
@@ -1227,6 +1141,8 @@ def predict_returns(
             warnings=[f"return_computation_failed:{e}"],
             computation_time_ms=(time.time() - t0) * 1000.0,
         )
+
+# ─────────────────────────────── Directions ──────────────────────────────────
 
 def compute_directions_safe(
     natal: Dict[str, Any],
@@ -1242,28 +1158,18 @@ def compute_directions_safe(
     target: Optional[Union[datetime, str, float]] = None,
     years_after: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """
-    Safe wrapper for compute_directions that handles parameter mismatches.
-    """
     try:
-        # Import the actual function
-        from app.core.directions import compute_directions
-        
-        # Calculate years_after if we have target but not years_after
+        from app.core.directions import compute_directions  # shadow import
         if target is not None and years_after is None:
             if isinstance(target, (int, float)):
                 years_after = (float(target) - jd_tt_natal) / TROPICAL_YEAR_D
             else:
                 target_dt = _ensure_utc(target)
-                natal_epoch_ts = (jd_tt_natal - 2440587.5) * 86400.0
-                natal_dt = datetime.fromtimestamp(natal_epoch_ts, tz=timezone.utc)
-                years_after = (target_dt - natal_dt).total_seconds() / (TROPICAL_YEAR_D * 86400.0)
-        
-        # Set default years_after if still None
+                natal_epoch_ts = (jd_tt_natal - _JD_UNIX_EPOCH) * _SECONDS_PER_DAY
+                natal_dt = datetime.fromtimestamp(natal_epoch_ts, tz=_UTC)
+                years_after = (target_dt - natal_dt).total_seconds() / (TROPICAL_YEAR_D * _SECONDS_PER_DAY)
         if years_after is None:
-            years_after = 1.0  # Default to 1 year after natal
-        
-        # Call with correct parameters
+            years_after = 1.0
         return compute_directions(
             natal=natal,
             method=method,
@@ -1277,10 +1183,8 @@ def compute_directions_safe(
             orbs=orbs,
             profile=profile,
         )
-        
     except TypeError as e:
         if "unexpected keyword argument" in str(e):
-            # Try with even fewer parameters if there are more signature mismatches
             try:
                 return compute_directions(
                     natal=natal,
@@ -1291,37 +1195,12 @@ def compute_directions_safe(
                     orbs=orbs,
                 )
             except Exception as fallback_error:
-                return {
-                    "ok": False,
-                    "error": f"directions_parameter_mismatch:{fallback_error}",
-                    "hits": [],
-                    "meta": {"warnings": ["parameter_signature_incompatible"]}
-                }
-        else:
-            return {
-                "ok": False,
-                "error": f"directions_type_error:{e}",
-                "hits": [],
-                "meta": {"warnings": ["function_call_failed"]}
-            }
-            
+                return {"ok": False, "error": f"directions_parameter_mismatch:{fallback_error}", "hits": [], "meta": {"warnings": ["parameter_signature_incompatible"]}}
+        return {"ok": False, "error": f"directions_type_error:{e}", "hits": [], "meta": {"warnings": ["function_call_failed"]}}
     except ImportError:
-        # Function doesn't exist - return fallback
-        return _compute_directions_fallback(
-            natal=natal,
-            method=method,
-            jd_tt_natal=jd_tt_natal,
-            jd_ut1_natal=jd_ut1_natal,
-            orbs=orbs,
-        )
-        
+        return _compute_directions_fallback(natal=natal, method=method, jd_tt_natal=jd_tt_natal, jd_ut1_natal=jd_ut1_natal, orbs=orbs)
     except Exception as e:
-        return {
-            "ok": False,
-            "error": f"directions_computation_failed:{e}",
-            "hits": [],
-            "meta": {"warnings": ["directions_function_error"]}
-        }
+        return {"ok": False, "error": f"directions_computation_failed:{e}", "hits": [], "meta": {"warnings": ["directions_function_error"]}}
 
 def _compute_directions_fallback(
     natal: Dict[str, Any],
@@ -1330,45 +1209,24 @@ def _compute_directions_fallback(
     jd_ut1_natal: float,
     orbs: Dict[str, float],
 ) -> Dict[str, Any]:
-    """
-    Basic fallback implementation for directions calculation.
-    """
     try:
         hits = []
-        
-        # Get natal positions
         natal_bodies = natal.get("bodies", [])
-        
-        # For solar arc directions (most common method)
         if method == "solar_arc":
-            # Calculate approximate solar arc rate (typically ~1°/year)
-            years_elapsed = (jd_tt_natal - 2451545.0) / 365.25  # Years from J2000
-            arc_rate = 1.0  # degrees per year (simplified)
-            
+            years_elapsed = (jd_tt_natal - 2451545.0) / 365.25
+            arc_rate = 1.0
             for i, body_a in enumerate(natal_bodies):
                 if not isinstance(body_a, dict) or "name" not in body_a:
                     continue
-                    
-                body_a_name = body_a["name"]
-                body_a_lon = float(body_a.get("longitude", body_a.get("lon", 0.0)))
-                
-                # Calculate directed position (very simplified)
-                directed_lon = (body_a_lon + arc_rate * years_elapsed) % 360.0
-                
-                # Check aspects to other natal bodies
+                a_name = body_a["name"]
+                a_lon = float(body_a.get("longitude", body_a.get("lon", 0.0)))
+                directed_lon = (a_lon + arc_rate * years_elapsed) % 360.0
                 for j, body_b in enumerate(natal_bodies):
                     if i >= j or not isinstance(body_b, dict) or "name" not in body_b:
                         continue
-                        
-                    body_b_name = body_b["name"]
-                    body_b_lon = float(body_b.get("longitude", body_b.get("lon", 0.0)))
-                    
-                    # Calculate aspect
-                    separation = abs(directed_lon - body_b_lon)
-                    if separation > 180:
-                        separation = 360 - separation
-                        
-                    # Check for major aspects
+                    b_name = body_b["name"]
+                    b_lon = float(body_b.get("longitude", body_b.get("lon", 0.0)))
+                    separation = abs((directed_lon - b_lon + 180.0) % 360.0 - 180.0)
                     aspects_to_check = [
                         ("conjunction", 0.0, orbs.get("conjunction", 8.0)),
                         ("opposition", 180.0, orbs.get("opposition", 8.0)),
@@ -1376,36 +1234,20 @@ def _compute_directions_fallback(
                         ("square", 90.0, orbs.get("square", 6.0)),
                         ("sextile", 60.0, orbs.get("sextile", 4.0)),
                     ]
-                    
                     for aspect_name, exact_angle, orb_limit in aspects_to_check:
                         orb = abs(separation - exact_angle)
                         if orb <= orb_limit:
                             hits.append({
-                                "planet_a": body_a_name,
-                                "planet_b": body_b_name,
+                                "planet_a": a_name,
+                                "planet_b": b_name,
                                 "aspect": aspect_name,
                                 "orb": orb,
                                 "max_orb": orb_limit,
-                                "p_value": 0.5,  # Default significance
+                                "p_value": 0.5,
                             })
-        
-        return {
-            "ok": True,
-            "hits": hits[:20],  # Limit to 20 hits to prevent overwhelming response
-            "meta": {
-                "warnings": ["using_fallback_directions_implementation"],
-                "method": method,
-                "computation": "simplified"
-            }
-        }
-        
+        return {"ok": True, "hits": hits[:20], "meta": {"warnings": ["using_fallback_directions_implementation"], "method": method, "computation": "simplified"}}
     except Exception as e:
-        return {
-            "ok": False,
-            "error": f"directions_fallback_failed:{e}",
-            "hits": [],
-            "meta": {"warnings": ["fallback_computation_failed"]}
-        }
+        return {"ok": False, "error": f"directions_fallback_failed:{e}", "hits": [], "meta": {"warnings": ["fallback_computation_failed"]}}
 
 def predict_directions(
     natal_chart: Dict[str, Any],
@@ -1427,17 +1269,12 @@ def predict_directions(
     try:
         if not _DIR_OK:
             raise RuntimeError(f"directions unavailable: {_DIR_ERR}")
-            
-        # Use fixed timescale resolution
+
         jd_tt_natal, jd_ut1_natal, w = _resolve_natal_timescales_fixed(natal_chart)
         warns.extend(w)
-        
-        if isinstance(target_date, (int, float)):
-            target_dt: Optional[datetime] = None
-        else:
-            target_dt = _ensure_utc(target_date)
-            
-        # Use safe wrapper that handles parameter mismatch
+
+        target_dt: Optional[datetime] = None if isinstance(target_date, (int, float)) else _ensure_utc(target_date)
+
         dr = compute_directions_safe(
             natal=natal_chart,
             method=method,
@@ -1451,20 +1288,20 @@ def predict_directions(
             profile=True,
             target=target_date,
         )
-        
+
         if not dr.get("ok"):
             raise RuntimeError(dr.get("error", "directions_failed"))
-            
+
         events: List[PredictionEvent] = []
-        
+        append = events.append
+        base_orbs = orbs or DEFAULT_ORBS_DIRECTIONS
         for h in dr.get("hits", []):
             asp = _canon_aspect(h.get("aspect"))
             orb = float(h.get("orb", 0.0))
-            max_orb = float(h.get("max_orb", max((orbs or DEFAULT_ORBS_DIRECTIONS).get(asp, 1.0), 1e-9)))
+            max_orb = float(max(_MIN_FLOAT, h.get("max_orb", base_orbs.get(asp, 1.0))))
             tight = max(0.0, 1.0 - orb / max_orb)
             conf = min(1.0, tight + (0.2 if asp in {"conjunction","opposition","square","trine"} else 0.0))
-            
-            events.append(PredictionEvent(
+            append(PredictionEvent(
                 event_type="direction",
                 technique=f"{method}_direction",
                 description=f"Directed {h.get('planet_a','?')} {asp} Natal {h.get('planet_b','?')}",
@@ -1478,9 +1315,8 @@ def predict_directions(
                     "finder": "directions.compute_directions",
                 },
             ))
-            
+
         stats: Dict[str, float] = {}
-        
         return PredictionResult(
             ok=True, technique=f"{method}_directions",
             events=events, synthesis={"total_hits": len(events)}, timing_windows=[],
@@ -1488,7 +1324,6 @@ def predict_directions(
             warnings=warns, metadata={"natal_jd_tt": jd_tt_natal},
             computation_time_ms=(time.time() - t0) * 1000.0,
         )
-        
     except Exception as e:
         return PredictionResult(
             ok=False, technique="directions",
@@ -1496,33 +1331,33 @@ def predict_directions(
             computation_time_ms=(time.time() - t0) * 1000.0,
         )
 
+# ─────────────────────────── Safe wrappers (Vedic) ───────────────────────────
+
 def vimsottari_dasha_safe(*args, **kwargs):
-    """Safe wrapper for vimsottari_dasha to prevent hangs."""
     try:
         return vimsottari_dasha(*args, **kwargs)
-    except Exception as e:
-        return []  # Return empty list on error
+    except Exception:
+        return []
 
 def _synthesize_safe(all_events, predictions, method, time_range):
-    """Safe wrapper for _synthesize to prevent hangs."""
     try:
         return _synthesize(all_events, predictions, method=method, time_range=time_range)
     except Exception as e:
         return {"error": f"synthesis_failed:{e}", "event_count": len(all_events)}
 
 def _identify_peak_periods_safe(all_events, time_range, window_days):
-    """Safe wrapper for _identify_peak_periods to prevent hangs."""
     try:
         return _identify_peak_periods(all_events, time_range, window_days=window_days)
-    except Exception as e:
-        return []  # Return empty list on error
+    except Exception:
+        return []
 
 def _risk_safe(all_events, synthesis):
-    """Safe wrapper for _risk to prevent hangs."""
     try:
         return _risk(all_events, synthesis)
     except Exception as e:
         return {"error": f"risk_assessment_failed:{e}", "level": "unknown"}
+
+# ────────────────────────── Comprehensive forecast ───────────────────────────
 
 def comprehensive_forecast(
     natal_chart: Dict[str, Any],
@@ -1539,113 +1374,89 @@ def comprehensive_forecast(
     _check_env()
     t0 = time.time()
     warns: List[str] = []
-    
-    # Add comprehensive timeout protection
-    max_computation_time = 25.0  # 25 seconds maximum
-    max_progression_samples = 10  # Limit progression sampling
-    max_return_years = 5  # Limit return calculations
-    
+    max_computation_time = 25.0
+    max_progression_samples = 10
+    max_return_years = 5
     try:
         techs = techniques or ["transits", "progressions", "solar_returns"]
         start_dt = _ensure_utc(time_range[0]); end_dt = _ensure_utc(time_range[1])
 
-        # Validate time range to prevent excessive computation
         duration_days = (end_dt - start_dt).days
-        if duration_days > 3650:  # More than 10 years
+        if duration_days > 3650:
             warns.append("time_range_capped_to_10_years")
             end_dt = start_dt + timedelta(days=3650)
-            duration_days = 3650
 
         predictions: Dict[str, PredictionResult] = {}
         all_events: List[PredictionEvent] = []
 
-        # TRANSITS - Usually works, but add timeout check
+        # TRANSITS
         if "transits" in techs:
-            if time.time() - t0 > max_computation_time * 0.3:  # Use 30% of time budget
-                warns.append("transits_skipped_due_to_timeout_risk")
-            else:
+            if time.time() - t0 <= max_computation_time * 0.3:
                 try:
                     params = {k.replace("transit_", ""): v for k, v in tk_kwargs.items() if k.startswith("transit_")}
                     tr = predict_transits(natal_chart, (start_dt, end_dt), confidence_threshold=confidence_threshold, statistical_validation=False, **params)
                     predictions["transits"] = tr
-                    all_events += tr.events if tr.ok else []
-                    if not tr.ok: warns += tr.warnings
+                    if tr.ok:
+                        all_events += tr.events
+                    else:
+                        warns += tr.warnings
                 except Exception as e:
                     warns.append(f"transits_failed:{e}")
-
-        # PROGRESSIONS - This was causing infinite loops
-        if "progressions" in techs:
-            if time.time() - t0 > max_computation_time * 0.6:  # Use 60% of time budget
-                warns.append("progressions_skipped_due_to_timeout_risk")
             else:
+                warns.append("transits_skipped_due_to_timeout_risk")
+
+        # PROGRESSIONS (sampled)
+        if "progressions" in techs:
+            if time.time() - t0 <= max_computation_time * 0.6:
                 try:
                     params = {k.replace("progression_", ""): v for k, v in tk_kwargs.items() if k.startswith("progression_")}
-                    
-                    # CRITICAL FIX: Limit progression sampling to prevent infinite loops
-                    step = max(30, duration_days // max_progression_samples)  # At least 30-day steps
-                    dates = [start_dt + timedelta(days=i) for i in range(0, min(duration_days + 1, step * max_progression_samples), step)]
-                    
-                    # Cap to maximum samples
+                    dur_days = (end_dt - start_dt).days
+                    step = max(30, dur_days // max_progression_samples)  # at least monthly
+                    dates = [start_dt + timedelta(days=i) for i in range(0, min(dur_days + 1, step * max_progression_samples), step)]
                     if len(dates) > max_progression_samples:
                         dates = dates[:max_progression_samples]
                         warns.append(f"progression_samples_capped_to_{max_progression_samples}")
-                    
+
                     pevents: List[PredictionEvent] = []
-                    successful_samples = 0
-                    
+                    successful = 0
                     for dt in dates:
-                        # Check timeout before each progression call
                         if time.time() - t0 > max_computation_time * 0.8:
                             warns.append("progression_sampling_stopped_due_to_timeout")
                             break
-                            
                         try:
                             pr = predict_progressions(natal_chart, dt, statistical_validation=False, **params)
-                            if pr.ok: 
+                            if pr.ok:
                                 pevents += pr.events
-                                successful_samples += 1
+                                successful += 1
                         except Exception as e:
                             warns.append(f"progression_sample_failed:{e}")
-                            continue
-                    
                     predictions["progressions"] = PredictionResult(
                         ok=True, technique="progressions_ensemble",
-                        events=pevents, 
-                        synthesis={
-                            "sample_dates": successful_samples, 
-                            "total_events": len(pevents),
-                            "computation_limited": len(dates) < duration_days // 30
-                        },
+                        events=pevents,
+                        synthesis={"sample_dates": successful, "total_events": len(pevents), "computation_limited": len(dates) < max_progression_samples},
                         confidence_score=(sum(e.confidence for e in pevents) / len(pevents)) if pevents else 0.0,
                     )
                     all_events += pevents
-                    
                 except Exception as e:
                     warns.append(f"progressions_ensemble_failed:{e}")
-
-        # SOLAR RETURNS - Add limits to prevent excessive computation
-        if "solar_returns" in techs:
-            if time.time() - t0 > max_computation_time * 0.9:  # Use 90% of time budget
-                warns.append("returns_skipped_due_to_timeout_risk")
             else:
+                warns.append("progressions_skipped_due_to_timeout_risk")
+
+        # SOLAR RETURNS (limited years)
+        if "solar_returns" in techs:
+            if time.time() - t0 <= max_computation_time * 0.9:
                 try:
                     params = {k.replace("return_", ""): v for k, v in tk_kwargs.items() if k.startswith("return_")}
-                    
-                    # Limit years to prevent excessive computation
-                    all_years = list(range(start_dt.year, end_dt.year + 1))
-                    if len(all_years) > max_return_years:
-                        all_years = all_years[:max_return_years]
+                    years = list(range(start_dt.year, end_dt.year + 1))
+                    if len(years) > max_return_years:
+                        years = years[:max_return_years]
                         warns.append(f"return_years_capped_to_{max_return_years}")
-                    
                     revents: List[PredictionEvent] = []
                     successful_returns = 0
-                    
-                    for y in all_years:
-                        # Check timeout before each return call
+                    for y in years:
                         if time.time() - t0 > max_computation_time * 0.95:
                             warns.append("return_computation_stopped_due_to_timeout")
                             break
-                            
                         try:
                             rr = predict_returns(natal_chart, "solar", y, statistical_validation=False, **params)
                             if rr.ok:
@@ -1655,33 +1466,24 @@ def comprehensive_forecast(
                                 successful_returns += 1
                         except Exception as e:
                             warns.append(f"return_year_{y}_failed:{e}")
-                            continue
-                    
                     predictions["solar_returns"] = PredictionResult(
                         ok=True, technique="solar_returns_ensemble",
-                        events=revents, 
-                        synthesis={
-                            "years_computed": successful_returns, 
-                            "total_events": len(revents),
-                            "years_requested": len(all_years)
-                        },
+                        events=revents,
+                        synthesis={"years_computed": successful_returns, "total_events": len(revents), "years_requested": len(years)},
                         confidence_score=(sum(e.confidence for e in revents) / len(revents)) if revents else 0.0,
                     )
                     all_events += revents
-                    
                 except Exception as e:
                     warns.append(f"solar_returns_ensemble_failed:{e}")
+            else:
+                warns.append("returns_skipped_due_to_timeout_risk")
 
-        # VEDIC TECHNIQUES - Simplify to prevent issues
+        # VEDIC (light)
         if include_vedic and _PRED_OK and time.time() - t0 < max_computation_time * 0.98:
             try:
-                # Use fixed timescale resolution
                 jd_tt_natal, _, w_vedic = _resolve_natal_timescales_fixed(natal_chart)
                 warns.extend(w_vedic)
-                
                 ay = float(natal_chart.get("ayanamsa_deg", 0.0) or 0.0)
-                
-                # Simplified moon longitude search
                 moon_lon = None
                 if isinstance(natal_chart.get("natal_longitudes"), dict):
                     moon_lon = float(natal_chart["natal_longitudes"].get("moon", None))
@@ -1689,24 +1491,21 @@ def comprehensive_forecast(
                     for b in (natal_chart.get("bodies") or []):
                         if isinstance(b, dict) and str(b.get("name","")).lower() == "moon":
                             moon_lon = float(b.get("longitude", b.get("lon", None))); break
-                            
                 if moon_lon is not None:
-                    # Use safe function call instead of direct call
                     periods = vimsottari_dasha_safe(
                         birth_jd_tt=jd_tt_natal,
                         moon_lon_tropical_deg=moon_lon,
                         ayanamsa_deg=ay,
-                        levels=min(int(tk_kwargs.get("vedic_levels", 3)), 2),  # Limit to 2 levels max
-                        span_years=min(float(tk_kwargs.get("vedic_span_years", 120.0)), 50.0),  # Limit span
+                        levels=min(int(tk_kwargs.get("vedic_levels", 3)), 2),
+                        span_years=min(float(tk_kwargs.get("vedic_span_years", 120.0)), 50.0),
                     )
-                    
                     s_tt, _ = _jd_pair_from_dt_fixed(start_dt); e_tt, _ = _jd_pair_from_dt_fixed(end_dt)
                     des: List[PredictionEvent] = []
-                    
-                    for p in periods[:20]:  # Limit to 20 periods maximum
+                    append = des.append
+                    for p in periods[:20]:
                         if p.end_jd_tt < s_tt or p.start_jd_tt > e_tt:
                             continue
-                        des.append(PredictionEvent(
+                        append(PredictionEvent(
                             event_type="dasha", technique="vimshottari_dasha",
                             description="/".join(p.parent_chain), datetime_utc=None,
                             jd_tt=p.start_jd_tt, jd_ut1=None, precision_seconds=None,
@@ -1717,27 +1516,25 @@ def comprehensive_forecast(
                                 "start_jd_tt": p.start_jd_tt, "end_jd_tt": p.end_jd_tt,
                             },
                         ))
-                        
                     predictions["dasha"] = PredictionResult(
                         ok=True, technique="dasha",
                         events=des, synthesis={"total_periods": len(des)},
                         confidence_score=(sum(e.confidence for e in des) / len(des)) if des else 0.0,
                     )
                     all_events += des
-                    
             except Exception as e:
                 warns.append(f"vedic_techniques_failed:{e}")
 
-        # Check final timeout before synthesis
+        # Synthesis
         if time.time() - t0 > max_computation_time:
             warns.append("synthesis_simplified_due_to_timeout")
             synthesis = {"error": "computation_timeout_before_synthesis", "event_count": len(all_events)}
         else:
             synthesis = _synthesize_safe(all_events, predictions, method=synthesis_method, time_range=(start_dt, end_dt))
-        
+
         peak_periods = _identify_peak_periods_safe(all_events, (start_dt, end_dt), window_days=peak_window_days)
         risk = _risk_safe(all_events, synthesis)
-        
+
         conf_metrics = {
             "overall_confidence": synthesis.get("weighted_confidence", 0.0),
             "technique_agreement": synthesis.get("consensus_score", 0.0),
@@ -1757,15 +1554,16 @@ def comprehensive_forecast(
             validation_results=None,
             computation_time_ms=(time.time() - t0) * 1000.0,
         )
-        
     except Exception as e:
         return ComprehensiveForecast(
             natal_chart=natal_chart,
-            time_range=( _ensure_utc(time_range[0]) if isinstance(time_range[0], (str, datetime)) else datetime.now(timezone.utc),
-                         _ensure_utc(time_range[1]) if isinstance(time_range[1], (str, datetime)) else datetime.now(timezone.utc)),
+            time_range=(_ensure_utc(time_range[0]) if isinstance(time_range[0], (str, datetime)) else datetime.now(_UTC),
+                        _ensure_utc(time_range[1]) if isinstance(time_range[1], (str, datetime)) else datetime.now(_UTC)),
             synthesis={"error": f"comprehensive_forecast_failed:{e}", "warnings": warns},
             computation_time_ms=(time.time() - t0) * 1000.0,
         )
+
+# ───────────────────────────── Relationship mode ─────────────────────────────
 
 def relationship_forecast(
     natal_a: Dict[str, Any],
@@ -1868,7 +1666,7 @@ def relationship_forecast(
             confidence_metrics={"overall_confidence": 0.0},
         )
 
-# ── Synthesis & analytics ────────────────────────────────────────────────────
+# ─────────────────────────── Synthesis & analytics ───────────────────────────
 
 def _synthesize(all_events: List[PredictionEvent], preds: Dict[str, PredictionResult], *, method: str, time_range: Tuple[datetime, datetime]) -> Dict[str, Any]:
     if method == "weighted_consensus":
@@ -1900,7 +1698,7 @@ def _temporal_cluster_strength(events: List[PredictionEvent], time_range: Tuple[
     ev = [e for e in events if e.datetime_utc and time_range[0] <= e.datetime_utc <= time_range[1]]
     if len(ev) < 3: return 0.0
     ev.sort(key=lambda x: x.datetime_utc)  # type: ignore
-    gaps = [ (b.datetime_utc - a.datetime_utc).total_seconds()/86400.0 for a, b in zip(ev, ev[1:]) ]  # type: ignore
+    gaps = [ (b.datetime_utc - a.datetime_utc).total_seconds()/_SECONDS_PER_DAY for a, b in zip(ev, ev[1:]) ]  # type: ignore
     if not gaps: return 0.0
     mean_gap = sum(gaps)/len(gaps)
     var_gap = sum((g - mean_gap) ** 2 for g in gaps) / len(gaps)
@@ -1921,13 +1719,14 @@ def _consensus_score(preds: Dict[str, PredictionResult], time_range: Tuple[datet
     cors: List[float] = []
     names = list(timings.keys())
     for i in range(len(names)):
+        ai = timings[names[i]]
         for j in range(i + 1, len(names)):
-            a_events = timings[names[i]]; b_events = timings[names[j]]
-            if not a_events or not b_events: continue
+            bj = timings[names[j]]
+            if not ai or not bj: continue
             total = 0.0; cnt = 0
-            for day_a, conf_a in a_events:
+            for day_a, conf_a in ai:
                 best = 0.0
-                for day_b, conf_b in b_events:
+                for day_b, conf_b in bj:
                     dt = abs(day_a - day_b)
                     if dt <= 7:
                         best = max(best, math.exp(-dt / 3.0) * min(conf_a, conf_b))
@@ -2023,7 +1822,7 @@ def _relationship_critical(events: List[PredictionEvent], time_range: Tuple[date
     outs.sort(key=lambda x: x[1].peak_jd_tt or 0.0)
     return [w for _, w in outs[:5]]
 
-# ── Validation harness (lightweight stubs) ───────────────────────────────────
+# ───────────────────────── Validation harness (light) ────────────────────────
 
 def validate_prediction_model(
     test_cases: List[Dict[str, Any]],
@@ -2073,7 +1872,7 @@ def _eval_metrics(test: List[Dict[str, Any]], train: List[Dict[str, Any]], metri
     for case in test:
         try:
             natal = case.get("natal_chart", {})
-            trange = case.get("time_range", (datetime.now(timezone.utc), datetime.now(timezone.utc) + timedelta(days=365)))
+            trange = case.get("time_range", (datetime.now(_UTC), datetime.now(_UTC) + timedelta(days=365)))
             pred_type = case.get("prediction_type", "transits")
             if pred_type == "comprehensive":
                 cf = comprehensive_forecast(natal, trange, confidence_threshold=thr, statistical_validation=False, **kwargs)
@@ -2098,11 +1897,11 @@ def _eval_metrics(test: List[Dict[str, Any]], train: List[Dict[str, Any]], metri
                 for pv in evs:
                     if pv.event_type == ex_type and pv.datetime_utc and ex_time:
                         dt = _ensure_utc(ex_time)
-                        if abs((pv.datetime_utc - dt).total_seconds()) <= 7 * 86400: matches.append(pv)
+                        if abs((pv.datetime_utc - dt).total_seconds()) <= 7 * _SECONDS_PER_DAY: matches.append(pv)
                 if matches:
                     preds.append(True); truth.append(True)
                     best = max(matches, key=lambda x: x.confidence)
-                    t_errs.append(abs((best.datetime_utc - _ensure_utc(ex_time)).total_seconds()) / 86400.0)  # type: ignore
+                    t_errs.append(abs((best.datetime_utc - _ensure_utc(ex_time)).total_seconds()) / _SECONDS_PER_DAY)  # type: ignore
                     conf_pred.append(best.confidence); conf_true.append(ex_conf)
                 else:
                     preds.append(False); truth.append(True)
@@ -2112,7 +1911,7 @@ def _eval_metrics(test: List[Dict[str, Any]], train: List[Dict[str, Any]], metri
                     matched = False
                     for ex in expected:
                         ex_time = ex.get("datetime")
-                        if pv.datetime_utc and ex_time and abs((pv.datetime_utc - _ensure_utc(ex_time)).total_seconds()) <= 7 * 86400:
+                        if pv.datetime_utc and ex_time and abs((pv.datetime_utc - _ensure_utc(ex_time)).total_seconds()) <= 7 * _SECONDS_PER_DAY:
                             matched = True; break
                     if not matched:
                         preds.append(True); truth.append(False)
@@ -2156,7 +1955,7 @@ def _holdout(cases: List[Dict[str, Any]], metrics: List[str], thr: float, **kwar
     r = _eval_metrics(test, train, metrics, thr, **kwargs)
     return {"ok": True, "method": "holdout", "metrics": r}
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ───────────────────────────────── Helpers ───────────────────────────────────
 
 def _chart_from_composite(comp: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not comp.get("positions"):
@@ -2167,7 +1966,7 @@ def _chart_from_composite(comp: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if comp.get("mc")  is not None: angles["mc_deg"]  = float(comp["mc"])
     return {"bodies": bodies, "angles": angles, "mode": comp.get("meta", {}).get("zodiac_mode", "tropical")}
 
-# ── Exports ──────────────────────────────────────────────────────────────────
+# ───────────────────────────────── Exports ───────────────────────────────────
 
 __all__ = [
     "predict_transits",
