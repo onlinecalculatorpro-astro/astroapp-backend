@@ -1016,47 +1016,110 @@ def timescales_endpoint():
 
 # ───────────────────────── endpoints ─────────────────────────
 from time import perf_counter
+from typing import Any, Dict, Optional
 
 MAJORS = ("Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn","Uranus","Neptune","Pluto")
 
-def _extract_positions_from_chart(chart: dict) -> dict:
+def _coerce_float(v: Any) -> Optional[float]:
+    try:
+        x = float(v)
+        if x != x or x == float("inf") or x == float("-inf"):  # NaN / inf guard
+            return None
+        return x
+    except Exception:
+        return None
+
+def _canon_name(name: Any) -> Optional[str]:
+    if not isinstance(name, str):
+        return None
+    # Canonicalize majors (case-insensitive); otherwise keep original
+    n = name.strip()
+    for m in MAJORS:
+        if n.lower() == m.lower():
+            return m
+    return n or None
+
+def _rows_to_positions(rows: Any) -> Dict[str, float]:
+    """
+    Accepts a list of dict rows with keys like:
+      name/body, lon/longitude, (optionally nested under 'ecliptic')
+    """
+    out: Dict[str, float] = {}
+    if not isinstance(rows, list):
+        return out
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        name = _canon_name(r.get("name") or r.get("body"))
+        # try direct lon keys
+        lon = r.get("lon")
+        if lon is None: lon = r.get("longitude")
+        # try nested ecliptic
+        if lon is None and isinstance(r.get("ecliptic"), dict):
+            lon = r["ecliptic"].get("lon") or r["ecliptic"].get("longitude")
+        lon_f = _coerce_float(lon)
+        if name and lon_f is not None:
+            out[name] = float(lon_f)
+    return out
+
+def _mapping_to_positions(mp: Any) -> Dict[str, float]:
+    """
+    Accepts dict-like maps:
+      { "Sun": deg, ... } or { "Sun": { "lon": deg } }
+    """
+    out: Dict[str, float] = {}
+    if not isinstance(mp, dict):
+        return out
+    for k, v in mp.items():
+        name = _canon_name(k)
+        if not name:
+            continue
+        if isinstance(v, (int, float, str)):
+            lon_f = _coerce_float(v)
+        elif isinstance(v, dict):
+            lon_f = _coerce_float(v.get("lon") or v.get("longitude"))
+        else:
+            lon_f = None
+        if lon_f is not None:
+            out[name] = float(lon_f)
+    return out
+
+def _extract_positions_from_chart(chart: Dict[str, Any]) -> Dict[str, float]:
     """
     Normalize planet longitudes from various chart shapes into:
       { "Sun": deg, "Moon": deg, ... }
-    Returns {} if nothing recognizable is found.
+    Tries several common schemas and returns {} if nothing is found.
     """
     if not isinstance(chart, dict):
         return {}
 
-    # 1) Direct dict
+    # 1) Preferred direct dicts
     if isinstance(chart.get("positions"), dict):
-        return {str(k): float(v) for k, v in chart["positions"].items() if v is not None}
-
-    # 2) 'planets' as dict or list
-    planets = chart.get("planets")
-    if isinstance(planets, dict):
-        return {str(k): float(v) for k, v in planets.items() if v is not None}
-    if isinstance(planets, list):
-        out = {}
-        for item in planets:
-            if not isinstance(item, dict): continue
-            name = item.get("name") or item.get("body")
-            lon  = item.get("lon")  or item.get("longitude")
-            if name is not None and lon is not None:
-                out[str(name)] = float(lon)
+        out = _mapping_to_positions(chart["positions"])
         if out: return out
 
-    # 3) Generic 'rows' list of dicts
-    rows = chart.get("rows")
-    if isinstance(rows, list):
-        out = {}
-        for r in rows:
-            if not isinstance(r, dict): continue
-            name = r.get("name") or r.get("body")
-            lon  = r.get("lon")  or r.get("longitude")
-            if name is not None and lon is not None:
-                out[str(name)] = float(lon)
+    if isinstance(chart.get("planets"), dict):
+        out = _mapping_to_positions(chart["planets"])
         if out: return out
+
+    # 2) Lists of rows
+    if isinstance(chart.get("planets"), list):
+        out = _rows_to_positions(chart["planets"])
+        if out: return out
+
+    if isinstance(chart.get("rows"), list):
+        out = _rows_to_positions(chart["rows"])
+        if out: return out
+
+    # 3) Other common nests
+    ephem = chart.get("ephemeris") or {}
+    if isinstance(ephem, dict):
+        if isinstance(ephem.get("positions"), dict):
+            out = _mapping_to_positions(ephem["positions"])
+            if out: return out
+        if isinstance(ephem.get("rows"), list):
+            out = _rows_to_positions(ephem["rows"])
+            if out: return out
 
     return {}
 
@@ -1067,9 +1130,13 @@ def calculate():
     try:
         body = request.get_json(force=True) or {}
         payload = parse_chart_payload(body)
+
+        # Optional house system override passthrough
         hs = str(body.get("house_system", "")).strip()
         if hs:
             payload["house_system"] = hs
+
+        # Whitelist passthroughs
         for k in ("bodies", "points", "ayanamsa", "topocentric", "elevation_m", "elev_m", "dut1", "houses"):
             if k in body:
                 payload[k] = body[k]
@@ -1090,6 +1157,7 @@ def calculate():
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
 
+    # Compute core chart
     try:
         chart = _call_compute_chart(payload, ts)
     except Exception as e:
@@ -1103,6 +1171,7 @@ def calculate():
         if DEBUG_VERBOSE:
             chart["error"] = str(e)
 
+    # Houses (optional)
     houses: Optional[Dict[str, Any]] = None
     if want_houses:
         try:
@@ -1116,6 +1185,7 @@ def calculate():
         except Exception as e:
             return _json_error("houses_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
+        # Sidereal rotation for houses, if needed
         mode = (payload.get("mode") or "tropical").lower()
         if mode == "sidereal":
             ay = _extract_ayanamsa_from_chart(chart)
@@ -1125,9 +1195,11 @@ def calculate():
                         return None
                     x = (float(v) - float(ay)) % 360.0
                     return 0.0 if abs(x) < 1e-12 else x
+
                 for k in ("asc", "asc_deg", "mc", "mc_deg", "vertex", "eastpoint"):
-                    if k in houses and isinstance(houses[k], (int, float)):
+                    if isinstance(houses.get(k), (int, float)):
                         houses[k] = rot(houses[k])
+
                 if isinstance(houses.get("cusps"), list):
                     houses["cusps"] = [rot(c) for c in houses["cusps"]]
                 if isinstance(houses.get("cusps_deg"), list):
@@ -1135,6 +1207,7 @@ def calculate():
 
         houses = _recompute_houses_angles_if_needed(houses, ts, payload, chart)
 
+    # Meta
     meta = {
         "timescales": ts,
         "timescales_locked": True,
@@ -1144,7 +1217,7 @@ def calculate():
     }
     meta.update(_snapshot_ephemeris_meta(chart.get("meta")))
 
-    # Aspects
+    # Aspects (optional)
     aspects_result = None
     if body.get("aspects", False):
         try:
@@ -1153,7 +1226,7 @@ def calculate():
             if DEBUG_VERBOSE:
                 aspects_result = {"error": str(e)}
 
-    # ---- NEW: normalize positions to top-level for clients/tests
+    # Normalize positions to top-level for clients/tests
     positions = _extract_positions_from_chart(chart)
 
     resp = {
@@ -1161,7 +1234,7 @@ def calculate():
         "timescales": ts,
         "chart": chart,
         "meta": meta,
-        "positions": positions,       # <— add this line
+        "positions": positions,  # <-- stable place for majors (incl. Sun)
     }
     if want_houses:
         resp["houses"] = houses
@@ -1169,7 +1242,6 @@ def calculate():
         resp["aspects"] = aspects_result
 
     ms = (perf_counter() - t0) * 1000.0  # ---- end timing
-    # return with timing header so your test suite can report server time
     return jsonify(resp), 200, {"X-Compute-Time-ms": f"{ms:.0f}"}
 
 @api.post("/api/report")
