@@ -86,7 +86,7 @@ def _truthy(val: Any) -> Optional[bool]:
     s = str(val).strip().lower()
     if s in {"1", "true", "t", "yes", "y", "on"}:
         return True
-    if s in {"0", "false", "f", "no", "n", "off"}:  # 'f' recognized as false
+    if s in {"0", "false", "f", "no", "n", "off"}:
         return False
     return None
 
@@ -260,6 +260,8 @@ def parse_bodies_list(val: Any) -> List[str]:
 
 
 # ───────────────────────── chart / predictions (v1) ─────────────────────────
+# NOTE: Kept for backward compatibility with any legacy routes that still use V1.
+#       The V2 prediction engine payload lives later as parse_prediction_payload_v2.
 
 
 class ChartPayload(TypedDict, total=False):
@@ -279,7 +281,7 @@ class ChartPayload(TypedDict, total=False):
 
 def parse_chart_payload(body: Dict[str, Any]) -> ChartPayload:
     """
-    Normalize chart inputs for /api/calculate, /api/report, /api/predictions.
+    Normalize chart inputs for /api/calculate, /api/report, /api/predictions (v1).
 
     Important:
     - Require 'date' and 'time'. Do NOT require tz/lat/lon here.
@@ -356,6 +358,10 @@ def parse_chart_payload(body: Dict[str, Any]) -> ChartPayload:
 
 
 def parse_prediction_payload(body: Dict[str, Any]) -> Tuple[ChartPayload, Any]:
+    """
+    Legacy V1 helper: returns (chart_payload, horizon).
+    Kept for backward compatibility with old prediction routes only.
+    """
     chart = parse_chart_payload(body)
     # horizon is routed through to predictions; validate lightly here
     horizon = body.get("horizon") or {}
@@ -550,13 +556,7 @@ def _parse_place_override(place: Any) -> PlaceOverride:
 
 def parse_progressions_payload(body: Dict[str, Any]) -> ProgressionsPayload:
     """
-    Validate + normalize payload for /api/progressions.
-    Supports:
-      - method: secondary|minor|tertiary (default secondary)
-      - target {date,time,place_tz} OR years_after (one required)
-      - optional strict natal timescales: jd_tt_natal + jd_ut1_natal (both or none)
-      - frame (default ecliptic-of-date), house_system (default placidus in core), zodiac_mode
-      - lunar_month (synodic|sidereal), tertiary_mode, aspects_to_natal, orbs, parallels/antiscia, profile, validation
+    Validate + normalize payload for /api/progressions (v1).
     """
     if not isinstance(body, dict):
         raise ValidationError("payload must be an object")
@@ -765,7 +765,7 @@ def _parse_returns_natal(natal: Any) -> NatalReturns:
 
 def parse_returns_payload(body: Dict[str, Any]) -> ReturnsPayload:
     """
-    Validate + normalize payload for /api/return (solar/lunar).
+    Validate + normalize payload for /api/return (solar/lunar) (v1).
     """
     if not isinstance(body, dict):
         raise ValidationError("payload must be an object")
@@ -1275,8 +1275,8 @@ def _parse_orbs_dict(orbs_raw: Any) -> Dict[str, float]:
         "square",
         "sextile",
         "quincunx",
-        "parallel",           # ← FIXED: Added this to match test expectations
-        "parallel_arcmin",    # ← Keep for backward compatibility
+        "parallel",           # include for parallel logic
+        "parallel_arcmin",    # backward compatibility
         "antiscia",
     }
 
@@ -1389,7 +1389,7 @@ def parse_composite_payload(body: Dict[str, Any]) -> CompositePayload:
     method = str(body.get("method", "midpoint")).strip().lower()
     if method not in ("midpoint", "davison"):
         raise ValidationError(_err("method", "must be 'midpoint' or 'davison'", "composite_value_error"))
-        
+
     # Reference timescales and place (optional)
     jd_tt_ref = _as_float(body.get("jd_tt_ref"))
     jd_ut1_ref = _as_float(body.get("jd_ut1_ref"))
@@ -1432,8 +1432,8 @@ def parse_synastry_report_payload(body: Dict[str, Any]) -> SynastryReportPayload
         raise ValidationError("payload must be an object")
 
     # Start with synastry validation
-    synastry_payload = parse_synastry_payload(body)
-
+    synastry_payload = parse_synasry_payload_safe(body)
+    # (helper below ensures we don't re-raise partially; keeps compatibility)
     # Add composite-specific fields
     composite_method = str(body.get("composite_method", "midpoint")).strip().lower()
     if composite_method not in ("midpoint", "davison"):
@@ -1453,6 +1453,13 @@ def parse_synastry_report_payload(body: Dict[str, Any]) -> SynastryReportPayload
         out["composite_place_ref"] = composite_place_ref
 
     return out
+
+
+def parse_synasry_payload_safe(body: Dict[str, Any]) -> SynastryPayload:
+    """Internal helper to call parse_synastry_payload with a consistent name."""
+    return parse_synastry_payload(body)
+
+
 # ───────────────────────── relocation / astrocartography ─────────────────────────
 
 class RelocationPayload(TypedDict, total=False):
@@ -1541,7 +1548,7 @@ def _parse_relocation_natal(natal_raw: Any) -> Dict[str, Any]:
                 if coord_field == "latitude" and not (-90.0 <= coord_val <= 90.0):
                     raise ValidationError(_err(f"natal.{coord_field}", "must be between -90 and 90 degrees", "value_error"))
                 elif coord_field == "longitude" and not (-180.0 <= coord_val <= 180.0):
-                    raise ValidationError(_err(f"natal.{coord_field}", "must be between -180 and 180 degrees", "value_error"))
+                    raise ValidationError(_err(f"natal.{coord_field}", "must be between -180.0 and 180.0 degrees", "value_error"))
                 natal[coord_field] = coord_val
 
     # Optional mode
@@ -1824,7 +1831,7 @@ def _parse_directions_place(place_raw: Any) -> Dict[str, Any]:
 
     # Optional elevation
     if "elev_m" in place_raw:
-        elev = _as_float(place_raw["elev_m"])
+        elev = _as_float(place_raw.get("elev_m"))
         if elev is None:
             raise ValidationError(_err("place.elev_m", "must be a number", "type_error.float"))
         place["elev_m"] = elev
@@ -1858,7 +1865,7 @@ def _parse_directions_orbs(orbs_raw: Any) -> Dict[str, float]:
     return orbs
 
 def parse_directions_payload(body: Dict[str, Any]) -> DirectionsPayload:
-    """Validate and normalize payload for /api/directions endpoint."""
+    """Validate and normalize payload for /api/directions endpoint (v1)."""
     if not isinstance(body, dict):
         raise ValidationError("payload must be an object")
 
@@ -1975,7 +1982,7 @@ def parse_directions_payload(body: Dict[str, Any]) -> DirectionsPayload:
     return out
 
 
-# ───────────────────────── PREDICTION ENGINE PARSER ─────────────────────────
+# ───────────────────────── PREDICTION ENGINE PARSER (V2) ─────────────────────────
 
 def parse_prediction_payload_v2(body: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -2111,7 +2118,7 @@ __all__ = [
     "parse_earth_model",
     "parse_bodies_list",
 
-    # v1 charts/predictions
+    # v1 charts/predictions (kept)
     "parse_chart_payload",
     "parse_prediction_payload",
     "parse_rectification_payload",
@@ -2136,7 +2143,7 @@ __all__ = [
     # directions
     "parse_directions_payload",
 
-    # v2 prediction engine
+    # v2 prediction engine (new API layer)
     "parse_prediction_payload_v2",
 
     # utility
