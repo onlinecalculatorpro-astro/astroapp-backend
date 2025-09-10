@@ -3494,9 +3494,16 @@ def _returns_pick_fn(kind: str) -> Optional[Any]:
     return None
 
 def _parse_return_kind(raw: Any) -> str:
+    """Parse and validate return kind with strict validation."""
     s = str(raw or "").strip().lower()
     if not s:
         return "solar"
+    
+    # Valid kinds only
+    valid_kinds = {"solar", "lunar", "sun", "moon", "sol", "lun"}
+    if s not in valid_kinds:
+        raise ValidationError([{"loc": ["kind"], "msg": f"must be 'solar' or 'lunar', got '{s}'", "type": "value_error"}])
+    
     alias = {
         "sun": "solar", "sol": "solar",
         "moon": "lunar", "lun": "lunar",
@@ -3523,22 +3530,25 @@ def _normalize_window(body: Dict[str, Any], default_days: float = 30.0) -> Tuple
     tz = body.get("tz") or body.get("place_tz") or body.get("timezone")
 
     if isinstance(date0, str) and isinstance(time0, str) and isinstance(tz, str):
-        ts0 = _compute_timescales_from_local(date0, time0, tz, payload=body)
-        jd0f = float(ts0["jd_tt"])
-        if isinstance(date1, str) and isinstance(time1, str):
-            ts1 = _compute_timescales_from_local(date1, time1, tz, payload=body)
-            jd1f = float(ts1["jd_tt"])
-            if jd1f > jd0f:
-                return jd0f, jd1f
-        else:
-            return jd0f, jd0f + float(default_days)
+        try:
+            ts0 = _compute_timescales_from_local(date0, time0, tz, payload=body)
+            jd0f = float(ts0["jd_tt"])
+            if isinstance(date1, str) and isinstance(time1, str):
+                ts1 = _compute_timescales_from_local(date1, time1, tz, payload=body)
+                jd1f = float(ts1["jd_tt"])
+                if jd1f > jd0f:
+                    return jd0f, jd1f
+            else:
+                return jd0f, jd0f + float(default_days)
+        except Exception:
+            pass
 
     return None, None
 
 def _build_returns_kwargs(body: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[List[Dict[str, Any]]]]:
     """
     Route-friendly builder for returns engines.
-    - Validates minimal natal fields
+    - Validates minimal natal fields with strict validation
     - Fills jd_tt_natal / jd_ut1_natal if missing
     - Normalizes frame/zodiac/house
     - Derives topocentric from coords
@@ -3563,8 +3573,13 @@ def _build_returns_kwargs(body: Dict[str, Any]) -> Tuple[Dict[str, Any], Optiona
         frame = parse_frame(body.get("frame"))
     except ValidationError as e:
         return {}, e.errors()
+    
     zodiac_mode = (body.get("zodiac_mode") or body.get("mode") or "tropical").strip().lower()
+    if zodiac_mode not in ("tropical", "sidereal"):
+        errs.append({"loc": ["zodiac_mode"], "msg": "must be 'tropical' or 'sidereal'", "type": "value_error"})
+    
     house_system = (body.get("house_system") or "placidus").strip().lower()
+    
     ay = body.get("ayanamsa_deg")
     ay_f = None
     try:
@@ -3575,8 +3590,12 @@ def _build_returns_kwargs(body: Dict[str, Any]) -> Tuple[Dict[str, Any], Optiona
     except Exception:
         errs.append({"loc": ["ayanamsa_deg"], "msg": "must be a number", "type": "type_error.float"})
 
-    # return kind
-    kind = _parse_return_kind(body.get("kind") or body.get("type") or body.get("planet"))
+    # return kind with validation
+    try:
+        kind = _parse_return_kind(body.get("kind") or body.get("type") or body.get("planet"))
+    except ValidationError as e:
+        errs.extend(e.errors())
+        kind = "solar"  # fallback
 
     # natal strict timescales (fill if missing)
     jd_tt_natal = body.get("jd_tt_natal")
@@ -3590,6 +3609,8 @@ def _build_returns_kwargs(body: Dict[str, Any]) -> Tuple[Dict[str, Any], Optiona
                 jd_ut1_natal = float(ts_nat["jd_ut1"])
     except ValidationError as e:
         errs.extend(e.errors())
+    except Exception as e:
+        errs.append({"loc": ["natal"], "msg": f"timescale computation failed: {str(e)}", "type": "value_error"})
 
     # Additional return parameters
     place = body.get("place")
@@ -3616,17 +3637,63 @@ def _build_returns_kwargs(body: Dict[str, Any]) -> Tuple[Dict[str, Any], Optiona
         errs.extend(e.errors())
         jd0 = jd1 = None
 
-    # Additional solver & validation knobs
-    tol_arcmin = float(body.get("tol_arcmin", 1.0))
-    max_iters = int(body.get("max_iters", 12))
+    # Additional solver & validation knobs with validation
+    try:
+        tol_arcmin = float(body.get("tol_arcmin", 1.0))
+        if tol_arcmin <= 0:
+            errs.append({"loc": ["tol_arcmin"], "msg": "must be positive", "type": "value_error"})
+    except (ValueError, TypeError):
+        errs.append({"loc": ["tol_arcmin"], "msg": "must be a number", "type": "type_error.float"})
+        tol_arcmin = 1.0
+
+    try:
+        max_iters = int(body.get("max_iters", 12))
+        if max_iters < 1:
+            errs.append({"loc": ["max_iters"], "msg": "must be >= 1", "type": "value_error"})
+    except (ValueError, TypeError):
+        errs.append({"loc": ["max_iters"], "msg": "must be an integer", "type": "type_error.int"})
+        max_iters = 12
+
     estimate_uncertainty = bool(body.get("estimate_uncertainty", True))
-    fd_step_minutes = float(body.get("fd_step_minutes", 2.0))
+    
+    try:
+        fd_step_minutes = float(body.get("fd_step_minutes", 2.0))
+        if fd_step_minutes <= 0:
+            errs.append({"loc": ["fd_step_minutes"], "msg": "must be positive", "type": "value_error"})
+    except (ValueError, TypeError):
+        errs.append({"loc": ["fd_step_minutes"], "msg": "must be a number", "type": "type_error.float"})
+        fd_step_minutes = 2.0
+
     profile = bool(body.get("profile", False))
+    
     validation = (body.get("validation") or "basic").strip().lower()
-    validation_residual_arcmin = float(body.get("validation_residual_arcmin", 1.0))
+    if validation not in ("none", "basic", "extended"):
+        errs.append({"loc": ["validation"], "msg": "must be 'none', 'basic', or 'extended'", "type": "value_error"})
+        validation = "basic"
+
+    try:
+        validation_residual_arcmin = float(body.get("validation_residual_arcmin", 1.0))
+        if validation_residual_arcmin <= 0:
+            errs.append({"loc": ["validation_residual_arcmin"], "msg": "must be positive", "type": "value_error"})
+    except (ValueError, TypeError):
+        errs.append({"loc": ["validation_residual_arcmin"], "msg": "must be a number", "type": "type_error.float"})
+        validation_residual_arcmin = 1.0
 
     guess_years_offset = body.get("guess_years_offset")
+    if guess_years_offset is not None:
+        try:
+            guess_years_offset = int(guess_years_offset)
+        except (ValueError, TypeError):
+            errs.append({"loc": ["guess_years_offset"], "msg": "must be an integer", "type": "type_error.int"})
+            guess_years_offset = None
+
     around_jd_tt = body.get("around_jd_tt")
+    if around_jd_tt is not None:
+        try:
+            around_jd_tt = float(around_jd_tt)
+        except (ValueError, TypeError):
+            errs.append({"loc": ["around_jd_tt"], "msg": "must be a number", "type": "type_error.float"})
+            around_jd_tt = None
 
     orbs = body.get("orbs") if isinstance(body.get("orbs"), dict) else None
     aspects_to_natal = bool(body.get("aspects_to_natal", True))
@@ -3634,6 +3701,9 @@ def _build_returns_kwargs(body: Dict[str, Any]) -> Tuple[Dict[str, Any], Optiona
     antiscia = bool(body.get("antiscia", False))
 
     lunar_month = (body.get("lunar_month") or "sidereal").strip().lower()
+    if lunar_month not in ("sidereal", "synodic"):
+        errs.append({"loc": ["lunar_month"], "msg": "must be 'sidereal' or 'synodic'", "type": "value_error"})
+        lunar_month = "sidereal"
 
     if errs:
         return {}, errs
@@ -3647,7 +3717,7 @@ def _build_returns_kwargs(body: Dict[str, Any]) -> Tuple[Dict[str, Any], Optiona
         "frame": frame,
         "house_system": house_system,
         "zodiac_mode": zodiac_mode,
-        "ayanamsa_deg": ay_f if ay_f is not None else None,
+        "ayanamsa_deg": ay_f if ay_f is not None else 0.0,  # Default to 0.0 instead of None
         "lunar_month": lunar_month,
         "guess_years_offset": guess_years_offset,
         "around_jd_tt": around_jd_tt,
@@ -3667,9 +3737,9 @@ def _build_returns_kwargs(body: Dict[str, Any]) -> Tuple[Dict[str, Any], Optiona
         "topocentric": topocentric,
     }
 
-    # prune explicit None (except window and ayanamsa which can be None safely)
+    # prune explicit None (except window which can be None safely)
     for k in list(kwargs.keys()):
-        if kwargs[k] is None and k not in ("jd_start_tt", "jd_end_tt", "ayanamsa_deg"):
+        if kwargs[k] is None and k not in ("jd_start_tt", "jd_end_tt", "guess_years_offset", "around_jd_tt", "orbs", "place"):
             kwargs.pop(k, None)
 
     return kwargs, None
@@ -3721,20 +3791,53 @@ def returns_compute_route():
         det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
         return _json_error("returns_internal", det or "internal_error", 500)
 
-    # normalize response
-    meta = _returns_enrich_meta(result.get("meta") or {})
+    # FIXED: Better response normalization with error handling
+    if not isinstance(result, dict):
+        return _json_error("returns_internal", "invalid result format from compute function", 500)
 
+    # Check if the result indicates an error
+    if not result.get("ok", True):
+        error_details = result.get("details", {})
+        error_message = result.get("error", "computation_failed")
+        
+        if DEBUG_VERBOSE:
+            det = {"result": result, "error_details": error_details}
+        else:
+            det = None
+            
+        return _json_error(error_message, det, 500)
+
+    # normalize response structure
+    meta = _returns_enrich_meta(result.get("meta") or {})
     event = result.get("event") or {}
+    
+    # FIXED: Ensure event has required structure
+    if not isinstance(event, dict):
+        return _json_error("returns_internal", "invalid event structure", 500)
+
+    # FIXED: Better epoch handling
     epoch = None
     if isinstance(event, dict) and ("jd_tt" in event or "jd_ut1" in event):
-        epoch = {"jd_tt": float(event.get("jd_tt")), "jd_ut1": float(event.get("jd_ut1"))}
+        try:
+            epoch = {
+                "jd_tt": float(event.get("jd_tt", 0)),
+                "jd_ut1": float(event.get("jd_ut1", 0))
+            }
+        except (ValueError, TypeError):
+            # Don't fail the whole request for epoch formatting issues
+            epoch = None
+
+    # FIXED: Validate positions structure
+    positions = result.get("positions")
+    if positions is not None and not isinstance(positions, dict):
+        positions = None
 
     resp = {
         "ok": True,
         "kind": (event.get("kind") or kwargs.get("kind") or "solar"),
         "event": event,
         "epoch": epoch,
-        "positions": result.get("positions"),
+        "positions": positions,
         "houses": result.get("houses"),
         "meta": meta,
         "warnings": list(meta.get("warnings") or []),
@@ -3789,6 +3892,7 @@ def returns_scan_route():
         det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
         return _json_error("returns_internal", det or "internal_error", 500)
 
+    # FIXED: Better results handling
     meta: Dict[str, Any] = {}
     if isinstance(results, dict):
         meta = _returns_enrich_meta(results.get("meta") or {})
@@ -3805,6 +3909,7 @@ def returns_scan_route():
         "results": res_list,
         "meta": meta,
     }), 200
+    
 
 # ───────────────────────── PARANS ─────────────────────────
 @api.post("/api/parans")
