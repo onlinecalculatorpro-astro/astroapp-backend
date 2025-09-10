@@ -1388,8 +1388,8 @@ def parse_composite_payload(body: Dict[str, Any]) -> CompositePayload:
     # Composite method
     method = str(body.get("method", "midpoint")).strip().lower()
     if method not in ("midpoint", "davison"):
-        raise ValidationError(_err("method", "must be 'midpoint' or 'davison'", "value_error"))
-
+        raise ValidationError(_err("method", "must be 'midpoint' or 'davison'", "composite_value_error"))
+        
     # Reference timescales and place (optional)
     jd_tt_ref = _as_float(body.get("jd_tt_ref"))
     jd_ut1_ref = _as_float(body.get("jd_ut1_ref"))
