@@ -2770,6 +2770,119 @@ def predictive_ingresses():
         _give_gate()
 
         
+# ───────────────────────── /predictive/station ─────────────────────────
+@api.post("/api/predictive/stations")
+def predictive_stations():
+    try:
+        # Try optional engine (rename to your actual module/function if different)
+        from app.core.predictive import compute_stations as _compute
+    except Exception:
+        return _json_error("stations_unavailable", "predictive stations engine not wired", 501)
+
+    try:
+        body = request.get_json(force=True) or {}
+        res = _compute(body)  # adapt if your signature differs
+        return jsonify({"ok": True, **(res if isinstance(res, dict) else {"result": res})}), 200
+    except ValueError as e:
+        return _json_error("stations_value_error", str(e), 400)
+    except Exception as e:
+        return _json_error("stations_internal", {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else "internal_error", 500)
+
+# ───────────────────────── /predictive/Dasha ─────────────────────────
+
+@api.post("/api/predictive/dasha")
+def predictive_dasha():
+    try:
+        from app.core.vedic import compute_dasha as _compute
+    except Exception:
+        return _json_error("dasha_unavailable", "vedic/dasha engine not wired", 501)
+
+    try:
+        body = request.get_json(force=True) or {}
+        res = _compute(body)
+        return jsonify({"ok": True, **(res if isinstance(res, dict) else {"result": res})}), 200
+    except ValueError as e:
+        return _json_error("dasha_value_error", str(e), 400)
+    except Exception as e:
+        return _json_error("dasha_internal", {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else "internal_error", 500)
+
+
+# ───────────────────────── /predictive/varga ─────────────────────────
+
+@api.post("/api/predictive/vargas")
+def predictive_vargas():
+    try:
+        from app.core.vedic import compute_vargas as _compute
+    except Exception:
+        return _json_error("vargas_unavailable", "vedic/vargas engine not wired", 501)
+
+    try:
+        body = request.get_json(force=True) or {}
+        res = _compute(body)
+        return jsonify({"ok": True, **(res if isinstance(res, dict) else {"result": res})}), 200
+    except ValueError as e:
+        return _json_error("vargas_value_error", str(e), 400)
+    except Exception as e:
+        return _json_error("vargas_internal", {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else "internal_error", 500)
+
+
+# ───────────────────────── /predictive/yoga ─────────────────────────
+
+@api.post("/api/predictive/yogas")
+def predictive_yogas():
+    try:
+        from app.core.vedic import compute_yogas as _compute
+    except Exception:
+        return _json_error("yogas_unavailable", "vedic/yogas engine not wired", 501)
+
+    try:
+        body = request.get_json(force=True) or {}
+        res = _compute(body)
+        return jsonify({"ok": True, **(res if isinstance(res, dict) else {"result": res})}), 200
+    except ValueError as e:
+        return _json_error("yogas_value_error", str(e), 400)
+    except Exception as e:
+        return _json_error("yogas_internal", {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else "internal_error", 500)
+
+
+# ───────────────────────── /predictive/evaluate ─────────────────────────
+@api.post("/api/evaluate")
+def evaluate_transit_prox_sun():
+    try:
+        from app.core.evaluate import transit_prox_sun as _compute
+    except Exception:
+        return _json_error("evaluate_unavailable", "evaluate engine not wired", 501)
+
+    try:
+        body = request.get_json(force=True) or {}
+        res = _compute(body)
+        return jsonify({"ok": True, **(res if isinstance(res, dict) else {"result": res})}), 200
+    except ValueError as e:
+        return _json_error("evaluate_value_error", str(e), 400)
+    except Exception as e:
+        return _json_error("evaluate_internal", {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else "internal_error", 500)
+
+
+# ───────────────────────── /predictive/holdout ─────────────────────────
+
+@api.post("/api/holdout")
+def holdout_transit():
+    try:
+        from app.core.holdout import transit_holdout as _compute
+    except Exception:
+        return _json_error("holdout_unavailable", "holdout engine not wired", 501)
+
+    try:
+        body = request.get_json(force=True) or {}
+        res = _compute(body)
+        return jsonify({"ok": True, **(res if isinstance(res, dict) else {"result": res})}), 200
+    except ValueError as e:
+        return _json_error("holdout_value_error", str(e), 400)
+    except Exception as e:
+        return _json_error("holdout_internal", {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else "internal_error", 500)
+
+
+
 # ───────────────────────── PROGRESSIONS ─────────────────────────
 @api.post("/api/progressions")
 @rate_limit(RL_PROGRESSIONS)
