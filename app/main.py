@@ -5,7 +5,6 @@ import logging
 import os
 import sys
 import traceback
-from dataclasses import asdict, is_dataclass  # harmless if unused elsewhere
 from time import perf_counter
 from typing import Any, Dict, Final, Optional
 
@@ -181,11 +180,14 @@ def create_app() -> Flask:
         def _health_fallback():
             return jsonify(ok=False, error="routes_blueprint_not_loaded", detail=_routes_import_err), 500
 
-    # ───── Register the Vedic API blueprint (scoped) ─────
+    # ───── Register the Vedic API blueprint ─────
     if _ENABLE_VEDIC and _vedic_bp is not None:
-        # vedic_routes.py should define relative rules (e.g., '/panchanga');
-        # we scope them to /api/vedic here.
-        app.register_blueprint(_vedic_bp, url_prefix="/api/vedic")
+        # IMPORTANT:
+        # Your vedic_routes.py defines ABSOLUTE paths (e.g. '/api/vedic/dasha/vimshottari').
+        # Therefore we DO NOT set url_prefix here. If you later convert vedic routes to
+        # relative paths (e.g. '/dasha/vimshottari'), change the next line to:
+        #     app.register_blueprint(_vedic_bp, url_prefix="/api/vedic")
+        app.register_blueprint(_vedic_bp)
     elif _ENABLE_VEDIC and _vedic_bp is None:
         @app.get("/api/vedic/health")
         def _vedic_health_fallback():
