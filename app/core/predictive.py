@@ -23,7 +23,7 @@ from datetime import datetime, date as _date
 # ───────────────────── global, preloaded Skyfield objects ─────────────────────
 # NOTE: TS and PLANETS are singletons created at process start in app/core/__init__.py
 #       Importing them here avoids reloading kernels/timescales on every request.
-from app.core import TS, PLANETS
+from app.core.ephem_singleton import TS, PLANETS
 
 # ───────────────────── precise backends (soft imports) ─────────────────────
 # Ephemeris adapter
