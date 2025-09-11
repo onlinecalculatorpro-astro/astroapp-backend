@@ -1,18 +1,19 @@
 # app/core/common_predictive.py
 from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Callable, Literal
+from typing import Any, Dict, List, Optional, Tuple, Callable, Literal, TYPE_CHECKING
 import math, random
 from datetime import datetime, date as _date
 
 # Preloaded singletons (don’t reload kernels)
 from app.core.ephem_singleton import TS, PLANETS
 
-# Optional ephemeris adapter (type only)
+# Optional ephemeris adapter (type only at runtime if available)
 try:
     from app.core.ephemeris_adapter import EphemerisAdapter, Config as EphemConfig
     _EPH_OK = True
-except Exception:
+except Exception:  # pragma: no cover - optional dep
     _EPH_OK = False
     EphemerisAdapter = object  # type: ignore
     EphemConfig = object       # type: ignore
@@ -57,11 +58,11 @@ def is_finite(*xs: float) -> bool:
     return all(math.isfinite(float(x)) for x in xs)
 
 # ── date/time helpers used by Western scans ──────────────────────────────────
-def _to_date(s) -> _date:
+def _to_date(s: Any) -> _date:
     """
     Best-effort coercion to date. Accepts:
     - date object
-    - ISO datetime/date string (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS[.sss])
+    - ISO datetime/date string (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS[.sss][Z|±HH:MM])
     Fallback: UTC today.
     """
     if isinstance(s, _date):
@@ -76,7 +77,7 @@ def _to_date(s) -> _date:
             pass
     return datetime.utcnow().date()
 
-def _jd_from_date(d: _date, tz: str, ts_resolve) -> float:
+def _jd_from_date(d: _date, tz: str, ts_resolve: Callable[..., Dict[str, Any]] | None) -> float:
     """Compute JD_TT at local midnight of given date in given timezone using provided resolver."""
     if ts_resolve is None:
         raise RuntimeError("Timescale resolver unavailable; pass jd_tt/jd_ut1 directly.")
@@ -86,31 +87,32 @@ def _jd_from_date(d: _date, tz: str, ts_resolve) -> float:
 # ── Houses & timescales (shared) ────────────────────────────────────────────
 try:
     from app.core.validators import resolve_timescales_from_civil_erfa as _ts_resolve
-    _TS_OK = True; _TS_ERR = None
-except Exception as e:
-    _TS_OK = False; _TS_ERR = e
+    _TS_OK = True
+    _TS_ERR: Optional[Exception] = None
+except Exception as e:  # pragma: no cover - optional path
+    _TS_OK = False
+    _TS_ERR = e
     _ts_resolve = None  # type: ignore
 
 # house engines (policy → fallback)
 _HAS_POLICY = False
 _HOUSES_OK = True
+_HOUSES_ERR: Optional[Exception] = None
 try:
     from app.core.house import compute_houses_with_policy as _compute_houses_policy
     _HAS_POLICY = True
 except Exception:
     try:
         from app.core.houses import asc_mc_houses as _asc_mc_houses
-    except Exception as _houses_err:
+    except Exception as _houses_err:  # pragma: no cover - optional path
         _HOUSES_OK = False
         _compute_houses_policy = None  # type: ignore
         _asc_mc_houses = None          # type: ignore
         _HOUSES_ERR = _houses_err
-    else:
-        _HOUSES_ERR = None
-else:
-    _HOUSES_ERR = None
 
-def compute_houses(*, latitude: float, longitude: float, jd_tt: float, jd_ut1: float, system: str = "placidus") -> Dict[str, Any]:
+def compute_houses(
+    *, latitude: float, longitude: float, jd_tt: float, jd_ut1: float, system: str = "placidus"
+) -> Dict[str, Any]:
     """
     Return {'asc': float, 'mc': float, 'cusps': [12 floats]} using either:
     - policy engine (if present), or
@@ -119,12 +121,16 @@ def compute_houses(*, latitude: float, longitude: float, jd_tt: float, jd_ut1: f
     if not _HOUSES_OK:
         raise RuntimeError(f"Houses unavailable: {_HOUSES_ERR}")
     if _HAS_POLICY:
-        pay = _compute_houses_policy(lat=latitude, lon=longitude, system=system, jd_tt=jd_tt, jd_ut1=jd_ut1, jd_ut=jd_ut1)
+        pay = _compute_houses_policy(  # type: ignore[misc]
+            lat=latitude, lon=longitude, system=system, jd_tt=jd_tt, jd_ut1=jd_ut1, jd_ut=jd_ut1
+        )
         return {"asc": float(pay["asc"]), "mc": float(pay["mc"]), "cusps": [float(x) for x in pay["cusps"]]}
-    asc, mc, cusps = _asc_mc_houses(system, latitude, longitude, jd_tt=jd_tt, jd_ut1=jd_ut1, jd_ut=jd_ut1)
+    asc, mc, cusps = _asc_mc_houses(  # type: ignore[misc]
+        system, latitude, longitude, jd_tt=jd_tt, jd_ut1=jd_ut1, jd_ut=jd_ut1
+    )
     return {"asc": float(asc), "mc": float(mc), "cusps": [float(x) for x in cusps]}
 
-def timescales_from_civil(date_yyyy_mm_dd: str, time_hh_mm_ss: str, place_tz: str) -> Dict[str, float]:
+def timescales_from_civil(date_yyyy_mm_dd: str, time_hh_mm_ss: str, place_tz: str) -> Dict[str, Any]:
     """Resolve civil date/time + TZ to timescales dict with jd_tt/jd_ut1."""
     if _ts_resolve is None:
         raise RuntimeError("Timescale resolver unavailable; pass jd_tt/jd_ut1 directly.")
@@ -133,7 +139,8 @@ def timescales_from_civil(date_yyyy_mm_dd: str, time_hh_mm_ss: str, place_tz: st
     return _ts_resolve(d, time_hh_mm_ss, place_tz)
 
 # ── Validation utilities (evaluate/holdout) ─────────────────────────────────
-FeatureFn = Callable[[Dict[str, Any], EphemerisAdapter], Dict[str, float]]
+# FeatureFn takes (record, ephemeris) and returns {feature_name: float}
+FeatureFn = Callable[[Dict[str, Any], EphemerisAdapter], Dict[str, float]]  # type: ignore[valid-type]
 
 def _pearson_welford(x: List[float], y: List[float]) -> float:
     """
@@ -266,7 +273,7 @@ def bh_fdr(pvals: List[float], alpha: float = 0.05) -> Tuple[List[float], List[b
     q = [0.0] * m
     min_q = 1.0
     # reverse pass
-    for rank, i in enumerate(reversed(order), start=1):
+    for rank, _ in enumerate(reversed(order), start=1):
         j = order[-rank]
         pi = pvals[j]
         qj = (pi * m) / (m - rank + 1)
@@ -288,7 +295,7 @@ class EvalResult:
 def evaluate_univariate(
     records: List[Dict[str, Any]],
     feature_fn: FeatureFn,
-    *, ephem: Optional[EphemerisAdapter] = None,
+    *, ephem: Optional[EphemerisAdapter] = None,  # type: ignore[valid-type]
     n_perm: int = 2000, alpha: float = 0.05,
     stratify_by: Optional[str] = None, group_by: Optional[str] = None,
     perm_mode: Literal["iid","within","circular"] = "iid",
@@ -328,7 +335,7 @@ def evaluate_univariate(
 
         for i, r in enumerate(rows):
             v = r.get(name, None)
-            if v is None or not math.isfinite(v):
+            if v is None or not math.isfinite(v):  # ← fixed: no stray ')'
                 continue
             x.append(float(v))
             yy.append(y[i])
