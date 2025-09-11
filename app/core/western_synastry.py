@@ -1,64 +1,72 @@
-# app/core/synastry.py
+# app/core/western_synastry.py
 # -*- coding: utf-8 -*-
 """
-Research-grade Synastry & Composite module (v12.1)
+Western Synastry & Composite module (v1.0, tropical-only)
 
-Goals
+Scope
 -----
-- Stable, explicit error taxonomy:
-  * validation_error                → input/schema issues (e.g., missing date/time/place_tz)
-  * synastry_computation_failed     → unexpected runtime error in synastry
-  * composite_value_error           → invalid composite method
-  * composite_computation_failed    → unexpected runtime error in composite
-- Consistent warnings and meta blocks
-- Defensive ephemeris & houses calls with graceful degradation
-- Sidereal adjustments (ayanamsa) supported
-- Heuristic scoring preserved
+Implements Western (tropical) relationship techniques:
+- Planet-to-planet zodiacal aspects
+- Declination parallels / contra-parallels
+- Antiscia / contra-antiscia
+- House overlays (optional)
+- Composite charts (midpoint & Davison)
 
-Public APIs
------------
-compute_synastry(natal_a, natal_b, **kwargs) -> dict
-compute_composite(natal_a, natal_b, **kwargs) -> dict
-synastry_report(natal_a, natal_b, **kwargs) -> dict
+Non-goals (handled elsewhere):
+- Vedic: Ashta Koota, Manglik, Nadi, Navamsa logic, ayanamsa shifts, etc.
+
+Public API (Western-only)
+-------------------------
+compute_western_synastry(natal_a, natal_b, **kwargs) -> dict
+compute_western_composite(natal_a, natal_b, **kwargs) -> dict
+western_synastry_report(natal_a, natal_b, **kwargs) -> dict
+
+Error taxonomy (compatible)
+---------------------------
+- validation_error
+- synastry_computation_failed
+- composite_value_error
+- composite_computation_failed
+- synastry_report_failed
 """
 
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Tuple, Optional
-from datetime import datetime
+from functools import lru_cache
+from typing import Any, Dict, List, Tuple, Optional, TypedDict
 
 # ═══════════════════════════════ RESILIENT IMPORTS ═══════════════════════════════
 
 # Ephemeris adapter (required)
 try:
     from app.core.ephemeris_adapter import EphemerisAdapter
-    _EPHEMERIS_AVAILABLE = True
-    _EPHEMERIS_ERROR = None
+    _EPHEM_OK = True
+    _EPHEM_ERR: Optional[Exception] = None
 except Exception as e:  # pragma: no cover
     EphemerisAdapter = None  # type: ignore
-    _EPHEMERIS_AVAILABLE = False
-    _EPHEMERIS_ERROR = e
+    _EPHEM_OK = False
+    _EPHEM_ERR = e
 
 # Timescales builder (required)
 try:
     from app.core.timescales import build_timescales
-    _TIMESCALES_AVAILABLE = True
-    _TIMESCALES_ERROR = None
+    _TS_OK = True
+    _TS_ERR: Optional[Exception] = None
 except Exception as e:  # pragma: no cover
     build_timescales = None  # type: ignore
-    _TIMESCALES_AVAILABLE = False
-    _TIMESCALES_ERROR = e
+    _TS_OK = False
+    _TS_ERR = e
 
-# Houses computation (optional for overlays)
+# Houses computation (optional for overlays/composites)
 try:
     from app.core.houses import compute_houses_with_policy
-    _HOUSES_AVAILABLE = True
-    _HOUSES_ERROR = None
+    _HOUSES_OK = True
+    _HOUSES_ERR: Optional[Exception] = None
 except Exception as e:  # pragma: no cover
     compute_houses_with_policy = None  # type: ignore
-    _HOUSES_AVAILABLE = False
-    _HOUSES_ERROR = e
+    _HOUSES_OK = False
+    _HOUSES_ERR = e
 
 # ═══════════════════════════════ CONSTANTS ═══════════════════════════════════════
 
@@ -67,6 +75,7 @@ MAJOR_BODIES: Tuple[str, ...] = (
     "Jupiter", "Saturn", "Uranus", "Neptune", "Pluto"
 )
 
+# Default orbs (degrees); declination "parallel" also in degrees of declination.
 DEFAULT_ORBS: Dict[str, float] = {
     "conjunction": 8.0,
     "opposition": 6.0,
@@ -74,8 +83,8 @@ DEFAULT_ORBS: Dict[str, float] = {
     "square": 5.0,
     "sextile": 3.0,
     "quincunx": 2.0,
-    "parallel": 1.0,   # degrees declination
-    "antiscia": 2.0,
+    "parallel": 1.0,          # declination orb (deg)
+    "antiscia": 2.0,          # solstitial reflection tolerance (deg)
 }
 
 ASPECT_ANGLES: Dict[str, float] = {
@@ -95,50 +104,60 @@ ASPECT_WEIGHTS: Dict[str, float] = {
     "opposition": -4.0,
     "quincunx": -1.0,
     "parallel": 2.0,
+    "contra-parallel": -1.5,
     "antiscia": 1.5,
+    "contra-antiscia": -1.0,
 }
+
+# ═══════════════════════════════ TYPES ══════════════════════════════════════════
+
+class Position(TypedDict, total=False):
+    name: str
+    longitude: float
+    latitude: float
+    speed: float  # ecliptic longitude speed (deg/day) if provided
+
+class Aspect(TypedDict, total=False):
+    planet_a: str
+    planet_b: str
+    aspect: str
+    angle: float
+    separation: float     # absolute sep from exact angle OR declination difference
+    orb: float            # same units as separation
+    applying: bool
 
 # ═══════════════════════════════ UTILITIES ═══════════════════════════════════════
 
-def _normalize_angle(degrees: float) -> float:
-    """Normalize angle to [0, 360)."""
-    return degrees % 360.0
+def _normalize_angle(x: float) -> float:
+    return x % 360.0
 
+def _angdiff(a: float, b: float) -> float:
+    """Shortest absolute angular distance (degrees) between a and b."""
+    d = abs(_normalize_angle(b) - _normalize_angle(a))
+    return d if d <= 180.0 else 360.0 - d
 
-def _angular_separation(a: float, b: float) -> float:
-    """Shortest angular separation between two angles."""
-    diff = abs(_normalize_angle(b) - _normalize_angle(a))
-    return min(diff, 360.0 - diff)
+def _circ_mid(a: float, b: float) -> float:
+    """Circular midpoint of two longitudes (degrees)."""
+    a = _normalize_angle(a); b = _normalize_angle(b)
+    d = _normalize_angle(b - a)
+    return _normalize_angle(a + d * 0.5) if d <= 180.0 else _normalize_angle(a - (360.0 - d) * 0.5)
 
+def _antiscia_point(lon: float) -> float:
+    """Antiscia reflection across 0° Cancer."""
+    return _normalize_angle(180.0 - lon)
 
-def _circular_midpoint(a: float, b: float) -> float:
-    """Circular midpoint on a circle."""
-    a_norm = _normalize_angle(a)
-    b_norm = _normalize_angle(b)
-    diff = _normalize_angle(b_norm - a_norm)
-    if diff <= 180.0:
-        return _normalize_angle(a_norm + diff * 0.5)
-    return _normalize_angle(a_norm - (360.0 - diff) * 0.5)
-
-
-def _antiscia_point(longitude: float) -> float:
-    """Antiscia point (reflection across 0° Cancer)."""
-    return _normalize_angle(180.0 - longitude)
-
-
-def _mean_obliquity(jd_tt: float) -> float:
-    """Mean obliquity (IAU 2006 approx) in degrees."""
+@lru_cache(maxsize=256)
+def _mean_obliquity_deg(jd_tt: float) -> float:
+    """Mean obliquity IAU 2006 (arcsec→deg), cached by jd_tt."""
     T = (jd_tt - 2451545.0) / 36525.0
     eps0 = 84381.406 - 46.836769*T - 0.0001831*T*T + 0.00200340*T*T*T
     return eps0 / 3600.0
 
-
-def _ecliptic_to_declination(longitude: float, latitude: float, jd_tt: float) -> float:
-    """Convert ecliptic (λ,β) to declination δ (deg)."""
-    epsilon = math.radians(_mean_obliquity(jd_tt))
-    lam = math.radians(longitude)
-    beta = math.radians(latitude)
-    sin_dec = math.sin(beta) * math.cos(epsilon) + math.cos(beta) * math.sin(epsilon) * math.sin(lam)
+def _ecl_to_decl(lon: float, lat: float, jd_tt: float) -> float:
+    """Convert ecliptic (λ,β) to declination δ in degrees."""
+    eps = math.radians(_mean_obliquity_deg(jd_tt))
+    lam = math.radians(lon); beta = math.radians(lat)
+    sin_dec = math.sin(beta)*math.cos(eps) + math.cos(beta)*math.sin(eps)*math.sin(lam)
     return math.degrees(math.asin(max(-1.0, min(1.0, sin_dec))))
 
 # ═══════════════════════════════ CORE HELPERS ════════════════════════════════════
@@ -153,70 +172,70 @@ def _resolve_timescales(
     Returns: (jd_tt, jd_ut1, warnings)
     Raises:
       ValueError: for missing civil-time fields (date/time/place_tz)
-      RuntimeError: when timescales machinery is unavailable or fails
+      RuntimeError: when timescales unavailable or fail
     """
     warnings: List[str] = []
 
-    # Strict path: use provided timescales
     if jd_tt is not None and jd_ut1 is not None:
         return float(jd_tt), float(jd_ut1), warnings
 
-    if not _TIMESCALES_AVAILABLE:
-        raise RuntimeError(f"Timescales builder unavailable: {_TIMESCALES_ERROR}")
+    if not _TS_OK:
+        raise RuntimeError(f"Timescales builder unavailable: {_TS_ERR}")
 
     date_str = natal.get("date")
     time_str = natal.get("time")
     tz_name = natal.get("place_tz")
 
     if not (date_str and time_str and tz_name):
-        # Explicit validation error for test harness and clients
         raise ValueError("missing date/time/place_tz in natal data")
 
     try:
-        ts = build_timescales(str(date_str), str(time_str), str(tz_name), 0.0)  # DUT1=0s assumption
+        ts = build_timescales(str(date_str), str(time_str), str(tz_name), 0.0)  # DUT1=0s
         warnings.append("timescales_computed_with_dut1_0")
         return float(ts.jd_tt), float(ts.jd_ut1), warnings
     except Exception as e:
         raise RuntimeError(f"Failed to resolve timescales: {e}") from e
 
-
-def _get_planet_positions(
+def _get_positions(
     jd_tt: float,
     place: Optional[Dict[str, Any]],
     frame: str,
     bodies: List[str],
-) -> Tuple[List[Dict[str, Any]], List[str]]:
+) -> Tuple[List[Position], List[str]]:
     """
     Query planetary positions via EphemerisAdapter.
-    Returns: (positions, warnings) where positions is a list of dicts:
-      {"name":<str>, "longitude":<float>, "latitude":<float>, ["speed":<float>]}
+    Returns: (positions, warnings)
+    Each position: {"name", "longitude", "latitude", ["speed"]}
     """
     warnings: List[str] = []
-    if not _EPHEMERIS_AVAILABLE:
-        raise RuntimeError(f"Ephemeris adapter unavailable: {_EPHEMERIS_ERROR}")
+    if not _EPHEM_OK:
+        raise RuntimeError(f"Ephemeris adapter unavailable: {_EPHEM_ERR}")
 
     adapter = EphemerisAdapter(frame=frame)
 
-    # Topo vs geo
+    # Determine center and params
+    kwargs: Dict[str, Any]
     if place and all(k in place for k in ("latitude", "longitude")):
-        center = "topocentric"
         kwargs = {
             "jd_tt": float(jd_tt),
             "bodies": bodies,
-            "center": center,
+            "center": "topocentric",
             "latitude": float(place["latitude"]),
             "longitude": float(place["longitude"]),
             "elevation_m": float(place.get("elev_m", 0.0)),
         }
     else:
-        center = "geocentric"
-        kwargs = {"jd_tt": float(jd_tt), "bodies": bodies, "center": center}
-        if place is None:
+        kwargs = {"jd_tt": float(jd_tt), "bodies": bodies, "center": "geocentric"}
+        # warn if a place dict exists but missing coords, or place absent
+        if not place:
             warnings.append("geocentric_no_coordinates")
+        else:
+            if "latitude" not in place or "longitude" not in place:
+                warnings.append("geocentric_missing_coordinates")
 
     result: Any = None
 
-    # Prefer modern batch method with velocities
+    # Prefer batch with velocities
     if hasattr(adapter, "ecliptic_longitudes_and_velocities"):
         try:
             result = adapter.ecliptic_longitudes_and_velocities(**kwargs)  # type: ignore[arg-type]
@@ -234,13 +253,13 @@ def _get_planet_positions(
         raise RuntimeError("No working ephemeris method found")
 
     # Normalize outputs
-    positions: List[Dict[str, Any]] = []
+    positions: List[Position] = []
     if isinstance(result, dict):
         if "results" in result and isinstance(result["results"], list):
             for item in result["results"]:
                 if isinstance(item, dict) and "name" in item:
-                    pos = {
-                        "name": item["name"],
+                    pos: Position = {
+                        "name": str(item["name"]),
                         "longitude": float(item.get("longitude", item.get("lon", 0.0))),
                         "latitude": float(item.get("latitude", item.get("lat", 0.0))),
                     }
@@ -251,9 +270,8 @@ def _get_planet_positions(
             # Simple dict: { "Sun": 123.45, ... }
             for name, value in result.items():
                 if isinstance(value, (int, float)):
-                    positions.append({"name": name, "longitude": float(value), "latitude": 0.0})
+                    positions.append({"name": str(name), "longitude": float(value), "latitude": 0.0})
     return positions, warnings
-
 
 def _compute_houses(
     jd_tt: float,
@@ -262,8 +280,8 @@ def _compute_houses(
     house_system: str,
 ) -> Tuple[Optional[Dict[str, Any]], List[str]]:
     """
-    Compute houses (optional). Returns (houses_dict|None, warnings)
-    houses_dict keys typically: asc_deg, mc_deg, cusps_deg (list of 12)
+    Compute houses (optional). Returns (houses|None, warnings)
+    houses keys typically: asc_deg, mc_deg, cusps_deg (list of 12)
     """
     warnings: List[str] = []
 
@@ -271,7 +289,7 @@ def _compute_houses(
         warnings.append("houses_no_coordinates")
         return None, warnings
 
-    if not _HOUSES_AVAILABLE:
+    if not _HOUSES_OK:
         warnings.append("houses_computation_unavailable")
         return None, warnings
 
@@ -289,65 +307,65 @@ def _compute_houses(
         warnings.append(f"houses_computation_failed_{type(e).__name__}")
         return None, warnings
 
+# ═══════════════════════════════ ASPECTS / OVERLAYS / SCORE ══════════════════════
 
-def _find_aspects(
-    positions_a: List[Dict[str, Any]],
-    positions_b: List[Dict[str, Any]],
+def _find_zodiacal_aspects(
+    pa: List[Position],
+    pb: List[Position],
     orbs: Dict[str, float],
-) -> List[Dict[str, Any]]:
-    """Zodiacal aspects between two sets of positions."""
-    out: List[Dict[str, Any]] = []
-    for pa in positions_a:
-        for pb in positions_b:
-            sep = _angular_separation(pa["longitude"], pb["longitude"])
+) -> List[Aspect]:
+    out: List[Aspect] = []
+    for a in pa:
+        for b in pb:
+            sep = _angdiff(a["longitude"], b["longitude"])
+            # velocity-based applying/separating if available (deg/day)
+            rel_speed = float(a.get("speed", 0.0)) - float(b.get("speed", 0.0))
             for name, angle in ASPECT_ANGLES.items():
                 orb = orbs.get(name, DEFAULT_ORBS.get(name, 0.0))
                 if orb <= 0:
                     continue
                 dev = abs(sep - angle)
                 if dev <= orb:
+                    applying = (rel_speed < 0.0) if "speed" in a or "speed" in b else (sep < angle)
                     out.append({
-                        "planet_a": pa["name"],
-                        "planet_b": pb["name"],
+                        "planet_a": a["name"],
+                        "planet_b": b["name"],
                         "aspect": name,
                         "angle": angle,
                         "separation": sep,
                         "orb": dev,
-                        "applying": sep < angle,  # heuristic
+                        "applying": applying,
                     })
     return out
 
-
 def _find_antiscia_aspects(
-    positions_a: List[Dict[str, Any]],
-    positions_b: List[Dict[str, Any]],
+    pa: List[Position],
+    pb: List[Position],
     orbs: Dict[str, float],
-) -> List[Dict[str, Any]]:
-    """Antiscia & contra-antiscia aspects."""
-    out: List[Dict[str, Any]] = []
+) -> List[Aspect]:
+    out: List[Aspect] = []
     orb = orbs.get("antiscia", DEFAULT_ORBS["antiscia"])
     if orb <= 0:
         return out
-
-    for pa in positions_a:
-        a_ref = _antiscia_point(pa["longitude"])
-        for pb in positions_b:
-            sep0 = _angular_separation(a_ref, pb["longitude"])
+    for a in pa:
+        a_ref = _antiscia_point(a["longitude"])
+        for b in pb:
+            sep0 = _angdiff(a_ref, b["longitude"])
             if sep0 <= orb:
                 out.append({
-                    "planet_a": pa["name"],
-                    "planet_b": pb["name"],
+                    "planet_a": a["name"],
+                    "planet_b": b["name"],
                     "aspect": "antiscia",
                     "angle": 0.0,
                     "separation": sep0,
                     "orb": sep0,
                     "applying": False,
                 })
-            sep180 = _angular_separation(a_ref, pb["longitude"] + 180.0)
+            sep180 = _angdiff(_normalize_angle(a_ref + 180.0), b["longitude"])
             if sep180 <= orb:
                 out.append({
-                    "planet_a": pa["name"],
-                    "planet_b": pb["name"],
+                    "planet_a": a["name"],
+                    "planet_b": b["name"],
                     "aspect": "contra-antiscia",
                     "angle": 180.0,
                     "separation": sep180,
@@ -356,39 +374,36 @@ def _find_antiscia_aspects(
                 })
     return out
 
-
-def _find_parallel_aspects(
-    positions_a: List[Dict[str, Any]],
-    positions_b: List[Dict[str, Any]],
+def _find_declination_aspects(
+    pa: List[Position],
+    pb: List[Position],
     jd_tt: float,
     orbs: Dict[str, float],
-) -> List[Dict[str, Any]]:
-    """Declination parallel & contra-parallel aspects."""
-    out: List[Dict[str, Any]] = []
+) -> List[Aspect]:
+    out: List[Aspect] = []
     orb = orbs.get("parallel", DEFAULT_ORBS["parallel"])
     if orb <= 0:
         return out
-
-    for pa in positions_a:
-        dec_a = _ecliptic_to_declination(pa["longitude"], pa.get("latitude", 0.0), jd_tt)
-        for pb in positions_b:
-            dec_b = _ecliptic_to_declination(pb["longitude"], pb.get("latitude", 0.0), jd_tt)
+    for a in pa:
+        dec_a = _ecl_to_decl(a["longitude"], float(a.get("latitude", 0.0)), jd_tt)
+        for b in pb:
+            dec_b = _ecl_to_decl(b["longitude"], float(b.get("latitude", 0.0)), jd_tt)
             d = abs(dec_a - dec_b)
             if d <= orb:
                 out.append({
-                    "planet_a": pa["name"],
-                    "planet_b": pb["name"],
+                    "planet_a": a["name"],
+                    "planet_b": b["name"],
                     "aspect": "parallel",
                     "angle": 0.0,
                     "separation": d,
                     "orb": d,
                     "applying": False,
                 })
-            d2 = abs(dec_a + dec_b)
+            d2 = abs(dec_a + dec_b)  # declinations opposite sign, same magnitude
             if d2 <= orb:
                 out.append({
-                    "planet_a": pa["name"],
-                    "planet_b": pb["name"],
+                    "planet_a": a["name"],
+                    "planet_b": b["name"],
                     "aspect": "contra-parallel",
                     "angle": 180.0,
                     "separation": d2,
@@ -397,12 +412,23 @@ def _find_parallel_aspects(
                 })
     return out
 
+def _find_house_number(longitude: float, cusps: List[float]) -> int:
+    """Find house index (1..12) from cusps (deg)."""
+    lon = _normalize_angle(longitude)
+    if not isinstance(cusps, list) or len(cusps) != 12:
+        return 1
+    for i in range(12):
+        c0 = _normalize_angle(cusps[i])
+        c1 = _normalize_angle(cusps[(i + 1) % 12])
+        if c0 <= c1:
+            if c0 <= lon < c1:
+                return i + 1
+        else:  # wrap
+            if lon >= c0 or lon < c1:
+                return i + 1
+    return 1
 
-def _calculate_house_overlays(
-    positions: List[Dict[str, Any]],
-    houses: Optional[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """Which houses planets fall into."""
+def _calc_overlays(positions: List[Position], houses: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     overlays: List[Dict[str, Any]] = []
     if not houses or "cusps_deg" not in houses:
         return overlays
@@ -417,40 +443,18 @@ def _calculate_house_overlays(
         })
     return overlays
 
-
-def _find_house_number(longitude: float, cusps: List[float]) -> int:
-    """Find house index (1..12)."""
-    lon = _normalize_angle(longitude)
-    for i in range(12):
-        c0 = _normalize_angle(cusps[i])
-        c1 = _normalize_angle(cusps[(i + 1) % 12])
-        if c0 <= c1:
-            if c0 <= lon < c1:
-                return i + 1
-        else:  # wrap
-            if lon >= c0 or lon < c1:
-                return i + 1
-    return 1  # fallback
-
-
-def _calculate_midpoints(
-    positions_a: List[Dict[str, Any]],
-    positions_b: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """Planet-wise midpoints (same-name bodies)."""
+def _calc_midpoints(pa: List[Position], pb: List[Position]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
-    b_by_name = {p["name"]: p for p in positions_b}
-    for pa in positions_a:
-        pb = b_by_name.get(pa["name"])
-        if pb:
-            out.append({"planet": pa["name"], "longitude": _circular_midpoint(pa["longitude"], pb["longitude"])})
+    b_map = {p["name"]: p for p in pb}
+    for a in pa:
+        b = b_map.get(a["name"])
+        if b:
+            out.append({"planet": a["name"], "longitude": _circ_mid(a["longitude"], b["longitude"])})
     return out
 
-
-def _score_aspects(aspects: List[Dict[str, Any]]) -> Tuple[float, Dict[str, float]]:
-    """Heuristic compatibility score."""
+def _score_aspects(aspects: List[Aspect]) -> Tuple[float, Dict[str, float]]:
     total = 0.0
-    by = {}
+    by: Dict[str, float] = {}
     for asp in aspects:
         kind = asp["aspect"]
         w = ASPECT_WEIGHTS.get(kind, 0.0)
@@ -461,9 +465,9 @@ def _score_aspects(aspects: List[Dict[str, Any]]) -> Tuple[float, Dict[str, floa
         by[kind] = by.get(kind, 0.0) + s
     return total, by
 
-# ═══════════════════════════════ PUBLIC API ══════════════════════════════════════
+# ═══════════════════════════════ SYN ASTRY CORE ══════════════════════════════════
 
-def compute_synastry(
+def _do_synastry(
     natal_a: Dict[str, Any],
     natal_b: Dict[str, Any],
     *,
@@ -474,78 +478,61 @@ def compute_synastry(
     place_a: Optional[Dict[str, Any]] = None,
     place_b: Optional[Dict[str, Any]] = None,
     frame: str = "ecliptic-of-date",
-    ayanamsa_deg: float = 0.0,
-    zodiac_mode: str = "tropical",
     house_system: str = "placidus",
     orbs: Optional[Dict[str, float]] = None,
     parallels: bool = True,
     antiscia: bool = True,
 ) -> Dict[str, Any]:
     """
-    Compute synastry between two natal charts.
+    Western synastry core (tropical-only).
     Returns dict with aspects/overlays/midpoints/scores/meta.
     """
-    all_warnings: List[str] = []
+    warnings_all: List[str] = []
     try:
-        # Orbs
-        effective_orbs = {**DEFAULT_ORBS, **(orbs or {})}
+        eff_orbs = {**DEFAULT_ORBS, **(orbs or {})}
 
-        # Timescales (with validation semantics)
+        # Resolve timescales with strict validation semantics
         try:
             jd_tt_a_r, jd_ut1_a_r, wa = _resolve_timescales(natal_a, jd_tt_a, jd_ut1_a)
             jd_tt_b_r, jd_ut1_b_r, wb = _resolve_timescales(natal_b, jd_tt_b, jd_ut1_b)
         except ValueError as ve:
-            # Explicit input error
-            return {
-                "ok": False,
-                "error": "validation_error",
-                "details": str(ve),
-                "warnings": all_warnings,
-            }
-        all_warnings.extend(wa)
-        all_warnings.extend(wb)
+            return {"ok": False, "error": "validation_error", "details": str(ve), "warnings": warnings_all}
+        warnings_all.extend(wa); warnings_all.extend(wb)
 
-        # Places (fallback to natal dict)
+        # Places (fallback to natal dicts)
         place_a_final = place_a if place_a else natal_a
         place_b_final = place_b if place_b else natal_b
 
         # Positions
-        pos_a, wpa = _get_planet_positions(jd_tt_a_r, place_a_final, frame, list(MAJOR_BODIES))
-        pos_b, wpb = _get_planet_positions(jd_tt_b_r, place_b_final, frame, list(MAJOR_BODIES))
-        all_warnings.extend(wpa)
-        all_warnings.extend(wpb)
-
-        # Sidereal shift if requested
-        if zodiac_mode.lower() == "sidereal" and abs(ayanamsa_deg) > 1e-9:
-            for p in pos_a + pos_b:
-                p["longitude"] = _normalize_angle(p["longitude"] - ayanamsa_deg)
+        pos_a, wpa = _get_positions(jd_tt_a_r, place_a_final, frame, list(MAJOR_BODIES))
+        pos_b, wpb = _get_positions(jd_tt_b_r, place_b_final, frame, list(MAJOR_BODIES))
+        warnings_all.extend(wpa); warnings_all.extend(wpb)
 
         # Houses (optional)
         houses_a, wha = _compute_houses(jd_tt_a_r, jd_ut1_a_r, place_a_final, house_system)
         houses_b, whb = _compute_houses(jd_tt_b_r, jd_ut1_b_r, place_b_final, house_system)
-        all_warnings.extend(wha)
-        all_warnings.extend(whb)
+        warnings_all.extend(wha); warnings_all.extend(whb)
 
         # Aspects
-        ab = _find_aspects(pos_a, pos_b, effective_orbs)
-        ba = _find_aspects(pos_b, pos_a, effective_orbs)
-        aa = _find_aspects(pos_a, pos_a, effective_orbs)
-        bb = _find_aspects(pos_b, pos_b, effective_orbs)
+        ab = _find_zodiacal_aspects(pos_a, pos_b, eff_orbs)
+        ba = _find_zodiacal_aspects(pos_b, pos_a, eff_orbs)
+        aa = _find_zodiacal_aspects(pos_a, pos_a, eff_orbs)
+        bb = _find_zodiacal_aspects(pos_b, pos_b, eff_orbs)
 
         if antiscia:
-            ab += _find_antiscia_aspects(pos_a, pos_b, effective_orbs)
-            ba += _find_antiscia_aspects(pos_b, pos_a, effective_orbs)
+            ab += _find_antiscia_aspects(pos_a, pos_b, eff_orbs)
+            ba += _find_antiscia_aspects(pos_b, pos_a, eff_orbs)
 
         if parallels:
-            ab += _find_parallel_aspects(pos_a, pos_b, jd_tt_a_r, effective_orbs)
-            ba += _find_parallel_aspects(pos_b, pos_a, jd_tt_b_r, effective_orbs)
+            ab += _find_declination_aspects(pos_a, pos_b, jd_tt_a_r, eff_orbs)
+            ba += _find_declination_aspects(pos_b, pos_a, jd_tt_b_r, eff_orbs)
 
         # Overlays
-        overlays_a_in_b = _calculate_house_overlays(pos_a, houses_b)
-        overlays_b_in_a = _calculate_house_overlays(pos_b, houses_a)
+        overlays_a_in_b = _calc_overlays(pos_a, houses_b)
+        overlays_b_in_a = _calc_overlays(pos_b, houses_a)
 
         # Midpoints & score
-        mids = _calculate_midpoints(pos_a, pos_b)
+        mids = _calc_midpoints(pos_a, pos_b)
         all_aspects = ab + ba
         total_score, by_aspect = _score_aspects(all_aspects)
 
@@ -553,11 +540,11 @@ def compute_synastry(
             "ok": True,
             "meta": {
                 "frame": frame,
-                "zodiac_mode": zodiac_mode,
-                "ayanamsa_deg": ayanamsa_deg,
+                "zodiac_mode": "tropical",
+                "ayanamsa_deg": 0.0,
                 "house_system": house_system,
-                "orbs_used": effective_orbs,
-                "warnings": all_warnings,
+                "orbs_used": eff_orbs,
+                "warnings": warnings_all,
                 "timescales": {
                     "chart_a": {"jd_tt": jd_tt_a_r, "jd_ut1": jd_ut1_a_r},
                     "chart_b": {"jd_tt": jd_tt_b_r, "jd_ut1": jd_ut1_b_r},
@@ -581,93 +568,66 @@ def compute_synastry(
             },
         }
     except Exception as e:
-        return {
-            "ok": False,
-            "error": "synastry_computation_failed",
-            "details": str(e),
-            "warnings": all_warnings,
-        }
+        return {"ok": False, "error": "synastry_computation_failed", "details": str(e), "warnings": warnings_all}
 
+# ═══════════════════════════════ COMPOSITE CORE ══════════════════════════════════
 
-def compute_composite(
+def _do_composite(
     natal_a: Dict[str, Any],
     natal_b: Dict[str, Any],
     *,
-    method: str = "midpoint",
-    jd_tt_ref: Optional[float] = None,   # reserved (not required here)
-    jd_ut1_ref: Optional[float] = None,  # reserved (not required here)
+    method: str = "midpoint",          # "midpoint" or "davison"
+    jd_tt_ref: Optional[float] = None, # reserved (unused)
+    jd_ut1_ref: Optional[float] = None,# reserved (unused)
     place_ref: Optional[Dict[str, Any]] = None,
     frame: str = "ecliptic-of-date",
     house_system: str = "placidus",
-    ayanamsa_deg: float = 0.0,
-    zodiac_mode: str = "tropical",
 ) -> Dict[str, Any]:
-    """
-    Compute composite chart using 'midpoint' or 'davison'.
-    Error taxonomy:
-      - composite_value_error for bad 'method'
-      - composite_computation_failed for unexpected errors
-    """
-    all_warnings: List[str] = []
+    warnings_all: List[str] = []
 
-    # Input validation: method
     if method not in ("midpoint", "davison"):
-        return {
-            "ok": False,
-            "error": "composite_value_error",
-            "details": f"Unknown composite method: {method}",
-            "warnings": all_warnings,
-        }
+        return {"ok": False, "error": "composite_value_error", "details": f"Unknown composite method: {method}", "warnings": warnings_all}
 
     try:
-        # Resolve timescales for both charts (validation semantics: ValueError -> validation_error not used here)
+        # Resolve timescales for both charts
         jd_tt_a, jd_ut1_a, wa = _resolve_timescales(natal_a, None, None)
         jd_tt_b, jd_ut1_b, wb = _resolve_timescales(natal_b, None, None)
-        all_warnings.extend(wa)
-        all_warnings.extend(wb)
+        warnings_all.extend(wa); warnings_all.extend(wb)
 
         if method == "midpoint":
-            # Positions at their respective births, then midpoint longitudes per body
-            pos_a, wpa = _get_planet_positions(jd_tt_a, natal_a, frame, list(MAJOR_BODIES))
-            pos_b, wpb = _get_planet_positions(jd_tt_b, natal_b, frame, list(MAJOR_BODIES))
-            all_warnings.extend(wpa)
-            all_warnings.extend(wpb)
-
-            if zodiac_mode.lower() == "sidereal" and abs(ayanamsa_deg) > 1e-9:
-                for p in pos_a + pos_b:
-                    p["longitude"] = _normalize_angle(p["longitude"] - ayanamsa_deg)
+            # Positions at respective births; midpoint per same-name body
+            pos_a, wpa = _get_positions(jd_tt_a, natal_a, frame, list(MAJOR_BODIES))
+            pos_b, wpb = _get_positions(jd_tt_b, natal_b, frame, list(MAJOR_BODIES))
+            warnings_all.extend(wpa); warnings_all.extend(wpb)
 
             positions: Dict[str, float] = {}
-            for pa in pos_a:
-                for pb in pos_b:
-                    if pa["name"] == pb["name"]:
-                        positions[pa["name"]] = _circular_midpoint(pa["longitude"], pb["longitude"])
-                        break
+            b_map = {p["name"]: p for p in pos_b}
+            for a in pos_a:
+                b = b_map.get(a["name"])
+                if b:
+                    positions[a["name"]] = _circ_mid(a["longitude"], b["longitude"])
 
-            # Houses midpoint if available
+            # Houses midpoint if separately available
             houses_a, wha = _compute_houses(jd_tt_a, jd_ut1_a, natal_a, house_system)
             houses_b, whb = _compute_houses(jd_tt_b, jd_ut1_b, natal_b, house_system)
-            all_warnings.extend(wha)
-            all_warnings.extend(whb)
+            warnings_all.extend(wha); warnings_all.extend(whb)
 
             asc = mc = None
             cusps = None
             if houses_a and houses_b:
                 if "asc_deg" in houses_a and "asc_deg" in houses_b:
-                    asc = _circular_midpoint(houses_a["asc_deg"], houses_b["asc_deg"])
+                    asc = _circ_mid(houses_a["asc_deg"], houses_b["asc_deg"])
                 if "mc_deg" in houses_a and "mc_deg" in houses_b:
-                    mc = _circular_midpoint(houses_a["mc_deg"], houses_b["mc_deg"])
+                    mc = _circ_mid(houses_a["mc_deg"], houses_b["mc_deg"])
                 if "cusps_deg" in houses_a and "cusps_deg" in houses_b:
                     ca = houses_a["cusps_deg"]; cb = houses_b["cusps_deg"]
                     if isinstance(ca, list) and isinstance(cb, list) and len(ca) == 12 and len(cb) == 12:
-                        cusps = [_circular_midpoint(a, b) for a, b in zip(ca, cb)]
+                        cusps = [_circ_mid(a, b) for a, b in zip(ca, cb)]
 
-        else:  # davison
-            # Midpoint time
+        else:  # Davison: midpoint time/place, then compute positions/houses there
             jd_tt_mid = (jd_tt_a + jd_tt_b) / 2.0
             jd_ut1_mid = (jd_ut1_a + jd_ut1_b) / 2.0
 
-            # Midpoint place: average lat/lon if both available, else use place_ref if provided
             place_mid: Optional[Dict[str, Any]] = None
             if all(k in natal_a for k in ("latitude", "longitude")) and all(k in natal_b for k in ("latitude", "longitude")):
                 place_mid = {
@@ -678,19 +638,14 @@ def compute_composite(
             elif place_ref:
                 place_mid = place_ref
             else:
-                all_warnings.append("davison_no_coordinates")
+                warnings_all.append("davison_no_coordinates")
 
-            pos, wp = _get_planet_positions(jd_tt_mid, place_mid, frame, list(MAJOR_BODIES))
-            all_warnings.extend(wp)
-
-            if zodiac_mode.lower() == "sidereal" and abs(ayanamsa_deg) > 1e-9:
-                for p in pos:
-                    p["longitude"] = _normalize_angle(p["longitude"] - ayanamsa_deg)
-
+            pos, wp = _get_positions(jd_tt_mid, place_mid, frame, list(MAJOR_BODIES))
+            warnings_all.extend(wp)
             positions = {p["name"]: p["longitude"] for p in pos}
 
             houses, wh = _compute_houses(jd_tt_mid, jd_ut1_mid, place_mid, house_system)
-            all_warnings.extend(wh)
+            warnings_all.extend(wh)
             asc = houses.get("asc_deg") if houses else None
             mc = houses.get("mc_deg") if houses else None
             cusps = houses.get("cusps_deg") if houses else None
@@ -704,43 +659,61 @@ def compute_composite(
             "cusps": cusps,
             "meta": {
                 "frame": frame,
-                "zodiac_mode": zodiac_mode,
-                "ayanamsa_deg": ayanamsa_deg,
+                "zodiac_mode": "tropical",
+                "ayanamsa_deg": 0.0,
                 "house_system": house_system,
-                "warnings": all_warnings,
+                "warnings": warnings_all,
             },
         }
 
     except Exception as e:
-        return {
-            "ok": False,
-            "error": "composite_computation_failed",
-            "details": str(e),
-            "warnings": all_warnings,
-        }
+        return {"ok": False, "error": "composite_computation_failed", "details": str(e), "warnings": warnings_all}
 
+# ═══════════════════════════════ PUBLIC WESTERN API ══════════════════════════════
 
-def synastry_report(
+def compute_western_synastry(
     natal_a: Dict[str, Any],
     natal_b: Dict[str, Any],
-    *,
-    composite_method: str = "midpoint",
-    composite_place_ref: Optional[Dict[str, Any]] = None,
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """
-    Combined synastry + composite report.
-    - If composite fails, report still returns synastry with composite error payload attached.
+    Western (tropical) synastry — always tropical.
+    Any 'zodiac_mode' or 'ayanamsa' kwargs are ignored.
+    """
+    # Strip any sidereal/ayanamsa hints to avoid confusion
+    kwargs = dict(kwargs)
+    kwargs.pop("zodiac_mode", None)
+    kwargs.pop("ayanamsa_deg", None)
+    return _do_synastry(natal_a, natal_b, **kwargs)
+
+def compute_western_composite(
+    natal_a: Dict[str, Any],
+    natal_b: Dict[str, Any],
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """
+    Western composite chart (midpoint or Davison) — always tropical.
+    Valid kwargs include: method, frame, house_system, place_ref.
+    """
+    kwargs = dict(kwargs)
+    kwargs.pop("zodiac_mode", None)
+    kwargs.pop("ayanamsa_deg", None)
+    return _do_composite(natal_a, natal_b, **kwargs)
+
+def western_synastry_report(
+    natal_a: Dict[str, Any],
+    natal_b: Dict[str, Any],
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """
+    Combined Western synastry + composite report.
+    If composite fails, returns synastry with composite error attached.
     """
     try:
-        syn = compute_synastry(natal_a, natal_b, **kwargs)
+        syn = compute_western_synastry(natal_a, natal_b, **kwargs)
         if not syn.get("ok", False):
             return syn
-
-        comp_kwargs = {k: v for k, v in kwargs.items() if k in ("frame", "house_system", "ayanamsa_deg", "zodiac_mode")}
-        comp_kwargs.update({"method": composite_method, "place_ref": composite_place_ref})
-
-        comp = compute_composite(natal_a, natal_b, **comp_kwargs)
+        comp = compute_western_composite(natal_a, natal_b, **kwargs)
         syn["composite"] = comp
 
         # Metrics
@@ -758,13 +731,9 @@ def synastry_report(
         if isinstance(comp, dict) and comp.get("meta", {}).get("warnings"):
             all_ws.extend([f"composite_{w}" for w in comp["meta"]["warnings"]])
         syn["meta"]["warnings"] = all_ws
-        syn["meta"]["report_type"] = "comprehensive"
+        syn["meta"]["report_type"] = "western_synastry_report"
 
         return syn
 
     except Exception as e:
-        return {
-            "ok": False,
-            "error": "synastry_report_failed",
-            "details": str(e),
-        }
+        return {"ok": False, "error": "synastry_report_failed", "details": str(e)}
