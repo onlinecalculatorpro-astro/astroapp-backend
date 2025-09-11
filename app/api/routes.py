@@ -1,6 +1,6 @@
 # app/api/routes.py
 """
-AstroApp — Canonical API Routes
+AstroApp — Canonical API Routes (circular-safe header)
 - Timescales (ERFA-aligned)
 - Chart + Houses
 - Predictions (legacy + v2 prediction engine)
@@ -18,17 +18,20 @@ Notes:
 - Topocentric ephemeris honored via either center:"topocentric" or topocentric:true
 - Ephemeris responses include adapter meta (with meta.topocentric)
 - Adapter/kernel meta is bubbled up to API responses so dev tools can verify DE440s/DE421 quickly.
-- V2 prediction engine provides comprehensive forecasting capabilities
+- V2 prediction engine provides comprehensive forecasting capabilities.
+
+This header intentionally avoids importing anything from `app.core.__init__`
+and only imports concrete modules directly to prevent circular imports.
 """
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
+import math
 import os
 import re
-import math
-import inspect
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -40,6 +43,8 @@ from app.version import VERSION
 from app.utils.config import load_config
 from app.utils.hc import flag_predictions
 from app.utils.ratelimit import rate_limit, client_key, endpoint_key
+
+# ───────────────────────── validators / parsers (pure, no heavy deps) ─────────────────────────
 from app.core.validators import (
     ValidationError,
     parse_chart_payload,
@@ -53,13 +58,14 @@ from app.core.validators import (
     parse_parans_payload,
     parse_synastry_payload,
     parse_composite_payload,
+    parse_synasry_payload_safe,     # internal alias used by synastry report helper
     parse_synastry_report_payload,
     parse_relocation_payload,
     parse_astrocartography_payload,
     parse_directions_payload,
 )
 
-# Timescales core (guarded)
+# ───────────────────────── timescales core (ERFA-only; safe) ─────────────────────────
 try:
     from app.core.timescales import build_timescales, TimeScales
     _TIMESCALES_OK = True
@@ -68,9 +74,9 @@ except Exception as e:
     _TIMESCALES_OK = False
     _TIMESCALES_ERR = e
     build_timescales = None  # type: ignore
-    TimeScales = None  # type: ignore
+    TimeScales = None        # type: ignore
 
-# Prediction Engine (NEW - comprehensive prediction system)
+# ───────────────────────── prediction engine (v2, optional) ─────────────────────────
 try:
     from app.core.prediction import (
         predict_transits,
@@ -91,7 +97,7 @@ try:
 except Exception as e:
     _PREDICTION_ENGINE_OK = False
     _PREDICTION_ENGINE_ERR = e
-    # Placeholders to avoid NameError downstream
+    # Shims to avoid NameError in routes where features are disabled
     predict_transits = None  # type: ignore
     predict_progressions = None  # type: ignore
     predict_returns = None  # type: ignore
@@ -105,17 +111,17 @@ except Exception as e:
     RelationshipForecast = None  # type: ignore
     TimingWindow = None  # type: ignore
 
-# Progressions core (optional low-level helper; not required if v2 engine is used)
+# ───────────────────────── progressions (legacy helper; optional) ─────────────────────────
 try:
     from app.core.progressions import compute_progressions
 except Exception:
     compute_progressions = None  # type: ignore
 
-# Returns core (prefer 'returns.py', fallback to single-file 'return.py')
+# ───────────────────────── returns core (prefer module; fallback to file) ─────────────────────────
 _returns_mod = None
 _RETURNS_IMPORT_ERROR: Optional[Exception] = None
 try:
-    from app.core import returns as _returns_mod  # app/core/returns.py (recommended)
+    from app.core import returns as _returns_mod  # app/core/returns.py (preferred)
 except Exception as _e1:
     _RETURNS_IMPORT_ERROR = _e1
     try:
@@ -131,7 +137,7 @@ except Exception as _e1:
     except Exception as _e2:
         _RETURNS_IMPORT_ERROR = _e2  # keep last error for diagnostics
 
-# Parans core (optional import guard)
+# ───────────────────────── parans core (optional) ─────────────────────────
 _parans_compute = None  # function when available
 _PARANS_IMPORT_ERROR: Optional[Exception] = None
 try:
@@ -140,7 +146,7 @@ except Exception as _e:
     _PARANS_IMPORT_ERROR = _e
     _parans_compute = None  # type: ignore
 
-# Synastry core (optional import guard)
+# ───────────────────────── synastry / composite (optional) ─────────────────────────
 _synastry_compute = None
 _composite_compute = None
 _synastry_report_compute = None
@@ -159,7 +165,7 @@ except Exception as _e:
     _synastry_report_compute = None
     _SYN_OK = False
 
-# Relocation core (optional import guard)
+# ───────────────────────── relocation / astrocartography (optional) ─────────────────────────
 _compute_relocated = None
 _compute_astrocartography = None
 _RELOCATION_IMPORT_ERROR: Optional[Exception] = None
@@ -173,7 +179,7 @@ except Exception as _e:
     _compute_relocated = None
     _compute_astrocartography = None
 
-# Directions core (optional low-level helper; v2 engine exposes predict_directions)
+# ───────────────────────── directions (legacy helper; optional) ─────────────────────────
 _compute_directions = None
 _DIRECTIONS_IMPORT_ERROR: Optional[Exception] = None
 try:
@@ -184,13 +190,14 @@ except Exception as _e:
     _compute_directions = None
     _DIR_OK = False
 
+# ───────────────────────── logging / blueprint / env caps ─────────────────────────
 log = logging.getLogger(__name__)
 api = Blueprint("api", __name__)
 
 DEBUG_VERBOSE = os.getenv("ASTRO_DEBUG_VERBOSE", "0").lower() in ("1", "true", "yes", "on")
 ARCSEC_TOL = float(os.getenv("ASTRO_ASC_TOL_ARCSEC", "3.6"))  # 0.001°
 
-# per-endpoint rate-limit caps (calls per minute, env-overridable)
+# Per-endpoint rate-limit caps (calls per minute, env-overridable)
 _RL = lambda k, d: int(os.getenv(k, str(d)))
 RL_TIMESCALES   = _RL("ASTRO_RL_TIMESCALES_PER_MIN",   60)
 RL_CALCULATE    = _RL("ASTRO_RL_CALCULATE_PER_MIN",    24)
@@ -219,53 +226,61 @@ RL_PREDICTION_VALIDATION = _RL("ASTRO_RL_PREDICTION_VALIDATION_PER_MIN", 2)
 
 # ───────────────────────── helpers ─────────────────────────
 def _wrap360(x: float) -> float:
+    """Normalize any angle to [0, 360). Returns 0.0 for values within 1e-12 of 0."""
     try:
         v = float(x) % 360.0
         return 0.0 if abs(v) < 1e-12 else v
     except Exception:
+        # Preserve original on non-numeric input to avoid surprising callers.
         return x
 
 def _shortest_delta_deg(a2: float, a1: float) -> float:
+    """Smallest signed angular difference a2−a1 in (−180, 180]."""
     d = (float(a2) - float(a1) + 540.0) % 360.0 - 180.0
     return -180.0 if d == 180.0 else d
 
 def _delta_arcsec(a: float, b: float) -> float:
+    """Absolute angular separation in arcseconds."""
     return abs(_shortest_delta_deg(a, b)) * 3600.0
 
 def _json_error(code: str, details: Any = None, http: int = 400):
+    """Uniform JSON error envelope."""
     out: Dict[str, Any] = {"ok": False, "error": code}
     if details is not None:
         out["details"] = details
     return jsonify(out), http
 
 def _split_jd(jd: float) -> tuple[float, float]:
-    d = int(jd // 1)
-    return float(d), float(jd - d)
+    """Split a JD into its integer day and fractional remainder."""
+    d = math.floor(float(jd))
+    return float(d), float(jd) - float(d)
 
 def _sind(a: float) -> float:
-    import math as _m
-    return _m.sin(_m.radians(a))
+    """sin(deg)."""
+    return math.sin(math.radians(a))
 
 def _cosd(a: float) -> float:
-    import math as _m
-    return _m.cos(_m.radians(a))
+    """cos(deg)."""
+    return math.cos(math.radians(a))
 
 def _atan2d(y: float, x: float) -> float:
-    import math as _m
+    """atan2 in degrees, normalized to [0, 360). Raises on 0/0 to catch bad inputs early."""
     if abs(x) < 1e-18 and abs(y) < 1e-18:
         raise ValueError("atan2(0,0) undefined")
-    return _wrap360(_m.degrees(_m.atan2(y, x)))
+    return _wrap360(math.degrees(math.atan2(y, x)))
 
 def _gast_deg(jd_ut1: float, jd_tt: float) -> float:
+    """
+    Greenwich Apparent Sidereal Time (deg).
+    Prefers ERFA gst06a; falls back to a standard approximation if ERFA unavailable.
+    """
     try:
         import erfa  # type: ignore
         d1u, d2u = _split_jd(jd_ut1)
         d1t, d2t = _split_jd(jd_tt)
         gst_rad = erfa.gst06a(d1u, d2u, d1t, d2t)
-        import math as _m
-        return _wrap360(_m.degrees(gst_rad))
+        return _wrap360(math.degrees(gst_rad))
     except Exception:
-        import math as _m
         T = (float(jd_ut1) - 2451545.0) / 36525.0
         theta = (
             280.46061837
@@ -276,32 +291,39 @@ def _gast_deg(jd_ut1: float, jd_tt: float) -> float:
         return _wrap360(theta)
 
 def _true_obliquity_deg(jd_tt: float) -> float:
+    """
+    True obliquity ε (deg). Prefers ERFA (obl06 + nut06a); falls back to
+    a polynomial if ERFA unavailable.
+    """
     try:
         import erfa  # type: ignore
         d1, d2 = _split_jd(jd_tt)
         eps0 = erfa.obl06(d1, d2)
         _dpsi, deps = erfa.nut06a(d1, d2)
-        import math as _m
-        return _m.degrees(eps0 + deps)
+        return math.degrees(eps0 + deps)
     except Exception:
-        import math as _m
         T = (float(jd_tt) - 2451545.0) / 36525.0
         eps_arcsec = 84381.448 - 46.8150 * T - 0.00059 * (T**2) + 0.001813 * (T**3)
         return eps_arcsec / 3600.0
 
 def _ramc_deg(jd_ut1: float, jd_tt: float, lon_east_deg: float) -> float:
+    """Right Ascension of the MC = GAST + longitude_E (deg), normalized."""
     return _wrap360(_gast_deg(jd_ut1, jd_tt) + float(lon_east_deg))
 
 def _mc_from_ramc(ramc: float, eps: float) -> float:
+    """Compute MC longitude (deg) from RAMC and true obliquity."""
     return _atan2d(_sind(ramc) * _cosd(eps), _cosd(ramc))
 
 def _asc_from_phi_ramc(phi: float, ramc: float, eps: float) -> float:
-    import math as _m
+    """Compute Ascendant longitude (deg) given latitude φ, RAMC, and true obliquity."""
     def _acotd(x: float) -> float:
-        return _wrap360(_m.degrees(_m.atan2(1.0, x)))
-    num = -((_m.tan(_m.radians(phi)) * _sind(eps)) + (_sind(ramc) * _cosd(eps)))
+        return _wrap360(math.degrees(math.atan2(1.0, x)))
+
+    num = -((math.tan(math.radians(phi)) * _sind(eps)) + (_sind(ramc) * _cosd(eps)))
     den = _cosd(ramc)
-    den = den if abs(den) > 1e-15 else _m.copysign(1e-15, den if den != 0 else 1.0)
+    # Guard against den → 0 to avoid infs while preserving sign.
+    if abs(den) <= 1e-15:
+        den = math.copysign(1e-15, den if den != 0 else 1.0)
     return _acotd(num / den)
 
 def _recompute_angles_exact(
@@ -313,6 +335,10 @@ def _recompute_angles_exact(
     mode: str,
     ayanamsa_deg: Optional[float],
 ) -> Optional[Dict[str, float]]:
+    """
+    Recompute Ascendant/MC from fundamentals to correct parity issues from
+    upstream house engines. Applies sidereal offset when mode == 'sidereal'.
+    """
     if latitude is None or longitude_east is None:
         return None
     eps = _true_obliquity_deg(jd_tt)
@@ -351,6 +377,10 @@ def _as_json(obj: Any) -> Any:
 
 @api.route("/v2/health", methods=["GET"])
 def health_v2():
+    """
+    Lightweight health endpoint focused on core/optional engines.
+    Mirrors /api/health but scoped to v2 components.
+    """
     status = {
         "version": VERSION,
         "prediction_engine": _PREDICTION_ENGINE_OK,
@@ -373,16 +403,16 @@ def _compute_timescales_from_local(
     payload: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Calls build_timescales(date, time, tz, dut1_seconds) and adapts result.
+    Build ERFA-aligned timescales from local civil input.
 
-    DUT1 precedence:
+    DUT1 source precedence:
       1) payload["dut1_seconds"] (preferred)
-      2) payload["dut1"]         (legacy)
-      3) env ASTRO_DUT1_BROADCAST / ASTRO_DUT1 (default "0.0")
+      2) payload["dut1"]         (legacy key)
+      3) env ASTRO_DUT1_BROADCAST or ASTRO_DUT1 (fallback, default "0.0")
     """
-    # tz validation
+    # Validate tz early (nice error for bad IANA names)
     try:
-        _ = ZoneInfo(tz_name)
+        ZoneInfo(str(tz_name))
     except Exception:
         raise ValidationError([{
             "loc": ["tz"],
@@ -391,9 +421,9 @@ def _compute_timescales_from_local(
         }])
 
     def _env_dut1() -> float:
-        env_val = os.getenv("ASTRO_DUT1_BROADCAST", os.getenv("ASTRO_DUT1", "0.0"))
+        val = os.getenv("ASTRO_DUT1_BROADCAST", os.getenv("ASTRO_DUT1", "0.0"))
         try:
-            return float(env_val)
+            return float(val)
         except Exception:
             raise ValidationError([{
                 "loc": ["dut1"],
@@ -401,15 +431,17 @@ def _compute_timescales_from_local(
                 "type": "value_error",
             }])
 
-    # tolerant DUT1 parsing (treat "", None, "null", "undefined" as "not provided")
     def _parse_payload_dut1(p: Optional[Dict[str, Any]]) -> float:
+        """
+        Tolerant extractor:
+        - Treat None / "" / "null" / "undefined" as "not provided"
+        - Accepts either 'dut1_seconds' or legacy 'dut1'
+        """
         if not isinstance(p, dict):
             return _env_dut1()
-        has_primary = "dut1_seconds" in p
-        has_legacy = "dut1" in p
-        if not (has_primary or has_legacy):
+        key = "dut1_seconds" if "dut1_seconds" in p else ("dut1" if "dut1" in p else None)
+        if key is None:
             return _env_dut1()
-        key = "dut1_seconds" if has_primary else "dut1"
         raw = p.get(key)
         if raw in (None, "", "null", "undefined"):
             return _env_dut1()
@@ -428,9 +460,10 @@ def _compute_timescales_from_local(
         ts: TimeScales = build_timescales(date_str, time_str, tz_name, dut1_seconds)
     except ValueError as e:
         msg = str(e)
-        if "DUT1" in msg.upper():
+        up = msg.upper()
+        if "DUT1" in up:
             raise ValidationError([{"loc": ["dut1"], "msg": msg, "type": "value_error"}])
-        if "1960" in msg or "pre-1960" in msg.lower():
+        if "1960" in up or "PRE-1960" in up:
             raise ValidationError([{"loc": ["date"], "msg": msg, "type": "value_error"}])
         raise ValidationError([{"loc": ["timescales"], "msg": msg, "type": "value_error"}])
 
@@ -441,7 +474,7 @@ def _compute_timescales_from_local(
         "delta_t": float(ts.delta_t),
         "delta_at": float(ts.dat),
         "dut1": float(ts.dut1),
-        "timezone": tz_name,
+        "timezone": str(tz_name),
         "tz_offset_seconds": int(ts.tz_offset_seconds),
         "warnings": list(ts.warnings),
     }
@@ -454,9 +487,11 @@ try:  # pragma: no cover
     _CHART_ENGINE_NAME = "app.core.astronomy.compute_chart"
 except Exception as e1:  # pragma: no cover
     try:
-        from app.core.chart import compute_chart as _compute_chart  # <-- proper fallback
+        from app.core.chart import compute_chart as _compute_chart  # fallback
         _CHART_ENGINE_NAME = "app.core.chart.compute_chart"
-        log.warning("Primary astronomy.compute_chart missing; fallback chart.compute_chart in use. err=%r", e1)
+        log.warning(
+            "Primary astronomy.compute_chart missing; using chart.compute_chart. err=%r", e1
+        )
     except Exception as e2:
         _compute_chart = None  # type: ignore
         _CHART_ENGINE_NAME = None
@@ -485,6 +520,7 @@ except Exception:
         log.error("No house engine available: %r", e)
 
 def _sig_accepts(fn, *names: str) -> Dict[str, bool]:
+    """Return a map of {param_name: bool} indicating if fn accepts each name."""
     try:
         params = fn.__signature__.parameters  # type: ignore[attr-defined]
     except Exception:
@@ -494,30 +530,27 @@ def _sig_accepts(fn, *names: str) -> Dict[str, bool]:
 # ---------- adapter/kernel meta snapshot (for dev tools visibility) ----------
 def _snapshot_ephemeris_meta(chart_meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
-    Return a small dict with adapter/kernel information WITHOUT forcing a kernel
-    load. Values populate lazily once a kernel is actually loaded.
+    Snapshot adapter/kernel info without forcing a kernel load.
+    Values fill in lazily once kernels are actually loaded.
     """
     info: Dict[str, Any] = {}
     try:
         from app.core import ephemeris_adapter as ea  # late import by design
 
-        # Prefer diagnostics if available (it will also reflect SPICE status)
+        # Prefer diagnostics (exposes kernels & coverage if available)
         try:
             diag = ea.ephemeris_diagnostics()
         except Exception:
             diag = None
 
-        # Kernel short name
         try:
             info["kernel"] = ea.current_kernel_name()
         except Exception:
             pass
 
-        # Kernels list (basenames) if diagnostics provided
         if isinstance(diag, dict) and isinstance(diag.get("kernels"), list):
             info["kernels"] = list(diag["kernels"])
 
-        # Path + coverage (may be None until the kernel is loaded)
         try:
             info["ephemeris_path"] = ea.current_kernel_path()
         except Exception:
@@ -527,7 +560,7 @@ def _snapshot_ephemeris_meta(chart_meta: Optional[Dict[str, Any]] = None) -> Dic
         except Exception:
             pass
 
-        # Tag the source engine that produced the chart data
+        # Tag source engine that produced chart data
         if isinstance(chart_meta, dict):
             src = chart_meta.get("source") or chart_meta.get("engine")
             if src:
@@ -535,13 +568,12 @@ def _snapshot_ephemeris_meta(chart_meta: Optional[Dict[str, Any]] = None) -> Dic
         if "source" not in info and _CHART_ENGINE_NAME:
             info["source"] = _CHART_ENGINE_NAME
     except Exception:
-        # If adapter import fails, we still return what we can
         if _CHART_ENGINE_NAME:
             info["source"] = _CHART_ENGINE_NAME
     return info
 
-
 def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str, Any]:
+    """Call whichever chart engine is present, adapting args as needed."""
     if _compute_chart is None:
         raise RuntimeError("chart_engine_unavailable")
 
@@ -557,7 +589,7 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
                 q.setdefault("names", bodies)
             elif all(isinstance(b, dict) for b in bodies):
                 q.setdefault("names", [str(b.get("name") or b.get("body") or "").strip() for b in bodies])
-        if "ayanamsa" in q and isinstance(q["ayanamsa"], str):
+        if isinstance(q.get("ayanamsa"), str):
             q["ayanamsa"] = q["ayanamsa"].strip().lower()
         q.setdefault("jd_ut", ts["jd_utc"])
         q.setdefault("jd_tt", ts["jd_tt"])
@@ -566,9 +598,8 @@ def _call_compute_chart(payload: Dict[str, Any], ts: Dict[str, Any]) -> Dict[str
         return q
 
     if "payload" in param_names:
-        payload2 = _normalize_payload_for_engine(payload)
         try:
-            chart = _compute_chart(payload2)  # type: ignore[arg-type]
+            chart = _compute_chart(_normalize_payload_for_engine(payload))  # type: ignore[arg-type]
         except Exception as e:
             chart = {
                 "mode": payload.get("mode"),
@@ -642,6 +673,7 @@ def _sig_accepts_houses() -> Dict[str, bool]:
     )
 
 def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
+    """Call the available house-engine with normalized args."""
     if _houses_fn is None:
         raise RuntimeError("houses_engine_unavailable")
 
@@ -697,16 +729,15 @@ def _call_compute_houses(payload: Dict[str, Any], ts: Dict[str, Any]) -> Any:
         kwargs["validation"] = True
 
     try:
-        result = _houses_fn(**kwargs)
-        return result
+        return _houses_fn(**kwargs)
     except Exception as e:
         log.error("House calculation failed: %s: %s", type(e).__name__, e)
         raise
 
 def _call_compute_aspects(payload: Dict[str, Any], chart: Dict[str, Any], houses: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Build a positions dict from chart (and optional houses) and delegate to the
-    HTTP-facing aspects adapter (run_aspects_api). All angles are normalized to [0, 360).
+    Build positions from chart/optional houses and delegate to run_aspects_api.
+    Angles are normalized to [0, 360).
     """
     try:
         from app.core.aspects import run_aspects_api
@@ -732,7 +763,6 @@ def _call_compute_aspects(payload: Dict[str, Any], chart: Dict[str, Any], houses
                 if isinstance(c, (int, float)):
                     positions[f"House {i+1}"] = _wrap360(float(c))
 
-        # Add angles (Asc/MC) when present
         asc_v = houses.get("asc") if isinstance(houses.get("asc"), (int, float)) else houses.get("asc_deg")
         mc_v  = houses.get("mc")  if isinstance(houses.get("mc"), (int, float))  else houses.get("mc_deg")
         if isinstance(asc_v, (int, float)):
@@ -759,12 +789,12 @@ def _call_compute_aspects(payload: Dict[str, Any], chart: Dict[str, Any], houses
         "mode": (payload.get("mode") or "tropical"),
     }
     if decls:
-        aspects_config["declinations"] = decls  # only enables parallels if requested in `aspects`
+        aspects_config["declinations"] = decls  # Only enables parallels if requested.
 
-    # --- Run aspects engine (adapter handles empty positions gracefully) ---
     return run_aspects_api(**aspects_config)
 
 def _extract_ayanamsa_from_chart(chart: Dict[str, Any]) -> Optional[float]:
+    """Find ayanamsa in typical chart/meta locations."""
     if not isinstance(chart, dict):
         return None
     meta = chart.get("meta") or {}
@@ -775,6 +805,7 @@ def _extract_ayanamsa_from_chart(chart: Dict[str, Any]) -> Optional[float]:
     return float(ay2) if isinstance(ay2, (int, float)) else None
 
 def _normalize_houses_payload(h: Any) -> Any:
+    """Normalize house payload keys and wrap angles to [0, 360)."""
     if not isinstance(h, dict):
         return h
     if "cusps" not in h and "cusps_deg" in h:
@@ -800,6 +831,7 @@ def _normalize_houses_payload(h: Any) -> Any:
 def _recompute_houses_angles_if_needed(
     h: Any, ts: Dict[str, Any], payload: Dict[str, Any], chart: Dict[str, Any]
 ) -> Any:
+    """Fix Asc/MC parity issues by recomputing from fundamentals when needed."""
     if not isinstance(h, dict):
         return h
     lat = payload.get("latitude")
@@ -816,16 +848,17 @@ def _recompute_houses_angles_if_needed(
     )
     if not recomputed:
         return h
+
     asc_new, mc_new = recomputed["asc_deg"], recomputed["mc_deg"]
     asc_old = h.get("asc_deg") if isinstance(h.get("asc_deg"), (int, float)) else h.get("asc")
-    mc_old = h.get("mc_deg") if isinstance(h.get("mc_deg"), (int, float)) else h.get("mc")
+    mc_old  = h.get("mc_deg")  if isinstance(h.get("mc_deg"), (int, float))  else h.get("mc")
     warn_list = h.get("warnings") or []
     changed = False
 
-    if isinstance(asc_old, (int, float)):
-        _ = _delta_arcsec(asc_new, float(asc_old))
-    else:
+    if not isinstance(asc_old, (int, float)):
         h["asc_deg"] = _wrap360(asc_new); h["asc"] = h["asc_deg"]; changed = True
+    # (We compute delta but only enforce correction threshold on MC parity below)
+    _ = _delta_arcsec(asc_new, float(asc_old)) if isinstance(asc_old, (int, float)) else None
 
     if isinstance(mc_old, (int, float)):
         d_mc = _delta_arcsec(mc_new, float(mc_old))
@@ -840,6 +873,7 @@ def _recompute_houses_angles_if_needed(
     return _normalize_houses_payload(h)
 
 def _prepare_chart_for_predict(chart: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach a bodies_map[name] → body_record for quick prediction lookups."""
     ch = dict(chart)
     bodies = ch.get("bodies")
     if isinstance(bodies, list):
@@ -856,8 +890,8 @@ def _prepare_chart_for_predict(chart: Dict[str, Any]) -> Dict[str, Any]:
     return ch
 
 def _require_coords_for_houses(payload: Dict[str, Any]):
-    lat = payload.get("latitude")
-    lon = payload.get("longitude")
+    """Strict check: both latitude and longitude must be finite numbers."""
+    lat = payload.get("latitude"); lon = payload.get("longitude")
     try:
         lat_ok = isinstance(lat, (int, float)) and float(lat) == float(lat)
         lon_ok = isinstance(lon, (int, float)) and float(lon) == float(lon)
@@ -878,36 +912,44 @@ def _want_houses(body: Dict[str, Any]) -> bool:
     h = body.get("houses")
     if isinstance(h, bool):
         return h
-    if isinstance(h, dict):
-        if "compute" in h and h.get("compute") is False:
-            return False
+    if isinstance(h, dict) and h.get("compute") is False:
+        return False
     return True
 
 # ───────────────────────── health / ops ─────────────────────────
 @api.get("/api/health")
 def health():
+    """Lightweight liveness + engine-capability snapshot."""
+    def _returns_available() -> bool:
+        # consider both the preferred module and the single-file fallback
+        return bool(_returns_mod)
+
+    engines = {
+        "chart": _CHART_ENGINE_NAME is not None,
+        "houses": _HOUSES_KIND != "unavailable",
+        "predictions": _PREDICTION_ENGINE_OK,            # legacy alias for callers
+        "prediction_engine_v2": _PREDICTION_ENGINE_OK,
+        "progressions": compute_progressions is not None,
+        "returns": _returns_available(),
+        "synastry": _SYN_OK,
+        "directions": _DIR_OK,
+        "parans": _parans_compute is not None,
+        "relocation": _compute_relocated is not None,
+        "astrocartography": _compute_astrocartography is not None,
+    }
+
     return jsonify({
-        "ok": True, 
-        "status": "up", 
+        "ok": True,
+        "status": "up",
         "version": VERSION,
-        "engines": {
-            "chart": _CHART_ENGINE_NAME is not None,
-            "houses": _HOUSES_KIND != "unavailable",
-            "predictions": predict_engine is not None,
-            "prediction_engine_v2": _PREDICTION_ENGINE_OK,
-            "progressions": compute_progressions is not None,
-            "returns": _returns_available(),
-            "synastry": _SYN_OK,
-            "directions": _DIR_OK,
-            "parans": _parans_compute is not None,
-            "relocation": _compute_relocated is not None,
-            "astrocartography": _compute_astrocartography is not None,
-        }
+        "engines": engines,
     }), 200
+
 
 @api.get("/api/config")
 @rate_limit(1)
 def config_info():
+    """Expose selected server configuration + sample timescales (UTC now)."""
     cfg_path = os.environ.get("ASTRO_CONFIG", "config/defaults.yaml")
     calib_path = os.environ.get("ASTRO_CALIBRATORS", "config/calibrators.json")
     th_path = os.environ.get("ASTRO_HC_THRESHOLDS", "config/hc_thresholds.json")
@@ -916,6 +958,7 @@ def config_info():
     calib_ver = None
     th_summary = None
 
+    # Try to compute a small, current timescale snapshot in UTC
     try:
         now_utc = datetime.now(timezone.utc)
         ts_now = _compute_timescales_from_local(
@@ -934,6 +977,7 @@ def config_info():
     except Exception:
         ts_sample = None
 
+    # Optional calibrators / thresholds metadata
     try:
         with open(calib_path, "r", encoding="utf-8") as f:
             calib_ver = (json.load(f) or {}).get("version")
@@ -943,36 +987,44 @@ def config_info():
     try:
         with open(th_path, "r", encoding="utf-8") as f:
             th = json.load(f) or {}
-            th_summary = {"entropy_H": th.get("entropy_H"), "defaults": th.get("defaults")}
+            th_summary = {
+                "entropy_H": th.get("entropy_H"),
+                "defaults": th.get("defaults"),
+            }
     except Exception:
         pass
 
-    return jsonify(
-        {
-            "ok": True,
-            "mode": cfg.mode,
-            "ayanamsa": getattr(cfg, "ayanamsa", None),
-            "rate_limits_per_hour": getattr(cfg, "rate_limits_per_hour", None),
-            "pro_features_enabled": getattr(cfg, "pro_features_enabled", None),
-            "calibrators_version": calib_ver,
-            "hc_thresholds_summary": th_summary,
-            "timescale_sample": ts_sample,
-            "version": VERSION,
-        }
-    ), 200
+    return jsonify({
+        "ok": True,
+        "mode": cfg.mode,
+        "ayanamsa": getattr(cfg, "ayanamsa", None),
+        "rate_limits_per_hour": getattr(cfg, "rate_limits_per_hour", None),
+        "pro_features_enabled": getattr(cfg, "pro_features_enabled", None),
+        "calibrators_version": calib_ver,
+        "hc_thresholds_summary": th_summary,
+        "timescale_sample": ts_sample,
+        "version": VERSION,
+    }), 200
+
 
 @api.get("/api/openapi")
 @rate_limit(RL_DEBUG)
 def openapi_spec():
+    """Return parsed OpenAPI YAML bundled with the app (if present)."""
     import yaml
     base = os.path.dirname(__file__)
-    for p in (os.path.join(base, "..", "openapi.yaml"), os.path.join(base, "..", "..", "openapi.yaml")):
+    candidates = (
+        os.path.join(base, "..", "openapi.yaml"),
+        os.path.join(base, "..", "..", "openapi.yaml"),
+    )
+    for p in candidates:
         try:
             with open(p, "r", encoding="utf-8") as f:
                 return jsonify(yaml.safe_load(f)), 200
         except Exception:
             continue
     return _json_error("openapi_not_found", None, 404)
+
 
 @api.get("/__debug/routes")
 @rate_limit(RL_DEBUG)
@@ -987,10 +1039,12 @@ def debug_routes():
     rules.sort(key=lambda x: x["rule"])
     return jsonify({"ok": True, "routes": rules}), 200
 
+
 # ───────────────────────── timescales ─────────────────────────
 @api.post("/api/timescales")
 @rate_limit(RL_TIMESCALES)
 def timescales_endpoint():
+    """Build ERFA-aligned timescales from a local civil instant."""
     body = request.get_json(force=True) or {}
     try:
         date = body.get("date")
@@ -998,6 +1052,7 @@ def timescales_endpoint():
         time_ = str(body.get("time") or "").strip()
         if re.match(r"^\d{1,2}:\d{2}$", time_):
             time_ = f"{time_}:00"
+
         if not isinstance(date, str) or not isinstance(time_, str) or not isinstance(tz, str):
             errs = []
             if not isinstance(date, str):
@@ -1007,8 +1062,12 @@ def timescales_endpoint():
             if not isinstance(tz, str):
                 errs.append({"loc": ["tz"], "msg": "required string (IANA zone)", "type": "value_error"})
             raise ValidationError(errs or "invalid payload")
-        ts = _compute_timescales_from_local(date, time_, tz, payload=body if isinstance(body, dict) else None)
+
+        ts = _compute_timescales_from_local(
+            date, time_, tz, payload=body if isinstance(body, dict) else None
+        )
         return jsonify({"ok": True, "timescales": ts}), 200
+
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
     except Exception as e:
@@ -1016,20 +1075,21 @@ def timescales_endpoint():
 
 # ───────────────────────── endpoints ─────────────────────────
 from time import perf_counter
-from typing import Any, Dict, Optional, List
 
-# Optional ephemeris fallback
+# Optional ephemeris fallback (same adapter the returns module uses)
 try:
-    from app.core.ephemeris_adapter import EphemerisAdapter  # same adapter your returns module uses
+    from app.core.ephemeris_adapter import EphemerisAdapter
+    _EPH_FALLBACK_ERR = None
 except Exception as _e:
     EphemerisAdapter = None
     _EPH_FALLBACK_ERR = _e
 
-MAJORS = ("Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn","Uranus","Neptune","Pluto")
+MAJORS = ("Sun", "Moon", "Mercury", "Venus", "Mars", "Jupiter", "Saturn", "Uranus", "Neptune", "Pluto")
 
 # ---------- robust helpers ----------
 
 def _coerce_float(v: Any) -> Optional[float]:
+    """Safely coerce to finite float; return None on NaN/Inf/TypeError."""
     try:
         x = float(v)
         if x != x or x in (float("inf"), float("-inf")):
@@ -1038,7 +1098,9 @@ def _coerce_float(v: Any) -> Optional[float]:
     except Exception:
         return None
 
+
 def _canon_name(name: Any) -> Optional[str]:
+    """Normalize a body name; prefer canonical capitalization for MAJORS."""
     if not isinstance(name, str):
         return None
     n = name.strip()
@@ -1047,16 +1109,19 @@ def _canon_name(name: Any) -> Optional[str]:
             return m
     return n or None
 
+
 def _find_lon_in_dict(d: Dict[str, Any]) -> Optional[float]:
     """Search common longitude keys, including nested 'ecliptic' objects."""
     if not isinstance(d, dict):
         return None
+
     # direct candidates
     for k in ("lon", "longitude", "lon_deg", "lambda", "lam", "ecl_lon", "ecliptic_lon"):
         if k in d:
             v = _coerce_float(d[k])
             if v is not None:
                 return v
+
     # nested ecliptic containers
     ecl = d.get("ecliptic")
     if isinstance(ecl, dict):
@@ -1065,9 +1130,12 @@ def _find_lon_in_dict(d: Dict[str, Any]) -> Optional[float]:
                 v = _coerce_float(ecl[k])
                 if v is not None:
                     return v
+
     return None
 
+
 def _rows_to_positions(rows: Any) -> Dict[str, float]:
+    """Normalize a list of row dicts into {Name: longitude_deg}."""
     out: Dict[str, float] = {}
     if not isinstance(rows, list):
         return out
@@ -1080,7 +1148,9 @@ def _rows_to_positions(rows: Any) -> Dict[str, float]:
             out[name] = float(lon)
     return out
 
+
 def _mapping_to_positions(mp: Any) -> Dict[str, float]:
+    """Normalize a mapping into {Name: longitude_deg} handling nested dicts."""
     out: Dict[str, float] = {}
     if not isinstance(mp, dict):
         return out
@@ -1098,6 +1168,7 @@ def _mapping_to_positions(mp: Any) -> Dict[str, float]:
             out[name] = float(lon)
     return out
 
+
 def _extract_positions_from_chart(chart: Dict[str, Any]) -> Dict[str, float]:
     """
     Normalize planet longitudes into: { "Sun": deg, "Moon": deg, ... }
@@ -1110,37 +1181,42 @@ def _extract_positions_from_chart(chart: Dict[str, Any]) -> Dict[str, float]:
     for key in ("positions", "planets"):
         if isinstance(chart.get(key), dict):
             out = _mapping_to_positions(chart[key])
-            if out: return out
+            if out:
+                return out
 
     # 2) Lists
     for key in ("planets", "rows"):
         if isinstance(chart.get(key), list):
             out = _rows_to_positions(chart[key])
-            if out: return out
+            if out:
+                return out
 
     # 3) Common nested container
     ephem = chart.get("ephemeris")
     if isinstance(ephem, dict):
         if isinstance(ephem.get("positions"), dict):
             out = _mapping_to_positions(ephem["positions"])
-            if out: return out
+            if out:
+                return out
         if isinstance(ephem.get("rows"), list):
             out = _rows_to_positions(ephem["rows"])
-            if out: return out
+            if out:
+                return out
 
     return {}
 
+
 def _ayanamsa_from(chart: Dict[str, Any], payload: Dict[str, Any]) -> float:
-    # Prefer chart/meta if your engine writes it there; else payload; else 0.0
+    """Extract ayanamsa (deg) from chart/meta or payload; default 0.0."""
     try:
-        # reuse your existing helper if available
-        ay = _extract_ayanamsa_from_chart(chart)  # type: ignore[name-defined]
+        ay = _extract_ayanamsa_from_chart(chart)  # defined earlier in this module
         if isinstance(ay, (int, float)):
             return float(ay)
     except Exception:
         pass
     ay = payload.get("ayanamsa")
     return float(ay) if isinstance(ay, (int, float)) else 0.0
+
 
 def _snapshot_ephemeris_fallback(
     jd_tt: float,
@@ -1149,31 +1225,39 @@ def _snapshot_ephemeris_fallback(
 ) -> Dict[str, float]:
     """
     Use EphemerisAdapter directly if the chart didn’t provide positions (or Sun).
+    Returns a {Name: longitude_deg} mapping in the requested mode.
     """
     if EphemerisAdapter is None:
         return {}
 
     bodies: List[str] = list(payload.get("bodies") or MAJORS)
-    # frame: prefer ecliptic-of-date for calculate endpoint
     frame = "ecliptic-of-date"
+
     try:
         adapter = EphemerisAdapter(frame=frame)
     except Exception:
         return {}
 
     # topocentric if place present
-    lat = payload.get("latitude"); lon = payload.get("longitude")
+    lat = payload.get("latitude")
+    lon = payload.get("longitude")
     elev = payload.get("elev_m") or payload.get("elevation_m") or 0.0
     topocentric = isinstance(lat, (int, float)) and isinstance(lon, (int, float))
 
     kwargs = {"jd_tt": float(jd_tt), "bodies": bodies}
     if topocentric:
-        kwargs.update({"topocentric": True, "latitude": float(lat), "longitude": float(lon), "elevation_m": float(elev)})
+        kwargs.update({
+            "topocentric": True,
+            "latitude": float(lat),
+            "longitude": float(lon),
+            "elevation_m": float(elev),
+        })
     else:
         kwargs["topocentric"] = False
 
     rows: List[Dict[str, Any]] = []
-    # Prefer velocities method (usually faster to parse, consistent)
+
+    # Prefer method with velocities (stable schema); fall back to longitudes
     for method_name in ("ecliptic_longitudes_and_velocities", "ecliptic_longitudes"):
         if not hasattr(adapter, method_name):
             continue
@@ -1201,7 +1285,6 @@ def _snapshot_ephemeris_fallback(
     if mode == "sidereal" and positions:
         ay = _ayanamsa_from(chart, payload)
         if ay:
-            # shift longitudes by -ayanamsa, wrap 0..360
             out = {}
             for k, v in positions.items():
                 x = (v - ay) % 360.0
@@ -1210,7 +1293,8 @@ def _snapshot_ephemeris_fallback(
 
     return positions
 
-# ---------- endpoint ----------
+
+# ---------- endpoint: /api/calculate ----------
 
 @api.post("/api/calculate")
 @rate_limit(RL_CALCULATE)
@@ -1220,6 +1304,7 @@ def calculate():
         body = request.get_json(force=True) or {}
         payload = parse_chart_payload(body)
 
+        # house system (normalized)
         hs = str(body.get("house_system", "")).strip()
         if hs:
             payload["house_system"] = hs
@@ -1245,7 +1330,7 @@ def calculate():
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
 
-    # compute chart
+    # compute chart (resilient)
     try:
         chart = _call_compute_chart(payload, ts)
     except Exception as e:
@@ -1273,6 +1358,7 @@ def calculate():
         except Exception as e:
             return _json_error("houses_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
+        # apply sidereal rotation to houses if needed
         mode = (payload.get("mode") or "tropical").lower()
         if mode == "sidereal":
             ay = _ayanamsa_from(chart, payload)
@@ -1330,7 +1416,7 @@ def calculate():
         "timescales": ts,
         "chart": chart,
         "meta": meta,
-        "positions": positions,   # <-- stable place for majors (incl. Sun)
+        "positions": positions,   # stable place for majors (incl. Sun)
     }
     if want_houses:
         resp["houses"] = houses
@@ -1340,15 +1426,22 @@ def calculate():
     ms = (perf_counter() - t0) * 1000.0
     return jsonify(resp), 200, {"X-Compute-Time-ms": f"{ms:.0f}"}
 
+
+# ---------- endpoint: /api/report ----------
+
 @api.post("/api/report")
 @rate_limit(RL_REPORT)
 def report():
     try:
         body = request.get_json(force=True) or {}
         payload = parse_chart_payload(body)
+
+        # normalize house system if provided
         hs = str(body.get("house_system", "")).strip()
         if hs:
             payload["house_system"] = hs
+
+        # passthroughs
         for k in ("bodies", "points", "ayanamsa", "topocentric", "elevation_m", "elev_m", "dut1", "houses"):
             if k in body:
                 payload[k] = body[k]
@@ -1432,44 +1525,47 @@ def report():
 @api.post("/api/aspects")
 @rate_limit(RL_ASPECTS)
 def aspects():
-    def _norm_orbs(orbs_raw):
-        """Ensure orbs is a dict[str,float]."""
+    def _norm_orbs(orbs_raw: Any) -> Dict[str, float]:
+        """Normalize `orbs` into {aspect_name_lower: float_orb}."""
         if not isinstance(orbs_raw, dict):
             return {}
-        out = {}
+        out: Dict[str, float] = {}
         for k, v in orbs_raw.items():
             try:
-                f = float(v)
+                out[str(k).strip().lower()] = float(v)
             except Exception:
+                # skip non-numeric values
                 continue
-            out[str(k).strip().lower()] = f
         return out
 
-    def _norm_aspects(aspects_raw):
-        """Ensure aspects is a list[str]."""
+    def _norm_aspects(aspects_raw: Any) -> Optional[List[str]]:
+        """Normalize `aspects` into a list[str] (lower-cased)."""
         if aspects_raw is None:
             return None
         if isinstance(aspects_raw, str):
-            return [aspects_raw.strip().lower()]
+            s = aspects_raw.strip().lower()
+            return [s] if s else []
         if isinstance(aspects_raw, (list, tuple)):
-            return [str(a).strip().lower() for a in aspects_raw if a]
+            return [str(a).strip().lower() for a in aspects_raw if str(a).strip()]
         return None
 
-    def _norm_bodies(bodies_raw):
-        """Ensure bodies is a list[str]."""
+    def _norm_bodies(bodies_raw: Any) -> Optional[List[str]]:
+        """Normalize `bodies` into a list[str] (original case preserved)."""
         if bodies_raw is None:
             return None
         if isinstance(bodies_raw, str):
-            return [bodies_raw.strip()]
+            s = bodies_raw.strip()
+            return [s] if s else []
         if isinstance(bodies_raw, (list, tuple)):
-            return [str(b).strip() for b in bodies_raw if b]
+            return [str(b).strip() for b in bodies_raw if str(b).strip()]
         return None
 
+    # ---- parse & normalize input ------------------------------------------------
     try:
         body = request.get_json(force=True) or {}
         payload = parse_chart_payload(body)
 
-        # Normalized additional parameters
+        # Optional knobs for aspects engine
         if "orbs" in body:
             payload["orbs"] = _norm_orbs(body.get("orbs"))
         if "aspects" in body:
@@ -1477,30 +1573,30 @@ def aspects():
         if "bodies" in body:
             payload["bodies"] = _norm_bodies(body.get("bodies"))
         if "points" in body:
-            payload["points"] = body.get("points")  # keep raw, engine decides
+            payload["points"] = body.get("points")  # pass-through (engine decides)
         if "mode" in body:
             payload["mode"] = str(body.get("mode")).strip().lower()
         if "houses" in body:
             payload["houses"] = bool(body.get("houses"))
-
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
     except Exception as e:
         return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
 
+    # ---- timescales -------------------------------------------------------------
     tz_name = payload.get("place_tz") or payload.get("timezone") or "UTC"
     try:
         ts = _compute_timescales_from_local(payload["date"], payload["time"], tz_name, payload=payload)
     except ValidationError as e:
         return _json_error("validation_error", e.errors(), 400)
 
-    # Get chart data
+    # ---- chart -----------------------------------------------------------------
     try:
         chart = _call_compute_chart(payload, ts)
     except Exception as e:
         return _json_error("chart_internal", str(e) if DEBUG_VERBOSE else "chart_failed", 500)
 
-    # Get houses if needed
+    # ---- houses (optional) -----------------------------------------------------
     houses = None
     if payload.get("houses", True):
         try:
@@ -1510,7 +1606,7 @@ def aspects():
         except Exception as e:
             return _json_error("houses_internal", str(e) if DEBUG_VERBOSE else "houses_failed", 500)
 
-    # Calculate aspects
+    # ---- aspects ----------------------------------------------------------------
     try:
         aspects_result = _call_compute_aspects(payload, chart, houses)
     except Exception as e:
@@ -1533,18 +1629,21 @@ def aspects():
         "meta": meta,
     }), 200
 
+
 # ───────────────────────── helper function for returns ─────────────────────────
 def _returns_available() -> bool:
+    """Whether a returns engine (module or fallback) is available."""
     return _returns_mod is not None
 
 # ───────────────────────── PREDICTION ENGINE API (Flask • Clean • Stable) ─────────────────────────
-# Drop this whole block into your routes module. No new files. Existing names are reused.
-
-# Expected globals already defined elsewhere in your app:
+# Drop-in block: relies on globals already defined in your routes module:
 #   api, rate_limit, RL_PREDICTION_*, _json_error, _snapshot_ephemeris_meta,
 #   _CHART_ENGINE_NAME, _HOUSES_KIND, _PREDICTION_ENGINE_OK, _PREDICTION_ENGINE_ERR,
 #   comprehensive_forecast, predict_transits, predict_progressions, predict_returns, predict_directions,
 #   relationship_forecast, validate_prediction_model
+
+from typing import Any, Dict, List, Optional, FrozenSet, Tuple
+from flask import jsonify, Response, request
 
 # ───────────────────────── Fast JSON (optional) ─────────────────────────
 try:
@@ -1571,16 +1670,18 @@ except Exception:
     class _ValidationError(Exception):
         def __init__(self, details):
             super().__init__("validation_error")
-            self._details = details if isinstance(details, list) else [{"loc": [], "msg": str(details), "type": "value_error"}]
+            self._details = details if isinstance(details, list) else [
+                {"loc": [], "msg": str(details), "type": "value_error"}
+            ]
         def errors(self):
             return self._details
 
 def parse_prediction_payload(body: Dict[str, Any]) -> Dict[str, Any]:
-    """Wrapper over validators.parse_prediction_payload_v2 with a minimal fallback."""
+    """Wrapper over validators.parse_prediction_payload_v2 with a resilient fallback."""
     if _parse_v2 is not None:
         return _parse_v2(body)
 
-    # Minimal fallback to avoid 500s if validators cannot be imported
+    # Minimal, defensive fallback
     if not isinstance(body, dict):
         raise _ValidationError([{"loc": [], "msg": "payload must be an object", "type": "type_error.dict"}])
     if "natal_chart" not in body or not isinstance(body.get("natal_chart"), dict):
@@ -1618,10 +1719,11 @@ def _build_meta(extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         meta.update(extra)
     return meta
 
-def _accept(payload: Dict[str, Any], accept_keys: "frozenset[str]") -> Dict[str, Any]:
+def _accept(payload: Dict[str, Any], accept_keys: FrozenSet[str]) -> Dict[str, Any]:
+    """Filter `payload` down to the keys the backend actually accepts."""
     return {k: payload[k] for k in payload.keys() & accept_keys}
 
-# ───────────────────────── Serializer shims (prevent NameError) ─────────────────────────
+# ───────────────────────── Serializer shims (guard against NameError) ─────────────────────────
 if "_serialize_prediction_event" not in globals():
     def _serialize_prediction_event(event: Any) -> Dict[str, Any]:
         if event is None:
@@ -1675,16 +1777,17 @@ if "_serialize_comprehensive_forecast" not in globals():
     def _serialize_comprehensive_forecast(forecast: Any) -> Dict[str, Any]:
         if forecast is None:
             return {}
-        predictions = {}
+        predictions: Dict[str, Any] = {}
         if hasattr(forecast, "predictions") and forecast.predictions:
             predictions = {k: _serialize_prediction_result(v) for k, v in forecast.predictions.items()}
-        time_range = getattr(forecast, "time_range", [])
-        if time_range and len(time_range) >= 2:
+
+        time_range_iso: List[str] = []
+        tr = getattr(forecast, "time_range", [])
+        if isinstance(tr, (list, tuple)) and len(tr) >= 2:
             time_range_iso = [
-                (dt.isoformat() if hasattr(dt, "isoformat") else str(dt)) for dt in time_range[:2]
+                (dt.isoformat() if hasattr(dt, "isoformat") else str(dt)) for dt in tr[:2]
             ]
-        else:
-            time_range_iso = []
+
         return {
             "natal_chart": getattr(forecast, "natal_chart", {}) or {},
             "time_range": time_range_iso,
@@ -1713,36 +1816,36 @@ if "_serialize_relationship_forecast" not in globals():
         }
 
 # ───────────────────────── Accept sets ─────────────────────────
-_ACCEPT_TRANSITS = frozenset({
+_ACCEPT_TRANSITS: FrozenSet[str] = frozenset({
     "transiting_bodies", "natal_bodies", "orbs", "aspects", "include_aspects_to",
     "include_house_cusps", "frame", "zodiac_mode", "ayanamsa_deg", "exact_timing",
     "statistical_validation", "confidence_threshold",
 })
 
-_ACCEPT_PROGRESSIONS = frozenset({
+_ACCEPT_PROGRESSIONS: FrozenSet[str] = frozenset({
     "method", "lunar_month", "tertiary_mode", "frame", "house_system",
     "zodiac_mode", "ayanamsa_deg", "aspects_to_natal", "orbs",
     "parallels", "antiscia", "statistical_validation",
 })
 
-_ACCEPT_RETURNS = frozenset({
+_ACCEPT_RETURNS: FrozenSet[str] = frozenset({
     "lunar_month", "place", "frame", "house_system", "zodiac_mode",
     "ayanamsa_deg", "estimate_uncertainty", "aspects_to_natal", "orbs",
     "statistical_validation",
 })
 
 # IMPORTANT: Do NOT forward 'aspects_to_natal' to directions (legacy backends can choke)
-_ACCEPT_DIRECTIONS = frozenset({
+_ACCEPT_DIRECTIONS: FrozenSet[str] = frozenset({
     "method", "frame", "zodiac_mode", "ayanamsa_deg", "house_system",
     "orbs", "statistical_validation",
 })
 
-_ACCEPT_RELATIONSHIP = frozenset({
+_ACCEPT_RELATIONSHIP: FrozenSet[str] = frozenset({
     "synastry_orbs", "composite_method", "include_transits_to_composite",
     "include_progressions", "confidence_threshold", "parallels", "antiscia",
     "frame", "zodiac_mode", "ayanamsa_deg", "house_system",
 })
-_REL_PREFIXES = ("transit_", "progression_")
+_REL_PREFIXES: Tuple[str, ...] = ("transit_", "progression_")
 
 # ───────────────────────── Routes ─────────────────────────
 
@@ -2009,219 +2112,31 @@ def prediction_validation_route():
 
 
 # ───────────────────────── predictive (transits • validation • dasha • varga • yogas) ─────────────────────────
-from typing import Any, Dict, List, Tuple, Optional
-import os, time, math, threading
-from flask import request, jsonify
+# Cleaned & deduplicated drop-in. Keeps behavior; improves structure, typing, and guards.
 
-# Global adapter for performance optimization (per-frame cache)
-from app.core.ephemeris_adapter import EphemerisAdapter, Config as EphemConfig
+from __future__ import annotations
 
-# ───────────────────────── shared adapters & gating ─────────────────────────
-_GLOBAL_ADAPTERS: Dict[str, EphemerisAdapter] = {}
-_ADAPTER_LOCK = threading.Lock()
-
-def _norm_frame_key(frame: Optional[str]) -> str:
-    s = (frame or "ecliptic-of-date").strip().lower()
-    return "ecliptic-j2000" if s in ("ecliptic-j2000", "j2000", "ecl-j2000") else "ecliptic-of-date"
-
-def get_shared_adapter(frame: str = "ecliptic-of-date") -> EphemerisAdapter:
-    """Get or create a shared EphemerisAdapter instance (per frame) for performance."""
-    key = _norm_frame_key(frame)
-    with _ADAPTER_LOCK:
-        ep = _GLOBAL_ADAPTERS.get(key)
-        if ep is None:
-            ep = EphemerisAdapter(EphemConfig(frame=key, compute_velocity_default=False))
-            _GLOBAL_ADAPTERS[key] = ep
-        return ep
-
-# small concurrency gate to avoid 429s under burst load from the same pod
-_PRED_MAX_CONC = int(os.getenv("PREDICTIVE_MAX_CONCURRENCY", "2"))
-_PRED_SEM_TIMEOUT_S = float(os.getenv("PREDICTIVE_SEM_TIMEOUT_S", "25"))
-_PRED_SEM = threading.Semaphore(_PRED_MAX_CONC)
-
-def _busy():
-    resp = _json_error("server_busy", "try again shortly", 429)
-    resp.headers["Retry-After"] = "2"
-    return resp
-
-def _take_gate():
-    return _PRED_SEM.acquire(timeout=_PRED_SEM_TIMEOUT_S)
-
-def _give_gate():
-    try:
-        _PRED_SEM.release()
-    except Exception:
-        pass
-
-# ───────────────────────── math helpers ─────────────────────────
-TAU = 360.0
-
-def _norm360(x: float) -> float:
-    r = float(x) % TAU
-    return r + TAU if r < 0.0 else r
-
-def _wrap180(x: float) -> float:
-    v = ((float(x) + 180.0) % 360.0) - 180.0
-    return 180.0 if v == -180.0 else v
-
-def _wrap360(x: float) -> float:
-    v = float(x) % 360.0
-    return v + 360.0 if v < 0.0 else v
-
-def _split_dt(s: str, fallback: str) -> Tuple[str, str]:
-    """Split 'YYYY-MM-DD[ T]HH:MM:SS' into (date, time) with sensible fallbacks."""
-    s = (s or "").strip().replace("T", " ")
-    if len(s) <= 10:
-        return s[:10], fallback
-    return s[:10], (s[11:19] or fallback)
-
-# ───────────────────────── time window parsing ─────────────────────────
-def _parse_time_range_like(body: Dict[str, Any]) -> Tuple[float, float]:
-    """
-    Accepts any of:
-      - jd_start_tt & jd_end_tt (floats)
-      - time_range: [start, end] where each item can be ISO date or full ISO datetime
-      - date*_*/time*_* + place_tz / timezone (old shape)
-    Returns (jd0, jd1) in TT, raises ValidationError-compatible dict on problems.
-    """
-    # direct JDs
-    jd0 = body.get("jd_start_tt")
-    jd1 = body.get("jd_end_tt")
-    if isinstance(jd0, (int, float)) and isinstance(jd1, (int, float)):
-        jd0f, jd1f = float(jd0), float(jd1)
-        if not (math.isfinite(jd0f) and math.isfinite(jd1f) and jd1f > jd0f):
-            raise ValidationError([{"loc": ["jd_start_tt", "jd_end_tt"], "msg": "invalid range"}])
-        return jd0f, jd1f
-
-    # time_range: ["YYYY-MM-DD" | ISO, "YYYY-MM-DD" | ISO]
-    tr = body.get("time_range")
-    if isinstance(tr, (list, tuple)) and len(tr) == 2:
-        tz = body.get("place_tz") or body.get("timezone") or "UTC"
-        s0, s1 = tr[0], tr[1]
-        if not (isinstance(s0, str) and isinstance(s1, str)):
-            raise ValidationError([{"loc": ["time_range"], "msg": "items must be strings"}])
-        d0, t0 = _split_dt(s0, "00:00:00")
-        d1, t1 = _split_dt(s1, "23:59:59")
-        ts0 = _compute_timescales_from_local(d0, t0, tz, payload=body)
-        ts1 = _compute_timescales_from_local(d1, t1, tz, payload=body)
-        jd0f, jd1f = float(ts0["jd_tt"]), float(ts1["jd_tt"])
-        if jd1f <= jd0f:
-            raise ValidationError([{"loc": ["time_range"], "msg": "end must be after start"}])
-        return jd0f, jd1f
-
-    # legacy civil fields
-    date0 = body.get("date_start") or body.get("date")
-    time0 = body.get("time_start") or body.get("time") or "00:00:00"
-    date1 = body.get("date_end")
-    time1 = body.get("time_end") or "23:59:59"
-    tz = body.get("place_tz") or body.get("timezone") or "UTC"
-    if not (isinstance(date0, str) and isinstance(time0, str)):
-        raise ValidationError([{"loc": ["date_start/time_start"], "msg": "required"}])
-    ts0 = _compute_timescales_from_local(date0, time0, tz, payload=body)
-    if isinstance(date1, str):
-        ts1 = _compute_timescales_from_local(date1, time1, tz, payload=body)
-        jd0f, jd1f = float(ts0["jd_tt"]), float(ts1["jd_tt"])
-    else:
-        jd0f = float(ts0["jd_tt"])
-        jd1f = jd0f + 1.0  # default 24h window
-    if not (math.isfinite(jd0f) and math.isfinite(jd1f) and jd1f > jd0f):
-        raise ValidationError([{"loc": ["jd_start_tt", "jd_end_tt"], "msg": "invalid range"}])
-    return jd0f, jd1f
-
-def _parse_step_minutes(v: Any, *, default_min: float) -> Any:
-    """
-    Accept numeric minutes (>0) or "auto"/0/None → "auto".
-    Returns either float minutes or the string "auto" (engine understands both).
-    """
-    if v is None:
-        return "auto" if default_min <= 0 else default_min
-    if isinstance(v, str) and v.strip().lower() == "auto":
-        return "auto"
-    try:
-        f = float(v)
-        return "auto" if f <= 0 else f
-    except Exception:
-        return default_min
-
-# ───────────────────────── ephemeris perf helpers ─────────────────────────
-def _k(jd: float, *, ndigits: int = 6) -> float:
-    """JD bucket: round to ~1e-6 day (~0.0864 s)."""
-    return round(float(jd), ndigits)
-
-class _PerRequestEphem:
-    """Per-request memoized ephemeris accessor with sidereal toggle & batching."""
-    def __init__(self, adapter: EphemerisAdapter, obs: dict, *, sidereal: bool, ay_deg: float):
-        self.adapter = adapter
-        self.obs = obs
-        self.sidereal = bool(sidereal)
-        self.ay = float(ay_deg if sidereal else 0.0)
-        self.lon_cache: dict[tuple[float, str], float] = {}
-        self.calls = 0  # count adapter calls
-
-    def _nir(self, lon_trop: float) -> float:
-        return _norm360(float(lon_trop) - self.ay)
-
-    def map(self, jd_tt: float, names: list[str]) -> dict[str, float]:
-        rows = self.adapter.ecliptic_longitudes(jd_tt, names, **self.obs).get("results", [])
-        self.calls += 1
-        out: dict[str, float] = {}
-        if not rows:
-            return out
-        jd_key = _k(jd_tt)
-        if self.sidereal:
-            for row in rows:
-                nm = row["name"]
-                lon = self._nir(row["longitude"])
-                out[nm] = lon
-                self.lon_cache[(jd_key, nm)] = lon
-        else:
-            for row in rows:
-                nm = row["name"]
-                lon = float(row["longitude"])
-                out[nm] = lon
-                self.lon_cache[(jd_key, nm)] = lon
-        return out
-
-    def one(self, jd_tt: float, name: str) -> Optional[float]:
-        key = (_k(jd_tt), name)
-        if key in self.lon_cache:
-            return self.lon_cache[key]
-        rows = self.adapter.ecliptic_longitudes(jd_tt, [name], **self.obs).get("results", [])
-        self.calls += 1
-        if not rows:
-            return None
-        lon = float(rows[0]["longitude"])
-        if self.sidereal:
-            lon = self._nir(lon)
-        self.lon_cache[key] = lon
-        return lon
-
-class _CountingAdapter:
-    """Lightweight proxy to count ephemeris calls made by engines we don't control."""
-    def __init__(self, base: EphemerisAdapter):
-        self._base = base
-        self.calls = 0
-    def ecliptic_longitudes(self, jd_tt, names, **obs):
-        self.calls += 1
-        return self._base.ecliptic_longitudes(jd_tt, names, **obs)
-
-from typing import Any, Dict, List, Tuple, Optional
-import os, time, math, threading
-from enum import Enum
+import math
+import os
+import threading
+import time
 from datetime import date, datetime
-from flask import request, jsonify, make_response
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple
+
+from flask import jsonify, request
 
 # External app symbols expected to exist:
 # - api (Flask Blueprint), rate_limit, RL_PREDICTIVE
 # - _json_error, DEBUG_VERBOSE, ValidationError
 # - parse_frame, parse_latlon, _compute_timescales_from_local, _call_compute_chart, _wrap360
-# - _ALL_ASPECTS, _MAJOR_ASPECTS
-# - app.core.predictive as pred  (must expose TransitEngine)
+# - app.core.predictive as pred  (must expose TransitEngine, MAJOR_ASPECTS, MINOR_ASPECTS)
 
 from app.core.ephemeris_adapter import EphemerisAdapter, Config as EphemConfig
-from app.core import predictive as pred  # TransitEngine
+from app.core import predictive as pred  # TransitEngine, aspect presets
 
-# ───────────────────────── JSON safety ─────────────────────────
+
+# ───────────────────────── JSON safety (utility) ─────────────────────────
 
 try:
     import numpy as _np
@@ -2229,8 +2144,9 @@ try:
 except Exception:
     _HAS_NP = False
 
+
 def _json_safe(x: Any) -> Any:
-    """Recursively convert common non-JSON types to JSON-safe primitives."""
+    """Recursively coerce common non-JSON types into JSON-safe primitives."""
     if x is None or isinstance(x, (bool, int, float, str)):
         if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
             return None
@@ -2240,32 +2156,34 @@ def _json_safe(x: Any) -> Any:
     if isinstance(x, Enum):
         return x.name.lower()
     if _HAS_NP:
-        if isinstance(x, (_np.floating,)):
+        if isinstance(x, _np.floating):
             v = float(x)
             return None if (math.isnan(v) or math.isinf(v)) else v
-        if isinstance(x, (_np.integer,)):
+        if isinstance(x, _np.integer):
             return int(x)
-        if isinstance(x, (_np.ndarray,)):
+        if isinstance(x, _np.ndarray):
             return [_json_safe(v) for v in x.tolist()]
-    if isinstance(x, (list, tuple)):
-        return [_json_safe(v) for v in x]
-    if isinstance(x, set):
-        return [_json_safe(v) for v in sorted(x, key=lambda y: str(y))]
+    if isinstance(x, (list, tuple, set)):
+        it = x if not isinstance(x, set) else sorted(x, key=lambda y: str(y))
+        return [_json_safe(v) for v in it]
     if isinstance(x, dict):
         return {str(k): _json_safe(v) for k, v in x.items()}
     return str(x)
 
-# ───────────────────────── Shared ephemeris adapter ─────────────────────────
+
+# ───────────────────────── Shared ephemeris adapters (perf) ─────────────────────────
 
 _GLOBAL_ADAPTERS: Dict[str, EphemerisAdapter] = {}
 _ADAPTER_LOCK = threading.Lock()
 
+
 def _norm_frame_key(frame: Optional[str]) -> str:
     s = (frame or "ecliptic-of-date").strip().lower()
-    return "ecliptic-j2000" if s in ("ecliptic-j2000", "j2000", "ecl-j2000") else "ecliptic-of-date"
+    return "ecliptic-j2000" if s in {"ecliptic-j2000", "j2000", "ecl-j2000"} else "ecliptic-of-date"
+
 
 def get_shared_adapter(frame: str = "ecliptic-of-date") -> EphemerisAdapter:
-    """Get or create a shared EphemerisAdapter instance (per frame) for performance."""
+    """Get or create a shared EphemerisAdapter instance (per-frame cache)."""
     key = _norm_frame_key(frame)
     with _ADAPTER_LOCK:
         ep = _GLOBAL_ADAPTERS.get(key)
@@ -2274,16 +2192,19 @@ def get_shared_adapter(frame: str = "ecliptic-of-date") -> EphemerisAdapter:
             _GLOBAL_ADAPTERS[key] = ep
         return ep
 
-# ───────────────────────── Concurrency gate ─────────────────────────
+
+# ───────────────────────── Concurrency gate (burst protection) ─────────────────────────
 
 _PRED_MAX_CONC = int(os.getenv("PREDICTIVE_MAX_CONCURRENCY", "2"))
 _PRED_SEM_TIMEOUT_S = float(os.getenv("PREDICTIVE_SEM_TIMEOUT_S", "25"))
 _PRED_SEM = threading.Semaphore(_PRED_MAX_CONC)
 
+
 def _busy():
     resp = _json_error("server_busy", {"msg": "try again shortly"}, 429)
     resp.headers["Retry-After"] = "2"
     return resp
+
 
 def _take_gate() -> bool:
     try:
@@ -2291,11 +2212,13 @@ def _take_gate() -> bool:
     except Exception:
         return False
 
+
 def _give_gate():
     try:
         _PRED_SEM.release()
     except Exception:
         pass
+
 
 # ───────────────────────── Time parsing helpers ─────────────────────────
 
@@ -2306,6 +2229,7 @@ def _split_dt(s: Any, fallback_time: str) -> Tuple[str, str]:
         return s[:10], fallback_time
     return s[:10], (s[11:19] or fallback_time)
 
+
 def _parse_time_range_like(body: Dict[str, Any]) -> Tuple[float, float]:
     """
     Accepts:
@@ -2314,7 +2238,7 @@ def _parse_time_range_like(body: Dict[str, Any]) -> Tuple[float, float]:
       - legacy date/time + place_tz/timezone
     Returns (jd0, jd1) in TT.
     """
-    # direct JDs
+    # Direct JDs
     jd0, jd1 = body.get("jd_start_tt"), body.get("jd_end_tt")
     if isinstance(jd0, (int, float)) and isinstance(jd1, (int, float)):
         jd0f, jd1f = float(jd0), float(jd1)
@@ -2338,7 +2262,7 @@ def _parse_time_range_like(body: Dict[str, Any]) -> Tuple[float, float]:
             raise ValidationError([{"loc": ["time_range"], "msg": "end must be after start"}])
         return jd0f, jd1f
 
-    # legacy civil fields
+    # Legacy civil fields
     date0 = body.get("date_start") or body.get("date")
     time0 = body.get("time_start") or body.get("time") or "00:00:00"
     date1 = body.get("date_end")
@@ -2360,10 +2284,11 @@ def _parse_time_range_like(body: Dict[str, Any]) -> Tuple[float, float]:
         raise ValidationError([{"loc": ["jd_start_tt", "jd_end_tt"], "msg": "invalid range"}])
     return jd0f, jd1f
 
-def _parse_step_minutes(v: Any, *, default_min: float) -> Any:
+
+def _parse_step_minutes(v: Any, *, default_min: float) -> float | str:
     """
     Accept numeric minutes (>0) or "auto"/0/None → "auto".
-    Returns float or the string "auto".
+    Returns float minutes or the string "auto".
     """
     if v is None:
         return "auto" if default_min <= 0 else default_min
@@ -2375,15 +2300,12 @@ def _parse_step_minutes(v: Any, *, default_min: float) -> Any:
     except Exception:
         return default_min
 
-# ───────────────────────── Aspects normalization ─────────────────────────
 
-_MAJOR_NAMES = ["conjunction", "opposition", "square", "trine, sextile".split(", ")[-1]]  # fix split quirk
-# Actually define correctly:
-_MAJOR_NAMES = ["conjunction", "opposition", "square", "trine", "sextile"]
+# ───────────────────────── Aspect presets & normalization ─────────────────────────
 
-_MINOR_NAMES = [
-    "quincunx","semisextile","semisquare","sesquisquare","quintile","biquintile"
-]
+_MAJOR_NAMES = list(getattr(pred, "MAJOR_ASPECTS", ("conjunction", "opposition", "square", "trine", "sextile")))
+_MINOR_NAMES = list(getattr(pred, "MINOR_ASPECTS", ("quincunx", "semisextile", "semisquare", "sesquisquare", "quintile", "biquintile")))
+
 
 def _normalize_aspects(x: Any, *, include_minors: bool) -> List[str]:
     """
@@ -2394,7 +2316,7 @@ def _normalize_aspects(x: Any, *, include_minors: bool) -> List[str]:
         return (_MAJOR_NAMES + _MINOR_NAMES) if include_minors else list(_MAJOR_NAMES)
 
     if isinstance(x, dict):
-        return [str(k) for k in x.keys()]
+        return [str(k).strip().lower() for k in x.keys()]
 
     if isinstance(x, (list, tuple, set)):
         out: List[str] = []
@@ -2403,179 +2325,191 @@ def _normalize_aspects(x: Any, *, include_minors: bool) -> List[str]:
                 out.append(a.strip().lower())
             elif isinstance(a, dict) and "name" in a:
                 out.append(str(a["name"]).strip().lower())
-        return out if out else ((_MAJOR_NAMES + _MINOR_NAMES) if include_minors else list(_MAJOR_NAMES))
+        return out or ((_MAJOR_NAMES + _MINOR_NAMES) if include_minors else list(_MAJOR_NAMES))
 
     if isinstance(x, str):
         return [x.strip().lower()]
 
-    # Fallback to defaults
     return (_MAJOR_NAMES + _MINOR_NAMES) if include_minors else list(_MAJOR_NAMES)
+
 
 # ───────────────────────── Route: /api/predictive/transits ─────────────────────────
 
 @api.post("/api/predictive/transits")
 @rate_limit(RL_PREDICTIVE)
 def predictive_transits():
-   """
-   Scan transits (moving bodies vs target longitudes) with robust refinement.
-   Accepts either a direct targets map or a 'targets_chart' (natal chart params).
-   Also accepts 'time_range' in addition to jd/date fields.
-   """
-   try:
-       body = request.get_json(force=True) or {}
-   except Exception as e:
-       return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
+    """
+    Scan transits (moving bodies vs target longitudes) with robust refinement.
+    Accepts either a direct targets map or a 'targets_chart' (natal chart params).
+    Also accepts 'time_range' in addition to jd/date fields.
+    """
+    try:
+        body = request.get_json(force=True) or {}
+    except Exception as e:
+        return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
 
-   if not _take_gate():
-       return _busy()
+    if not _take_gate():
+        return _busy()
 
-   t0 = time.perf_counter()
+    t0 = time.perf_counter()
+    try:
+        # -------- time window (jd_tt) --------
+        try:
+            jd0, jd1 = _parse_time_range_like(body)
+        except ValidationError as e:
+            return _json_error("validation_error", e.errors(), 400)
+        except Exception as e:
+            return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
 
-   try:
-       # -------- time window (jd_tt) --------
-       try:
-           jd0, jd1 = _parse_time_range_like(body)
-       except ValidationError as e:
-           return _json_error("validation_error", e.errors(), 400)
-       except Exception as e:
-           return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
+        # -------- movers / targets --------
+        raw_movers = body.get("movers") or ["Sun", "Moon", "Mercury", "Venus", "Mars", "Jupiter", "Saturn"]
+        if not (isinstance(raw_movers, list) and all(isinstance(x, str) and x for x in raw_movers)):
+            return _json_error("validation_error", [{"loc": ["movers"], "msg": "must be a list of names"}], 400)
+        movers = list(dict.fromkeys(m.strip() for m in raw_movers if m))
 
-       # -------- movers / targets --------
-       raw_movers = body.get("movers") or ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn"]
-       if not (isinstance(raw_movers, list) and all(isinstance(x, str) and x for x in raw_movers)):
-           return _json_error("validation_error", [{"loc":["movers"],"msg":"must be a list of names"}], 400)
+        # targets_longitudes: direct map (preferred)
+        targets: Dict[str, float] = {}
+        raw_targets = body.get("targets_longitudes")
+        if isinstance(raw_targets, dict):
+            for k, v in raw_targets.items():
+                try:
+                    targets[str(k)] = _wrap360(float(v))
+                except Exception:
+                    pass
 
-       movers = list(dict.fromkeys(m.strip() for m in raw_movers if m))
+        # Or build targets from a chart payload (e.g., natal)
+        if not targets and isinstance(body.get("targets_chart"), dict):
+            targ = dict(body["targets_chart"])
+            tz_nat = targ.get("place_tz") or targ.get("timezone") or "UTC"
+            try:
+                ts_nat = _compute_timescales_from_local(
+                    targ["date"],
+                    targ.get("time", "00:00:00"),
+                    tz_nat,
+                    payload=targ,
+                )
+            except Exception as e:
+                return _json_error("validation_error", [{"loc": ["targets_chart"], "msg": str(e)}], 400)
 
-       # targets_longitudes: direct map (preferred, fastest path)
-       targets: Dict[str, float] = {}
-       raw_targets = body.get("targets_longitudes")
-       if isinstance(raw_targets, dict):
-           for k, v in raw_targets.items():
-               try:
-                   targets[str(k)] = _wrap360(float(v))
-               except Exception:
-                   pass
+            try:
+                ch = _call_compute_chart(targ, ts_nat)
+            except Exception as e:
+                return _json_error("chart_internal", str(e) if DEBUG_VERBOSE else "chart_failed", 500)
 
-       # Or build targets from a chart payload (e.g., natal)
-       if not targets and isinstance(body.get("targets_chart"), dict):
-           targ = dict(body["targets_chart"])
-           tz_nat = targ.get("place_tz") or targ.get("timezone") or "UTC"
-           try:
-               ts_nat = _compute_timescales_from_local(targ["date"], targ.get("time", "00:00:00"), tz_nat, payload=targ)
-           except Exception as e:
-               return _json_error("validation_error", [{"loc":["targets_chart"], "msg": str(e)}], 400)
+            for row in (ch.get("bodies") or []) + (ch.get("points") or []):
+                if isinstance(row, dict) and "name" in row and isinstance(row.get("longitude_deg"), (int, float)):
+                    targets[str(row["name"])] = _wrap360(float(row["longitude_deg"]))
 
-           try:
-               ch = _call_compute_chart(targ, ts_nat)
-           except Exception as e:
-               return _json_error("chart_internal", str(e) if DEBUG_VERBOSE else "chart_failed", 500)
+        if not targets:
+            return _json_error(
+                "validation_error",
+                [{"loc": ["targets_longitudes|targets_chart"], "msg": "no targets to scan"}],
+                400,
+            )
 
-           for row in (ch.get("bodies") or []) + (ch.get("points") or []):
-               if isinstance(row, dict) and "name" in row and isinstance(row.get("longitude_deg"), (int, float)):
-                   targets[str(row["name"])] = _wrap360(float(row["longitude_deg"]))
+        # -------- engine options --------
+        topocentric = bool(body.get("topocentric")) or (
+            isinstance(body.get("latitude"), (int, float)) and isinstance(body.get("longitude"), (int, float))
+        )
+        lat = float(body.get("latitude")) if isinstance(body.get("latitude"), (int, float)) else None
+        lon = float(body.get("longitude")) if isinstance(body.get("longitude"), (int, float)) else None
+        elev = float(body.get("elevation_m")) if isinstance(body.get("elevation_m"), (int, float)) else None
+        frame = parse_frame(body.get("frame"))
+        step_arg = _parse_step_minutes(body.get("step_minutes"), default_min=30.0)
 
-       if not targets:
-           return _json_error("validation_error", [{"loc":["targets_longitudes|targets_chart"],"msg":"no targets to scan"}], 400)
+        if topocentric and (lat is not None or lon is not None):
+            try:
+                lat, lon = parse_latlon(lat, lon)
+            except ValidationError as e:
+                return _json_error("validation_error", e.errors(), 400)
 
-       # -------- engine options --------
-       topocentric = bool(body.get("topocentric")) or (
-           isinstance(body.get("latitude"), (int,float)) and isinstance(body.get("longitude"), (int,float))
-       )
-       lat = float(body.get("latitude")) if isinstance(body.get("latitude"), (int,float)) else None
-       lon = float(body.get("longitude")) if isinstance(body.get("longitude"), (int,float)) else None
-       elev = float(body.get("elevation_m")) if isinstance(body.get("elevation_m"), (int,float)) else None
-       frame = parse_frame(body.get("frame"))
-       step_arg = _parse_step_minutes(body.get("step_minutes"), default_min=30.0)
+        include_antiscia = bool(body.get("include_antiscia", False))
+        antiscia_orb_deg = float(body.get("antiscia_orb_deg", 2.0))
+        include_minors = bool(body.get("include_minors", False))
 
-       if topocentric and (lat is not None or lon is not None):
-           try:
-               lat, lon = parse_latlon(lat, lon)
-           except ValidationError as e:
-               return _json_error("validation_error", e.errors(), 400)
+        # sidereal options
+        zodiac_mode = (body.get("zodiac_mode") or "tropical").lower()
+        ayanamsa_deg = float(body.get("ayanamsa_deg", 0.0))
 
-       include_antiscia = bool(body.get("include_antiscia", False))
-       antiscia_orb_deg = float(body.get("antiscia_orb_deg", 2.0))
-       include_minors = bool(body.get("include_minors", False))
+        # aspect set
+        aspects = _normalize_aspects(body.get("aspects"), include_minors=include_minors)
 
-       # sidereal options (thread through to engine)
-       zodiac_mode = (body.get("zodiac_mode") or "tropical").lower()
-       ayanamsa_deg = float(body.get("ayanamsa_deg", 0.0))
+        # -------- run engine with shared adapter --------
+        try:
+            shared_adapter = get_shared_adapter(frame)
+            eng = pred.TransitEngine(
+                ephem=shared_adapter,
+                frame=frame,
+                topocentric=topocentric,
+                latitude=lat,
+                longitude=lon,
+                elevation_m=elev,
+            )
 
-       # aspect set
-       from app.core import predictive as pred
-       aspects = list(pred.MAJOR_ASPECTS)
-       if include_minors:
-           aspects += list(pred.MINOR_ASPECTS)
+            # thread sidereal into engine (no API change)
+            eng.sidereal_mode = zodiac_mode.startswith("sidereal")
+            eng.ayanamsa_deg = ayanamsa_deg
 
-       # -------- run engine with shared adapter --------
-       try:
-           shared_adapter = get_shared_adapter(frame)
-           eng = pred.TransitEngine(
-               ephem=shared_adapter,
-               frame=frame,
-               topocentric=topocentric,
-               latitude=lat,
-               longitude=lon,
-               elevation_m=elev
-           )
+            events = eng.scan_aspects(
+                jd_start_tt=float(jd0),
+                jd_end_tt=float(jd1),
+                movers=[str(m) for m in movers],
+                targets=targets,
+                aspects=aspects,
+                step_minutes=step_arg,  # supports "auto"
+                include_antiscia=include_antiscia,
+                antiscia_orb_deg=antiscia_orb_deg,
+            )
+        except Exception as e:
+            return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
 
-           # thread sidereal into engine (no API change)
-           eng.sidereal_mode = zodiac_mode.startswith("sidereal")
-           eng.ayanamsa_deg = ayanamsa_deg
+        out = [
+            {
+                "jd_tt": e.jd_tt,
+                "body": e.body,
+                "target": e.target,
+                "aspect": e.aspect,
+                "kind": e.kind,
+                "separation_deg": e.separation_deg,
+                "applying": e.applying,
+                "exact": e.exact,
+                "meta": e.meta,
+            }
+            for e in events
+        ]
 
-           events = eng.scan_aspects(
-               jd_start_tt=float(jd0),
-               jd_end_tt=float(jd1),
-               movers=[str(m) for m in movers],
-               targets=targets,
-               aspects=aspects,
-               step_minutes=step_arg,  # supports "auto"
-               include_antiscia=include_antiscia,
-               antiscia_orb_deg=antiscia_orb_deg,
-           )
-       except Exception as e:
-           return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
+        resp = jsonify(
+            {
+                "ok": True,
+                "window": {
+                    "jd_start_tt": float(jd0),
+                    "jd_end_tt": float(jd1),
+                    "step_minutes": (step_arg if isinstance(step_arg, float) else "auto"),
+                },
+                "engine": {
+                    "frame": frame,
+                    "topocentric": topocentric,
+                    "zodiac_mode": zodiac_mode,
+                    "ayanamsa_deg": ayanamsa_deg,
+                },
+                "targets": targets,
+                "movers": movers,
+                "results": out,
+            }
+        )
+        resp.status_code = 200
+        resp.headers["X-Compute-Time-ms"] = f"{(time.perf_counter() - t0) * 1000:.0f}"
+        return resp
 
-       out = [
-           {
-               "jd_tt": e.jd_tt,
-               "body": e.body,
-               "target": e.target,
-               "aspect": e.aspect,
-               "kind": e.kind,
-               "separation_deg": e.separation_deg,
-               "applying": e.applying,
-               "exact": e.exact,
-               "meta": e.meta,
-           }
-           for e in events
-       ]
-
-       resp = jsonify({
-           "ok": True,
-           "window": {
-               "jd_start_tt": float(jd0),
-               "jd_end_tt": float(jd1),
-               "step_minutes": (step_arg if isinstance(step_arg, float) else "auto"),
-           },
-           "engine": {"frame": frame, "topocentric": topocentric, "zodiac_mode": zodiac_mode, "ayanamsa_deg": ayanamsa_deg},
-           "targets": targets,
-           "movers": movers,
-           "results": out
-       })
-       resp.status_code = 200
-       resp.headers["X-Compute-Time-ms"] = f"{(time.perf_counter() - t0)*1000:.0f}"
-       return resp
-
-   finally:
-       _give_gate()
+    finally:
+        _give_gate()
 
 
 # ───────────────────────── /predictive/ingresses ─────────────────────────
 @api.post("/api/predictive/ingresses")
 @rate_limit(RL_PREDICTIVE)
 def predictive_ingresses():
+    """Find sign-ingress moments for moving bodies within a time window."""
     try:
         body = request.get_json(force=True) or {}
     except Exception as e:
@@ -2586,7 +2520,7 @@ def predictive_ingresses():
 
     t_wall = time.perf_counter()
     try:
-        # inputs / validation
+        # ── Window (TT) ──────────────────────────────────────────────────────
         try:
             jd0, jd1 = _parse_time_range_like(body)
         except ValidationError as e:
@@ -2594,52 +2528,64 @@ def predictive_ingresses():
         except Exception as e:
             return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
 
-        raw_movers = body.get("movers") or ["Sun","Mercury","Venus","Mars","Jupiter","Saturn"]
-        movers = [m.strip() for m in raw_movers if m and str(m).strip()]
+        # ── Inputs ──────────────────────────────────────────────────────────
+        raw_movers = body.get("movers") or ["Sun", "Mercury", "Venus", "Mars", "Jupiter", "Saturn"]
+        movers = [str(m).strip() for m in raw_movers if str(m).strip()]
         if not movers:
-            return _json_error("validation_error", [{"msg":"movers cannot be empty"}], 400)
+            return _json_error("validation_error", [{"loc": ["movers"], "msg": "movers cannot be empty"}], 400)
 
         frame = parse_frame(body.get("frame"))
-        base_adapter = get_shared_adapter(frame)
+        adapter = get_shared_adapter(frame)
 
-        # observing options
-        obs = dict(
-            topocentric=bool(body.get("topocentric")),
-            latitude=(float(body["latitude"]) if isinstance(body.get("latitude"), (int, float)) else None),
-            longitude=(float(body["longitude"]) if isinstance(body.get("longitude"), (int, float)) else None),
-            elevation_m=(float(body["elevation_m"]) if isinstance(body.get("elevation_m"), (int, float)) else None),
-        )
+        # Observing options
+        obs = {
+            "topocentric": bool(body.get("topocentric")),
+            "latitude": float(body["latitude"]) if isinstance(body.get("latitude"), (int, float)) else None,
+            "longitude": float(body["longitude"]) if isinstance(body.get("longitude"), (int, float)) else None,
+            "elevation_m": float(body["elevation_m"]) if isinstance(body.get("elevation_m"), (int, float)) else None,
+        }
 
-        # sidereal/tropical
+        # Sidereal/tropical
         zodiac_mode = (body.get("zodiac_mode") or "tropical").lower()
         sidereal = zodiac_mode.startswith("sidereal")
         ayanamsa_deg = float(body.get("ayanamsa_deg", 0.0))
 
-        # step sizing
+        # Step sizing
         step_arg = _parse_step_minutes(body.get("step_minutes"), default_min=60.0)
 
-        # per-request ephemeris with memo
-        E = _PerRequestEphem(base_adapter, obs, sidereal=sidereal, ay_deg=ayanamsa_deg)
+        # ── Per-request ephemeris (memoized) ─────────────────────────────────
+        E = _PerRequestEphem(adapter, obs, sidereal=sidereal, ay_deg=ayanamsa_deg)
 
+        # ── Helpers ─────────────────────────────────────────────────────────
         def _sign_idx(lon_deg: float) -> int:
             return int(math.floor(_norm360(lon_deg) / 30.0)) % 12
 
-        def _auto_step_minutes(names: list[str]) -> float:
-            # slightly bolder autos (Brent refinement guarantees accuracy)
-            caps = []
+        def _auto_step_minutes(names: List[str]) -> float:
+            """
+            Heuristic coarse step (minutes). Fine timing is refined with Brent,
+            so we can be a bit bold here.
+            """
+            caps: List[int] = []
             for m in names:
                 n = (m or "").lower()
-                if n == "moon": caps.append(20)                        # was 10
-                elif n in ("mercury", "venus", "mars"): caps.append(60)
-                elif n in ("sun", "jupiter", "saturn"): caps.append(120)
-                else: caps.append(180)
+                if n == "moon":
+                    caps.append(20)           # faster mover
+                elif n in {"mercury", "venus", "mars"}:
+                    caps.append(60)
+                elif n in {"sun", "jupiter", "saturn"}:
+                    caps.append(120)
+                else:
+                    caps.append(180)
             return float(max(15, min(caps) if caps else 90))
 
-        # Brent–Dekker on wrapped delta
+        # Brent–Dekker root on wrapped delta (deg)
         def _refine_zero_brent(f, a, b, fa, fb, *, max_iter=64, tol_days=1e-6) -> float:
-            if fa == 0.0: return a
-            if fb == 0.0: return b
-            # bracket if needed via bisection
+            if fa == 0.0:
+                return a
+            if fb == 0.0:
+                return b
+
+            # Ensure bracket via bisection if needed
             if fa * fb > 0.0:
                 aa, bb = a, b
                 for _ in range(max_iter):
@@ -2652,22 +2598,30 @@ def predictive_ingresses():
                     else:
                         aa, fa = m, fm
                 return 0.5 * (aa + bb)
+
             c, fc = a, fa
             d = e = b - a
             for _ in range(max_iter):
                 if abs(fb) < abs(fa):
-                    a, b = b, a; fa, fb = fb, fa
+                    a, b = b, a
+                    fa, fb = fb, fa
                 m = 0.5 * (a + b)
                 tol = tol_days
                 if abs(b - a) <= tol:
                     return b
-                # inverse quadratic or secant
+
+                # Inverse quadratic or secant
                 if fa != fc and fb != fc:
-                    s = (a*fb*fc)/((fa-fb)*(fa-fc)) + (b*fa*fc)/((fb-fa)*(fb-fc)) + (c*fa*fb)/((fc-fa)*(fc-fb))
+                    s = (
+                        (a * fb * fc) / ((fa - fb) * (fa - fc))
+                        + (b * fa * fc) / ((fb - fa) * (fb - fc))
+                        + (c * fa * fb) / ((fc - fa) * (fc - fb))
+                    )
                 else:
-                    s = b - fb*(b-a)/(fb-fa)
-                # acceptability checks; else bisection
-                cond = not ((3*a + b)/4 < s < b if a < b else b < s < (3*a + b)/4)
+                    s = b - fb * (b - a) / (fb - fa)
+
+                # Acceptability checks; else bisection
+                cond = not ((3 * a + b) / 4 < s < b if a < b else b < s < (3 * a + b) / 4)
                 cond |= (e and abs(s - b) >= abs(e) / 2)
                 cond |= (not e and abs(s - b) >= abs(d) / 2)
                 cond |= (abs(e) < tol) or (abs(d) < tol)
@@ -2676,6 +2630,7 @@ def predictive_ingresses():
                     d = e = b - a
                 else:
                     d, e = e, b - s
+
                 fs = f(s)
                 c, fc = a, fa
                 if (fa * fs) < 0:
@@ -2683,18 +2638,19 @@ def predictive_ingresses():
                 else:
                     a, fa = s, fs
                 if abs(fa) < abs(fb):
-                    a, b = b, a; fa, fb = fb, fa
+                    a, b = b, a
+                    fa, fb = fb, fa
             return b
 
-        # core scan
+        # ── Core scan ────────────────────────────────────────────────────────
         step_minutes = _auto_step_minutes(movers) if isinstance(step_arg, str) else (
             float(step_arg) if float(step_arg) > 0.0 else _auto_step_minutes(movers)
         )
         dt = float(step_minutes) / (24.0 * 60.0)
 
         t0 = float(jd0)
-        events: list[dict[str, object]] = []
-        dedupe: set[tuple[str, int, int]] = set()
+        events: List[Dict[str, object]] = []
+        dedupe: set[Tuple[str, int, int]] = set()
 
         l0 = E.map(t0, movers)
         s0 = {k: _sign_idx(v) for k, v in l0.items()}
@@ -2706,16 +2662,18 @@ def predictive_ingresses():
             for body in movers:
                 if body not in l0 or body not in l1:
                     continue
-                a = float(l0[body]); b = float(l1[body])
+
+                a = float(l0[body])
+                b = float(l1[body])
                 s_prev = int(s0.get(body, _sign_idx(a)))
                 s_next = _sign_idx(b)
                 if s_prev == s_next:
-                    continue
+                    continue  # no ingress this step
 
-                # direction via shortest-path delta
+                # Direction via shortest-path delta
                 forward = (_wrap180(b - a) > 0.0)
 
-                # boundary
+                # Primary edge to test
                 boundary = (s_prev + 1) % 12 if forward else s_prev
                 edge_deg = 30.0 * boundary
 
@@ -2726,7 +2684,7 @@ def predictive_ingresses():
                 fa = _wrap180(a - edge_deg)
                 fb = _wrap180(b - edge_deg)
 
-                # try to shrink bracket using linear estimate
+                # Try to shrink the bracket using a linear estimate
                 ta, tb = t0, t1
                 den = _wrap180(b - a)
                 if den != 0.0:
@@ -2735,18 +2693,19 @@ def predictive_ingresses():
                         t_est = t0 + frac * (t1 - t0)
                         pad = 0.25 * (t1 - t0)
                         ta, tb = max(t0, t_est - pad), min(t1, t_est + pad)
-                        la = E.one(ta, body); lb = E.one(tb, body)
+                        la = E.one(ta, body)
+                        lb = E.one(tb, body)
                         if la is not None and lb is not None:
                             fa2 = _wrap180(float(la) - edge_deg)
                             fb2 = _wrap180(float(lb) - edge_deg)
                             if fa2 * fb2 <= 0.0:
-                                fa, fb = fa2, fb2
+                                fa, fb = fa2, fb2  # better bracket
 
-                # alt edge if unbracketed
+                # If still unbracketed, try adjacent edge (rare wrap cases)
                 if fa == 0.0:
-                    t_exact = t0
+                    t_exact = ta
                 elif fb == 0.0:
-                    t_exact = t1
+                    t_exact = tb
                 elif fa * fb > 0.0:
                     alt_edge = 30.0 * ((boundary + (1 if forward else -1)) % 12)
                     fa2 = _wrap180(a - alt_edge)
@@ -2761,12 +2720,14 @@ def predictive_ingresses():
                 else:
                     t_exact = _refine_zero_brent(f, ta, tb, fa, fb, tol_days=1e-6)
 
-                n_exact = E.one(t_exact, body)
-                if n_exact is None:
+                lon_exact = E.one(t_exact, body)
+                if lon_exact is None:
                     continue
-                from_sign = s_prev
-                to_sign = _sign_idx(n_exact)
 
+                from_sign = s_prev
+                to_sign = _sign_idx(lon_exact)
+
+                # Dedupe (per sec & edge)
                 bucket = int(math.floor(t_exact * 86400.0 + 0.5))
                 key = (body, bucket, int(edge_deg))
                 if key in dedupe:
@@ -2778,10 +2739,10 @@ def predictive_ingresses():
                     "body": body,
                     "from_sign": int(from_sign),
                     "to_sign": int(to_sign),
-                    "longitude_deg": float(n_exact),
+                    "longitude_deg": float(lon_exact),
                 })
 
-            # slide window
+            # Slide window
             t0 = t1
             l0 = l1
             s0 = {k: _sign_idx(v) for k, v in l0.items()}
@@ -2804,7 +2765,7 @@ def predictive_ingresses():
             "results": events,
         })
         resp.status_code = 200
-        resp.headers["X-Compute-Time-ms"] = f"{(time.perf_counter() - t_wall)*1000:.0f}"
+        resp.headers["X-Compute-Time-ms"] = f"{(time.perf_counter() - t_wall) * 1000:.0f}"
         resp.headers["X-Adapter-Calls"] = str(int(E.calls))
         return resp
 
@@ -2815,650 +2776,6 @@ def predictive_ingresses():
     finally:
         _give_gate()
 
-# ───────────────────────── /predictive/stations ─────────────────────────
-@api.post("/api/predictive/stations")
-@rate_limit(RL_PREDICTIVE)
-def predictive_stations():
-    try:
-        body = request.get_json(force=True) or {}
-    except Exception as e:
-        return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
-
-    if not _take_gate():
-        return _busy()
-    t_wall = time.perf_counter()
-
-    try:
-        # ── window ────────────────────────────────────────────────────────────
-        try:
-            jd0, jd1 = _parse_time_range_like(body)
-        except ValidationError as e:
-            return _json_error("validation_error", e.errors(), 400)
-        except Exception as e:
-            return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
-
-        # ── inputs ───────────────────────────────────────────────────────────
-        raw_movers = body.get("movers") or ["Mercury","Venus","Mars","Jupiter","Saturn","Uranus","Neptune","Pluto"]
-        movers = [str(m).strip() for m in raw_movers if m and str(m).strip()]
-        if not movers:
-            return _json_error("validation_error", [{"msg": "movers cannot be empty"}], 400)
-
-        frame = parse_frame(body.get("frame"))
-        shared_adapter = get_shared_adapter(frame)
-
-        obs = dict(
-            topocentric=bool(body.get("topocentric")),
-            latitude=(float(body["latitude"]) if isinstance(body.get("latitude"), (int, float)) else None),
-            longitude=(float(body["longitude"]) if isinstance(body.get("longitude"), (int, float)) else None),
-            elevation_m=(float(body["elevation_m"]) if isinstance(body.get("elevation_m"), (int, float)) else None),
-        )
-
-        zodiac_mode = (body.get("zodiac_mode") or "tropical").lower()
-        ayanamsa_deg = float(body.get("ayanamsa_deg", 0.0))
-        sidereal = zodiac_mode.startswith("sidereal")
-        ay = float(ayanamsa_deg if sidereal else 0.0)
-
-        step_arg = _parse_step_minutes(body.get("step_minutes"), default_min=60.0)
-
-        # ── helpers ──────────────────────────────────────────────────────────
-        TAU = 360.0
-
-        def _norm360(x: float) -> float:
-            r = x % TAU
-            return r + TAU if r < 0.0 else r
-
-        def _wrap180(x: float) -> float:
-            v = ((x + 180.0) % 360.0) - 180.0
-            return 180.0 if v == -180.0 else v
-
-        def _nir(lon_trop: float) -> float:
-            return _norm360(float(lon_trop) - ay)
-
-        # per-request caches
-        lon_cache: dict[tuple[str, float], float] = {}   # (body, round(jd,6))
-        spd_cache: dict[tuple[str, float, float], float] = {}  # (body, round(jd,6), h)
-
-        def _k(jd: float) -> float:
-            # ~0.0864 s bucket
-            return round(float(jd), 6)
-
-        def _lon_map(jd_tt: float, names: list[str]) -> dict[str, float]:
-            rows = shared_adapter.ecliptic_longitudes(jd_tt, names, **obs).get("results", [])
-            out: dict[str, float] = {}
-            for row in rows or []:
-                nm = row["name"]
-                lon = float(row["longitude"])
-                if sidereal:
-                    lon = _nir(lon)
-                out[nm] = lon
-                lon_cache[(nm, _k(jd_tt))] = lon
-            return out
-
-        def _lon_one(jd_tt: float, body: str) -> float | None:
-            kk = (body, _k(jd_tt))
-            if kk in lon_cache:
-                return lon_cache[kk]
-            rows = shared_adapter.ecliptic_longitudes(jd_tt, [body], **obs).get("results", [])
-            if not rows:
-                return None
-            lon = float(rows[0]["longitude"])
-            if sidereal:
-                lon = _nir(lon)
-            lon_cache[kk] = lon
-            return lon
-
-        def _auto_step_minutes(names: list[str]) -> float:
-            # Stations are slow; coarser is fine; refinement finds exact t
-            caps = []
-            for m in names:
-                n = (m or "").lower()
-                if n in ("mercury", "venus"): caps.append(90)   # inner planets: still coarse; refine later
-                elif n in ("mars",):           caps.append(180)
-                else:                          caps.append(360)
-            return float(max(30, min(caps) if caps else 180))
-
-        # central-difference speed (deg/day) with wrap
-        def _speed(body: str, t: float, h: float, lo: float, hi: float) -> float:
-            key = (body, _k(t), h)
-            if key in spd_cache:
-                return spd_cache[key]
-            t_m = max(lo, t - h); t_p = min(hi, t + h)
-            if t_p - t_m < 1e-9:  # widen a bit if degenerate
-                t_m = max(lo, t - 2*h); t_p = min(hi, t + 2*h)
-            la = _lon_one(t_m, body); lb = _lon_one(t_p, body)
-            if la is None or lb is None:
-                v = float("nan")
-            else:
-                diff = _wrap180(float(lb) - float(la))
-                dt = (t_p - t_m)
-                v = diff / dt if dt > 0.0 else float("nan")
-            spd_cache[key] = v
-            return v
-
-        # Quadratic (parabolic) refine using three samples around mid
-        def _refine_parabolic(body: str, a: float, b: float, h: float, lo: float, hi: float) -> float | None:
-            m = 0.5*(a+b)
-            # sample speeds at a, m, b
-            s_a = _speed(body, a, h, lo, hi)
-            s_m = _speed(body, m, h, lo, hi)
-            s_b = _speed(body, b, h, lo, hi)
-            if not (math.isfinite(s_a) and math.isfinite(s_m) and math.isfinite(s_b)):
-                return None
-            # fit parabola through (a,s_a), (m,s_m), (b,s_b)
-            # x' ∈ { -1,0,1 } after mapping t ∈ {a,m,b} to x' = (t - m)/(b-a)/0.5
-            # The vertex (zero) x0' = (s_a - s_b) / (2*(s_a - 2*s_m + s_b)) (if denom ≠ 0)
-            denom = (s_a - 2*s_m + s_b)
-            if abs(denom) < 1e-12:
-                return None
-            x0p = (s_a - s_b) / (2.0 * denom)
-            if -1.5 <= x0p <= 1.5:
-                t0 = m + x0p * (b - a) * 0.5
-                return max(lo, min(hi, t0))
-            return None
-
-        # Brent–Dekker fallback on s(t)
-        def _refine_zero_brent(body: str, a: float, b: float, fa: float, fb: float, *, h: float, lo: float, hi: float,
-                               max_iter=64, tol_days=1e-6) -> float | None:
-            if not (math.isfinite(fa) and math.isfinite(fb)):
-                return None
-            if fa == 0.0: return a
-            if fb == 0.0: return b
-            # ensure bracket by bisection if needed
-            if fa * fb > 0.0:
-                aa, bb = a, b
-                for _ in range(32):
-                    m = 0.5*(aa+bb)
-                    fm = _speed(body, m, h, lo, hi)
-                    if not math.isfinite(fm):
-                        break
-                    if fm == 0.0 or abs(bb-aa) <= tol_days:
-                        return m
-                    if fa * fm <= 0.0:
-                        bb, fb = m, fm
-                    else:
-                        aa, fa = m, fm
-                if fa * fb > 0.0:
-                    return None
-                a, b = aa, bb
-            c, fc = a, fa
-            d = e = b - a
-            for _ in range(max_iter):
-                if abs(fb) < abs(fa):
-                    a, b = b, a; fa, fb = fb, fa
-                m = 0.5*(a+b)
-                tol = tol_days
-                if abs(b-a) <= tol:
-                    return b
-                # inverse quadratic / secant
-                if fa != fc and fb != fc:
-                    s = (a*fb*fc)/((fa-fb)*(fa-fc)) + (b*fa*fc)/((fb-fa)*(fb-fc)) + (c*fa*fb)/((fc-fa)*(fc-fb))
-                else:
-                    s = b - fb*(b-a)/(fb-fa)
-                # acceptability checks; else bisection
-                cond = not ((3*a + b)/4 < s < b if a < b else b < s < (3*a + b)/4)
-                cond |= (e and abs(s-b) >= abs(e)/2)
-                cond |= (not e and abs(s-b) >= abs(d)/2)
-                cond |= (abs(e) < tol) or (abs(d) < tol)
-                if cond:
-                    s = m
-                    d = e = b - a
-                else:
-                    d, e = e, b - s
-                fs = _speed(body, s, h, lo, hi)
-                if not math.isfinite(fs):
-                    s = m; fs = _speed(body, s, h, lo, hi)
-                c, fc = a, fa
-                if (fa * fs) < 0:
-                    b, fb = s, fs
-                else:
-                    a, fa = s, fs
-                if abs(fa) < abs(fb):
-                    a, b = b, a; fa, fb = fb, fa
-            return b
-
-        # ── scan ──────────────────────────────────────────────────────────────
-        if isinstance(step_arg, str):
-            step_minutes = _auto_step_minutes(movers)
-        else:
-            step_minutes = float(step_arg) if float(step_arg) > 0.0 else _auto_step_minutes(movers)
-        dt = float(step_minutes) / (24.0 * 60.0)
-
-        # derivative half-stencil (tie to dt, clamp to ≤ 30m)
-        h = min(0.5*dt, 30.0/(24.0*60.0)) or (15.0/(24.0*60.0))
-
-        # warm caches at boundaries (batched)
-        _ = _lon_map(float(jd0), movers)
-        _ = _lon_map(float(jd1), movers)
-
-        events: list[dict[str, object]] = []
-        dedupe: set[tuple[str, int]] = set()
-
-        t = float(jd0)
-        while t < jd1 - 1e-12:
-            t_next = min(t + dt, jd1)
-            # warm at step endpoints (batched)
-            _ = _lon_map(t, movers)
-            _ = _lon_map(t_next, movers)
-
-            for body in movers:
-                s0 = _speed(body, t, h, jd0, jd1)
-                s1 = _speed(body, t_next, h, jd0, jd1)
-                if not (math.isfinite(s0) and math.isfinite(s1)):
-                    continue
-
-                # coarse detection: sign change or near zero at either end
-                if not ((s0 == 0.0) or (s1 == 0.0) or (s0*s1 < 0.0) or (min(abs(s0),abs(s1)) <= 0.05)):
-                    continue
-
-                # parabolic refine first (cheap), then Brent fallback
-                t_star = _refine_parabolic(body, t, t_next, h, jd0, jd1)
-                if t_star is None:
-                    t_star = _refine_zero_brent(body, t, t_next, s0, s1, h=h, lo=jd0, hi=jd1, tol_days=1e-6)
-                if t_star is None or not (t - 1e-9 <= t_star <= t_next + 1e-9):
-                    # fallback to minimum |s| among {t, mid, t_next}
-                    mid = 0.5*(t + t_next)
-                    sm = _speed(body, mid, h, jd0, jd1)
-                    if not math.isfinite(sm):
-                        continue
-                    t_star = min([(abs(s0), t), (abs(sm), mid), (abs(s1), t_next)], key=lambda x: x[0])[1]
-
-                lon_star = _lon_one(t_star, body)
-                if lon_star is None:
-                    continue
-
-                # determine SR / SD (direction change)
-                eps = max(1.0/(24.0*60.0), 0.25*h)  # ≥ 1 minute
-                sb = _speed(body, max(jd0, t_star - eps), h, jd0, jd1)
-                sa = _speed(body, min(jd1, t_star + eps), h, jd0, jd1)
-                kind, direction = "station", None
-                if math.isfinite(sb) and math.isfinite(sa):
-                    if sb > 0 and sa < 0:
-                        kind, direction = "SR", "retrograde"
-                    elif sb < 0 and sa > 0:
-                        kind, direction = "SD", "direct"
-
-                bucket = int(round(float(t_star) * 86400.0))
-                key = (body, bucket)
-                if key in dedupe:
-                    continue
-                dedupe.add(key)
-
-                events.append({
-                    "jd_tt": float(t_star),
-                    "body": body,
-                    "kind": kind,
-                    "direction": direction,
-                    "longitude_deg": float(lon_star),
-                    "speed_before_deg_per_day": float(sb) if math.isfinite(sb) else None,
-                    "speed_after_deg_per_day": float(sa) if math.isfinite(sa) else None,
-                })
-
-            t = t_next
-
-        events.sort(key=lambda e: (e["jd_tt"], e["body"]))
-        resp = jsonify({
-            "ok": True,
-            "window": {
-                "jd_start_tt": float(jd0),
-                "jd_end_tt": float(jd1),
-                "step_minutes": (step_minutes if not isinstance(step_arg, str) else "auto"),
-            },
-            "engine": {
-                "frame": frame,
-                "topocentric": bool(obs["topocentric"]),
-                "zodiac_mode": zodiac_mode,
-                "ayanamsa_deg": ayanamsa_deg,
-            },
-            "movers": movers,
-            "results": events,
-        })
-        resp.status_code = 200
-        resp.headers["X-Compute-Time-ms"] = f"{(time.perf_counter() - t_wall)*1000:.0f}"
-        return resp
-
-    except ValidationError as e:
-        return _json_error("validation_error", e.errors(), 400)
-    except Exception as e:
-        return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
-    finally:
-        _give_gate()
-
-
-@api.post("/api/predictive/evaluate")
-@rate_limit(RL_PREDICTIVE)
-def predictive_evaluate():
-    """
-    Univariate permutation test with optional time-series aware permutations.
-    """
-
-    # ── Local helpers ────────────────────────────────────────────────
-    PLANET_NORMALIZATION = {
-        'sun': 'Sun', 'Sun': 'Sun', 'SUN': 'Sun',
-        'moon': 'Moon', 'Moon': 'Moon', 'MOON': 'Moon',
-        'mercury': 'Mercury', 'Mercury': 'Mercury', 'MERCURY': 'Mercury',
-        'venus': 'Venus', 'Venus': 'Venus', 'VENUS': 'Venus',
-        'mars': 'Mars', 'Mars': 'Mars', 'MARS': 'Mars',
-        'jupiter': 'Jupiter', 'Jupiter': 'Jupiter', 'JUPITER': 'Jupiter',
-        'saturn': 'Saturn', 'Saturn': 'Saturn', 'SATURN': 'Saturn',
-        'uranus': 'Uranus', 'Uranus': 'Uranus', 'URANUS': 'Uranus',
-        'neptune': 'Neptune', 'Neptune': 'Neptune', 'NEPTUNE': 'Neptune',
-        'pluto': 'Pluto', 'Pluto': 'Pluto', 'PLUTO': 'Pluto',
-        'ascendant': 'Ascendant', 'Ascendant': 'Ascendant', 'ASCENDANT': 'Ascendant',
-        'mc': 'MC', 'MC': 'MC', 'midheaven': 'MC', 'Midheaven': 'MC', 'MIDHEAVEN': 'MC',
-    }
-
-    def dup_titlecase_and_lower(name: str, value):
-        canonical = PLANET_NORMALIZATION.get(name, name)
-        if canonical.islower():
-            canonical = canonical.capitalize()
-        return [(canonical, value), (canonical.lower(), value)]
-
-    def normalize_lons(lons: dict) -> dict:
-        out = {}
-        for k, v in (lons or {}).items():
-            for kk, vv in dup_titlecase_and_lower(str(k), v):
-                out[kk] = vv
-        return out
-
-    def normalize_records(records: list) -> list:
-        norm = []
-        for rec in records:
-            if not isinstance(rec, dict):
-                continue
-            r = dict(rec)
-            if "natal_longitudes" in r and isinstance(r["natal_longitudes"], dict):
-                r["natal_longitudes"] = normalize_lons(r["natal_longitudes"])
-            norm.append(r)
-        return norm
-
-    def normalize_movers(movers: list) -> list:
-        out = []
-        for m in (movers or []):
-            canonical = PLANET_NORMALIZATION.get(m, m)
-            if canonical.islower():
-                canonical = canonical.capitalize()
-            if canonical not in out:
-                out.append(canonical)
-        return out
-
-    def clamp_int(x, lo, hi, default):
-        try:
-            v = int(x)
-        except Exception:
-            v = default
-        return max(lo, min(hi, v))
-
-    # ── Body parsing ────────────────────────────────────────────────
-    try:
-        body = request.get_json(force=True) or {}
-    except Exception as e:
-        return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
-
-    recs = body.get("records") or []
-    if not (isinstance(recs, list) and recs):
-        return _json_error("validation_error", [{"loc": ["records"], "msg": "non-empty list required"}], 400)
-
-    normalized_recs = normalize_records(recs)
-
-    feature = str(body.get("feature") or "transit_proximity").lower()
-    perm_mode = str(body.get("perm_mode") or "iid").lower()
-    group_by = body.get("group_by")
-    alpha = float(body.get("alpha", 0.05))
-    n_perm = clamp_int(body.get("n_perm", 2000), 1, 10000, 2000)
-
-    from app.core import predictive as pred
-
-    # ── Feature selection ───────────────────────────────────────────
-    try:
-        if feature == "transit_proximity":
-            movers = normalize_movers(body.get("movers") or ["Sun", "Moon", "Mercury", "Venus", "Mars"])
-            orb_deg = float(body.get("orb_deg", 1.0))
-            ff = pred.feature_transit_proximity(movers=movers, orb_deg=orb_deg)
-
-        elif feature == "dasha_lords_onehot":
-            level = clamp_int(body.get("level", 1), 1, 3, 1)
-            ff = pred.feature_dasha_lords_onehot(level=level)
-
-        elif feature.startswith("dasha_l") and len(feature) == 8 and feature[7].isdigit():
-            level = clamp_int(feature[7], 1, 3, 1)
-            ff = pred.feature_dasha_lords_onehot(level=level)
-
-        elif feature == "yoga_flags":
-            names = body.get("yoga_names") or ["panch_mahapurusha", "gajakesari", "chandra_mangal", "parivartana"]
-            ff = pred.feature_yoga_flags(names)
-
-        elif feature == "angular_houses":
-            return _json_error("validation_error", [{"loc": ["feature"], "msg": "angular_houses feature not implemented"}], 400)
-
-        else:
-            return _json_error("validation_error", [{"loc": ["feature"], "msg": "unknown feature"}], 400)
-
-    except Exception as e:
-        return _json_error("validation_error", [{"loc": ["feature"], "msg": str(e)}], 400)
-
-    # ── Run evaluation ──────────────────────────────────────────────
-    try:
-        res = pred.evaluate_univariate(
-            normalized_recs, ff,
-            n_perm=n_perm, alpha=alpha,
-            perm_mode=perm_mode, group_by=group_by,
-            use_time=bool(body.get("use_time", True)),
-            seed=body.get("seed")
-        )
-        return jsonify({"ok": True, "results": [getattr(r, "__dict__", r) for r in res]}), 200
-    except Exception as e:
-        return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
-
-@api.post("/api/predictive/holdout")
-@rate_limit(RL_PREDICTIVE)
-def predictive_holdout():
-    """Train/holdout replication with the same feature menu as /evaluate."""
-
-    # ── Local helpers (same as above) ───────────────────────────────
-    PLANET_NORMALIZATION = {
-        'sun': 'Sun', 'Sun': 'Sun', 'SUN': 'Sun',
-        'moon': 'Moon', 'Moon': 'Moon', 'MOON': 'Moon',
-        'mercury': 'Mercury', 'Mercury': 'Mercury', 'MERCURY': 'Mercury',
-        'venus': 'Venus', 'Venus': 'Venus', 'VENUS': 'Venus',
-        'mars': 'Mars', 'Mars': 'Mars', 'MARS': 'Mars',
-        'jupiter': 'Jupiter', 'Jupiter': 'Jupiter', 'JUPITER': 'Jupiter',
-        'saturn': 'Saturn', 'Saturn': 'Saturn', 'SATURN': 'Saturn',
-        'uranus': 'Uranus', 'Uranus': 'Uranus', 'URANUS': 'Uranus',
-        'neptune': 'Neptune', 'Neptune': 'Neptune', 'NEPTUNE': 'Neptune',
-        'pluto': 'Pluto', 'Pluto': 'Pluto', 'PLUTO': 'Pluto',
-        'ascendant': 'Ascendant', 'Ascendant': 'Ascendant', 'ASCENDANT': 'Ascendant',
-        'mc': 'MC', 'MC': 'MC', 'midheaven': 'MC', 'Midheaven': 'MC', 'MIDHEAVEN': 'MC',
-    }
-
-    def dup_titlecase_and_lower(name: str, value):
-        canonical = PLANET_NORMALIZATION.get(name, name)
-        if canonical.islower():
-            canonical = canonical.capitalize()
-        return [(canonical, value), (canonical.lower(), value)]
-
-    def normalize_lons(lons: dict) -> dict:
-        out = {}
-        for k, v in (lons or {}).items():
-            for kk, vv in dup_titlecase_and_lower(str(k), v):
-                out[kk] = vv
-        return out
-
-    def normalize_records(records: list) -> list:
-        norm = []
-        for rec in records:
-            if not isinstance(rec, dict):
-                continue
-            r = dict(rec)
-            if "natal_longitudes" in r and isinstance(r["natal_longitudes"], dict):
-                r["natal_longitudes"] = normalize_lons(r["natal_longitudes"])
-            norm.append(r)
-        return norm
-
-    def normalize_movers(movers: list) -> list:
-        out = []
-        for m in (movers or []):
-            canonical = PLANET_NORMALIZATION.get(m, m)
-            if canonical.islower():
-                canonical = canonical.capitalize()
-            if canonical not in out:
-                out.append(canonical)
-        return out
-
-    def clamp_int(x, lo, hi, default):
-        try:
-            v = int(x)
-        except Exception:
-            v = default
-        return max(lo, min(hi, v))
-
-    # ── Body parsing ────────────────────────────────────────────────
-    try:
-        body = request.get_json(force=True) or {}
-    except Exception as e:
-        return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
-
-    recs = body.get("records") or []
-    if not (isinstance(recs, list) and recs):
-        return _json_error("validation_error", [{"loc": ["records"], "msg": "non-empty list required"}], 400)
-
-    normalized_recs = normalize_records(recs)
-
-    feature = str(body.get("feature") or "transit_proximity").lower()
-    perm_mode = str(body.get("perm_mode") or "iid").lower()
-    group_by = body.get("group_by")
-
-    from app.core import predictive as pred
-
-    # ── Feature selection ───────────────────────────────────────────
-    try:
-        if feature == "transit_proximity":
-            movers = normalize_movers(body.get("movers") or ["Sun", "Moon", "Mercury", "Venus", "Mars"])
-            orb_deg = float(body.get("orb_deg", 1.0))
-            ff = pred.feature_transit_proximity(movers=movers, orb_deg=orb_deg)
-
-        elif feature == "dasha_lords_onehot":
-            level = clamp_int(body.get("level", 1), 1, 3, 1)
-            ff = pred.feature_dasha_lords_onehot(level=level)
-
-        elif feature.startswith("dasha_l") and len(feature) == 8 and feature[7].isdigit():
-            level = clamp_int(feature[7], 1, 3, 1)
-            ff = pred.feature_dasha_lords_onehot(level=level)
-
-        elif feature == "yoga_flags":
-            names = body.get("yoga_names") or ["panch_mahapurusha", "gajakesari", "chandra_mangal", "parivartana"]
-            ff = pred.feature_yoga_flags(names)
-
-        elif feature == "angular_houses":
-            return _json_error("validation_error", [{"loc": ["feature"], "msg": "angular_houses feature not implemented"}], 400)
-
-        else:
-            return _json_error("validation_error", [{"loc": ["feature"], "msg": "unknown feature"}], 400)
-
-    except Exception as e:
-        return _json_error("validation_error", [{"loc": ["feature"], "msg": str(e)}], 400)
-
-    # ── Params ──────────────────────────────────────────────────────
-    train_frac = float(body.get("train_frac", 0.7))
-    if not (0.05 <= train_frac <= 0.95):
-        train_frac = 0.7
-    alpha = float(body.get("alpha", 0.05))
-    n_perm_train = clamp_int(body.get("n_perm_train", 2000), 1, 10000, 2000)
-    n_perm_test = clamp_int(body.get("n_perm_test", 4000), 1, 20000, 4000)
-
-    # ── Run holdout ─────────────────────────────────────────────────
-    try:
-        res = pred.holdout_replicate(
-            normalized_recs, ff,
-            train_frac=train_frac,
-            alpha=alpha,
-            n_perm_train=n_perm_train,
-            n_perm_test=n_perm_test,
-            perm_mode=perm_mode, group_by=group_by,
-            use_time=bool(body.get("use_time", True)),
-            seed=body.get("seed"),
-        )
-        return jsonify({"ok": True, **res}), 200
-    except Exception as e:
-        return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
-
-@api.post("/api/predictive/dasha")
-@rate_limit(RL_PREDICTIVE)
-def predictive_dasha():
-    try:
-        body = request.get_json(force=True) or {}
-        from app.core import predictive as pred
-        # Accept direct jd_tt or resolve from civil
-        if isinstance(body.get("birth_jd_tt"), (int,float)):
-            birth_jd_tt = float(body["birth_jd_tt"])
-        else:
-            tz = body.get("place_tz") or body.get("timezone") or "UTC"
-            ts = _compute_timescales_from_local(body["birth_date"], body["birth_time"], tz, payload=body)
-            birth_jd_tt = float(ts["jd_tt"])
-        moon_lon_tropical = float(body["moon_lon_tropical_deg"])
-        ay = float(body.get("ayanamsa_deg", 0.0))
-        levels = int(body.get("levels", 3))
-        span_years = float(body.get("span_years", 120.0))
-        res = pred.vimsottari_dasha(
-            birth_jd_tt=birth_jd_tt,
-            moon_lon_tropical_deg=moon_lon_tropical,
-            ayanamsa_deg=ay, levels=levels, span_years=span_years
-        )
-        return jsonify({"ok": True, "results": [r.__dict__ for r in res]}), 200
-    except ValidationError as e:
-        return _json_error("validation_error", e.errors(), 400)
-    except Exception as e:
-        return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
-
-
-@api.post("/api/predictive/vargas")
-@rate_limit(RL_PREDICTIVE)
-def predictive_vargas():
-    try:
-        body = request.get_json(force=True) or {}
-        from app.core import predictive as pred
-        pts = body.get("points_deg") or {}
-        pts2: Dict[str, float] = {}
-        for k, v in pts.items():
-            try:
-                pts2[str(k)] = _wrap360(float(v))
-            except Exception:
-                pass
-        if not pts2:
-            return _json_error("validation_error", [{"loc":["points_deg"],"msg":"empty/invalid"}], 400)
-        mode = (body.get("zodiac_mode") or "sidereal").lower()
-        ay = float(body.get("ayanamsa_deg", 0.0))
-        include = body.get("include") or ["D1","D2","D3","D9","D10","D12"]
-        res = pred.compute_vargas(points_deg=pts2, zodiac_mode=("sidereal" if mode.startswith("sid") else "tropical"), ayanamsa_deg=ay, include=include)
-        return jsonify({"ok": True, "results": res}), 200
-    except Exception as e:
-        return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
-
-
-@api.post("/api/predictive/yogas")
-@rate_limit(RL_PREDICTIVE)
-def predictive_yogas():
-    try:
-        body = request.get_json(force=True) or {}
-        from app.core import predictive as pred
-        pts = body.get("points_deg") or {}
-        cusps = body.get("cusps_deg") or []
-        pts2: Dict[str, float] = {}
-        for k, v in pts.items():
-            try:
-                pts2[str(k)] = _wrap360(float(v))
-            except Exception:
-                pass
-        cusps2: List[float] = []
-        for x in cusps:
-            if isinstance(x, (int,float)): cusps2.append(_wrap360(float(x)))
-        if not pts2 or len(cusps2) != 12:
-            return _json_error("validation_error", [{"loc":["points_deg|cusps_deg"],"msg":"need points and 12 cusps"}], 400)
-        include = body.get("include") or ["panch_mahapurusha","gajakesari","chandra_mangal","parivartana"]
-        res = pred.detect_yogas(points_deg=pts2, cusps_deg=cusps2, include=include, orbs=body.get("orbs") or {})
-        return jsonify({"ok": True, "results": res}), 200
-    except Exception as e:
-        return _json_error("predictive_internal", str(e) if DEBUG_VERBOSE else "internal_error", 500)
-
         
 # ───────────────────────── PROGRESSIONS ─────────────────────────
 @api.post("/api/progressions")
@@ -3466,34 +2783,34 @@ def predictive_yogas():
 def progressions_route():
     """
     Progressions: secondary / minor / tertiary.
-    Validates payload, normalizes aliases, fills natal JDs if missing,
-    filters kwargs to the engine's signature, and returns enriched meta.
 
-    Notes:
-    - Adds numeric epoch scalars for determinism checks:
-        * epoch_seconds  (jd_tt * 86400)
-        * epoch_jd_tt    (jd_tt)
-      and returns these alongside the original epoch object under `epoch_detail`.
-      For compatibility with external test suites expecting a number in `epoch`,
-      we set `epoch` to `epoch_seconds` when available.
-    - Adds mover/target/aspect aliases in `aspects_to_natal` so schema-agnostic
-      loggers can display readable samples.
+    • Validates payload and normalizes options.
+    • Fills missing natal JDs from civil datetime + tz (ERFA-aligned).
+    • Filters kwargs to the engine signature to avoid TypeErrors.
+    • Returns enriched meta and deterministic epoch scalars:
+        - epoch_seconds (jd_tt * 86400)
+        - epoch_jd_tt   (jd_tt)
+      For back-compat with suites expecting a number in `epoch`, we set
+      `epoch` to `epoch_seconds` and provide the original object in `epoch_detail`.
+    • Adds mover/target/aspect aliases in `aspects_to_natal` for schema-agnostic loggers.
     """
     from dataclasses import is_dataclass, asdict
-    from flask import request, jsonify, make_response
     from time import perf_counter
+    from flask import request, jsonify, make_response
+    from typing import Any, Dict, Optional, Tuple, List
+    import inspect
 
     if compute_progressions is None:
         return _json_error("progressions_unavailable", "progressions engine not wired", 501)
 
-    # ---------- helpers: normalize any TimeScales objects to plain dicts ----------
+    # ---------- helpers --------------------------------------------------------
     def _timescales_to_dict(ts_obj: Any) -> Optional[Dict[str, Any]]:
-        # Already dict-like?
+        """Best-effort normalize a TimeScales-like object into a plain dict."""
         if isinstance(ts_obj, dict):
             return ts_obj
-        # Our canonical type
+        # Canonical type (import locally to avoid hard import at module load)
         try:
-            from app.core.timescales import TimeScales as _TS  # local import
+            from app.core.timescales import TimeScales as _TS  # type: ignore
             if isinstance(ts_obj, _TS):
                 return {
                     "jd_utc": float(ts_obj.jd_utc),
@@ -3508,22 +2825,22 @@ def progressions_route():
                 }
         except Exception:
             pass
-        # Dataclass fallback
+        # Generic dataclass
         try:
             if is_dataclass(ts_obj):
                 return asdict(ts_obj)  # type: ignore[arg-type]
         except Exception:
             pass
-        # __dict__ fallback
+        # Plain __dict__
         try:
             if hasattr(ts_obj, "__dict__"):
                 return dict(ts_obj.__dict__)
         except Exception:
             pass
-        return None  # unknown shape
+        return None
 
-    def _strip_or_fix_timescales(container: Any) -> Any:
-        """Return a shallow-copied dict with any *.timescales normalized or removed."""
+    def _strip_or_fix_timescales_shallow(container: Any) -> Any:
+        """Normalize/strip 'timescales' in a shallow dict (no recursion)."""
         if not isinstance(container, dict):
             return container
         out = dict(container)
@@ -3531,14 +2848,59 @@ def progressions_route():
             if key in out:
                 fixed = _timescales_to_dict(out[key])
                 if fixed is None:
-                    out.pop(key, None)     # drop unrecognized object to avoid engine errors
+                    out.pop(key, None)
                 else:
                     out[key] = fixed
         return out
 
+    def _deep_clean(obj: Any) -> Any:
+        """Recursively drop/normalize any nested TimeScales-like objects."""
+        if isinstance(obj, dict):
+            cleaned: Dict[str, Any] = {}
+            for k, v in obj.items():
+                if k in ("timescales", "ts", "TimeScales"):
+                    tv = _timescales_to_dict(v)
+                    if tv is not None:
+                        cleaned[k] = tv
+                    # else drop unknown TS object
+                else:
+                    cleaned[k] = _deep_clean(v)
+            return cleaned
+        if isinstance(obj, list):
+            return [_deep_clean(v) for v in obj]
+        if isinstance(obj, tuple):
+            return tuple(_deep_clean(v) for v in obj)
+        return obj
+
+    def _epoch_scalars(epoch_obj: Any) -> Tuple[Optional[float], Optional[float]]:
+        """(epoch_jd_tt, epoch_seconds) if available; else (None, None)."""
+        try:
+            jd_tt = float((epoch_obj or {}).get("jd_tt"))
+            return jd_tt, jd_tt * 86400.0
+        except Exception:
+            return None, None
+
+    def _augment_aspects(lst: Any) -> Any:
+        """Add friendly aliases to aspects_to_natal items."""
+        if not isinstance(lst, list):
+            return lst
+        out: List[Dict[str, Any]] = []
+        for a in lst:
+            if not isinstance(a, dict):
+                out.append(a)
+                continue
+            b = dict(a)
+            b.setdefault("mover_name", b.get("prog"))
+            b.setdefault("target_name", b.get("natal"))
+            b.setdefault("aspect", b.get("type"))
+            if "orb_deg" not in b and isinstance(b.get("orb"), (int, float)):
+                b["orb_deg"] = float(b["orb"])
+            out.append(b)
+        return out
+
     t0 = perf_counter()
 
-    # ---- parse & validate body ------------------------------------------------
+    # ---------- parse & validate body -----------------------------------------
     try:
         body = request.get_json(force=True) or {}
         payload = parse_progressions_payload(body)
@@ -3547,13 +2909,13 @@ def progressions_route():
     except Exception as e:
         return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
 
-    # ---- sanitize nested dicts that may carry TimeScales -----------------------
-    natal_clean  = _strip_or_fix_timescales(payload.get("natal")  or {})
-    target_clean = _strip_or_fix_timescales(payload.get("target") or {})
-    place_clean  = _strip_or_fix_timescales(payload.get("place")  or {})
+    # ---------- sanitize shallow nested dicts ---------------------------------
+    natal_clean  = _strip_or_fix_timescales_shallow(payload.get("natal")  or {})
+    target_clean = _strip_or_fix_timescales_shallow(payload.get("target") or {})
+    place_clean  = _strip_or_fix_timescales_shallow(payload.get("place")  or {})
 
-    # ---- seed kwargs from payload --------------------------------------------
-    kwargs = {
+    # ---------- assemble kwargs (defaults + payload) ---------------------------
+    kwargs: Dict[str, Any] = {
         "natal": natal_clean,
         "method": payload.get("method", "secondary"),
         "target": (target_clean or None) if isinstance(payload.get("target"), dict) and target_clean else None,
@@ -3575,18 +2937,18 @@ def progressions_route():
         "validation": payload.get("validation", "basic"),
     }
 
-    # ---- merge nested flags (if client sent payload.flags) --------------------
-    f = payload.get("flags")
-    if isinstance(f, dict):
-        if "aspects_to_natal" in f:
-            kwargs["aspects_to_natal"] = bool(kwargs.get("aspects_to_natal") or f.get("aspects_to_natal", False))
+    # ---------- merge nested flags (payload.flags) -----------------------------
+    flags = payload.get("flags")
+    if isinstance(flags, dict):
+        if "aspects_to_natal" in flags:
+            kwargs["aspects_to_natal"] = bool(kwargs.get("aspects_to_natal") or flags.get("aspects_to_natal", False))
         for k in ("parallels", "antiscia", "profile"):
-            if k in f:
-                kwargs[k] = bool(kwargs.get(k) or f.get(k, False))
-        if "orbs" in f and kwargs.get("orbs") is None and isinstance(f["orbs"], dict):
-            kwargs["orbs"] = f["orbs"]
+            if k in flags:
+                kwargs[k] = bool(kwargs.get(k) or flags.get(k, False))
+        if "orbs" in flags and kwargs.get("orbs") is None and isinstance(flags["orbs"], dict):
+            kwargs["orbs"] = flags["orbs"]
 
-    # ---- fill natal timescales if not provided --------------------------------
+    # ---------- fill natal timescales if missing -------------------------------
     try:
         if (kwargs.get("jd_tt_natal") is None or kwargs.get("jd_ut1_natal") is None) and isinstance(kwargs["natal"], dict):
             nat = kwargs["natal"]
@@ -3600,26 +2962,20 @@ def progressions_route():
     except Exception as e:
         if DEBUG_VERBOSE:
             return _json_error("timescales_error", {"type": type(e).__name__, "message": str(e)}, 400)
-        pass
 
-    # ---- filter to engine signature & map aliases -----------------------------
+    # ---------- deep clean payload to avoid TS objects sneaking in -------------
+    cleaned_kwargs = _deep_clean(kwargs)
+
+    # ---------- filter to engine signature & map aliases -----------------------
     try:
-        import inspect
         engine_params = set(inspect.signature(compute_progressions).parameters.keys())
-
-        # drop any accidental TimeScales again if user nested them deeper
-        def _deep_clean(obj: Any) -> Any:
-            if isinstance(obj, dict):
-                return {k: _deep_clean(v) if k not in ("timescales", "ts", "TimeScales") else _timescales_to_dict(v) or None
-                        for k, v in obj.items() if (k not in ("timescales", "ts", "TimeScales")) or (_timescales_to_dict(v) is not None)}
-            return obj
-
-        cleaned_kwargs = {k: _deep_clean(v) for k, v in kwargs.items()}
         safe_kwargs = {k: v for k, v in cleaned_kwargs.items() if k in engine_params}
 
+        # Map 'zodiac_mode' → 'mode' if engine expects 'mode'
         if "mode" in engine_params and "mode" not in safe_kwargs and "zodiac_mode" in cleaned_kwargs:
             safe_kwargs["mode"] = cleaned_kwargs["zodiac_mode"]
 
+        # prune explicit Nones (except for fields that legitimately use None)
         for k in list(safe_kwargs.keys()):
             if safe_kwargs[k] is None and k not in ("years_after", "target"):
                 safe_kwargs.pop(k, None)
@@ -3627,9 +2983,9 @@ def progressions_route():
         det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
         return _json_error("progressions_internal", det or "internal_error", 500)
 
-    # ---- call engine ----------------------------------------------------------
+    # ---------- call engine ----------------------------------------------------
     try:
-        result = compute_progressions(**safe_kwargs)
+        result = compute_progressions(**safe_kwargs)  # expected to return a dict
     except ValueError as e:
         return _json_error("progressions_value_error", str(e), 400)
     except RuntimeError as e:
@@ -3642,51 +2998,24 @@ def progressions_route():
         det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
         return _json_error("progressions_internal", det or "internal_error", 500)
 
-    # ---- meta enrichment (adapter snapshot) -----------------------------------
+    # ---------- enrich meta (ephemeris snapshot) -------------------------------
     meta = dict(result.get("meta") or {})
     try:
         meta.update(_snapshot_ephemeris_meta(meta))
     except Exception:
         pass
 
-    # ---- compat helpers --------------------------------------------------------
-    def _epoch_scalars(ep: Any) -> Tuple[Optional[float], Optional[float]]:
-        """Return (epoch_jd_tt, epoch_seconds) if available, else (None, None)."""
-        try:
-            jd_tt = float((ep or {}).get("jd_tt"))
-            return jd_tt, jd_tt * 86400.0
-        except Exception:
-            return None, None
-
-    def _augment_aspects(lst: Any) -> Any:
-        """Add common aliases so generic loggers can display names/orbs."""
-        if not isinstance(lst, list):
-            return lst
-        out = []
-        for a in lst:
-            if not isinstance(a, dict):
-                out.append(a); continue
-            b = dict(a)
-            b.setdefault("mover_name", b.get("prog"))
-            b.setdefault("target_name", b.get("natal"))
-            b.setdefault("aspect", b.get("type"))
-            if "orb_deg" not in b and "orb" in b and isinstance(b["orb"], (int, float)):
-                b["orb_deg"] = float(b["orb"])
-            out.append(b)
-        return out
-
+    # ---------- epoch scalars & aspects aliases --------------------------------
     epoch_obj = result.get("epoch") or {}
     epoch_jd_tt, epoch_seconds = _epoch_scalars(epoch_obj)
-
     aspects_out = _augment_aspects(result.get("aspects_to_natal") or [])
 
-    # ---- response -------------------------------------------------------------
-    resp_body = {
+    # ---------- response --------------------------------------------------------
+    body_out = {
         "ok": True,
         "mapping": (meta.get("mapping") if isinstance(meta.get("mapping"), dict) else None),
         "meta": meta,
-        "warnings": list((meta.get("warnings") or [])),
-        # Provide numeric epoch for determinism tests; keep full object under epoch_detail.
+        "warnings": list(meta.get("warnings") or []),
         "epoch": (epoch_seconds if epoch_seconds is not None else epoch_obj),
         "epoch_detail": (epoch_obj if epoch_seconds is not None else None),
         "epoch_seconds": epoch_seconds,
@@ -3696,231 +3025,229 @@ def progressions_route():
         "aspects_to_natal": aspects_out,
     }
 
-    resp = make_response(jsonify(resp_body), 200)
+    resp = make_response(jsonify(body_out), 200)
     try:
         resp.headers["X-Compute-Time-ms"] = str(int((perf_counter() - t0) * 1000))
     except Exception:
         pass
     return resp
 
-# ───────────────────────── RETURNS (rewritten) ─────────────────────────
+# ───────────────────────── RETURNS (clean rewrite) ─────────────────────────
+from typing import Any, Dict, List, Optional, Tuple
+
 def _returns_pick_fn(kind: str) -> Optional[Any]:
     """
-    Choose a function from the returns module based on intent.
-    For 'compute': prefer one-shot compute fn; for 'scan': prefer window scanner.
+    Pick a callable from the loaded returns module for the given intent.
+    kind: "compute" | "scan"
     """
     if not _returns_available():
         return None
 
-    candidates: list[str] = []
     if kind == "compute":
-        candidates = [
-            # primary / canonical
-            "compute_return",
-            # common alternates seen in legacy modules
+        names = (
+            "compute_return",               # canonical
             "run_return_api", "calculate_return", "compute_returns",
-            "solar_return", "lunar_return",
-        ]
+            "solar_return", "lunar_return", # legacy alternates
+        )
     elif kind == "scan":
-        candidates = ["scan_returns", "find_returns", "scan", "search_returns"]
+        names = ("scan_returns", "find_returns", "scan", "search_returns")
+    else:
+        return None
 
-    for name in candidates:
-        fn = getattr(_returns_mod, name, None)
+    for n in names:
+        fn = getattr(_returns_mod, n, None)
         if callable(fn):
             return fn
     return None
 
+
 def _parse_return_kind(raw: Any) -> str:
-    """Parse and validate return kind with strict validation."""
+    """Normalize/validate kind → 'solar'|'lunar' (supports common aliases)."""
     s = str(raw or "").strip().lower()
     if not s:
         return "solar"
-    
-    # Valid kinds only
-    valid_kinds = {"solar", "lunar", "sun", "moon", "sol", "lun"}
-    if s not in valid_kinds:
-        raise ValidationError([{"loc": ["kind"], "msg": f"must be 'solar' or 'lunar', got '{s}'", "type": "value_error"}])
-    
-    alias = {
-        "sun": "solar", "sol": "solar",
-        "moon": "lunar", "lun": "lunar",
-    }
-    return alias.get(s, s)
+    valid = {"solar", "lunar", "sun", "sol", "moon", "lun"}
+    if s not in valid:
+        raise ValidationError([{
+            "loc": ["kind"],
+            "msg": f"must be 'solar' or 'lunar', got '{s}'",
+            "type": "value_error",
+        }])
+    return {"sun": "solar", "sol": "solar", "moon": "lunar", "lun": "lunar"}.get(s, s)
+
 
 def _normalize_window(body: Dict[str, Any], default_days: float = 30.0) -> Tuple[Optional[float], Optional[float]]:
-    """Return (jd_start_tt, jd_end_tt) if resolvable from body; else (None, None)."""
-    jd0 = body.get("jd_start_tt")
-    jd1 = body.get("jd_end_tt")
+    """
+    Resolve a [jd_start_tt, jd_end_tt] from body. Falls back to civil window.
+    Returns (None, None) if the window cannot be resolved.
+    """
+    # Direct JDs
+    jd0, jd1 = body.get("jd_start_tt"), body.get("jd_end_tt")
     if isinstance(jd0, (int, float)) and isinstance(jd1, (int, float)):
         try:
-            jd0f = float(jd0); jd1f = float(jd1)
-            if jd1f > jd0f:
-                return jd0f, jd1f
+            a, b = float(jd0), float(jd1)
+            if b > a:
+                return a, b
         except Exception:
             pass
 
-    # Civil window
+    # Civil fields
     date0 = body.get("date_start") or body.get("start_date")
     time0 = body.get("time_start") or "00:00:00"
     date1 = body.get("date_end") or body.get("end_date")
     time1 = body.get("time_end") or "23:59:59"
-    tz = body.get("tz") or body.get("place_tz") or body.get("timezone")
+    tz    = body.get("tz") or body.get("place_tz") or body.get("timezone")
 
     if isinstance(date0, str) and isinstance(time0, str) and isinstance(tz, str):
         try:
             ts0 = _compute_timescales_from_local(date0, time0, tz, payload=body)
-            jd0f = float(ts0["jd_tt"])
+            a = float(ts0["jd_tt"])
             if isinstance(date1, str) and isinstance(time1, str):
                 ts1 = _compute_timescales_from_local(date1, time1, tz, payload=body)
-                jd1f = float(ts1["jd_tt"])
-                if jd1f > jd0f:
-                    return jd0f, jd1f
+                b = float(ts1["jd_tt"])
+                if b > a:
+                    return a, b
             else:
-                return jd0f, jd0f + float(default_days)
+                return a, a + float(default_days)
         except Exception:
             pass
 
     return None, None
 
+
 def _build_returns_kwargs(body: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[List[Dict[str, Any]]]]:
     """
-    Route-friendly builder for returns engines.
-    - Validates minimal natal fields with strict validation
-    - Fills jd_tt_natal / jd_ut1_natal if missing
-    - Normalizes frame/zodiac/house
-    - Derives topocentric from coords
-    - Computes optional scan window (jd_start_tt / jd_end_tt)
+    Construct kwargs for the returns engine with strict, friendly validation.
+
+    Ensures:
+      • natal.{date,time,place_tz} present (unless jd_* provided)
+      • jd_tt_natal / jd_ut1_natal filled when possible
+      • frame/zodiac/house normalized
+      • topocentric derived from coordinates if present
+      • optional scan window (jd_start_tt / jd_end_tt)
     """
     errs: List[Dict[str, Any]] = []
 
-    # natal (required)
+    # natal (required object)
     natal = body.get("natal") or {}
     if not isinstance(natal, dict):
         errs.append({"loc": ["natal"], "msg": "required object", "type": "value_error"})
         natal = {}
 
-    # natal essentials (only enforced here to be helpful; engine can still handle strict JDs)
-    date = natal.get("date"); time_s = natal.get("time")
+    date = natal.get("date")
+    time_s = natal.get("time")
     tz = natal.get("place_tz") or natal.get("tz") or natal.get("timezone")
-    if not (isinstance(date, str) and isinstance(time_s, str) and isinstance(tz, str)):
-        errs.append({"loc": ["natal.date|time|place_tz"], "msg": "required strings", "type": "value_error"})
 
-    # frame / zodiac / house / ayanamsa
+    # frame (validated via parse_frame)
     try:
         frame = parse_frame(body.get("frame"))
     except ValidationError as e:
         return {}, e.errors()
-    
+
+    # zodiac mode
     zodiac_mode = (body.get("zodiac_mode") or body.get("mode") or "tropical").strip().lower()
     if zodiac_mode not in ("tropical", "sidereal"):
         errs.append({"loc": ["zodiac_mode"], "msg": "must be 'tropical' or 'sidereal'", "type": "value_error"})
-    
+
+    # house system
     house_system = (body.get("house_system") or "placidus").strip().lower()
-    
-    ay = body.get("ayanamsa_deg")
-    ay_f = None
+
+    # ayanamsa
+    ay_f: Optional[float] = None
     try:
-        if isinstance(ay, (int, float)):
-            ay_f = float(ay)
-        elif ay is not None:
-            ay_f = float(str(ay))
+        ay_raw = body.get("ayanamsa_deg")
+        if isinstance(ay_raw, (int, float)):
+            ay_f = float(ay_raw)
+        elif ay_raw is not None:
+            ay_f = float(str(ay_raw))
     except Exception:
         errs.append({"loc": ["ayanamsa_deg"], "msg": "must be a number", "type": "type_error.float"})
 
-    # return kind with validation
+    # kind
     try:
         kind = _parse_return_kind(body.get("kind") or body.get("type") or body.get("planet"))
     except ValidationError as e:
         errs.extend(e.errors())
-        kind = "solar"  # fallback
+        kind = "solar"
 
-    # natal strict timescales (fill if missing)
+    # natal JDs (fill from civil when possible)
     jd_tt_natal = body.get("jd_tt_natal")
     jd_ut1_natal = body.get("jd_ut1_natal")
-    try:
-        if isinstance(date, str) and isinstance(time_s, str) and isinstance(tz, str):
-            ts_nat = _compute_timescales_from_local(date, time_s, tz, payload=natal)
-            if not isinstance(jd_tt_natal, (int, float)):
-                jd_tt_natal = float(ts_nat["jd_tt"])
-            if not isinstance(jd_ut1_natal, (int, float)):
-                jd_ut1_natal = float(ts_nat["jd_ut1"])
-    except ValidationError as e:
-        errs.extend(e.errors())
-    except Exception as e:
-        errs.append({"loc": ["natal"], "msg": f"timescale computation failed: {str(e)}", "type": "value_error"})
 
-    # Additional return parameters
+    if not (isinstance(jd_tt_natal, (int, float)) and isinstance(jd_ut1_natal, (int, float))):
+        # require civil fields to compute them
+        if not (isinstance(date, str) and isinstance(time_s, str) and isinstance(tz, str)):
+            errs.append({
+                "loc": ["natal.date|time|place_tz"],
+                "msg": "required strings (or provide jd_tt_natal & jd_ut1_natal)",
+                "type": "value_error",
+            })
+        else:
+            try:
+                ts_nat = _compute_timescales_from_local(date, time_s, tz, payload=natal)
+                jd_tt_natal  = float(ts_nat["jd_tt"])  if not isinstance(jd_tt_natal, (int, float)) else float(jd_tt_natal)
+                jd_ut1_natal = float(ts_nat["jd_ut1"]) if not isinstance(jd_ut1_natal, (int, float)) else float(jd_ut1_natal)
+            except ValidationError as e:
+                errs.extend(e.errors())
+            except Exception as e:
+                errs.append({"loc": ["natal"], "msg": f"timescale computation failed: {e}", "type": "value_error"})
+
+    # optional place
     place = body.get("place")
     if isinstance(place, dict):
         try:
-            la = float(place["latitude"]); lo = float(place["longitude"])
+            la = float(place["latitude"])
+            lo = float(place["longitude"])
             place = {"latitude": la, "longitude": lo, "elev_m": float(place.get("elev_m", 0.0))}
         except Exception:
             place = None
     else:
         place = None
 
+    # topocentric?
     def _has_coords(d: Dict[str, Any]) -> bool:
-        try:
-            return isinstance(d.get("latitude"), (int, float)) and isinstance(d.get("longitude"), (int, float))
-        except Exception:
-            return False
+        return isinstance(d.get("latitude"), (int, float)) and isinstance(d.get("longitude"), (int, float))
 
     topocentric = bool(body.get("topocentric")) or _has_coords(natal) or _has_coords(place or {})
 
+    # window
     try:
         jd0, jd1 = _normalize_window(body)
     except ValidationError as e:
         errs.extend(e.errors())
         jd0 = jd1 = None
 
-    # Additional solver & validation knobs with validation
-    try:
-        tol_arcmin = float(body.get("tol_arcmin", 1.0))
-        if tol_arcmin <= 0:
-            errs.append({"loc": ["tol_arcmin"], "msg": "must be positive", "type": "value_error"})
-    except (ValueError, TypeError):
-        errs.append({"loc": ["tol_arcmin"], "msg": "must be a number", "type": "type_error.float"})
-        tol_arcmin = 1.0
+    # numeric knobs
+    def _num(key: str, cast, default, positive=False, int_type=False) -> Any:
+        try:
+            v = cast(body.get(key, default))
+            if positive and v <= 0:
+                raise ValueError
+            return v
+        except Exception:
+            errs.append({"loc": [key], "msg": f"must be a {'positive ' if positive else ''}{'integer' if int_type else 'number'}",
+                         "type": f"type_error.{'int' if int_type else 'float'}"})
+            return default
 
-    try:
-        max_iters = int(body.get("max_iters", 12))
-        if max_iters < 1:
-            errs.append({"loc": ["max_iters"], "msg": "must be >= 1", "type": "value_error"})
-    except (ValueError, TypeError):
-        errs.append({"loc": ["max_iters"], "msg": "must be an integer", "type": "type_error.int"})
-        max_iters = 12
+    tol_arcmin             = _num("tol_arcmin", float, 1.0, positive=True)
+    max_iters              = _num("max_iters", int,   12,   positive=True, int_type=True)
+    fd_step_minutes        = _num("fd_step_minutes", float, 2.0, positive=True)
+    validation_residual_am = _num("validation_residual_arcmin", float, 1.0, positive=True)
 
+    # misc toggles
     estimate_uncertainty = bool(body.get("estimate_uncertainty", True))
-    
-    try:
-        fd_step_minutes = float(body.get("fd_step_minutes", 2.0))
-        if fd_step_minutes <= 0:
-            errs.append({"loc": ["fd_step_minutes"], "msg": "must be positive", "type": "value_error"})
-    except (ValueError, TypeError):
-        errs.append({"loc": ["fd_step_minutes"], "msg": "must be a number", "type": "type_error.float"})
-        fd_step_minutes = 2.0
-
-    profile = bool(body.get("profile", False))
-    
-    validation = (body.get("validation") or "basic").strip().lower()
+    profile              = bool(body.get("profile", False))
+    validation           = (body.get("validation") or "basic").strip().lower()
     if validation not in ("none", "basic", "extended"):
         errs.append({"loc": ["validation"], "msg": "must be 'none', 'basic', or 'extended'", "type": "value_error"})
         validation = "basic"
 
-    try:
-        validation_residual_arcmin = float(body.get("validation_residual_arcmin", 1.0))
-        if validation_residual_arcmin <= 0:
-            errs.append({"loc": ["validation_residual_arcmin"], "msg": "must be positive", "type": "value_error"})
-    except (ValueError, TypeError):
-        errs.append({"loc": ["validation_residual_arcmin"], "msg": "must be a number", "type": "type_error.float"})
-        validation_residual_arcmin = 1.0
-
+    # hints
     guess_years_offset = body.get("guess_years_offset")
     if guess_years_offset is not None:
         try:
             guess_years_offset = int(guess_years_offset)
-        except (ValueError, TypeError):
+        except Exception:
             errs.append({"loc": ["guess_years_offset"], "msg": "must be an integer", "type": "type_error.int"})
             guess_years_offset = None
 
@@ -3928,15 +3255,17 @@ def _build_returns_kwargs(body: Dict[str, Any]) -> Tuple[Dict[str, Any], Optiona
     if around_jd_tt is not None:
         try:
             around_jd_tt = float(around_jd_tt)
-        except (ValueError, TypeError):
+        except Exception:
             errs.append({"loc": ["around_jd_tt"], "msg": "must be a number", "type": "type_error.float"})
             around_jd_tt = None
 
+    # aspects config
     orbs = body.get("orbs") if isinstance(body.get("orbs"), dict) else None
     aspects_to_natal = bool(body.get("aspects_to_natal", True))
     parallels = bool(body.get("parallels", False))
-    antiscia = bool(body.get("antiscia", False))
+    antiscia  = bool(body.get("antiscia", False))
 
+    # lunar month
     lunar_month = (body.get("lunar_month") or "sidereal").strip().lower()
     if lunar_month not in ("sidereal", "synodic"):
         errs.append({"loc": ["lunar_month"], "msg": "must be 'sidereal' or 'synodic'", "type": "value_error"})
@@ -3954,7 +3283,7 @@ def _build_returns_kwargs(body: Dict[str, Any]) -> Tuple[Dict[str, Any], Optiona
         "frame": frame,
         "house_system": house_system,
         "zodiac_mode": zodiac_mode,
-        "ayanamsa_deg": ay_f if ay_f is not None else 0.0,  # Default to 0.0 instead of None
+        "ayanamsa_deg": (ay_f if ay_f is not None else 0.0),
         "lunar_month": lunar_month,
         "guess_years_offset": guess_years_offset,
         "around_jd_tt": around_jd_tt,
@@ -3964,7 +3293,7 @@ def _build_returns_kwargs(body: Dict[str, Any]) -> Tuple[Dict[str, Any], Optiona
         "fd_step_minutes": fd_step_minutes,
         "profile": profile,
         "validation": validation,
-        "validation_residual_arcmin": validation_residual_arcmin,
+        "validation_residual_arcmin": validation_residual_am,
         "aspects_to_natal": aspects_to_natal,
         "parallels": parallels,
         "antiscia": antiscia,
@@ -3974,29 +3303,29 @@ def _build_returns_kwargs(body: Dict[str, Any]) -> Tuple[Dict[str, Any], Optiona
         "topocentric": topocentric,
     }
 
-    # prune explicit None (except window which can be None safely)
+    # prune explicit None (except allowed window/hints/orbs/place)
     for k in list(kwargs.keys()):
-        if kwargs[k] is None and k not in ("jd_start_tt", "jd_end_tt", "guess_years_offset", "around_jd_tt", "orbs", "place"):
+        if kwargs[k] is None and k not in {"jd_start_tt", "jd_end_tt", "guess_years_offset", "around_jd_tt", "orbs", "place"}:
             kwargs.pop(k, None)
 
     return kwargs, None
 
+
 def _returns_enrich_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
-    m = dict(meta or {})
+    out = dict(meta or {})
     try:
-        m.update(_snapshot_ephemeris_meta(m))
+        out.update(_snapshot_ephemeris_meta(out))
     except Exception:
         pass
-    return m
+    return out
+
+
+# ───────────────────────── Routes ─────────────────────────
 
 @api.post("/api/return")
 @rate_limit(RL_RETURNS)
 def returns_compute_route():
-    """
-    Compute a single return (solar/lunar).
-
-    Body: see README; tolerant to extra fields.
-    """
+    """Compute a single solar/lunar return."""
     if not _returns_available():
         det = {"import_error": repr(_RETURNS_IMPORT_ERROR)} if DEBUG_VERBOSE and _RETURNS_IMPORT_ERROR else None
         return _json_error("returns_unavailable", det or "returns engine not wired", 501)
@@ -4010,12 +3339,12 @@ def returns_compute_route():
     if errs:
         return _json_error("validation_error", errs, 400)
 
-    compute_fn = _returns_pick_fn("compute")
-    if not callable(compute_fn):
+    fn = _returns_pick_fn("compute")
+    if not callable(fn):
         return _json_error("returns_unavailable", "no compute function exported by return(s) module", 501)
 
     try:
-        result = compute_fn(**kwargs)  # type: ignore[misc]
+        result = fn(**kwargs)  # type: ignore[misc]
     except ValueError as e:
         return _json_error("returns_value_error", str(e), 400)
     except TypeError as e:
@@ -4028,43 +3357,27 @@ def returns_compute_route():
         det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
         return _json_error("returns_internal", det or "internal_error", 500)
 
-    # FIXED: Better response normalization with error handling
     if not isinstance(result, dict):
         return _json_error("returns_internal", "invalid result format from compute function", 500)
 
-    # Check if the result indicates an error
+    # Engine-level error passthrough
     if not result.get("ok", True):
-        error_details = result.get("details", {})
-        error_message = result.get("error", "computation_failed")
-        
-        if DEBUG_VERBOSE:
-            det = {"result": result, "error_details": error_details}
-        else:
-            det = None
-            
-        return _json_error(error_message, det, 500)
+        det = {"result": result, "error_details": result.get("details", {})} if DEBUG_VERBOSE else None
+        return _json_error(result.get("error", "computation_failed"), det, 500)
 
-    # normalize response structure
     meta = _returns_enrich_meta(result.get("meta") or {})
     event = result.get("event") or {}
-    
-    # FIXED: Ensure event has required structure
     if not isinstance(event, dict):
         return _json_error("returns_internal", "invalid event structure", 500)
 
-    # FIXED: Better epoch handling
+    # epoch (tolerant)
     epoch = None
-    if isinstance(event, dict) and ("jd_tt" in event or "jd_ut1" in event):
+    if any(k in event for k in ("jd_tt", "jd_ut1")):
         try:
-            epoch = {
-                "jd_tt": float(event.get("jd_tt", 0)),
-                "jd_ut1": float(event.get("jd_ut1", 0))
-            }
-        except (ValueError, TypeError):
-            # Don't fail the whole request for epoch formatting issues
+            epoch = {"jd_tt": float(event.get("jd_tt", 0.0)), "jd_ut1": float(event.get("jd_ut1", 0.0))}
+        except Exception:
             epoch = None
 
-    # FIXED: Validate positions structure
     positions = result.get("positions")
     if positions is not None and not isinstance(positions, dict):
         positions = None
@@ -4081,17 +3394,18 @@ def returns_compute_route():
     }
     return jsonify(resp), 200
 
+
 @api.post("/api/return/scan")
 @rate_limit(RL_RETURNS)
 def returns_scan_route():
     """
-    Scan a time window for return events (e.g., all lunar returns in a month).
+    Scan a window for return events (e.g., all lunar returns in a month).
 
     Body:
       natal: { date, time, place_tz, latitude?, longitude? }
-      kind|type|planet: "solar"|"lunar"|...
+      kind|type|planet: "solar" | "lunar"
       jd_start_tt & jd_end_tt (preferred) OR date_start/time_start/date_end/time_end (+ tz)
-      frame, zodiac_mode, house_system, place, etc.
+      frame, zodiac_mode, house_system, place, …
     """
     if not _returns_available():
         det = {"import_error": repr(_RETURNS_IMPORT_ERROR)} if DEBUG_VERBOSE and _RETURNS_IMPORT_ERROR else None
@@ -4106,17 +3420,16 @@ def returns_scan_route():
     if errs:
         return _json_error("validation_error", errs, 400)
 
-    # ensure we have a real window
-    jd0 = kwargs.get("jd_start_tt"); jd1 = kwargs.get("jd_end_tt")
+    jd0, jd1 = kwargs.get("jd_start_tt"), kwargs.get("jd_end_tt")
     if not (isinstance(jd0, (int, float)) and isinstance(jd1, (int, float)) and jd1 > jd0):
         return _json_error("validation_error", [{"loc": ["jd_start_tt|date_start"], "msg": "window required"}], 400)
 
-    scan_fn = _returns_pick_fn("scan")
-    if not callable(scan_fn):
+    fn = _returns_pick_fn("scan")
+    if not callable(fn):
         return _json_error("returns_unavailable", "no scan function exported by return(s) module", 501)
 
     try:
-        results = scan_fn(**kwargs)  # type: ignore[misc]
+        results = fn(**kwargs)  # type: ignore[misc]
     except ValueError as e:
         return _json_error("returns_value_error", str(e), 400)
     except TypeError as e:
@@ -4129,7 +3442,7 @@ def returns_scan_route():
         det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
         return _json_error("returns_internal", det or "internal_error", 500)
 
-    # FIXED: Better results handling
+    # Normalize results shape
     meta: Dict[str, Any] = {}
     if isinstance(results, dict):
         meta = _returns_enrich_meta(results.get("meta") or {})
@@ -4146,9 +3459,10 @@ def returns_scan_route():
         "results": res_list,
         "meta": meta,
     }), 200
+
     
 
-# ───────────────────────── PARANS ─────────────────────────
+# ───────────────────────── PARANS (clean rewrite) ─────────────────────────
 
 @api.post("/api/parans")
 @rate_limit(RL_PARANS)
@@ -4156,76 +3470,71 @@ def parans_route():
     from time import perf_counter
     t0 = perf_counter()
 
+    # Engine availability
     if _parans_compute is None:
         det = {"import_error": repr(_PARANS_IMPORT_ERROR)} if DEBUG_VERBOSE and _PARANS_IMPORT_ERROR else None
         return _json_error("parans_unavailable", det or "parans engine not wired", 501)
 
-    # ---------- parse payload ----------
+    # ---------- Parse & validate payload ----------
     try:
         body = request.get_json(force=True) or {}
         payload = parse_parans_payload(body)
     except ValidationError as e:
         errs = e.errors()
 
-        def _norm_loc(loc):
-            # loc can be "place.latitude", ["place","latitude"], ["place.latitude"], etc.
+        # Map coordinate-style validation errors to a friendlier code
+        def _norm_loc(loc) -> list[str]:
             if loc is None:
                 return []
             if isinstance(loc, (list, tuple)):
-                parts = []
+                parts: list[str] = []
                 for x in loc:
-                    s = str(x)
-                    parts.extend(s.split("."))  # split dotted entries too
-                return [p.strip() for p in parts if p is not None and str(p).strip()]
+                    parts.extend(str(x).split("."))
+                return [p.strip() for p in parts if str(p).strip()]
             return [p.strip() for p in str(loc).split(".") if p.strip()]
 
-        def _is_coord_error(details):
-            for d in details:
+        def _is_coord_error(details: list[dict]) -> bool:
+            for d in details or []:
                 loc_parts = [s.lower() for s in _norm_loc(d.get("loc"))]
                 dot = ".".join(loc_parts)
                 msg = (str(d.get("msg", "")) or "").lower()
                 typ = (str(d.get("type", "")) or "").lower()
-
-                # hit if any of these are true:
                 if (
-                    # explicit locs
                     dot in ("place.latitude", "place.longitude")
-                    or (len(loc_parts) >= 2 and loc_parts[0] == "place" and loc_parts[1] in ("latitude","longitude"))
+                    or (len(loc_parts) >= 2 and loc_parts[0] == "place" and loc_parts[1] in {"latitude", "longitude"})
                     or ("latitude" in loc_parts) or ("longitude" in loc_parts)
-                    # message mentions lat/lon
                     or ("latitude" in msg) or ("longitude" in msg)
-                    # type complaints for numbers on place fields
                     or (("float" in typ or "number" in msg) and ("place" in loc_parts or dot.startswith("place")))
                 ):
                     return True
             return False
 
-        # Map all coordinate issues to parans_value_error
-        if _is_coord_error(errs):
-            return _json_error("parans_value_error", errs, 400)
-
-        # everything else stays as generic validation_error
-        return _json_error("validation_error", errs, 400)
+        return (
+            _json_error("parans_value_error", errs, 400)
+            if _is_coord_error(errs)
+            else _json_error("validation_error", errs, 400)
+        )
     except Exception as e:
         return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
 
-    # ---------- resolve timescales if strict not provided ----------
+    # ---------- Resolve reference timescales if needed ----------
     subject = payload.get("subject") or {}
-    place = payload.get("place") or {}
+    place   = payload.get("place") or {}
 
-    jd_tt_ref = payload.get("jd_tt_ref")
+    jd_tt_ref  = payload.get("jd_tt_ref")
     jd_ut1_ref = payload.get("jd_ut1_ref")
+
     if jd_tt_ref is None or jd_ut1_ref is None:
         try:
             ts = _compute_timescales_from_local(subject["date"], subject["time"], subject["place_tz"], payload=subject)
-            jd_tt_ref = float(ts["jd_tt"])
+            jd_tt_ref  = float(ts["jd_tt"])
             jd_ut1_ref = float(ts["jd_ut1"])
         except ValidationError as e:
             return _json_error("validation_error", e.errors(), 400)
         except Exception as e:
             return _json_error("timescales_error", str(e) if DEBUG_VERBOSE else None, 400)
 
-    # ---------- call engine ----------
+    # ---------- Build call kwargs (filter to engine signature) ----------
     paran_kwargs = {
         "subject": subject,
         "place": place,
@@ -4234,16 +3543,16 @@ def parans_route():
         "frame": payload.get("frame", "ecliptic-of-date"),
         "zodiac_mode": payload.get("zodiac_mode", "tropical"),
         "ayanamsa_deg": payload.get("ayanamsa_deg", 0.0),
-        "bodies": tuple(payload.get("bodies", ("Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn","Uranus","Neptune","Pluto"))),
-        "tolerance_minutes": payload.get("tolerance_minutes", 4.0),
-        "search_window_days": payload.get("search_window_days", 1.0),
-        "max_iters": payload.get("max_iters", 10),
-        "fd_step_minutes": payload.get("fd_step_minutes", 2.0),
+        "bodies": tuple(payload.get("bodies", ("Sun", "Moon", "Mercury", "Venus", "Mars", "Jupiter", "Saturn", "Uranus", "Neptune", "Pluto"))),
+        "tolerance_minutes": float(payload.get("tolerance_minutes", 4.0)),
+        "search_window_days": float(payload.get("search_window_days", 1.0)),
+        "max_iters": int(payload.get("max_iters", 10)),
+        "fd_step_minutes": float(payload.get("fd_step_minutes", 2.0)),
         "earth_model": payload.get("earth_model", "spherical"),
-        "apply_refraction": payload.get("apply_refraction", False),
-        "pressure_hPa": payload.get("pressure_hPa", 1010.0),
-        "temperature_C": payload.get("temperature_C", 10.0),
-        "profile": payload.get("profile", False),
+        "apply_refraction": bool(payload.get("apply_refraction", False)),
+        "pressure_hPa": float(payload.get("pressure_hPa", 1010.0)),
+        "temperature_C": float(payload.get("temperature_C", 10.0)),
+        "profile": bool(payload.get("profile", False)),
         "validation": payload.get("validation", "basic"),
     }
 
@@ -4252,8 +3561,10 @@ def parans_route():
         sig = inspect.signature(_parans_compute)
         paran_kwargs = {k: v for k, v in paran_kwargs.items() if k in sig.parameters}
     except Exception:
+        # If reflection fails, just pass the conservative set above.
         pass
 
+    # ---------- Run engine ----------
     try:
         result = _parans_compute(**paran_kwargs)
     except ValueError as e:
@@ -4265,15 +3576,15 @@ def parans_route():
         det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
         return _json_error("parans_internal", det or "internal_error", 500)
 
-    # ---------- normalize engine result ----------
+    # ---------- Normalize engine result ----------
     if not isinstance(result, dict) or not result.get("ok", False):
         details = result.get("details") if isinstance(result, dict) else None
         etype = result.get("error", "parans_failed") if isinstance(result, dict) else "parans_failed"
-        if etype in ("validation_error", "timescales_error", "parans_calculation_failed", "parans_value_error"):
+        if etype in {"validation_error", "timescales_error", "parans_calculation_failed", "parans_value_error"}:
             return _json_error(etype, details, 400)
         return _json_error("parans_internal", details if DEBUG_VERBOSE else None, 500)
 
-    meta = dict(result.get("meta", {}))
+    meta = dict(result.get("meta") or {})
     try:
         meta.update(_snapshot_ephemeris_meta(meta))
     except Exception:
@@ -4291,30 +3602,22 @@ def parans_route():
     return jsonify(resp), 200, {"X-Compute-Time-ms": f"{ms:.0f}"}
 
 
-# ───────────────────────── SYNASTRY & COMPOSITE (DIAGNOSTIC VERSION) ─────────────────────────
+# ───────────────────────── SYNASTRY & COMPOSITE (clean) ─────────────────────────
+
 @api.post("/api/synastry")
 @rate_limit(RL_SYNASTRY)
 def synastry_route():
-    """
-    Compute synastry between two natal charts.
-    """
-    print("=== SYNASTRY ROUTE DEBUG ===")
-    
+    """Compute synastry between two natal charts."""
     if _synastry_compute is None:
-        print("ERROR: _synastry_compute is None")
         det = {"import_error": repr(_SYNASTRY_IMPORT_ERROR)} if DEBUG_VERBOSE and _SYNASTRY_IMPORT_ERROR else None
         return _json_error("synastry_unavailable", det or "synastry engine not wired", 501)
 
     try:
         body = request.get_json(force=True) or {}
-        print(f"Raw request body: {body}")
         payload = parse_synastry_payload(body)
-        print(f"Parsed payload: {payload}")
     except ValidationError as e:
-        print(f"Validation error: {e.errors()}")
         return _json_error("validation_error", e.errors(), 400)
     except Exception as e:
-        print(f"Parse exception: {type(e).__name__}: {e}")
         return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
 
     # Build arguments for synastry computation
@@ -4328,74 +3631,40 @@ def synastry_route():
         "parallels": payload.get("parallels", True),
         "antiscia": payload.get("antiscia", True),
     }
-
-    # Add optional fields
     for field in ("jd_tt_a", "jd_ut1_a", "jd_tt_b", "jd_ut1_b", "place_a", "place_b", "orbs"):
         if field in payload:
             synastry_kwargs[field] = payload[field]
-            print(f"Added optional field: {field} = {payload[field]}")
 
-    print(f"Built synastry_kwargs: {list(synastry_kwargs.keys())}")
-
-    # Check function signature
+    # Filter to function signature if needed
     try:
         import inspect
         sig = inspect.signature(_synastry_compute)
-        synastry_params = set(sig.parameters.keys())
-        print(f"Function accepts parameters: {synastry_params}")
-        
-        # Check for **kwargs
-        has_kwargs = any(param.kind == param.VAR_KEYWORD for param in sig.parameters.values())
-        print(f"Function has **kwargs: {has_kwargs}")
-        
-        if has_kwargs:
-            filtered_kwargs = synastry_kwargs
-            print("Using all parameters (function has **kwargs)")
-        else:
-            filtered_kwargs = {k: v for k, v in synastry_kwargs.items() if k in synastry_params}
-            filtered_out = set(synastry_kwargs.keys()) - synastry_params
-            if filtered_out:
-                print(f"FILTERED OUT: {filtered_out}")
-            print(f"Final parameters: {list(filtered_kwargs.keys())}")
-            
-    except Exception as e:
-        print(f"Signature inspection failed: {e}")
+        params = set(sig.parameters.keys())
+        has_kwargs = any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())
+        filtered_kwargs = synastry_kwargs if has_kwargs else {k: v for k, v in synastry_kwargs.items() if k in params}
+    except Exception:
         filtered_kwargs = synastry_kwargs
 
-    # Call synastry computation
-    print(f"Calling _synastry_compute with: {list(filtered_kwargs.keys())}")
+    # Compute
     try:
         result = _synastry_compute(**filtered_kwargs)
-        print(f"Compute succeeded. Result keys: {list(result.keys()) if isinstance(result, dict) else type(result)}")
-        
-        # Check result structure
-        if isinstance(result, dict):
-            if 'aspects' in result:
-                aspect_count = sum(len(v) if isinstance(v, list) else 0 for v in result['aspects'].values())
-                print(f"Found {aspect_count} aspects")
-            if 'scores' in result:
-                print(f"Scores: {result['scores']}")
-        
     except ValueError as e:
-        print(f"ValueError in compute: {e}")
         return _json_error("synastry_value_error", str(e), 400)
     except TypeError as e:
-        print(f"TypeError in compute: {e}")
         det = {"type": "TypeError", "message": str(e)} if DEBUG_VERBOSE else None
         return _json_error("synastry_internal", det or "internal_error", 500)
     except Exception as e:
-        print(f"Other exception in compute: {type(e).__name__}: {e}")
         det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
         return _json_error("synastry_internal", det or "internal_error", 500)
 
     # Enrich metadata
-    meta = dict(result.get("meta", {}))
+    meta = dict(result.get("meta", {}) or {})
     try:
         meta.update(_snapshot_ephemeris_meta(meta))
-    except Exception as e:
-        print(f"Meta enrichment failed: {e}")
+    except Exception:
+        pass
 
-    # Structure response
+    # Response
     resp = {
         "ok": True,
         "meta": meta,
@@ -4405,38 +3674,25 @@ def synastry_route():
         "scores": result.get("scores", {}),
         "warnings": list(meta.get("warnings", [])),
     }
-    
-    print(f"Final response structure: {list(resp.keys())}")
-    print("=== END SYNASTRY DEBUG ===")
-
     return jsonify(resp), 200
+
 
 @api.post("/api/composite")
 @rate_limit(RL_COMPOSITE)
 def composite_route():
-    """
-    Compute composite chart between two natal charts.
-    """
-    print("=== COMPOSITE ROUTE DEBUG ===")
-    
+    """Compute composite chart between two natal charts."""
     if _composite_compute is None:
-        print("ERROR: _composite_compute is None")
         det = {"import_error": repr(_SYNASTRY_IMPORT_ERROR)} if DEBUG_VERBOSE and _SYNASTRY_IMPORT_ERROR else None
         return _json_error("composite_unavailable", det or "composite engine not wired", 501)
 
     try:
         body = request.get_json(force=True) or {}
-        print(f"Raw request body: {body}")
         payload = parse_composite_payload(body)
-        print(f"Parsed payload: {payload}")
     except ValidationError as e:
-        print(f"Validation error: {e.errors()}")
         return _json_error("validation_error", e.errors(), 400)
     except Exception as e:
-        print(f"Parse exception: {type(e).__name__}: {e}")
         return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
 
-    # Build arguments
     composite_kwargs = {
         "natal_a": payload["natal_a"],
         "natal_b": payload["natal_b"],
@@ -4446,60 +3702,33 @@ def composite_route():
         "ayanamsa_deg": payload.get("ayanamsa_deg", 0.0),
         "zodiac_mode": payload.get("zodiac_mode", "tropical"),
     }
-
-    # Add optional fields
     for field in ("jd_tt_ref", "jd_ut1_ref", "place_ref"):
         if field in payload:
             composite_kwargs[field] = payload[field]
-            print(f"Added optional field: {field} = {payload[field]}")
 
-    print(f"Built composite_kwargs: {list(composite_kwargs.keys())}")
-
-    # Check function signature
     try:
         import inspect
         sig = inspect.signature(_composite_compute)
-        composite_params = set(sig.parameters.keys())
-        print(f"Function accepts parameters: {composite_params}")
-        
-        has_kwargs = any(param.kind == param.VAR_KEYWORD for param in sig.parameters.values())
-        print(f"Function has **kwargs: {has_kwargs}")
-        
-        if has_kwargs:
-            filtered_kwargs = composite_kwargs
-            print("Using all parameters (function has **kwargs)")
-        else:
-            filtered_kwargs = {k: v for k, v in composite_kwargs.items() if k in composite_params}
-            filtered_out = set(composite_kwargs.keys()) - composite_params
-            if filtered_out:
-                print(f"FILTERED OUT: {filtered_out}")
-            print(f"Final parameters: {list(filtered_kwargs.keys())}")
-            
-    except Exception as e:
-        print(f"Signature inspection failed: {e}")
+        params = set(sig.parameters.keys())
+        has_kwargs = any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())
+        filtered_kwargs = composite_kwargs if has_kwargs else {k: v for k, v in composite_kwargs.items() if k in params}
+    except Exception:
         filtered_kwargs = composite_kwargs
 
-    # Call composite computation
-    print(f"Calling _composite_compute with: {list(filtered_kwargs.keys())}")
     try:
         result = _composite_compute(**filtered_kwargs)
-        print(f"Compute succeeded. Result keys: {list(result.keys()) if isinstance(result, dict) else type(result)}")
     except ValueError as e:
-        print(f"ValueError in compute: {e}")
         return _json_error("composite_value_error", str(e), 400)
     except Exception as e:
-        print(f"Exception in compute: {type(e).__name__}: {e}")
         det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
         return _json_error("composite_internal", det or "internal_error", 500)
 
-    # Enrich metadata
-    meta = dict(result.get("meta", {}))
+    meta = dict(result.get("meta", {}) or {})
     try:
         meta.update(_snapshot_ephemeris_meta(meta))
-    except Exception as e:
-        print(f"Meta enrichment failed: {e}")
+    except Exception:
+        pass
 
-    # Structure response
     resp = {
         "ok": True,
         "meta": meta,
@@ -4509,39 +3738,25 @@ def composite_route():
         "mc": result.get("mc"),
         "cusps": result.get("cusps"),
     }
-    
-    print(f"Final response structure: {list(resp.keys())}")
-    print("=== END COMPOSITE DEBUG ===")
-
     return jsonify(resp), 200
 
-# Add the synastry/report route with similar debugging...
+
 @api.post("/api/synastry/report")
 @rate_limit(RL_SYNASTRY)
 def synastry_report_route():
-    """
-    Comprehensive synastry report (synastry + composite + metrics).
-    """
-    print("=== SYNASTRY REPORT DEBUG ===")
-    
+    """Comprehensive synastry report (synastry + composite + metrics)."""
     if _synastry_report_compute is None:
-        print("ERROR: _synastry_report_compute is None")
         det = {"import_error": repr(_SYNASTRY_IMPORT_ERROR)} if DEBUG_VERBOSE and _SYNASTRY_IMPORT_ERROR else None
         return _json_error("synastry_report_unavailable", det or "synastry report engine not wired", 501)
 
     try:
         body = request.get_json(force=True) or {}
-        print(f"Raw request body: {body}")
         payload = parse_synastry_report_payload(body)
-        print(f"Parsed payload keys: {list(payload.keys())}")
     except ValidationError as e:
-        print(f"Validation error: {e.errors()}")
         return _json_error("validation_error", e.errors(), 400)
     except Exception as e:
-        print(f"Parse exception: {type(e).__name__}: {e}")
         return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
 
-    # Build arguments
     report_kwargs = {
         "natal_a": payload["natal_a"],
         "natal_b": payload["natal_b"],
@@ -4553,43 +3768,24 @@ def synastry_report_route():
         "antiscia": payload.get("antiscia", True),
         "composite_method": payload.get("composite_method", "midpoint"),
     }
-
-    # Add optional fields
-    optional_fields = (
-        "jd_tt_a", "jd_ut1_a", "jd_tt_b", "jd_ut1_b", 
-        "place_a", "place_b", "orbs", "composite_place_ref"
-    )
-    for field in optional_fields:
+    for field in ("jd_tt_a", "jd_ut1_a", "jd_tt_b", "jd_ut1_b", "place_a", "place_b", "orbs", "composite_place_ref"):
         if field in payload:
             report_kwargs[field] = payload[field]
-            print(f"Added optional field: {field}")
 
-    print(f"Built report_kwargs: {list(report_kwargs.keys())}")
-
-    # No filtering for now - pass everything
-    filtered_kwargs = report_kwargs
-
-    # Call report computation
-    print(f"Calling _synastry_report_compute with: {list(filtered_kwargs.keys())}")
     try:
-        result = _synastry_report_compute(**filtered_kwargs)
-        print(f"Compute succeeded. Result keys: {list(result.keys()) if isinstance(result, dict) else type(result)}")
+        result = _synastry_report_compute(**report_kwargs)
     except ValueError as e:
-        print(f"ValueError in compute: {e}")
         return _json_error("synastry_report_value_error", str(e), 400)
     except Exception as e:
-        print(f"Exception in compute: {type(e).__name__}: {e}")
         det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
         return _json_error("synastry_report_internal", det or "internal_error", 500)
 
-    # Enrich metadata
-    meta = dict(result.get("meta", {}))
+    meta = dict(result.get("meta", {}) or {})
     try:
         meta.update(_snapshot_ephemeris_meta(meta))
     except Exception:
         pass
 
-    # Structure response
     resp = {
         "ok": True,
         "meta": meta,
@@ -4601,27 +3797,21 @@ def synastry_report_route():
         "metrics": result.get("metrics", {}),
         "warnings": list(meta.get("warnings", [])),
     }
-    
-    print(f"Final response structure: {list(resp.keys())}")
-    print("=== END SYNASTRY REPORT DEBUG ===")
-
     return jsonify(resp), 200
+
+
 # ───────────────────────── RELOCATION & ASTROCARTOGRAPHY ─────────────────────────
+
 @api.post("/api/relocation")
 @rate_limit(RL_RELOCATION)
 def relocation_route():
     """
-    Compute relocated chart for new location while preserving natal time.
-    
+    Relocate a natal chart to a new place while keeping the natal instant.
     Body:
       natal: { date, time, place_tz, latitude?, longitude?, elev_m? }
-      place_new: { latitude, longitude, elev_m? } # required new location
-      jd_tt_natal?, jd_ut1_natal?: strict timescales (optional)
-      frame?: "ecliptic-of-date" | "ecliptic-j2000"
-      house_system?: string
-      zodiac_mode?: "tropical" | "sidereal"
-      ayanamsa_deg?: float
-      topocentric_positions?: bool (default false - use geocentric positions)
+      place_new: { latitude, longitude, elev_m? }   # required
+      jd_tt_natal?, jd_ut1_natal?                   # optional strict timescales
+      frame?, house_system?, zodiac_mode?, ayanamsa_deg?, topocentric_positions?
     """
     if _compute_relocated is None:
         det = {"import_error": repr(_RELOCATION_IMPORT_ERROR)} if DEBUG_VERBOSE and _RELOCATION_IMPORT_ERROR else None
@@ -4635,8 +3825,7 @@ def relocation_route():
     except Exception as e:
         return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
 
-    # Build arguments for relocation computation
-    relocation_kwargs = {
+    args = {
         "natal": payload["natal"],
         "place_new": payload["place_new"],
         "frame": payload.get("frame", "ecliptic-of-date"),
@@ -4645,74 +3834,55 @@ def relocation_route():
         "ayanamsa_deg": payload.get("ayanamsa_deg", 0.0),
         "topocentric_positions": payload.get("topocentric_positions", False),
     }
+    for k in ("jd_tt_natal", "jd_ut1_natal"):
+        if k in payload:
+            args[k] = payload[k]
 
-    # Add optional strict timescales
-    for field in ("jd_tt_natal", "jd_ut1_natal"):
-        if field in payload:
-            relocation_kwargs[field] = payload[field]
-
-    # Filter arguments to match function signature
     try:
         import inspect
-        relocation_params = set(inspect.signature(_compute_relocated).parameters.keys())
-        filtered_kwargs = {k: v for k, v in relocation_kwargs.items() if k in relocation_params}
+        params = set(inspect.signature(_compute_relocated).parameters.keys())
+        args = {k: v for k, v in args.items() if k in params}
     except Exception:
-        filtered_kwargs = relocation_kwargs
+        pass
 
-    # Call relocation computation
     try:
-        result = _compute_relocated(**filtered_kwargs)
+        result = _compute_relocated(**args)
     except ValueError as e:
         return _json_error("relocation_value_error", str(e), 400)
-    except TypeError as e:
-        det = {"type": "TypeError", "message": str(e)} if DEBUG_VERBOSE else None
-        return _json_error("relocation_internal", det or "internal_error", 500)
-    except RuntimeError as e:
-        det = {"type": "RuntimeError", "message": str(e)} if DEBUG_VERBOSE else None
+    except (TypeError, RuntimeError) as e:
+        det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
         return _json_error("relocation_internal", det or "internal_error", 500)
     except Exception as e:
         det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
         return _json_error("relocation_internal", det or "internal_error", 500)
 
-    # Enrich metadata with ephemeris adapter info
-    meta = dict(result.get("meta", {}))
+    meta = dict(result.get("meta", {}) or {})
     try:
         meta.update(_snapshot_ephemeris_meta(meta))
     except Exception:
         pass
 
-    # Structure response
-    resp = {
+    return jsonify({
         "ok": True,
         "meta": meta,
         "positions": result.get("positions", {}),
         "houses": result.get("houses"),
         "axes": result.get("axes", {}),
         "warnings": list(meta.get("warnings", [])),
-    }
+    }), 200
 
-    return jsonify(resp), 200
 
 @api.post("/api/astrocartography")
 @rate_limit(RL_ASTROCARTOGRAPHY)
 def astrocartography_route():
     """
-    Compute astrocartography lines (MC/IC/ASC/DC) for selected bodies.
-    
+    Compute astrocartography lines (ASC/DC/MC/IC) for selected bodies.
     Body:
       natal: { date, time, place_tz, latitude?, longitude?, elev_m? }
-      jd_tt?, jd_ut1?: epoch timescales (optional, defaults to natal time)
-      frame?: "ecliptic-of-date" | "ecliptic-j2000"
-      zodiac_mode?: "tropical" | "sidereal"
-      ayanamsa_deg?: float
-      bodies?: ["Sun", "Moon", ...] # default: major planets
-      lon_step_deg?: float # longitude sampling step (default 1.0)
-      lat_clip_deg?: float # latitude clipping limit (default 89.5)
-      earth_model?: "spherical" | "wgs84" # Earth model for dip calculation
-      apply_refraction?: bool # Saemundsson atmospheric refraction
-      pressure_hPa?: float # atmospheric pressure for refraction
-      temperature_C?: float # temperature for refraction
-      default_elev_m?: float # default elevation when no DEM available
+      jd_tt?, jd_ut1? (optional epoch; defaults to natal time)
+      frame?, zodiac_mode?, ayanamsa_deg?, bodies?
+      lon_step_deg?, lat_clip_deg?, earth_model?, apply_refraction?,
+      pressure_hPa?, temperature_C?, default_elev_m?
     """
     if _compute_astrocartography is None:
         det = {"import_error": repr(_RELOCATION_IMPORT_ERROR)} if DEBUG_VERBOSE and _RELOCATION_IMPORT_ERROR else None
@@ -4726,13 +3896,12 @@ def astrocartography_route():
     except Exception as e:
         return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
 
-    # Build arguments for astrocartography computation
-    astro_kwargs = {
+    args = {
         "natal": payload["natal"],
         "frame": payload.get("frame", "ecliptic-of-date"),
         "zodiac_mode": payload.get("zodiac_mode", "tropical"),
         "ayanamsa_deg": payload.get("ayanamsa_deg", 0.0),
-        "bodies": tuple(payload.get("bodies", ["Sun", "Moon", "Mercury", "Venus", "Mars", "Jupiter", "Saturn", "Uranus", "Neptune", "Pluto"])),
+        "bodies": tuple(payload.get("bodies", ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn","Uranus","Neptune","Pluto"])),
         "lon_step_deg": payload.get("lon_step_deg", 1.0),
         "lat_clip_deg": payload.get("lat_clip_deg", 89.5),
         "earth_model": payload.get("earth_model", "spherical"),
@@ -4741,78 +3910,66 @@ def astrocartography_route():
         "temperature_C": payload.get("temperature_C", 10.0),
         "default_elev_m": payload.get("default_elev_m", 0.0),
     }
+    for k in ("jd_tt", "jd_ut1"):
+        if k in payload:
+            args[k] = payload[k]
 
-    # Add optional epoch timescales
-    for field in ("jd_tt", "jd_ut1"):
-        if field in payload:
-            astro_kwargs[field] = payload[field]
-
-    # Filter arguments to match function signature
     try:
         import inspect
-        astro_params = set(inspect.signature(_compute_astrocartography).parameters.keys())
-        filtered_kwargs = {k: v for k, v in astro_kwargs.items() if k in astro_params}
+        params = set(inspect.signature(_compute_astrocartography).parameters.keys())
+        args = {k: v for k, v in args.items() if k in params}
     except Exception:
-        filtered_kwargs = astro_kwargs
+        pass
 
-    # Call astrocartography computation
     try:
-        result = _compute_astrocartography(**filtered_kwargs)
+        result = _compute_astrocartography(**args)
     except ValueError as e:
         return _json_error("astrocartography_value_error", str(e), 400)
-    except TypeError as e:
-        det = {"type": "TypeError", "message": str(e)} if DEBUG_VERBOSE else None
-        return _json_error("astrocartography_internal", det or "internal_error", 500)
-    except RuntimeError as e:
-        det = {"type": "RuntimeError", "message": str(e)} if DEBUG_VERBOSE else None
+    except (TypeError, RuntimeError) as e:
+        det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
         return _json_error("astrocartography_internal", det or "internal_error", 500)
     except Exception as e:
         det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
         return _json_error("astrocartography_internal", det or "internal_error", 500)
 
-    # Enrich metadata with ephemeris adapter info
-    meta = dict(result.get("meta", {}))
+    meta = dict(result.get("meta", {}) or {})
     try:
         meta.update(_snapshot_ephemeris_meta(meta))
     except Exception:
         pass
 
-    # Structure response
-    resp = {
+    return jsonify({
         "ok": True,
         "meta": meta,
         "lines": result.get("lines", []),
         "warnings": list(meta.get("warnings", [])),
-    }
-
-    return jsonify(resp), 200
+    }), 200
 
 # ───────────────────────── DIRECTIONS ─────────────────────────
 @api.post("/api/directions")
 @rate_limit(RL_DIRECTIONS)
 def directions_route():
     """
-    Compute Solar-Arc directions (direct/converse) and detect hits to natal targets.
-    
+    Solar-Arc directions (direct/converse) with optional hit detection.
     Body:
       natal: { date, time, place_tz, latitude?, longitude?, elev_m?, mode? }
-      method?: "solar_arc" (only supported method currently)
-      rate?: "naibod" | "true_sun" (default: "naibod")
-      target?: { date, time, place_tz } # alternative to years_after
-      years_after?: float # alternative to target
-      jd_tt_natal?, jd_ut1_natal?: strict timescales (optional)
-      place?: { latitude, longitude, elev_m? } # place override for directions
+      method?: "solar_arc"                     (default)
+      rate?: "naibod" | "true_sun"            (default: "naibod")
+      target?: { date, time, place_tz }       # alt to years_after
+      years_after?: float                      # alt to target
+      jd_tt_natal?, jd_ut1_natal?: floats
+      place?: { latitude, longitude, elev_m? }
       frame?: "ecliptic-of-date" | "ecliptic-j2000"
-      house_system?: string (default: "placidus")
+      house_system?: string                    (default: "placidus")
       zodiac_mode?: "tropical" | "sidereal"
       ayanamsa_deg?: float
-      arcs?: "direct" | "converse" | "both" (default: "direct")
+      arcs?: "direct" | "converse" | "both"   (default: "direct")
       orbs?: { conjunction: float, opposition: float, ... }
-      include_hits_to?: ["planets", "angles", "cusps"] # targets for hit detection
-      parallels?: bool (default: false)
-      antiscia?: bool (default: false)
-      profile?: bool (default: false)
-      validation?: "none" | "basic" (default: "basic")
+      include_hits_to?: ["planets","angles","cusps"] (default all)
+      parallels?: bool                         (default: false)
+      antiscia?: bool                          (default: false)
+      profile?: bool                           (default: false)
+      validation?: "none" | "basic"            (default: "basic")
     """
     if _compute_directions is None:
         det = {"import_error": repr(_DIRECTIONS_IMPORT_ERROR)} if DEBUG_VERBOSE and _DIRECTIONS_IMPORT_ERROR else None
@@ -4826,8 +3983,7 @@ def directions_route():
     except Exception as e:
         return _json_error("bad_request", str(e) if DEBUG_VERBOSE else None, 400)
 
-    # Build arguments for directions computation
-    directions_kwargs = {
+    args = {
         "natal": payload["natal"],
         "method": payload.get("method", "solar_arc"),
         "rate": payload.get("rate", "naibod"),
@@ -4842,58 +3998,39 @@ def directions_route():
         "profile": payload.get("profile", False),
         "validation": payload.get("validation", "basic"),
     }
-
-    # Add optional target or years_after
     if "target" in payload:
-        directions_kwargs["target"] = payload["target"]
+        args["target"] = payload["target"]
     elif "years_after" in payload:
-        directions_kwargs["years_after"] = payload["years_after"]
+        args["years_after"] = payload["years_after"]
+    for k in ("jd_tt_natal", "jd_ut1_natal", "place", "orbs"):
+        if k in payload:
+            args[k] = payload[k]
 
-    # Add optional strict timescales
-    for field in ("jd_tt_natal", "jd_ut1_natal"):
-        if field in payload:
-            directions_kwargs[field] = payload[field]
-
-    # Add optional place override
-    if "place" in payload:
-        directions_kwargs["place"] = payload["place"]
-
-    # Add optional orbs
-    if "orbs" in payload:
-        directions_kwargs["orbs"] = payload["orbs"]
-
-    # Filter arguments to match function signature
     try:
         import inspect
-        directions_params = set(inspect.signature(_compute_directions).parameters.keys())
-        filtered_kwargs = {k: v for k, v in directions_kwargs.items() if k in directions_params}
+        params = set(inspect.signature(_compute_directions).parameters.keys())
+        args = {k: v for k, v in args.items() if k in params}
     except Exception:
-        filtered_kwargs = directions_kwargs
+        pass
 
-    # Call directions computation
     try:
-        result = _compute_directions(**filtered_kwargs)
+        result = _compute_directions(**args)
     except ValueError as e:
         return _json_error("directions_value_error", str(e), 400)
-    except TypeError as e:
-        det = {"type": "TypeError", "message": str(e)} if DEBUG_VERBOSE else None
-        return _json_error("directions_internal", det or "internal_error", 500)
-    except RuntimeError as e:
-        det = {"type": "RuntimeError", "message": str(e)} if DEBUG_VERBOSE else None
+    except (TypeError, RuntimeError) as e:
+        det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
         return _json_error("directions_internal", det or "internal_error", 500)
     except Exception as e:
         det = {"type": type(e).__name__, "message": str(e)} if DEBUG_VERBOSE else None
         return _json_error("directions_internal", det or "internal_error", 500)
 
-    # Enrich metadata with ephemeris adapter info
-    meta = dict(result.get("meta", {}))
+    meta = dict(result.get("meta", {}) or {})
     try:
         meta.update(_snapshot_ephemeris_meta(meta))
     except Exception:
         pass
 
-    # Structure response
-    resp = {
+    return jsonify({
         "ok": True,
         "meta": meta,
         "epoch": result.get("epoch", {}),
@@ -4901,45 +4038,37 @@ def directions_route():
         "positions": result.get("positions", {}),
         "hits": result.get("hits", {}),
         "warnings": list(meta.get("warnings", [])),
-    }
+    }), 200
 
-    return jsonify(resp), 200
 
-# ───────────────────────── ephemeris ─────────────────────────
+# ───────────────────────── Ephemeris utilities ─────────────────────────
 def _coerce_float(v: Any) -> Optional[float]:
     try:
-        if v is None:
-            return None
-        return float(v)
+        return float(v) if v is not None else None
     except Exception:
         return None
 
 def _truthy(val: Any) -> Optional[bool]:
-    if isinstance(val, bool):
-        return val
-    if val is None:
-        return None
+    if isinstance(val, bool): return val
+    if val is None: return None
     s = str(val).strip().lower()
-    if s in {"1", "true", "t", "yes", "y", "on"}:
-        return True
-    if s in {"0", "false", "f", "no", "n", "off"}:
-        return False
+    if s in {"1","true","t","yes","y","on"}: return True
+    if s in {"0","false","f","no","n","off"}: return False
     return None
 
 def _norm_rows_from_longitudes(raw: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Normalize longitude results to consistent format."""
     rows: List[Dict[str, Any]] = []
     meta: Dict[str, Any] = {}
 
     if isinstance(raw, tuple) and len(raw) == 2:
         raw, meta = raw
-
     if isinstance(raw, dict):
         meta = dict(raw.get("meta") or {})
 
     if raw is None:
         return rows, meta
 
+    # mapping: {"Sun": 123.4, ...}
     if isinstance(raw, dict) and all(isinstance(v, (int, float)) for v in raw.values()):
         for k, v in raw.items():
             rows.append({"body": str(k).lower(), "name": str(k), "longitude": float(v)})
@@ -4948,34 +4077,23 @@ def _norm_rows_from_longitudes(raw: Any) -> Tuple[List[Dict[str, Any]], Dict[str
     data = raw.get("results") if isinstance(raw, dict) and isinstance(raw.get("results"), list) else raw
     if isinstance(data, list):
         for r in data:
-            if isinstance(r, dict):
-                if len(r) == 1 and isinstance(next(iter(r.values())), (int, float)):
-                    k, v = next(iter(r.items()))
-                    rows.append({"body": str(k).lower(), "name": str(k), "longitude": float(v)})
-                    continue
-
-                body = (r.get("body") or r.get("name") or r.get("planet") or r.get("id") or r.get("label"))
-                L = r.get("longitude") or r.get("lon") or r.get("lambda") or r.get("ecliptic_longitude")
-
-                if body and isinstance(L, (int, float)):
-                    row: Dict[str, Any] = {
-                        "body": str(body).lower(),
-                        "name": str(r.get("name") or body),
-                        "longitude": float(L),
-                    }
-                    if _coerce_float(r.get("speed")) is not None:
-                        row["speed"] = float(r.get("speed"))
-                    if _coerce_float(r.get("velocity")) is not None:
-                        row["velocity"] = float(r.get("velocity"))
-                    rows.append(row)
+            if not isinstance(r, dict):
+                continue
+            body = (r.get("body") or r.get("name") or r.get("planet") or r.get("id") or r.get("label"))
+            L = r.get("longitude") or r.get("lon") or r.get("lambda") or r.get("ecliptic_longitude")
+            if body and isinstance(L, (int, float)):
+                rec: Dict[str, Any] = {"body": str(body).lower(), "name": str(r.get("name") or body), "longitude": float(L)}
+                sp = _coerce_float(r.get("speed"))
+                if sp is not None: rec["speed"] = sp
+                vel = _coerce_float(r.get("velocity"))
+                if vel is not None: rec["velocity"] = vel
+                rows.append(rec)
 
     return rows, meta
 
 def _norm_rows_from_lv(raw: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Normalize longitude+velocity results to consistent format."""
     rows_map: Dict[str, Dict[str, Any]] = {}
     meta: Dict[str, Any] = {}
-
     if isinstance(raw, dict):
         meta = dict(raw.get("meta") or {})
 
@@ -4998,22 +4116,21 @@ def _norm_rows_from_lv(raw: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             rec = rows_map.setdefault(key, {"body": key, "name": str(r.get("name") or body)})
             L = r.get("longitude") or r.get("lon") or r.get("lambda") or r.get("ecliptic_longitude")
             V = r.get("velocity") or r.get("vel") or r.get("dlambda_dt") or r.get("deg_per_day") or r.get("speed")
-            if isinstance(L, (int, float)):
-                rec["longitude"] = float(L)
-            if isinstance(V, (int, float)):
-                rec["velocity"] = float(V)
+            if isinstance(L, (int, float)): rec["longitude"] = float(L)
+            if isinstance(V, (int, float)): rec["velocity"] = float(V)
 
     return list(rows_map.values()), meta
 
+
+# ───────────────────────── /ephemeris/longitudes ─────────────────────────
 @api.post("/api/ephemeris/longitudes")
 @rate_limit(RL_EPHEM)
 def ephemeris_longitudes_endpoint():
     """
-    Fixed endpoint that properly handles topocentric flag:
-      • If topocentric:true but no coords -> 422 topocentric_coords_required
-      • If coords present -> force topocentric True (even if flag was false)
+    Proper topocentric handling:
+      • If topocentric:true but no coords → 422 topocentric_coords_required
+      • If coords present → force topocentric True
       • center = 'topocentric' iff meta.topocentric truthy; else 'geocentric'
-      • Prefer adapter meta.topocentric; fallback to the resolved value
     """
     try:
         body = request.get_json(force=True) or {}
@@ -5023,18 +4140,15 @@ def ephemeris_longitudes_endpoint():
     except Exception as e:
         return _json_error("bad_request", str(e), 400)
 
-    # Core parameters
     jd_tt = payload["jd_tt"]
     frame = payload.get("frame", "ecliptic-of-date")
     bodies = payload["bodies"]
     names = payload["names"]
 
-    # Requested flag (body or query)
     requested_topo = _truthy(body.get("topocentric"))
     if requested_topo is None:
         requested_topo = _truthy(request.args.get("topocentric")) or False
 
-    # Extract coordinates: body.observer, body aliases, query aliases
     ob = body.get("observer") or {}
     lat = (
         _coerce_float(ob.get("lat"))
@@ -5064,24 +4178,22 @@ def ephemeris_longitudes_endpoint():
         or _coerce_float(request.args.get("elev_m"))
     )
 
-    coords_valid = (lat is not None) and (lon is not None)
-    observer = {"lat": lat, "lon": lon, "elevation_m": (elev if elev is not None else 0.0)} if coords_valid else None
+    coords_ok = (lat is not None) and (lon is not None)
+    observer = {"lat": lat, "lon": lon, "elevation_m": (elev if elev is not None else 0.0)} if coords_ok else None
 
-    # Rule 1: explicit topocentric without coords => 422
-    if requested_topo and not coords_valid:
+    if requested_topo and not coords_ok:
         return _json_error(
             "topocentric_coords_required",
             {
                 "message": "topocentric:true requires lat & lon (optional elevation_m) via body.observer or ?lat&lon[&elev_m].",
-                "aliases": {"lat": ["lat", "latitude"], "lon": ["lon", "lng", "longitude"], "elevation_m": ["elev_m", "elevation_m"]},
+                "aliases": {"lat": ["lat","latitude"], "lon": ["lon","lng","longitude"], "elevation_m": ["elev_m","elevation_m"]},
             },
             422,
         )
 
-    # Rule 2: coords force topocentric (override any false flag)
-    resolved_topo = True if coords_valid else bool(requested_topo)
+    resolved_topo = True if coords_ok else bool(requested_topo)
 
-    # Call adapter robustly
+    # Call adapter
     try:
         from app.core import ephemeris_adapter as ea
 
@@ -5090,16 +4202,15 @@ def ephemeris_longitudes_endpoint():
                 try:
                     return ea.ecliptic_longitudes(
                         jd_tt=jd_tt,
-                        bodies=names,                   # modern kw
+                        bodies=names,
                         frame=frame,
                         topocentric=resolved_topo,
                         observer=observer if resolved_topo else None,
-                        latitude=lat if resolved_topo else None,   # back-compat
+                        latitude=lat if resolved_topo else None,
                         longitude=lon if resolved_topo else None,
                         elevation_m=(elev if elev is not None else None) if resolved_topo else None,
                     )
                 except TypeError:
-                    # older signature variants
                     try:
                         return ea.ecliptic_longitudes(
                             jd_tt,
@@ -5120,15 +4231,12 @@ def ephemeris_longitudes_endpoint():
                             longitude=lon if resolved_topo else None,
                             elev_m=(elev if elev is not None else None) if resolved_topo else None,
                         )
-            elif hasattr(ea, "ecliptic_longitudes_and_velocities"):
+            if hasattr(ea, "ecliptic_longitudes_and_velocities"):
                 return ea.ecliptic_longitudes_and_velocities(
-                    jd_tt=jd_tt,
-                    bodies=names,
-                    frame=frame,
-                    topocentric=resolved_topo,
-                    observer=observer if resolved_topo else None,
+                    jd_tt=jd_tt, bodies=names, frame=frame, topocentric=resolved_topo, observer=observer if resolved_topo else None
                 )
             raise RuntimeError("adapter_missing")
+
         adapter_ret = _call()
     except Exception as e:
         return _json_error("adapter_error", str(e), 500)
@@ -5139,29 +4247,21 @@ def ephemeris_longitudes_endpoint():
     else:
         rows, meta = _norm_rows_from_longitudes(adapter_ret)
 
-    # Order by requested bodies
     requested = [b.lower() for b in bodies]
     name_map = {b.lower(): n for b, n in zip(bodies, names)}
     by_body = {r.get("body"): r for r in rows if r.get("body")}
 
-    ordered_results = []
-    for body_key in requested:
-        r = by_body.get(body_key)
+    ordered = []
+    for key in requested:
+        r = by_body.get(key)
         if r and isinstance(r.get("longitude"), (int, float)):
-            ordered_results.append({
-                "body": body_key,
-                "name": name_map.get(body_key, r.get("name", body_key)),
-                "longitude": float(r["longitude"]),
-            })
+            ordered.append({"body": key, "name": name_map.get(key, r.get("name", key)), "longitude": float(r["longitude"])})
 
-    # Meta + center resolution (prefer adapter meta; fallback to route)
     final_meta = dict(meta or {})
     if "topocentric" not in final_meta:
         final_meta["topocentric"] = resolved_topo
-    center = "topocentric" if (final_meta.get("topocentric") is True or str(final_meta.get("topocentric")).lower() == "true") else "geocentric"
+    center = "topocentric" if str(final_meta.get("topocentric")).lower() in {"1","true","t","yes"} else "geocentric"
     final_meta.setdefault("frame", frame)
-
-    # Augment with adapter snapshot so dev tools can see path/coverage
     final_meta.update(_snapshot_ephemeris_meta(final_meta))
 
     return jsonify({
@@ -5171,186 +4271,71 @@ def ephemeris_longitudes_endpoint():
         "center": center,
         "units": {"angles": "deg"},
         "meta": final_meta,
-        "results": ordered_results,
+        "results": ordered,
     }), 200
 
-# ───────────────────────── ephemeris diagnostics (for dev tools) ─────────────────────────
+# ───────────────────────── EPHEMERIS INFO (production-safe) ─────────────────────────
 @api.get("/api/ephemeris/diagnostics")
 @rate_limit(RL_DEBUG)
 def ephemeris_diagnostics_route():
     """
-    Lightweight adapter diagnostics surface.
-    Does not force a Skyfield kernel load; if a kernel has been loaded earlier,
-    path/coverage will show up. If only a BSP path is known, we lazily read
-    coverage from it (via jplephem) without loading Skyfield.
+    Lightweight adapter info surface for ops/monitoring.
+    Does not force kernel loads or perform file introspection.
     """
     try:
         from app.core import ephemeris_adapter as ea
 
-        out = dict(ea.ephemeris_diagnostics() or {})
+        info = dict(ea.ephemeris_diagnostics() or {})
 
-        # Always expose a single short kernel tag
-        out["kernel"] = out.get("ephemeris_name") or ea.current_kernel_name()
-
-        # Path (if known)
+        # Stable, minimal fields only
+        info["kernel"] = info.get("ephemeris_name") or ea.current_kernel_name()
         try:
-            out["ephemeris_path"] = ea.current_kernel_path()
+            info["ephemeris_path"] = ea.current_kernel_path()
         except Exception:
             pass
 
-        # De-dupe kernels if adapter returned duplicates
-        ks = out.get("kernels")
+        # De-dupe any kernel list the adapter may return
+        ks = info.get("kernels")
         if isinstance(ks, list):
-            out["kernels"] = list(dict.fromkeys(ks))
+            info["kernels"] = list(dict.fromkeys(ks))
 
-        # Lazy coverage: if missing but a BSP path exists, compute via jplephem
-        if not out.get("ephemeris_coverage_jd"):
-            p = out.get("ephemeris_path")
-            if p and os.path.isfile(p):
-                try:
-                    from jplephem.spk import SPK  # local import to keep it optional
-                    with SPK.open(p) as spk:
-                        cov_min = min(seg.start_jd for seg in spk.segments)
-                        cov_max = max(seg.end_jd for seg in spk.segments)
-                    out["ephemeris_coverage_jd"] = [cov_min, cov_max]
-                except Exception:
-                    # silently ignore if jplephem isn't available or file can't be read
-                    pass
+        # Do NOT attempt lazy coverage reads or other heavyweight diagnostics
+        info.pop("ephemeris_coverage_jd_lazy", None)
 
-        return jsonify({"ok": True, **out}), 200
+        return jsonify({"ok": True, **info}), 200
 
     except Exception as e:
         return _json_error("adapter_error", str(e) if DEBUG_VERBOSE else "adapter_error", 500)
 
-# ───────────────────────── DEBUG: House Engine Detection ─────────────────────────
-@api.get("/api/debug/engine-test")
-@rate_limit(RL_DEBUG)
-def debug_engine_test():
-    """Test direct call to advanced engine with diagnostics enabled."""
-    try:
-        from app.core.houses_advanced import PreciseHouseCalculator
 
-        calc = PreciseHouseCalculator(
-            require_strict_timescales=True,
-            enable_diagnostics=True,
-            enable_validation=True
-        )
+# ───────────────────────── REMOVED DEBUG ROUTES ─────────────────────────
+# The following developer-only diagnostic endpoints were intentionally removed
+# for production hardening:
+#   • /api/debug/engine-test
+#   • /api/debug/precision-test
+#   • /api/debug/function-signatures
+#
+# If you need them again locally, keep them behind a strict feature flag and
+# never enable them in production builds.
 
-        result = calc.calculate_houses(
-            latitude=40.7128,
-            longitude=-74.0060,
-            jd_ut=2460000.5,
-            house_system="placidus",
-            jd_tt=2460000.501,
-            jd_ut1=2460000.499
-        )
-
-        return jsonify({
-            "ok": True,
-            "direct_engine_result": {
-                "system": result.system,
-                "asc": result.ascendant,
-                "mc": result.midheaven,
-                "cusps": result.cusps,
-                "has_solver_stats": result.solver_stats is not None,
-                "solver_stats_keys": list(result.solver_stats.keys()) if result.solver_stats else None,
-                "has_error_budget": result.error_budget is not None,
-                "warnings": result.warnings,
-                "validation_count": len(result.validation_results)
-            }
-        }), 200
-    except Exception as e:
-        return _json_error("engine_test_error", str(e), 500)
-
-@api.get("/api/debug/precision-test")
-@rate_limit(RL_DEBUG)
-def debug_precision_test():
-    """Run multiple calculations to check for micro-variations."""
-    try:
-        results = []
-
-        for i in range(5):
-            # Tiny time variations to trigger different computational paths
-            ts = {
-                "jd_tt": 2460000.5 + i * 1e-8,
-                "jd_ut1": 2460000.499 + i * 1e-8,
-                "jd_utc": 2460000.5
-            }
-
-            payload = {
-                "latitude": 40.7128,
-                "longitude": -74.0060,
-                "house_system": "placidus"
-            }
-
-            houses = _call_compute_houses(payload, ts)
-
-            results.append({
-                "run": i,
-                "asc": getattr(houses, 'asc', getattr(houses, 'asc_deg', 'missing')),
-                "mc": getattr(houses, 'mc', getattr(houses, 'mc_deg', 'missing')),
-                "cusps_sample": getattr(houses, 'cusps', [])[:3] if hasattr(houses, 'cusps') else [],
-                "has_solver_stats": hasattr(houses, 'solver_stats'),
-                "warnings": getattr(houses, 'warnings', [])
-            })
-
-        # Check for variations
-        asc_values = [r["asc"] for r in results if isinstance(r["asc"], (int, float))]
-        variation = max(asc_values) - min(asc_values) if len(asc_values) > 1 else 0.0
-
-        return jsonify({
-            "ok": True,
-            "results": results,
-            "asc_variation_degrees": variation,
-            "expected_variation": "> 1e-9 for advanced engine",
-            "likely_advanced_engine": variation > 1e-9
-        }), 200
-    except Exception as e:
-        return _json_error("precision_test_error", str(e), 500)
-
-@api.get("/api/debug/function-signatures")
-@rate_limit(RL_DEBUG)
-def debug_function_signatures():
-    """Examine what functions are actually being called."""
-    try:
-        import inspect
-
-        info = {
-            "houses_function": str(_houses_fn),
-            "houses_function_name": getattr(_houses_fn, '__name__', 'unknown'),
-            "houses_function_module": getattr(_houses_fn, '__module__', 'unknown'),
-            "houses_kind": _HOUSES_KIND,
-            "chart_engine": _CHART_ENGINE_NAME
-        }
-
-        if _houses_fn:
-            try:
-                info["houses_function_signature"] = str(inspect.signature(_houses_fn))
-                info["houses_function_file"] = getattr(inspect.getmodule(_houses_fn), '__file__', 'unknown')
-            except Exception as e:
-                info["signature_error"] = str(e)
-
-        # Test advanced engine import
-        try:
-            from app.core.houses_advanced import PreciseHouseCalculator
-            info["advanced_engine_importable"] = True
-            info["advanced_engine_file"] = inspect.getfile(PreciseHouseCalculator)
-        except Exception as e:
-            info["advanced_engine_importable"] = False
-            info["advanced_engine_error"] = str(e)
-
-        return jsonify({"ok": True, "debug_info": info}), 200
-    except Exception as e:
-        return _json_error("function_signatures_error", str(e), 500)
-
-# ───────────────────────── system-validation (optional) ─────────────────────────
+# ───────────────────────── SYSTEM VALIDATION ─────────────────────────
 @api.get("/system-validation")
 @rate_limit(RL_DEBUG)
 def system_validation():
+    """
+    Lightweight system validation surface:
+      • Shows core config values
+      • Current timescale sample (UTC/TT/UT1)
+      • House engine policy
+      • Leap second status (if available)
+    """
+    # Config load
     cfg = load_config(os.environ.get("ASTRO_CONFIG", "config/defaults.yaml"))
+
+    # Leap second status (optional module)
     leap_status: Optional[Dict[str, Any]] = None
     try:
-        from app.core import leapseconds as _leaps  # optional
+        from app.core import leapseconds as _leaps
         for name in ("get_status", "status", "summary"):
             fn = getattr(_leaps, name, None)
             if callable(fn):
@@ -5365,6 +4350,7 @@ def system_validation():
     except Exception:
         pass
 
+    # Timescale sample at "now"
     try:
         now_utc = datetime.now(timezone.utc)
         ts_now = _compute_timescales_from_local(
@@ -5383,6 +4369,7 @@ def system_validation():
     except Exception:
         ts_sample = None
 
+    # Policy snapshot
     policy = {
         "houses_engine": _HOUSES_KIND,
         "polar": {
@@ -5393,21 +4380,23 @@ def system_validation():
         },
     }
 
-    return jsonify(
-        {
-            "ok": True,
-            "astronomy_accuracy": "ERFA-first timescales (JD_TT/JD_UT1), strict where required",
-            "performance_slo": {"calculate_p95_ms": 800, "rect_quick_p95_s": 20},
-            "mode_consistency": {
-                "sidereal_default": cfg.mode == "sidereal",
-                "ayanamsa": getattr(cfg, "ayanamsa", None),
-            },
-            "policy": policy,
-            "leap_seconds": leap_status,
-            "version": VERSION,
-            "timescale_sample": ts_sample,
-        }
-    ), 200
+    # Response
+    return jsonify({
+        "ok": True,
+        "astronomy_accuracy": "ERFA-first timescales (JD_TT/JD_UT1), strict where required",
+        "performance_slo": {
+            "calculate_p95_ms": 800,
+            "rect_quick_p95_s": 20,
+        },
+        "mode_consistency": {
+            "sidereal_default": cfg.mode == "sidereal",
+            "ayanamsa": getattr(cfg, "ayanamsa", None),
+        },
+        "policy": policy,
+        "leap_seconds": leap_status,
+        "version": VERSION,
+        "timescale_sample": ts_sample,
+    }), 200
 
 
 
