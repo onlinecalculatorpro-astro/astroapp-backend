@@ -878,7 +878,7 @@ class EphemerisAdapter:
 
         def xy_at(tjd: float) -> Tuple[float, float]:
             xyz = obs.at(_tt_time_for_jd(tjd)).observe(body).apparent().frame_xyz(ef)
-            return float(xyz.au[0]), float(xyz.au[1]]
+            return float(xyz.au[0]), float(xyz.au[1])
 
         # lon/lat now (one compute)
         geo_now = obs.at(_tt_time_for_jd(jd_tt)).observe(body).apparent()
