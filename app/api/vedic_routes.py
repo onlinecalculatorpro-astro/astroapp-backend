@@ -1,17 +1,17 @@
 # app/api/vedic_routes.py
 from __future__ import annotations
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 import inspect
 import os
 
 from flask import Blueprint, jsonify, request
-from app.utils.ratelimit import rate_limit  # fixed bucket
+from app.utils.ratelimit import rate_limit  # fixed shared bucket
 
-# ── Fixed shared bucket key (all callers share one bucket) ──
+# ── fixed shared bucket key ("20") ──
 def fixed_key(*_a, **_k) -> str:
     return "20"
 
-# ── Validator (no jd_utc inside) ──
+# ── validator (NO jd_utc) ──
 try:
     from app.core.vedic_validator import normalize_vim_payload  # type: ignore
 except Exception as _e:
@@ -20,30 +20,26 @@ except Exception as _e:
 else:
     _VALIDATOR_IMPORT_ERR = None
 
-# ── Dasha engines: registry (preferred) + module fallback ──
+# ── engines: registry (preferred) + module fallback ──
 _compute_dasha_registry = None
 _run_dasha = None
-_dasha_registry_mod = None
 try:
-    import app.core.dasha_registry as _dasha_registry_mod  # module handle (for diagnostics)
     from app.core.dasha_registry import compute_dasha as _compute_dasha_registry  # type: ignore
 except Exception:
-    _compute_dasha_registry = None
+    _compute_dasha_registry = None  # type: ignore
     try:
         from app.core.dasha_registry import run_dasha as _run_dasha  # type: ignore
     except Exception:
-        _run_dasha = None
+        _run_dasha = None  # type: ignore
 
 try:
     from app.core.vimshottari_dasha import compute_vimshottari as _compute_vim_module  # type: ignore
 except Exception:
     _compute_vim_module = None  # type: ignore
 
-# ── Blueprint & RL cap ──
 vedic_api = Blueprint("vedic_api", __name__)
 RL_VEDIC_PREDICTIVE = int(os.getenv("ASTRO_RL_VEDIC_PREDICTIVE_PER_MIN", "20"))
 
-# ── Helpers ──
 def _wrap_ok(out: Dict[str, Any], warns: list[str], tz_norm: str, branch: str) -> Dict[str, Any]:
     out.setdefault("ok", True)
     out.setdefault("meta", {})
@@ -73,14 +69,14 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
             "detail": f"app.core.vedic_validator.normalize_vim_payload import failed: {_VALIDATOR_IMPORT_ERR}",
         }
 
-    # Normalize; NO jd_utc anywhere
+    # normalize (produces jd_tt/jd_ut1 if it can; NO jd_utc); also aliases
     norm, warns, tz_norm = normalize_vim_payload(payload)  # type: ignore[misc]
 
-    # Ensure registry gets dut1_seconds it expects (even if it ignores it)
+    # ensure dut1_seconds carried for any build_timescales(...) callers
     if "dut1_seconds" not in norm or norm["dut1_seconds"] is None:
         norm["dut1_seconds"] = _env_dut1_seconds()
 
-    # 1) Registry (preferred)
+    # 1) unified registry (preferred)
     if _compute_dasha_registry is not None:
         try:
             depth_val = int(norm.get("levels") or norm.get("depth") or norm.get("max_levels") or 5)
@@ -88,50 +84,63 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(out, dict):
                 return _wrap_ok(out, warns, tz_norm, branch="registry.compute_dasha")
         except Exception as e:
-            # If the registry is compiled against a 3-arg build_timescales, it throws this exact error.
             msg = str(e)
+            # If registry is compiled against 3-arg build_timescales, it throws exactly this:
             if "build_timescales() missing 1 required positional argument: 'dut1_seconds'" in msg and _compute_vim_module:
-                try:
-                    civ_keys = ["date","time","tz","tz_name","ayanamsa","ayanamsa_key",
-                                "levels","depth","max_levels","latitude","longitude"]
-                    civ = {k: norm[k] for k in civ_keys if k in norm and norm[k] is not None}
-                    out = (_compute_vim_module(**civ) if callable(_compute_vim_module) else _compute_vim_module(civ))  # type: ignore[misc]
-                    if isinstance(out, dict):
-                        return _wrap_ok(out, warns, tz_norm, branch="fallback.module.compute_vimshottari")
-                except Exception as e2:
-                    return {"ok": False, "error": "vimshottari_module_failed", "detail": str(e2),
-                            "meta": {"route": "vimshottari", "tz_normalized": tz_norm, "branch": "fallback.module"}}
-            # Generic registry error
-            return {"ok": False, "error": "vimshottari_registry_failed", "detail": msg,
-                    "meta": {"route": "vimshottari", "tz_normalized": tz_norm, "branch": "registry.compute_dasha"}}
+                # fall through to module
+                pass
+            else:
+                return {
+                    "ok": False, "error": "vimshottari_registry_failed", "detail": msg,
+                    "meta": {"route": "vimshottari", "tz_normalized": tz_norm, "branch": "registry.compute_dasha"},
+                }
 
-    # 2) Alternate registry name
+    # 2) alternate registry (if present)
     if _run_dasha is not None:
         try:
             out = _run_dasha("vimshottari", norm)
             if isinstance(out, dict):
                 return _wrap_ok(out, warns, tz_norm, branch="registry.run_dasha")
         except Exception as e:
-            return {"ok": False, "error": "vimshottari_registry_failed", "detail": str(e),
-                    "meta": {"route": "vimshottari", "tz_normalized": tz_norm, "branch": "registry.run_dasha"}}
+            return {
+                "ok": False, "error": "vimshottari_registry_failed", "detail": str(e),
+                "meta": {"route": "vimshottari", "tz_normalized": tz_norm, "branch": "registry.run_dasha"},
+            }
 
-    # 3) Module fallback
+    # 3) module fallback — try kwargs, then single-dict positional
     if _compute_vim_module is not None:
         try:
-            civ_keys = ["date","time","tz","tz_name","ayanamsa","ayanamsa_key",
-                        "levels","depth","max_levels","latitude","longitude"]
+            civ_keys = [
+                "date","time","tz","tz_name","ayanamsa","ayanamsa_key",
+                "levels","depth","max_levels","latitude","longitude"
+            ]
             civ = {k: norm[k] for k in civ_keys if k in norm and norm[k] is not None}
-            out = (_compute_vim_module(**civ) if callable(_compute_vim_module) else _compute_vim_module(civ))  # type: ignore[misc]
+
+            try:
+                out = _compute_vim_module(**civ)  # type: ignore[misc]
+            except TypeError as te:
+                # e.g. "got an unexpected keyword argument 'date'" ⇒ call with a single dict
+                out = _compute_vim_module(civ)  # type: ignore[misc]
+
             if isinstance(out, dict):
                 return _wrap_ok(out, warns, tz_norm, branch="module.compute_vimshottari")
+            return {
+                "ok": False, "error": "vimshottari_module_invalid_return",
+                "detail": f"Expected dict, got {type(out).__name__}",
+                "meta": {"route": "vimshottari", "tz_normalized": tz_norm, "branch": "module.compute_vimshottari"},
+            }
         except Exception as e:
-            return {"ok": False, "error": "vimshottari_module_failed", "detail": str(e),
-                    "meta": {"route": "vimshottari", "tz_normalized": tz_norm, "branch": "module.compute_vimshottari"}}
+            return {
+                "ok": False, "error": "vimshottari_module_failed", "detail": str(e),
+                "meta": {"route": "vimshottari", "tz_normalized": tz_norm, "branch": "module.compute_vimshottari"},
+            }
 
-    return {"ok": False, "error": "vimshottari_engine_unavailable",
-            "meta": {"route": "vimshottari", "tz_normalized": tz_norm, "branch": "none"}}
+    return {
+        "ok": False, "error": "vimshottari_engine_unavailable",
+        "meta": {"route": "vimshottari", "tz_normalized": tz_norm, "branch": "none"},
+    }
 
-# ── Absolute paths (no url_prefix in main.py) ──
+# ── absolute paths (main.py registers this bp without url_prefix) ──
 @vedic_api.get("/api/vedic/health")
 def vedic_health():
     return jsonify(ok=True, vedic=True), 200
@@ -146,8 +155,10 @@ def vedic_diag():
         "validator_error": _VALIDATOR_IMPORT_ERR,
         "registry_compute_present": bool(_compute_dasha_registry),
         "registry_compute_sig": sigs(_compute_dasha_registry) if _compute_dasha_registry else None,
-        "registry_module_loaded": _dasha_registry_mod is not None,
+        "registry_run_present": bool(_run_dasha),
+        "registry_run_sig": sigs(_run_dasha) if _run_dasha else None,
         "module_vimshottari_present": bool(_compute_vim_module),
+        "module_vimshottari_sig": sigs(_compute_vim_module) if _compute_vim_module else None,
         "rl_cap_per_min": RL_VEDIC_PREDICTIVE,
         "rl_bucket_key": "20",
         "dut1_seconds_env": _env_dut1_seconds(),
