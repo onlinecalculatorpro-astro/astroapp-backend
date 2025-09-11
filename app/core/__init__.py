@@ -1,28 +1,21 @@
 # app/core/__init__.py
-# Core exports + ephemeris singletons (re-exported)
+# -------------------------------------------------------------------
+# Lightweight package init. No heavy imports here (avoids circulars).
+# Ephemeris singletons live in ephem_singleton and can be imported
+# from this package for convenience.
+# -------------------------------------------------------------------
 
-from .predictive import (
-    TransitEngine, TransitEvent, find_transits_in_range,
-    DashaPeriod, vimsottari_dasha, predict_dasha_periods,
-    compute_vargas_for_point, compute_vargas,
-    detect_yogas, house_index_for_longitude,
-    compute_houses, timescales_from_civil,
-    EvalResult, evaluate_univariate, permutation_pvalue_corr, bh_fdr,
-    holdout_replicate, validate_predictions,
-    feature_transit_proximity, feature_dasha_lords_onehot, feature_yoga_flags,
-)
-
-# re-export singletons; no heavy work here → avoids circular init
 from .ephem_singleton import TS, PLANETS, get_timescale, get_planets
 
 __all__ = [
-    "TransitEngine", "TransitEvent", "find_transits_in_range",
-    "DashaPeriod", "vimsottari_dasha", "predict_dasha_periods",
-    "compute_vargas_for_point", "compute_vargas",
-    "detect_yogas", "house_index_for_longitude",
-    "compute_houses", "timescales_from_civil",
-    "EvalResult", "evaluate_univariate", "permutation_pvalue_corr",
-    "bh_fdr", "holdout_replicate", "validate_predictions",
-    "feature_transit_proximity", "feature_dasha_lords_onehot", "feature_yoga_flags",
+    # Ephemeris singletons + accessors
     "TS", "PLANETS", "get_timescale", "get_planets",
 ]
+
+# Notes for importers:
+# - Import predictive symbols directly from their modules, e.g.:
+#     from app.core.predictive import TransitEngine, find_transits_in_range
+# - Import validators directly:
+#     from app.core.validators import resolve_timescales_from_civil_erfa
+# - Do NOT import predictive from app.core (this file) to avoid
+#   package import side-effects and circular imports.
