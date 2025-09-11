@@ -4,16 +4,38 @@ from typing import Any, Dict, Optional
 import inspect
 import os
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request as _flask_request
 
 # ── rate limiting (single key_fn) ──
 from app.utils.ratelimit import rate_limit, client_key, endpoint_key
 
-def client_endpoint_key() -> str:
+def _call_key(fn):
+    """Call key function that may be defined as fn() or fn(request)."""
     try:
-        return f"{client_key()}::{endpoint_key()}"
+        return fn(_flask_request)   # signature: fn(request)
+    except TypeError:
+        return fn()                 # signature: fn()
     except Exception:
-        return str(client_key())
+        return None
+
+def client_endpoint_key(*_args, **_kwargs) -> str:
+    """
+    Accepts positional args so it works with decorators that pass (request).
+    Falls back gracefully if inner key fns raise.
+    """
+    ck = _call_key(client_key)
+    ek = _call_key(endpoint_key)
+    if ck is None:
+        try:
+            ck = _flask_request.remote_addr or "anon"
+        except Exception:
+            ck = "anon"
+    if ek is None:
+        try:
+            ek = _flask_request.path or "unknown"
+        except Exception:
+            ek = "unknown"
+    return f"{ck}::{ek}"
 
 # ── payload normalization (from core; NO jd_utc inside) ──
 try:
@@ -73,7 +95,7 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
     norm, warns, tz_norm = normalize_vim_payload(payload)  # type: ignore[misc]
 
     # 1) Unified registry (preferred) — signature:
-    #    compute_dasha(system: str, payload: Dict[str, Any], *, depth: int | None = None) -> Dict[str, Any]
+    #    compute_dasha(system: str, payload: Dict[str, Any], *, depth: int | None = None)
     if _compute_dasha_registry is not None:
         try:
             depth_val = int(norm.get("levels") or norm.get("depth") or norm.get("max_levels") or 5)
@@ -134,7 +156,6 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
 def vedic_health():
     return jsonify(ok=True, vedic=True), 200
 
-# Optional diagnostics (kept — not an alias route)
 @vedic_api.get("/api/vedic/diag")
 def vedic_diag():
     def sigs(fn):
