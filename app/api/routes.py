@@ -2114,17 +2114,10 @@ def prediction_validation_route():
 # ───────────────────────── predictive (transits • validation • dasha • varga • yogas) ─────────────────────────
 # Cleaned & deduplicated drop-in. Keeps behavior; improves structure, typing, and guards.
 
-from __future__ import annotations
-
-import math
-import os
 import threading
 import time
 from datetime import date, datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
-
-from flask import jsonify, request
 
 # External app symbols expected to exist:
 # - api (Flask Blueprint), rate_limit, RL_PREDICTIVE
