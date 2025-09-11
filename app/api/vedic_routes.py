@@ -10,10 +10,10 @@ from flask import Blueprint, jsonify, request
 from app.utils.ratelimit import rate_limit
 
 def fixed_key(*_args, **_kwargs) -> str:
-    """Always returns the same bucket key. All calls share this bucket."""
+    """All requests share this bucket key."""
     return "20"
 
-# ── payload normalization (from core; NO jd_utc inside) ──
+# ── payload normalization (NO jd_utc inside) ──
 try:
     from app.core.vedic_validator import normalize_vim_payload  # type: ignore
 except Exception as _e:
@@ -41,7 +41,7 @@ except Exception:
 
 # ── blueprint & rate limits ──
 vedic_api = Blueprint("vedic_api", __name__)
-# default cap 20/min (env override: ASTRO_RL_VEDIC_PREDICTIVE_PER_MIN)
+# default cap 20/min (env override via ASTRO_RL_VEDIC_PREDICTIVE_PER_MIN)
 RL_VEDIC_PREDICTIVE = int(os.getenv("ASTRO_RL_VEDIC_PREDICTIVE_PER_MIN", "20"))
 
 # ── helpers ──
@@ -59,7 +59,15 @@ def _wrap_ok(out: Dict[str, Any], warns: list[str], tz_norm: str, branch: str) -
                 seen.add(s)
     return out
 
+def _env_dut1_seconds() -> float:
+    try:
+        return float(os.environ.get("ASTRO_DUT1_BROADCAST",
+                       os.environ.get("ASTRO_DUT1", "0.0")) or 0.0)
+    except Exception:
+        return 0.0
+
 def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
+    # Validator must be available
     if normalize_vim_payload is None:
         return {
             "ok": False,
@@ -69,6 +77,12 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     # normalize_vim_payload → (norm, warns, tz_norm)
     norm, warns, tz_norm = normalize_vim_payload(payload)  # type: ignore[misc]
+
+    # ── CRITICAL WIRING FOR REGISTRY ──
+    # dasha_registry.compute_dasha(...) calls build_timescales(date,time,tz,dut1_seconds)
+    # Ensure the payload carries dut1_seconds (env-provided, default 0.0)
+    if "dut1_seconds" not in norm or norm["dut1_seconds"] is None:
+        norm["dut1_seconds"] = _env_dut1_seconds()
 
     # 1) Unified registry (preferred)
     if _compute_dasha_registry is not None:
@@ -85,7 +99,7 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "meta": {"route": "vimshottari", "tz_normalized": tz_norm, "branch": "registry.compute_dasha"},
             }
 
-    # 2) Alternate registry name (if present)
+    # 2) Alternate registry function (if present)
     if _run_dasha is not None:
         try:
             out = _run_dasha("vimshottari", norm)
@@ -118,6 +132,7 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "meta": {"route": "vimshottari", "tz_normalized": tz_norm, "branch": "module.compute_vimshottari"},
             }
 
+    # No engine available
     return {
         "ok": False,
         "error": "vimshottari_engine_unavailable",
@@ -147,10 +162,11 @@ def vedic_diag():
         "module_vimshottari_present": bool(_compute_vim_module),
         "rl_cap_per_min": RL_VEDIC_PREDICTIVE,
         "rl_bucket_key": "20",
+        "dut1_seconds_env": _env_dut1_seconds(),
     }), 200
 
 @vedic_api.post("/api/vedic/dasha/vimshottari")
-@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)   # ← fixed key, single shared bucket
+@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)  # fixed bucket key "20"
 def vedic_vimshottari():
     body = request.get_json(silent=True) or {}
     try:
