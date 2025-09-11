@@ -6,8 +6,15 @@ import os
 from flask import Blueprint, jsonify, request
 
 # ───────────────────────── rate limiting ─────────────────────────
-# NOTE: decorator expects key_fn / ep_key_fn (NOT key_func / ep_key_func)
+# Your decorator accepts a single key_fn (not key_func / ep_key_fn)
 from app.utils.ratelimit import rate_limit, client_key, endpoint_key
+
+def client_endpoint_key() -> str:
+    """Compose client + endpoint to make the rate-limit key more granular."""
+    try:
+        return f"{client_key()}::{endpoint_key()}"
+    except Exception:
+        return str(client_key())
 
 # ───────────────────────── timescales (optional) ─────────────────────────
 try:
@@ -15,26 +22,24 @@ try:
     from app.core.timescales import build_timescales
     _TIMESCALES_OK = True
 except Exception:
-    _TIMESCALES_OK = False
     build_timescales = None  # type: ignore
+    _TIMESCALES_OK = False
 
 # ───────────────────────── dasha engines (registry preferred) ─────────────────────────
 _compute_dasha_registry = None
 _run_dasha = None
 try:
-    # Preferred: a unified registry with compute_dasha(kind, **kwargs)
     from app.core.dasha_registry import compute_dasha as _compute_dasha_registry  # type: ignore
 except Exception:
     _compute_dasha_registry = None  # type: ignore
 
 if _compute_dasha_registry is None:
     try:
-        # Alternate naming some repos use
         from app.core.dasha_registry import run_dasha as _run_dasha  # type: ignore
     except Exception:
         _run_dasha = None  # type: ignore
 
-# Module-level fallback for Vimśottari
+# Fallback module for Vimśottari
 try:
     from app.core.vimshottari_dasha import compute_vimshottari as _compute_vim_module  # type: ignore
 except Exception:
@@ -44,11 +49,11 @@ except Exception:
 vedic_api = Blueprint("vedic_api", __name__)
 
 # Per-endpoint rate-limit (env override)
-RL_PREDICTIVE = int(os.getenv("ASTRO_RL_PREDICTIVE_PER_MIN", "12"))
+RL_VEDIC_PREDICTIVE = int(os.getenv("ASTRO_RL_VEDIC_PREDICTIVE_PER_MIN", "12"))
 
 # ───────────────────────── helpers ─────────────────────────
 _TZ_ALIAS = {
-    "asia/patna": "Asia/Kolkata",   # legacy aliases → IANA canonical
+    "asia/patna": "Asia/Kolkata",
     "asia/calcutta": "Asia/Kolkata",
     "ist": "Asia/Kolkata",
 }
@@ -62,8 +67,9 @@ def _normalize_tz(tz: str) -> str:
 def _normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     """
     Normalize request:
-    - (date,time,tz) → (jd_tt, jd_ut1, jd_utc) if timescales available
-    - levels/depth/max_levels → depth 1..5 (default 5)
+      • (date,time,tz) → (jd_tt, jd_ut1) if timescales are available
+      • levels/depth/max_levels → depth 1..5 (default 5)
+    NOTE: We intentionally do NOT include jd_utc anywhere.
     """
     warns: List[str] = []
 
@@ -73,16 +79,19 @@ def _normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], Lis
 
     jd_tt: Optional[float] = payload.get("jd_tt")
     jd_ut1: Optional[float] = payload.get("jd_ut1")
-    jd_utc: Optional[float] = payload.get("jd_ut") or payload.get("jd_utc")
 
-    if (jd_tt is None or jd_ut1 is None or jd_utc is None) and _TIMESCALES_OK and date:
+    if (jd_tt is None or jd_ut1 is None) and _TIMESCALES_OK and date:
         try:
-            # DUT1 not provided by client here → assume 0.0s; engine should warn if strict
+            # DUT1 not provided by client here → assume 0.0s; strict engines may warn downstream.
             ts = build_timescales(date, time_str, tz_name, 0.0)  # type: ignore[call-arg]
-            # Expected keys from canonical timescales.py
-            jd_tt = float(ts["jd_tt"] if isinstance(ts, dict) else ts.jd_tt)      # type: ignore[index,attr-defined]
-            jd_ut1 = float(ts["jd_ut1"] if isinstance(ts, dict) else ts.jd_ut1)    # type: ignore[index,attr-defined]
-            jd_utc = float(ts["jd_utc"] if isinstance(ts, dict) else ts.jd_utc)    # type: ignore[index,attr-defined]
+            # Support object (attrs) or dict return types
+            if isinstance(ts, dict):
+                jd_tt = float(ts.get("jd_tt")) if ts.get("jd_tt") is not None else jd_tt
+                jd_ut1 = float(ts.get("jd_ut1")) if ts.get("jd_ut1") is not None else jd_ut1
+            else:
+                # Attribute access
+                jd_tt = float(getattr(ts, "jd_tt"))
+                jd_ut1 = float(getattr(ts, "jd_ut1"))
         except Exception as e:
             warns.append(f"timescales_failed:{e!s}")
 
@@ -107,7 +116,6 @@ def _normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], Lis
         "tz": tz_name,
         "jd_tt": jd_tt,
         "jd_ut1": jd_ut1,
-        "jd_utc": jd_utc,
         "ayanamsa": ayanamsa,
         "latitude": float(lat) if isinstance(lat, (int, float)) else None,
         "longitude": float(lon) if isinstance(lon, (int, float)) else None,
@@ -118,24 +126,24 @@ def _normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], Lis
     return norm, warns
 
 def _wrap_ok(out: Dict[str, Any], warns: List[str], tz_norm: str) -> Dict[str, Any]:
-    # Ensure standard envelope
     out.setdefault("ok", True)
     out.setdefault("meta", {})
     out["meta"].update({"route": "vimshottari", "tz_normalized": tz_norm})
     if warns:
         out.setdefault("warnings", [])
-        # Merge without dupes
-        w = set(map(str, out["warnings"]))
-        for x in warns:
-            if str(x) not in w:
-                out["warnings"].append(x)
+        seen = set(map(str, out["warnings"]))
+        for w in warns:
+            s = str(w)
+            if s not in seen:
+                out["warnings"].append(s)
+                seen.add(s)
     return out
 
 def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
     norm, warns = _normalize_vim_payload(payload)
     tz_norm = str(norm.get("tz", "UTC"))
 
-    # 1) unified registry preferred
+    # 1) Unified registry (preferred)
     if _compute_dasha_registry is not None:
         try:
             try:
@@ -148,7 +156,7 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
             return {"ok": False, "error": "vimshottari_registry_failed", "detail": str(e),
                     "meta": {"route": "vimshottari", "tz_normalized": tz_norm}}
 
-    # 2) alternate registry name
+    # 2) Alternate registry name
     if _run_dasha is not None:
         try:
             out = _run_dasha("vimshottari", norm)  # type: ignore[misc]
@@ -158,7 +166,7 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
             return {"ok": False, "error": "vimshottari_registry_failed", "detail": str(e),
                     "meta": {"route": "vimshottari", "tz_normalized": tz_norm}}
 
-    # 3) module fallback
+    # 3) Module fallback
     if _compute_vim_module is not None:
         try:
             out = (_compute_vim_module(**norm) if callable(_compute_vim_module)
@@ -172,14 +180,14 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok": False, "error": "vimshottari_engine_unavailable",
             "meta": {"route": "vimshottari", "tz_normalized": tz_norm}}
 
-# ───────────────────────── endpoints (assume blueprint mounted at /api/vedic) ─────────────────────────
+# ───────────────────────── endpoints (absolute paths in this blueprint) ─────────────────────────
 
 @vedic_api.get("/health")
 def vedic_health():
     return jsonify(ok=True, vedic=True), 200
 
 @vedic_api.post("/dasha/vimshottari")
-@rate_limit(RL_PREDICTIVE, key_fn=client_key, ep_key_fn=endpoint_key)
+@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=client_endpoint_key)
 def vedic_vimshottari():
     body = request.get_json(silent=True) or {}
     res = _run_vimshottari(body)
@@ -188,17 +196,17 @@ def vedic_vimshottari():
 
 # Aliases
 @vedic_api.post("/dasha/vimshottari/compute")
-@rate_limit(RL_PREDICTIVE, key_fn=client_key, ep_key_fn=endpoint_key)
+@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=client_endpoint_key)
 def vedic_vimshottari_compute():
     return vedic_vimshottari()
 
 @vedic_api.post("/vimshottari")
-@rate_limit(RL_PREDICTIVE, key_fn=client_key, ep_key_fn=endpoint_key)
+@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=client_endpoint_key)
 def vedic_vimshottari_short():
     return vedic_vimshottari()
 
 # Common misspelling alias (optional)
 @vedic_api.post("/dasha/vimshotri")
-@rate_limit(RL_PREDICTIVE, key_fn=client_key, ep_key_fn=endpoint_key)
+@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=client_endpoint_key)
 def vedic_vimshotri_alias():
     return vedic_vimshottari()
