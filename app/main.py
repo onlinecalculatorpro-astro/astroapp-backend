@@ -5,40 +5,14 @@ import logging
 import os
 import sys
 import traceback
+from dataclasses import asdict, is_dataclass  # harmless if unused elsewhere
 from time import perf_counter
-from typing import Any, Dict, Final
+from typing import Any, Dict, Final, Optional
 
 from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
-
-# ───────────────────────── Simple Module Reload Fix ─────────────────────────
-import importlib
-
-try:
-    # Only reload prediction module if it's already loaded
-    if 'app.core.prediction' in sys.modules:
-        print("Reloading app.core.prediction module...", file=sys.stderr)
-        importlib.reload(sys.modules['app.core.prediction'])
-        print("Prediction module reloaded successfully", file=sys.stderr)
-    if 'app.api.routes' in sys.modules:
-        print("Reloading app.api.routes module...", file=sys.stderr)
-        importlib.reload(sys.modules['app.api.routes'])
-        print("Routes module reloaded successfully", file=sys.stderr)
-except Exception as e:
-    print(f"Module reload error: {e}", file=sys.stderr)
-
-# ───────────────────────── import API blueprint ─────────────────────────
-_routes_import_err: str | None = None
-try:
-    from app.api import routes as _routes_mod  # type: ignore
-    _routes_bp = _routes_mod.api
-except Exception as e:  # pragma: no cover
-    _routes_bp = None
-    _routes_import_err = repr(e)
-    print("WARNING: routes blueprint failed to import:", _routes_import_err, file=sys.stderr)
-    traceback.print_exc()
 
 # ───────────────────────── Prometheus (safe shim) ─────────────────────────
 try:
@@ -47,26 +21,37 @@ try:
     )
 except Exception:  # pragma: no cover
     class _NoOpMetric:
-        def labels(self, **_kwargs): return self
-        def inc(self, *_a, **_k): return None
-        def observe(self, *_a, **_k): return None
-        def set(self, *_a, **_k): return None
-    def Counter(_n: str, _h: str, _lbls: list[str] | tuple[str, ...] = ()): return _NoOpMetric()  # type: ignore
-    def Gauge(_n: str, _h: str): return _NoOpMetric()  # type: ignore
-    def Histogram(_n: str, _h: str, _lbls: list[str] | tuple[str, ...] = ()): return _NoOpMetric()  # type: ignore
+        def labels(self, **_): return self
+        def inc(self, *_a, **_k): pass
+        def observe(self, *_a, **_k): pass
+        def set(self, *_a, **_k): pass
+    def Counter(*_, **__): return _NoOpMetric()  # type: ignore
+    def Gauge(*_, **__): return _NoOpMetric()    # type: ignore
+    def Histogram(*_, **__): return _NoOpMetric()# type: ignore
     CONTENT_TYPE_LATEST = "text/plain; version=0.0.4; charset=utf-8"  # type: ignore
-    class _NoRegistry: ...
-    REGISTRY = _NoRegistry()  # type: ignore
-    def generate_latest(_reg=None): return b""  # type: ignore
+    REGISTRY = object()  # type: ignore
+    def generate_latest(_reg=None): return b""   # type: ignore
 
-# Basic app-level metrics
+# App-level metrics
 MET_REQUESTS: Final = Counter("astro_api_requests_total", "API requests", ["route"])
 REQ_LATENCY: Final = Histogram("astro_request_seconds", "API request latency", ["route"])
 GAUGE_APP_UP: Final = Gauge("astro_app_up", "1 if app is running")
 GAUGE_DUT1: Final = Gauge("astro_dut1_broadcast_seconds", "DUT1 broadcast seconds")
 
+# ───────────────────────── routes blueprint import ─────────────────────────
+_routes_bp = None
+_routes_import_err: Optional[str] = None
+try:
+    from app.api import routes as _routes_mod  # type: ignore
+    _routes_bp = _routes_mod.api
+except Exception as e:  # pragma: no cover
+    _routes_import_err = repr(e)
+    print("WARNING: routes blueprint failed to import:", _routes_import_err, file=sys.stderr)
+    traceback.print_exc()
+
 # ───────────────────────── helpers: logging & errors ─────────────────────────
 def _configure_logging(app: Flask) -> None:
+    """Reuse gunicorn logger if present, else basicConfig."""
     gerr = logging.getLogger("gunicorn.error")
     if gerr.handlers:
         app.logger.handlers = gerr.handlers
@@ -74,7 +59,7 @@ def _configure_logging(app: Flask) -> None:
     else:
         logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 
-def _register_errors(app: Flask) -> None:
+def _register_error_handlers(app: Flask) -> None:
     @app.errorhandler(HTTPException)
     def _http(e: HTTPException):
         app.logger.warning("HTTP %s at %s %s: %s", e.code, request.method, request.path, e.description)
@@ -87,9 +72,7 @@ def _register_errors(app: Flask) -> None:
     def _any(e: Exception):
         tb = traceback.format_exc()
         app.logger.error("UNHANDLED %s at %s %s\n%s", type(e).__name__, request.method, request.path, tb)
-        return jsonify(
-            ok=False, error="internal_error", type=type(e).__name__, message=str(e), path=request.path,
-        ), 500
+        return jsonify(ok=False, error="internal_error", type=type(e).__name__, message=str(e), path=request.path), 500
 
 # ───────────────────────── basic auth for /metrics ─────────────────────────
 def _metrics_auth_ok() -> bool:
@@ -105,36 +88,34 @@ def create_app() -> Flask:
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)  # type: ignore
 
     _configure_logging(app)
-    _register_errors(app)
+    _register_error_handlers(app)
 
     GAUGE_APP_UP.set(1.0)
 
-    # Seed a few paths so histograms have labels
+    # Seed labels so histograms/gauges exist early
     for route in ("/", "/healthz", "/metrics"):
         MET_REQUESTS.labels(route=route).inc(0)
         REQ_LATENCY.labels(route=route).observe(0.0)
 
     @app.before_request
-    def _before():
+    def _before_request():
         try:
-            p = (request.path or "")
-            MET_REQUESTS.labels(route=p).inc()
+            MET_REQUESTS.labels(route=(request.path or "")).inc()
             request._t0 = perf_counter()
         except Exception:
             pass
 
     @app.after_request
-    def _after(resp):
+    def _after_request(resp: Response):
         try:
-            p = (request.path or "")
-            if hasattr(request, "_t0"):
-                dt = perf_counter() - request._t0
-                REQ_LATENCY.labels(route=p).observe(dt)
+            t0 = getattr(request, "_t0", None)
+            if t0 is not None:
+                REQ_LATENCY.labels(route=(request.path or "")).observe(perf_counter() - t0)
         except Exception:
             pass
         return resp
 
-    # ───── Health (keep only /healthz; root is a tiny noop) ─────
+    # ───── Health & root ─────
     @app.get("/")
     def _root():
         return jsonify(ok=True, service="astro-backend", health="/healthz"), 200
@@ -143,7 +124,7 @@ def create_app() -> Flask:
     def _healthz():
         return jsonify(ok=True, status="ok"), 200
 
-    # ───── /metrics (basic auth) ─────
+    # ───── Metrics (basic auth) ─────
     @app.get("/metrics")
     def metrics_endpoint():
         if not _metrics_auth_ok():
@@ -152,10 +133,9 @@ def create_app() -> Flask:
             GAUGE_DUT1.set(float(os.environ.get("ASTRO_DUT1_BROADCAST", os.environ.get("ASTRO_DUT1", "0.0")) or 0.0))
         except Exception:
             pass
-        data = generate_latest(REGISTRY)
-        return Response(data, mimetype=CONTENT_TYPE_LATEST)
+        return Response(generate_latest(REGISTRY), mimetype=CONTENT_TYPE_LATEST)
 
-    # ───── Debug helpers ─────
+    # ───── Debug helpers (minimal, non-sensitive) ─────
     @app.get("/__debug/routes")
     def __debug_routes():
         rules: list[Dict[str, Any]] = []
@@ -173,45 +153,6 @@ def create_app() -> Flask:
             "blueprints": list(app.blueprints.keys()),
         }), 200
 
-    # ───── Simple reload endpoint ─────
-    @app.post("/__debug/reload-prediction")
-    def __debug_reload_prediction():
-        try:
-            import importlib
-            import sys
-            if 'app.core.prediction' in sys.modules:
-                importlib.reload(sys.modules['app.core.prediction'])
-                app.logger.info("Prediction module reloaded successfully")
-                return jsonify({"ok": True, "message": "Prediction module reloaded"})
-            else:
-                return jsonify({"ok": False, "message": "Module not found in cache"})
-        except Exception as e:
-            app.logger.error(f"Failed to reload prediction module: {e}")
-            return jsonify({"ok": False, "error": str(e)})
-
-    # ───── Module status endpoint ─────
-    @app.get("/__debug/module-status")
-    def __debug_module_status():
-        try:
-            prediction_loaded = 'app.core.prediction' in sys.modules
-            if prediction_loaded:
-                import app.core.prediction as pred_mod
-                has_fixed_function = hasattr(pred_mod, '_resolve_natal_timescales_fixed')
-                return jsonify({
-                    "ok": True,
-                    "prediction_module_loaded": prediction_loaded,
-                    "has_fixed_function": has_fixed_function,
-                    "module_file": getattr(pred_mod, '__file__', 'unknown'),
-                })
-            else:
-                return jsonify({
-                    "ok": True,
-                    "prediction_module_loaded": False,
-                    "has_fixed_function": False,
-                })
-        except Exception as e:
-            return jsonify({"ok": False, "error": str(e)})
-
     @app.get("/favicon.ico")
     def _noop_favicon():
         return ("", 204)
@@ -221,7 +162,6 @@ def create_app() -> Flask:
         # routes.py uses absolute '/api/...' paths; no url_prefix needed
         app.register_blueprint(_routes_bp)
     else:
-        # Minimal fallback so health dashboards don't look totally red
         @app.get("/api/health")
         def _health_fallback():
             return jsonify(ok=False, error="routes_blueprint_not_loaded", detail=_routes_import_err), 500
@@ -232,7 +172,7 @@ def create_app() -> Flask:
 # ───────────────────────── app instance ─────────────────────────
 app = create_app()
 
-# CORS for browser UIs
+# ───────────────────────── CORS ─────────────────────────
 _allowed_origin = (
     os.environ.get("CORS_ALLOW_ORIGIN")
     or os.environ.get("NETLIFY_ORIGIN")
