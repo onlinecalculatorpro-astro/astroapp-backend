@@ -20,6 +20,11 @@ import random
 import logging
 from datetime import datetime, date as _date
 
+# ───────────────────── global, preloaded Skyfield objects ─────────────────────
+# NOTE: TS and PLANETS are singletons created at process start in app/core/__init__.py
+#       Importing them here avoids reloading kernels/timescales on every request.
+from app.core import TS, PLANETS
+
 # ───────────────────── precise backends (soft imports) ─────────────────────
 # Ephemeris adapter
 try:
@@ -212,7 +217,8 @@ class TransitEngine:
         prebatch_refinement: bool = False,   # new: opt-in
         lon_cache_max: Optional[int] = None, # new: override bound if desired
     ):
-        self.ephem = ephem or EphemerisAdapter(EphemConfig(frame=frame))
+        # Use preloaded TS/PLANETS so the adapter does not reload kernels per-instance
+        self.ephem = ephem or EphemerisAdapter(EphemConfig(frame=frame, timescale=TS, planets=PLANETS))
         self.frame = frame
         self.obs = dict(
             topocentric=bool(topocentric),
@@ -468,7 +474,7 @@ class TransitEngine:
                                 aspect=spec.name,
                                 kind=spec.kind,
                                 separation_deg=float(sep),
-                                applying=bool(applying),
+                                applying=bool(ev.applying) if False else bool(applying),  # keep stable
                                 exact=abs(sep) <= 1e-6,
                                 meta={"orb_deg": spec.orb_deg, "angle": spec.angle},
                             )
@@ -572,7 +578,8 @@ def find_transits_in_range(
     movers = list(transiting_bodies or ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn","Uranus","Neptune","Pluto"])
     tgts   = list(natal_targets or natal_bodies or ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn"])
 
-    ep = EphemerisAdapter(EphemConfig(frame=frame))
+    # Use preloaded ephemeris assets
+    ep = EphemerisAdapter(EphemConfig(frame=frame, timescale=TS, planets=PLANETS))
     eng = TransitEngine(ephem=ep, frame=frame)
     # thread sidereal mode into the engine (no API change)
     eng.sidereal_mode = zodiac_mode.startswith("sidereal")
@@ -758,7 +765,7 @@ def predict_dasha_periods(
         birth_jd_tt = float(ts["jd_tt"])
 
     # Need Moon tropical longitude at birth; ask adapter
-    ep = EphemerisAdapter(EphemConfig(frame="ecliptic-of-date"))
+    ep = EphemerisAdapter(EphemConfig(frame="ecliptic-of-date", timescale=TS, planets=PLANETS))
     mm_rows = ep.ecliptic_longitudes(birth_jd_tt, ["Moon"]).get("results", [])
     PROF["ephem_calls"] += 1
     moon_lon_trop = float(mm_rows[0]["longitude"]) if mm_rows else 0.0
@@ -1091,7 +1098,8 @@ def evaluate_univariate(
     use_time: bool = True,
     seed: Optional[int] = None
 ) -> List[EvalResult]:
-    ep = ephem or EphemerisAdapter(EphemConfig(frame="ecliptic-of-date"))
+    # Reuse caller-supplied ephem if provided, else build with preloaded TS/PLANETS
+    ep = ephem or EphemerisAdapter(EphemConfig(frame="ecliptic-of-date", timescale=TS, planets=PLANETS))
     y: List[int] = []; strata: List[Any] = []; rows: List[Dict[str, float]] = []; times: List[float] = []
 
     for rec in records:
@@ -1160,7 +1168,8 @@ def holdout_replicate(
     )
     selected = [r.feature for r in train_res if r.accepted]
 
-    ep = EphemerisAdapter(EphemConfig(frame="ecliptic-of-date"))
+    # Use preloaded ephemeris assets in test pass
+    ep = EphemerisAdapter(EphemConfig(frame="ecliptic-of-date", timescale=TS, planets=PLANETS))
     y_test: List[int] = []; strata: List[Any] = []; rows: List[Dict[str, float]] = []; times: List[float] = []
     for rec in test:
         y_test.append(int(rec.get("outcome", 0)))
