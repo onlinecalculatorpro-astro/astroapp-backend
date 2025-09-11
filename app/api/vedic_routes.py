@@ -1,8 +1,9 @@
 # app/api/vedic_routes.py
 from __future__ import annotations
 from typing import Any, Dict, List, Tuple, Optional
-
+import inspect
 import os
+
 from flask import Blueprint, jsonify, request
 
 # ── rate limiting (single key_fn) ──
@@ -14,9 +15,10 @@ def client_endpoint_key() -> str:
     except Exception:
         return str(client_key())
 
-# ── timescales (optional) ──
+# ── timescales (optional; NO jd_utc) ──
 try:
-    from app.core.timescales import build_timescales  # build_timescales(date, time, tz, dut1_seconds)
+    # build_timescales(date_str, time_str, tz_name, dut1_seconds) → has jd_tt/jd_ut1
+    from app.core.timescales import build_timescales
     _TIMESCALES_OK = True
 except Exception:
     build_timescales = None  # type: ignore
@@ -34,15 +36,13 @@ except Exception:
     except Exception:
         _run_dasha = None  # type: ignore
 
-# module fallback
+# fallback module
 try:
     from app.core.vimshottari_dasha import compute_vimshottari as _compute_vim_module  # type: ignore
 except Exception:
     _compute_vim_module = None  # type: ignore
 
 vedic_api = Blueprint("vedic_api", __name__)
-
-# per-endpoint RL
 RL_VEDIC_PREDICTIVE = int(os.getenv("ASTRO_RL_VEDIC_PREDICTIVE_PER_MIN", "12"))
 
 _TZ_ALIAS = {
@@ -56,7 +56,27 @@ def _normalize_tz(tz: str) -> str:
         return "UTC"
     return _TZ_ALIAS.get(tz.strip().lower(), tz)
 
+def _filter_kwargs(func, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Only pass parameters the callable can accept (prevents TypeError: unexpected kwarg)."""
+    try:
+        sig = inspect.signature(func)
+    except Exception:
+        return kwargs  # best effort
+    kept = {}
+    has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+    if has_varkw:
+        return kwargs
+    allowed = set(sig.parameters.keys())
+    for k, v in kwargs.items():
+        if k in allowed:
+            kept[k] = v
+    return kept
+
 def _normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    """
+    Normalize inputs; fill jd_tt/jd_ut1 (if timescales available); compute depth 1..5.
+    NO jd_utc anywhere.
+    """
     warns: List[str] = []
 
     date = str(payload.get("date") or payload.get("birth_date") or "")
@@ -70,10 +90,10 @@ def _normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], Lis
         try:
             ts = build_timescales(date, time_str, tz_name, 0.0)  # type: ignore[call-arg]
             if isinstance(ts, dict):
-                if ts.get("jd_tt") is not None: jd_tt = float(ts["jd_tt"])
+                if ts.get("jd_tt") is not None:  jd_tt  = float(ts["jd_tt"])
                 if ts.get("jd_ut1") is not None: jd_ut1 = float(ts["jd_ut1"])
             else:
-                jd_tt = float(getattr(ts, "jd_tt"))
+                jd_tt  = float(getattr(ts, "jd_tt"))
                 jd_ut1 = float(getattr(ts, "jd_ut1"))
         except Exception as e:
             warns.append(f"timescales_failed:{e!s}")
@@ -91,26 +111,37 @@ def _normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], Lis
     lat = payload.get("latitude")
     lon = payload.get("longitude")
 
+    # base kwargs (civil + optional timescales)
     norm: Dict[str, Any] = {
         "system": "vimshottari",
         "date": date,
         "time": time_str,
         "tz": tz_name,
-        "jd_tt": jd_tt,
-        "jd_ut1": jd_ut1,
         "ayanamsa": ayanamsa,
-        "latitude": float(lat) if isinstance(lat, (int, float)) else None,
-        "longitude": float(lon) if isinstance(lon, (int, float)) else None,
         "levels": depth,
         "max_levels": depth,
+        "latitude": float(lat) if isinstance(lat, (int, float)) else None,
+        "longitude": float(lon) if isinstance(lon, (int, float)) else None,
+        "jd_tt": jd_tt,
+        "jd_ut1": jd_ut1,
         "raw": payload,
     }
+
+    # common aliases some registries expect (harmless if unused)
+    norm.update({
+        "tz_name": tz_name,
+        "ayanamsa_key": ayanamsa,
+        "birth_date": date,
+        "birth_time": time_str,
+        "place_tz": tz_name,
+        "depth": depth,
+    })
     return norm, warns
 
-def _wrap_ok(out: Dict[str, Any], warns: List[str], tz_norm: str) -> Dict[str, Any]:
+def _wrap_ok(out: Dict[str, Any], warns: List[str], tz_norm: str, branch: str) -> Dict[str, Any]:
     out.setdefault("ok", True)
     out.setdefault("meta", {})
-    out["meta"].update({"route": "vimshottari", "tz_normalized": tz_norm})
+    out["meta"].update({"route": "vimshottari", "tz_normalized": tz_norm, "branch": branch})
     if warns:
         out.setdefault("warnings", [])
         seen = set(map(str, out["warnings"]))
@@ -125,53 +156,81 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
     norm, warns = _normalize_vim_payload(payload)
     tz_norm = str(norm.get("tz", "UTC"))
 
+    # 1) unified registry (preferred)
     if _compute_dasha_registry is not None:
         try:
+            k = _filter_kwargs(_compute_dasha_registry, norm)
             try:
-                out = _compute_dasha_registry("vimshottari", **norm)  # type: ignore[misc]
+                out = _compute_dasha_registry("vimshottari", **k)  # type: ignore[misc]
             except TypeError:
-                out = _compute_dasha_registry("vimshottari", norm)   # type: ignore[misc]
+                out = _compute_dasha_registry("vimshottari", k)   # type: ignore[misc]
             if isinstance(out, dict):
-                return _wrap_ok(out, warns, tz_norm)
+                return _wrap_ok(out, warns, tz_norm, branch="registry.compute_dasha")
         except Exception as e:
             return {"ok": False, "error": "vimshottari_registry_failed", "detail": str(e),
-                    "meta": {"route": "vimshottari", "tz_normalized": tz_norm}}
+                    "meta": {"route": "vimshottari", "tz_normalized": tz_norm, "branch": "registry.compute_dasha"}}
 
+    # 2) alternate registry name
     if _run_dasha is not None:
         try:
-            out = _run_dasha("vimshottari", norm)  # type: ignore[misc]
+            k = _filter_kwargs(_run_dasha, norm)
+            out = _run_dasha("vimshottari", k)  # most run_dasha(kind, payload) use a single dict
             if isinstance(out, dict):
-                return _wrap_ok(out, warns, tz_norm)
+                return _wrap_ok(out, warns, tz_norm, branch="registry.run_dasha")
         except Exception as e:
             return {"ok": False, "error": "vimshottari_registry_failed", "detail": str(e),
-                    "meta": {"route": "vimshottari", "tz_normalized": tz_norm}}
+                    "meta": {"route": "vimshottari", "tz_normalized": tz_norm, "branch": "registry.run_dasha"}}
 
+    # 3) module fallback: be conservative (civil + ayanamsa/levels only)
     if _compute_vim_module is not None:
         try:
-            out = (_compute_vim_module(**norm) if callable(_compute_vim_module)
-                   else _compute_vim_module(norm))  # type: ignore[misc]
+            civ_only_keys = ["date","time","tz","tz_name","ayanamsa","ayanamsa_key","levels","depth","max_levels","latitude","longitude"]
+            civ = {k: norm[k] for k in civ_only_keys if k in norm and norm[k] is not None}
+            k = _filter_kwargs(_compute_vim_module, civ)
+            out = (_compute_vim_module(**k) if callable(_compute_vim_module)
+                   else _compute_vim_module(k))  # type: ignore[misc]
             if isinstance(out, dict):
-                return _wrap_ok(out, warns, tz_norm)
+                return _wrap_ok(out, warns, tz_norm, branch="module.compute_vimshottari")
         except Exception as e:
             return {"ok": False, "error": "vimshottari_module_failed", "detail": str(e),
-                    "meta": {"route": "vimshottari", "tz_normalized": tz_norm}}
+                    "meta": {"route": "vimshottari", "tz_normalized": tz_norm, "branch": "module.compute_vimshottari"}}
 
     return {"ok": False, "error": "vimshottari_engine_unavailable",
-            "meta": {"route": "vimshottari", "tz_normalized": tz_norm}}
+            "meta": {"route": "vimshottari", "tz_normalized": tz_norm, "branch": "none"}}
 
-# ── ABSOLUTE PATHS (because main.py registers blueprint WITHOUT url_prefix) ──
+# ── ABSOLUTE PATHS (main.py registers this bp WITHOUT url_prefix) ──
 
 @vedic_api.get("/api/vedic/health")
 def vedic_health():
     return jsonify(ok=True, vedic=True), 200
 
+@vedic_api.get("/api/vedic/diag")
+def vedic_diag():
+    def sigs(fn):
+        try:
+            return str(inspect.signature(fn))
+        except Exception:
+            return None
+    return jsonify({
+        "timescales_ok": _TIMESCALES_OK,
+        "registry_compute_present": bool(_compute_dasha_registry),
+        "registry_run_present": bool(_run_dasha),
+        "module_vimshottari_present": bool(_compute_vim_module),
+        "registry_compute_sig": sigs(_compute_dasha_registry) if _compute_dasha_registry else None,
+        "registry_run_sig": sigs(_run_dasha) if _run_dasha else None,
+    }), 200
+
 @vedic_api.post("/api/vedic/dasha/vimshottari")
 @rate_limit(RL_VEDIC_PREDICTIVE, key_fn=client_endpoint_key)
 def vedic_vimshottari():
     body = request.get_json(silent=True) or {}
-    res = _run_vimshottari(body)
-    status = 200 if res.get("ok") else (503 if str(res.get("error", "")).endswith("unavailable") else 400)
-    return jsonify(res), status
+    try:
+        res = _run_vimshottari(body)
+        status = 200 if res.get("ok") else (503 if str(res.get("error","")).endswith("unavailable") else 400)
+        return jsonify(res), status
+    except Exception as e:
+        # Ensure JSON detail reaches the client for quick triage
+        return jsonify(ok=False, error="vedic_internal_error", detail=str(e)), 500
 
 @vedic_api.post("/api/vedic/dasha/vimshottari/compute")
 @rate_limit(RL_VEDIC_PREDICTIVE, key_fn=client_endpoint_key)
