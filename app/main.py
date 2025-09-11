@@ -38,7 +38,7 @@ REQ_LATENCY: Final = Histogram("astro_request_seconds", "API request latency", [
 GAUGE_APP_UP: Final = Gauge("astro_app_up", "1 if app is running")
 GAUGE_DUT1: Final = Gauge("astro_dut1_broadcast_seconds", "DUT1 broadcast seconds")
 
-# ───────────────────────── routes blueprint import ─────────────────────────
+# ───────────────────────── routes blueprint import (Western) ─────────────────────────
 _routes_bp = None
 _routes_import_err: Optional[str] = None
 try:
@@ -48,6 +48,18 @@ except Exception as e:  # pragma: no cover
     _routes_import_err = repr(e)
     print("WARNING: routes blueprint failed to import:", _routes_import_err, file=sys.stderr)
     traceback.print_exc()
+
+# ───────────────────────── Vedic routes blueprint import (optional) ─────────────────────────
+_vedic_bp = None
+_vedic_import_err: Optional[str] = None
+_ENABLE_VEDIC = os.getenv("ENABLE_VEDIC_API", "1").lower() in ("1", "true", "yes", "on")
+if _ENABLE_VEDIC:
+    try:
+        from app.api.vedic_routes import vedic_api as _vedic_bp  # type: ignore
+    except Exception as e:  # pragma: no cover
+        _vedic_import_err = repr(e)
+        print("WARNING: vedic_routes blueprint failed to import:", _vedic_import_err, file=sys.stderr)
+        traceback.print_exc()
 
 # ───────────────────────── helpers: logging & errors ─────────────────────────
 def _configure_logging(app: Flask) -> None:
@@ -150,6 +162,9 @@ def create_app() -> Flask:
         return jsonify({
             "routes_blueprint_loaded": _routes_bp is not None,
             "routes_import_error": _routes_import_err,
+            "vedic_blueprint_loaded": (_vedic_bp is not None),
+            "vedic_import_error": _vedic_import_err,
+            "vedic_enabled_flag": _ENABLE_VEDIC,
             "blueprints": list(app.blueprints.keys()),
         }), 200
 
@@ -157,7 +172,7 @@ def create_app() -> Flask:
     def _noop_favicon():
         return ("", 204)
 
-    # ───── Register the core API blueprint (all canonical routes live there) ─────
+    # ───── Register the core API blueprint (Western; canonical) ─────
     if _routes_bp is not None:
         # routes.py uses absolute '/api/...' paths; no url_prefix needed
         app.register_blueprint(_routes_bp)
@@ -166,7 +181,20 @@ def create_app() -> Flask:
         def _health_fallback():
             return jsonify(ok=False, error="routes_blueprint_not_loaded", detail=_routes_import_err), 500
 
-    app.logger.info("App initialized; routes_loaded=%s", bool(_routes_bp))
+    # ───── Register the Vedic API blueprint (scoped) ─────
+    if _ENABLE_VEDIC and _vedic_bp is not None:
+        # vedic_routes.py should define relative rules (e.g., '/panchanga');
+        # we scope them to /api/vedic here.
+        app.register_blueprint(_vedic_bp, url_prefix="/api/vedic")
+    elif _ENABLE_VEDIC and _vedic_bp is None:
+        @app.get("/api/vedic/health")
+        def _vedic_health_fallback():
+            return jsonify(ok=False, error="vedic_blueprint_not_loaded", detail=_vedic_import_err), 500
+
+    app.logger.info(
+        "App initialized; routes_loaded=%s vedic_enabled=%s vedic_loaded=%s",
+        bool(_routes_bp), _ENABLE_VEDIC, bool(_vedic_bp),
+    )
     return app
 
 # ───────────────────────── app instance ─────────────────────────
