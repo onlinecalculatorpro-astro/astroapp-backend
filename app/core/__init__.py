@@ -1,21 +1,30 @@
 # app/core/__init__.py
-# -------------------------------------------------------------------
-# Lightweight package init. No heavy imports here (avoids circulars).
-# Ephemeris singletons live in ephem_singleton and can be imported
-# from this package for convenience.
-# -------------------------------------------------------------------
+# -*- coding: utf-8 -*-
+"""
+AstroApp core package — lightweight __init__ (no heavy side effects).
 
-from .ephem_singleton import TS, PLANETS, get_timescale, get_planets
+This file intentionally avoids importing runtime-heavy modules (ephemerides,
+timescales, prediction engines, etc.) to prevent circular imports and slow
+startup. Import those from their concrete modules:
+
+- Ephemeris singleton (TS, PLANETS):   app.core.runtime
+- Constants & helpers:                  app.core.constants
+- Validators / parsers:                 app.core.validators
+- Timescales utilities:                 app.core.timescales
+"""
+
+from __future__ import annotations
+from typing import TYPE_CHECKING
 
 __all__ = [
-    # Ephemeris singletons + accessors
-    "TS", "PLANETS", "get_timescale", "get_planets",
+    # Core public modules (import these directly in your code)
+    "constants",
+    "validators",
+    "timescales",
 ]
 
-# Notes for importers:
-# - Import predictive symbols directly from their modules, e.g.:
-#     from app.core.predictive import TransitEngine, find_transits_in_range
-# - Import validators directly:
-#     from app.core.validators import resolve_timescales_from_civil_erfa
-# - Do NOT import predictive from app.core (this file) to avoid
-#   package import side-effects and circular imports.
+if TYPE_CHECKING:
+    # Type-only hints to keep editors happy without importing at runtime
+    from . import constants as constants
+    from . import validators as validators
+    from . import timescales as timescales
