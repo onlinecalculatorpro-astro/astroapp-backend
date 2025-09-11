@@ -1,9 +1,11 @@
 # app/api/routes.py
 """
 AstroApp — Canonical API Routes (circular-safe header)
+
+Scope wired here (imports/guards only; endpoints defined later in file):
 - Timescales (ERFA-aligned)
 - Chart + Houses
-- Predictions (legacy + v2 prediction engine)
+- Prediction engine (transits • progressions • returns • directions)
 - Ephemeris
 - Predictive toolkit
 - Progressions (secondary • minor • tertiary)
@@ -15,13 +17,10 @@ AstroApp — Canonical API Routes (circular-safe header)
 - Ops: /api/health, /api/config, /api/openapi, /__debug/routes
 
 Notes:
-- Topocentric ephemeris honored via either center:"topocentric" or topocentric:true
-- Ephemeris responses include adapter meta (with meta.topocentric)
-- Adapter/kernel meta is bubbled up to API responses so dev tools can verify DE440s/DE421 quickly.
-- V2 prediction engine provides comprehensive forecasting capabilities.
-
-This header intentionally avoids importing anything from `app.core.__init__`
-and only imports concrete modules directly to prevent circular imports.
+- Topocentric ephemeris honored via either center:"topocentric" or topocentric:true.
+- Ephemeris responses include adapter meta (see meta.topocentric).
+- Adapter/kernel meta bubbles up so dev tools can verify DE ephemerides quickly.
+- This header avoids importing from app.core.__init__ to prevent circulars; concrete modules only.
 """
 
 from __future__ import annotations
@@ -49,7 +48,7 @@ from app.core.validators import (
     ValidationError,
     parse_chart_payload,
     parse_prediction_payload,
-    parse_rectification_payload,  # noqa: F401 (kept for completeness)
+    parse_rectification_payload,   # noqa: F401 (kept for completeness)
     parse_ephemeris_payload,
     parse_frame,
     parse_latlon,
@@ -58,7 +57,7 @@ from app.core.validators import (
     parse_parans_payload,
     parse_synastry_payload,
     parse_composite_payload,
-    parse_synasry_payload_safe,     # internal alias used by synastry report helper
+    parse_synasry_payload_safe,    # internal alias used by synastry report helper
     parse_synastry_report_payload,
     parse_relocation_payload,
     parse_astrocartography_payload,
@@ -76,7 +75,7 @@ except Exception as e:
     build_timescales = None  # type: ignore
     TimeScales = None        # type: ignore
 
-# ───────────────────────── prediction engine (v2, optional) ─────────────────────────
+# ───────────────────────── prediction engine (optional) ─────────────────────────
 try:
     from app.core.prediction import (
         predict_transits,
@@ -97,19 +96,19 @@ try:
 except Exception as e:
     _PREDICTION_ENGINE_OK = False
     _PREDICTION_ENGINE_ERR = e
-    # Shims to avoid NameError in routes where features are disabled
-    predict_transits = None  # type: ignore
-    predict_progressions = None  # type: ignore
-    predict_returns = None  # type: ignore
-    predict_directions = None  # type: ignore
-    comprehensive_forecast = None  # type: ignore
-    relationship_forecast = None  # type: ignore
-    validate_prediction_model = None  # type: ignore
-    PredictionEvent = None  # type: ignore
-    PredictionResult = None  # type: ignore
-    ComprehensiveForecast = None  # type: ignore
-    RelationshipForecast = None  # type: ignore
-    TimingWindow = None  # type: ignore
+    # Shims so routes can be defined even if engine is unavailable
+    predict_transits = None              # type: ignore
+    predict_progressions = None          # type: ignore
+    predict_returns = None               # type: ignore
+    predict_directions = None            # type: ignore
+    comprehensive_forecast = None        # type: ignore
+    relationship_forecast = None         # type: ignore
+    validate_prediction_model = None     # type: ignore
+    PredictionEvent = None               # type: ignore
+    PredictionResult = None              # type: ignore
+    ComprehensiveForecast = None         # type: ignore
+    RelationshipForecast = None          # type: ignore
+    TimingWindow = None                  # type: ignore
 
 # ───────────────────────── progressions (legacy helper; optional) ─────────────────────────
 try:
@@ -138,7 +137,7 @@ except Exception as _e1:
         _RETURNS_IMPORT_ERROR = _e2  # keep last error for diagnostics
 
 # ───────────────────────── parans core (optional) ─────────────────────────
-_parans_compute = None  # function when available
+_parans_compute = None
 _PARANS_IMPORT_ERROR: Optional[Exception] = None
 try:
     from app.core.paran import compute_parans as _parans_compute
@@ -197,31 +196,31 @@ api = Blueprint("api", __name__)
 DEBUG_VERBOSE = os.getenv("ASTRO_DEBUG_VERBOSE", "0").lower() in ("1", "true", "yes", "on")
 ARCSEC_TOL = float(os.getenv("ASTRO_ASC_TOL_ARCSEC", "3.6"))  # 0.001°
 
-# Per-endpoint rate-limit caps (calls per minute, env-overridable)
-_RL = lambda k, d: int(os.getenv(k, str(d)))
-RL_TIMESCALES   = _RL("ASTRO_RL_TIMESCALES_PER_MIN",   60)
-RL_CALCULATE    = _RL("ASTRO_RL_CALCULATE_PER_MIN",    24)
-RL_REPORT       = _RL("ASTRO_RL_REPORT_PER_MIN",       12)
-RL_ASPECTS      = _RL("ASTRO_RL_ASPECTS_PER_MIN",      18)
-RL_EPHEM        = _RL("ASTRO_RL_EPHEM_PER_MIN",        30)
-RL_PREDICTIONS  = _RL("ASTRO_RL_PREDICTIONS_PER_MIN",   6)
-RL_PREDICTIVE   = _RL("ASTRO_RL_PREDICTIVE_PER_MIN",   12)
-RL_DEBUG        = _RL("ASTRO_RL_DEBUG_PER_MIN",         6)
-RL_PROGRESSIONS = _RL("ASTRO_RL_PROGRESSIONS_PER_MIN", 12)
-RL_RETURNS      = _RL("ASTRO_RL_RETURNS_PER_MIN",      12)
-RL_PARANS       = _RL("ASTRO_RL_PARANS_PER_MIN",       12)
-RL_SYNASTRY     = _RL("ASTRO_RL_SYNASTRY_PER_MIN",     6)
-RL_COMPOSITE    = _RL("ASTRO_RL_COMPOSITE_PER_MIN",    8)
-RL_RELOCATION   = _RL("ASTRO_RL_RELOCATION_PER_MIN",   10)
-RL_ASTROCARTOGRAPHY = _RL("ASTRO_RL_ASTROCARTOGRAPHY_PER_MIN", 4)
-RL_DIRECTIONS   = _RL("ASTRO_RL_DIRECTIONS_PER_MIN",    8)
-RL_PREDICTION_FORECAST = _RL("ASTRO_RL_PREDICTION_FORECAST_PER_MIN", 4)
-RL_PREDICTION_TRANSITS = _RL("ASTRO_RL_PREDICTION_TRANSITS_PER_MIN", 8)
-RL_PREDICTION_PROGRESSIONS = _RL("ASTRO_RL_PREDICTION_PROGRESSIONS_PER_MIN", 6)
-RL_PREDICTION_RETURNS = _RL("ASTRO_RL_PREDICTION_RETURNS_PER_MIN", 6)
-RL_PREDICTION_DIRECTIONS = _RL("ASTRO_RL_PREDICTION_DIRECTIONS_PER_MIN", 6)
-RL_PREDICTION_RELATIONSHIP = _RL("ASTRO_RL_PREDICTION_RELATIONSHIP_PER_MIN", 3)
-RL_PREDICTION_VALIDATION = _RL("ASTRO_RL_PREDICTION_VALIDATION_PER_MIN", 2)
+# Per-endpoint rate-limit caps (calls per minute; env-overridable)
+_env_int = lambda key, default: int(os.getenv(key, str(default)))
+RL_TIMESCALES   = _env_int("ASTRO_RL_TIMESCALES_PER_MIN",   60)
+RL_CALCULATE    = _env_int("ASTRO_RL_CALCULATE_PER_MIN",    24)
+RL_REPORT       = _env_int("ASTRO_RL_REPORT_PER_MIN",       12)
+RL_ASPECTS      = _env_int("ASTRO_RL_ASPECTS_PER_MIN",      18)
+RL_EPHEM        = _env_int("ASTRO_RL_EPHEM_PER_MIN",        30)
+RL_PREDICTIONS  = _env_int("ASTRO_RL_PREDICTIONS_PER_MIN",   6)
+RL_PREDICTIVE   = _env_int("ASTRO_RL_PREDICTIVE_PER_MIN",   12)
+RL_DEBUG        = _env_int("ASTRO_RL_DEBUG_PER_MIN",         6)
+RL_PROGRESSIONS = _env_int("ASTRO_RL_PROGRESSIONS_PER_MIN", 12)
+RL_RETURNS      = _env_int("ASTRO_RL_RETURNS_PER_MIN",      12)
+RL_PARANS       = _env_int("ASTRO_RL_PARANS_PER_MIN",       12)
+RL_SYNASTRY     = _env_int("ASTRO_RL_SYNASTRY_PER_MIN",      6)
+RL_COMPOSITE    = _env_int("ASTRO_RL_COMPOSITE_PER_MIN",     8)
+RL_RELOCATION   = _env_int("ASTRO_RL_RELOCATION_PER_MIN",   10)
+RL_ASTROCARTOGRAPHY = _env_int("ASTRO_RL_ASTROCARTOGRAPHY_PER_MIN", 4)
+RL_DIRECTIONS   = _env_int("ASTRO_RL_DIRECTIONS_PER_MIN",     8)
+RL_PREDICTION_FORECAST     = _env_int("ASTRO_RL_PREDICTION_FORECAST_PER_MIN",     4)
+RL_PREDICTION_TRANSITS     = _env_int("ASTRO_RL_PREDICTION_TRANSITS_PER_MIN",     8)
+RL_PREDICTION_PROGRESSIONS = _env_int("ASTRO_RL_PREDICTION_PROGRESSIONS_PER_MIN", 6)
+RL_PREDICTION_RETURNS      = _env_int("ASTRO_RL_PREDICTION_RETURNS_PER_MIN",      6)
+RL_PREDICTION_DIRECTIONS   = _env_int("ASTRO_RL_PREDICTION_DIRECTIONS_PER_MIN",   6)
+RL_PREDICTION_RELATIONSHIP = _env_int("ASTRO_RL_PREDICTION_RELATIONSHIP_PER_MIN", 3)
+RL_PREDICTION_VALIDATION   = _env_int("ASTRO_RL_PREDICTION_VALIDATION_PER_MIN",   2)
 
 
 # ───────────────────────── helpers ─────────────────────────
