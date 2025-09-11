@@ -1,6 +1,7 @@
 # app/core/validators.py
 from __future__ import annotations
 
+
 import math
 import re
 from datetime import datetime, date, timedelta
@@ -2041,6 +2042,7 @@ def resolve_timescales_from_civil_erfa(
     Notes:
     • Accepts leap second (SS==60) and the special "24:00:00" end-of-day.
     • Uses Skyfield's ΔT (TT−UT1) to derive UT1; if unavailable, falls back to UT1≈UTC.
+    • Uses the lazy ephemeris singleton (no heavy imports at module import time).
     """
     # Validate/normalize inputs
     tz = _validate_iana_tz(str(place_tz).strip())
@@ -2073,14 +2075,11 @@ def resolve_timescales_from_civil_erfa(
         dt_local += timedelta(seconds=1)
     dt_utc = dt_local.astimezone(ZoneInfo("UTC"))
 
-    # Skyfield times
-    try:
-        from skyfield.api import load
-    except Exception as e:
-        raise RuntimeError(f"Skyfield not installed: {e}") from e
+    # Use the lazy singleton to get a Timescale instance
+    from app.core.ephem_singleton import get_timescale
+    ts = get_timescale()
 
-    ts = load.timescale()
-    # Skyfield can take the aware UTC datetime directly, or components
+    # Build a Skyfield Time from UTC components
     t = ts.utc(
         dt_utc.year, dt_utc.month, dt_utc.day,
         dt_utc.hour, dt_utc.minute, dt_utc.second + dt_utc.microsecond / 1e6
