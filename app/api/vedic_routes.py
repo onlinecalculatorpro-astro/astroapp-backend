@@ -4,38 +4,14 @@ from typing import Any, Dict, Optional
 import inspect
 import os
 
-from flask import Blueprint, jsonify, request as _flask_request
+from flask import Blueprint, jsonify, request
 
-# ── rate limiting (single key_fn) ──
-from app.utils.ratelimit import rate_limit, client_key, endpoint_key
+# ── rate limiting: fixed key ──
+from app.utils.ratelimit import rate_limit
 
-def _call_key(fn):
-    """Call key function that may be defined as fn() or fn(request)."""
-    try:
-        return fn(_flask_request)   # signature: fn(request)
-    except TypeError:
-        return fn()                 # signature: fn()
-    except Exception:
-        return None
-
-def client_endpoint_key(*_args, **_kwargs) -> str:
-    """
-    Accepts positional args so it works with decorators that pass (request).
-    Falls back gracefully if inner key fns raise.
-    """
-    ck = _call_key(client_key)
-    ek = _call_key(endpoint_key)
-    if ck is None:
-        try:
-            ck = _flask_request.remote_addr or "anon"
-        except Exception:
-            ck = "anon"
-    if ek is None:
-        try:
-            ek = _flask_request.path or "unknown"
-        except Exception:
-            ek = "unknown"
-    return f"{ck}::{ek}"
+def fixed_key(*_args, **_kwargs) -> str:
+    """Always returns the same bucket key. All calls share this bucket."""
+    return "20"
 
 # ── payload normalization (from core; NO jd_utc inside) ──
 try:
@@ -65,7 +41,8 @@ except Exception:
 
 # ── blueprint & rate limits ──
 vedic_api = Blueprint("vedic_api", __name__)
-RL_VEDIC_PREDICTIVE = int(os.getenv("ASTRO_RL_VEDIC_PREDICTIVE_PER_MIN", "12"))
+# default cap 20/min (env override: ASTRO_RL_VEDIC_PREDICTIVE_PER_MIN)
+RL_VEDIC_PREDICTIVE = int(os.getenv("ASTRO_RL_VEDIC_PREDICTIVE_PER_MIN", "20"))
 
 # ── helpers ──
 def _wrap_ok(out: Dict[str, Any], warns: list[str], tz_norm: str, branch: str) -> Dict[str, Any]:
@@ -83,7 +60,6 @@ def _wrap_ok(out: Dict[str, Any], warns: list[str], tz_norm: str, branch: str) -
     return out
 
 def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
-    # Validator must be available
     if normalize_vim_payload is None:
         return {
             "ok": False,
@@ -94,8 +70,7 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
     # normalize_vim_payload → (norm, warns, tz_norm)
     norm, warns, tz_norm = normalize_vim_payload(payload)  # type: ignore[misc]
 
-    # 1) Unified registry (preferred) — signature:
-    #    compute_dasha(system: str, payload: Dict[str, Any], *, depth: int | None = None)
+    # 1) Unified registry (preferred)
     if _compute_dasha_registry is not None:
         try:
             depth_val = int(norm.get("levels") or norm.get("depth") or norm.get("max_levels") or 5)
@@ -143,7 +118,6 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "meta": {"route": "vimshottari", "tz_normalized": tz_norm, "branch": "module.compute_vimshottari"},
             }
 
-    # No engine available
     return {
         "ok": False,
         "error": "vimshottari_engine_unavailable",
@@ -171,10 +145,12 @@ def vedic_diag():
         "registry_run_present": bool(_run_dasha),
         "registry_run_sig": sigs(_run_dasha) if _run_dasha else None,
         "module_vimshottari_present": bool(_compute_vim_module),
+        "rl_cap_per_min": RL_VEDIC_PREDICTIVE,
+        "rl_bucket_key": "20",
     }), 200
 
 @vedic_api.post("/api/vedic/dasha/vimshottari")
-@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=client_endpoint_key)
+@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)   # ← fixed key, single shared bucket
 def vedic_vimshottari():
     body = request.get_json(silent=True) or {}
     try:
@@ -182,5 +158,4 @@ def vedic_vimshottari():
         status = 200 if res.get("ok") else (503 if str(res.get("error","")).endswith("unavailable") else 400)
         return jsonify(res), status
     except Exception as e:
-        # Ensure JSON detail reaches the client for quick triage
         return jsonify(ok=False, error="vedic_internal_error", detail=str(e)), 500
