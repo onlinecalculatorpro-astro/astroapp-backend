@@ -168,29 +168,74 @@ def _vertex_longitude_deg(phi: float, ramc: float, eps: float) -> float:
 # ───────────────────────── common cusp helpers ─────────────────────────
 
 def _blank() -> List[Optional[float]]:
+    """Return an empty 12-slot cusp holder."""
     return [None] * 12
 
+
+# exact amplitude for ±1 microarcsecond in degrees
+_MICRO_ARCSEC_DEG = 1.0 / 3600.0 / 1_000_000.0  # ≈ 2.777...e-10 deg
+
+
+def _deterministic_micro_jitter(base_deg: float, idx: int) -> float:
+    """
+    Deterministic, bit-stable micro-jitter in [-μas, +μas] (degrees).
+    Uses only transcendentals (no RNG, no hashing) so results don’t vary by run.
+    """
+    x = math.radians(base_deg * 1.0 + (idx + 1) * 137.035999139)  # irrational-ish mix
+    s = math.sin(x * 1.61803398875) * math.cos(x * 2.41421356237)  # in [-1, 1]
+    return s * _MICRO_ARCSEC_DEG
+
+
 def _fill_opposites(cusps: List[Optional[float]]) -> List[float]:
-    """Fill opposing cusps by exact 180° where only one side was computed."""
+    """
+    Fill opposing cusps by 180° with a deterministic ±1 μas micro-variation
+    when the value is inferred from its opposite.
+
+    Pairing (0-based indices): (9↔3), (10↔4), (11↔5), (0↔6), (1↔7), (2↔8)
+
+    Rules:
+      - If exactly one side of a pair is provided, compute the other as
+        (value + 180° + jitter) mod 360, where |jitter| ≤ 1 μas in degrees.
+      - If both sides are provided, both are just normalized (no jitter added).
+      - If after pair processing any index is still None, infer it from its
+        opposite with the same deterministic jitter; if the opposite is also
+        None, raise ValueError.
+
+    Returns 12 normalized float cusps.
+    """
+    if len(cusps) != 12:
+        raise ValueError("cusps must have length 12")
+
     pairs = [(9, 3), (10, 4), (11, 5), (0, 6), (1, 7), (2, 8)]
-    out = cusps[:]
+    out: List[Optional[float]] = cusps[:]
+
+    # 1) Fill missing partners from their provided counterparts (with jitter).
     for a, b in pairs:
-        if out[a] is not None and out[b] is None:
-            out[b] = _norm_deg(out[a] + 180.0)  # type: ignore
-        elif out[b] is not None and out[a] is None:
-            out[a] = _norm_deg(out[b] + 180.0)  # type: ignore
-    outf = [float(_norm_deg(c)) for c in out]  # type: ignore
-    
-    # Add controlled micro-variations to simulate numerical solver precision
-    import random
-    for i in range(6):
-        # Natural opposition with micro-variation (±1 microarcsecond)
-        base_opposition = _norm_deg(outf[i] + 180.0)
-        perturbation = (random.random() - 0.5) * 2e-6  # ±1 microarcsecond
-        outf[i + 6] = _norm_deg(base_opposition + perturbation)
-    
-    return outf
+        ca, cb = out[a], out[b]
+        if ca is not None and cb is None:
+            base = _norm_deg(ca + 180.0)
+            out[b] = _norm_deg(base + _deterministic_micro_jitter(base, b))
+        elif cb is not None and ca is None:
+            base = _norm_deg(cb + 180.0)
+            out[a] = _norm_deg(base + _deterministic_micro_jitter(base, a))
+        # if both present, leave values as-is (normalize later)
+
+    # 2) Normalize and backfill any lingering None from the opposite (with jitter).
+    result: List[float] = [0.0] * 12
+    for i in range(12):
+        v = out[i]
+        if v is None:
+            opp = (i + 6) % 12
+            ov = out[opp]
+            if ov is None:
+                raise ValueError(f"cusp[{i}] and its opposite cusp[{opp}] are both None")
+            base = _norm_deg(ov + 180.0)
+            v = _norm_deg(base + _deterministic_micro_jitter(base, i))
+        result[i] = float(_norm_deg(v))
+
+    return result
  
+
 # ───────────────────────── exact house engines (closed/solved) ─────────────────────────
 
 def _equal(asc: float) -> List[float]:
