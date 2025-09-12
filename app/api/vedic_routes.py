@@ -1,3 +1,4 @@
+# app/api/vedic_routes.py
 from __future__ import annotations
 from typing import Any, Dict
 import inspect
@@ -68,7 +69,7 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
             "detail": f"app.core.vedic_validator.normalize_vim_payload import failed: {_VALIDATOR_IMPORT_ERR}",
         }
 
-    # normalize (produces jd_tt/jd_ut1 if it can; NO jd_utc); also aliases
+    # normalize (may produce jd_tt/jd_ut1; NO jd_utc); includes friendly aliases
     norm, warns, tz_norm = normalize_vim_payload(payload)  # type: ignore[misc]
 
     # Ensure dut1_seconds for any build_timescales(...) callers in registry
@@ -84,13 +85,14 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
                 return _wrap_ok(out, warns, tz_norm, branch="registry.compute_dasha")
         except Exception as e:
             msg = str(e)
-            # If registry uses a 3-arg build_timescales, it’ll throw this exact error; we’ll fall back.
+            # If registry uses a 3-arg build_timescales, it will throw this exact error; fall through to module.
             if "build_timescales() missing 1 required positional argument: 'dut1_seconds'" not in msg:
                 return {
-                    "ok": False, "error": "vimshottari_registry_failed", "detail": msg,
+                    "ok": False,
+                    "error": "vimshottari_registry_failed",
+                    "detail": msg,
                     "meta": {"route": "vimshottari", "tz_normalized": tz_norm, "branch": "registry.compute_dasha"},
                 }
-            # else: proceed to module fallback
 
     # 2) alternate registry (if present)
     if _run_dasha is not None:
@@ -100,11 +102,13 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
                 return _wrap_ok(out, warns, tz_norm, branch="registry.run_dasha")
         except Exception as e:
             return {
-                "ok": False, "error": "vimshottari_registry_failed", "detail": str(e),
+                "ok": False,
+                "error": "vimshottari_registry_failed",
+                "detail": str(e),
                 "meta": {"route": "vimshottari", "tz_normalized": tz_norm, "branch": "registry.run_dasha"},
             }
 
-    # 3) module fallback — **positional dict first**, no 'timescales'/'jd_*'/'dut1_seconds'
+    # 3) module fallback — **positional dict first**, strip internals
     if _compute_vim_module is not None:
         try:
             civ_keys = [
@@ -113,42 +117,47 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
             ]
             civ = {k: norm[k] for k in civ_keys if k in norm and norm[k] is not None}
 
-            # Explicitly strip any strays (paranoia safeguard)
+            # Paranoia: ensure no engine-internal keys leak
             for k in ("timescales", "jd_tt", "jd_ut1", "dut1_seconds"):
                 civ.pop(k, None)
 
-            # Many Vedic modules expect a single payload dict positional argument.
+            # Many Vedic modules expect a single dict positional argument.
             try:
                 out = _compute_vim_module(civ)  # type: ignore[misc]
             except TypeError:
-                # If the module actually wants kwargs, fall back to kwargs.
+                # If the module actually wants kwargs, retry with kwargs.
                 out = _compute_vim_module(**civ)  # type: ignore[misc]
 
             if isinstance(out, dict):
                 return _wrap_ok(out, warns, tz_norm, branch="module.compute_vimshottari")
 
             return {
-                "ok": False, "error": "vimshottari_module_invalid_return",
+                "ok": False,
+                "error": "vimshottari_module_invalid_return",
                 "detail": f"Expected dict, got {type(out).__name__}",
                 "meta": {"route": "vimshottari", "tz_normalized": tz_norm, "branch": "module.compute_vimshottari"},
             }
         except Exception as e:
             return {
-                "ok": False, "error": "vimshottari_module_failed", "detail": str(e),
+                "ok": False,
+                "error": "vimshottari_module_failed",
+                "detail": str(e),
                 "meta": {"route": "vimshottari", "tz_normalized": tz_norm, "branch": "module.compute_vimshottari"},
             }
 
+    # No engine available
     return {
-        "ok": False, "error": "vimshottari_engine_unavailable",
+        "ok": False,
+        "error": "vimshottari_engine_unavailable",
         "meta": {"route": "vimshottari", "tz_normalized": tz_norm, "branch": "none"},
     }
 
-# ── absolute paths (main.py registers this bp without url_prefix) ──
-@vedic_api.get("/api/vedic/health")
+# ── RELATIVE PATHS (main.py mounts this blueprint at /api/vedic) ──
+@vedic_api.get("/health")
 def vedic_health():
     return jsonify(ok=True, vedic=True), 200
 
-@vedic_api.get("/api/vedic/diag")
+@vedic_api.get("/diag")
 def vedic_diag():
     def sigs(fn):
         try: return str(inspect.signature(fn))
@@ -167,13 +176,10 @@ def vedic_diag():
         "dut1_seconds_env": _env_dut1_seconds(),
     }), 200
 
-@vedic_api.post("/api/vedic/dasha/vimshottari")
+@vedic_api.post("/dasha/vimshottari")
 @rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)  # shared bucket "20"
 def vedic_vimshottari():
     body = request.get_json(silent=True) or {}
-    try:
-        res = _run_vimshottari(body)
-        status = 200 if res.get("ok") else (503 if str(res.get("error","")).endswith("unavailable") else 400)
-        return jsonify(res), status
-    except Exception as e:
-        return jsonify(ok=False, error="vedic_internal_error", detail=str(e)), 500
+    res = _run_vimshottari(body)
+    status = 200 if res.get("ok") else (503 if str(res.get("error","")).endswith("unavailable") else 400)
+    return jsonify(res), status
