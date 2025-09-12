@@ -362,22 +362,47 @@ def _normalize_time_for_leap_second(time_str: str) -> str:
 
 def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[str]) -> Tuple[float, float, float, float]:
     """
-    Return (jd_utc, jd_tt, jd_ut1, dut1_used_seconds).
+    Return (jd_ut, jd_tt, jd_ut1, dut1_used_seconds).
 
-    NOTE: When consuming a dict from time_kernel, we **prefer `jd_utc`**
-    and only fall back to `jd_ut` if `jd_utc` is absent. This avoids
-    misinterpreting a forwarder that uses `jd_ut` as UT1.
+    Notes
+    -----
+    - jd_ut here means *UTC JD* (historical naming); ERFA is *never* given UTC.
+      ERFA routines later are called with jd_ut1 (UT1) and jd_tt (TT).
+    - If caller provides dut1/dut1_seconds explicitly, we recompute UT1 from UTC.
+    - Prefer 'jd_utc' when present; fall back to 'jd_ut' (both represent UTC JD).
     """
-    jd_ut = payload.get("jd_ut") or payload.get("jd_utc")
-    jd_tt = payload.get("jd_tt")
-    jd_ut1 = payload.get("jd_ut1")
+    # --- caller DUT1 (with clamp) ---
+    dut1_req = payload.get("dut1")
+    if not isinstance(dut1_req, (int, float)):
+        dut1_req = payload.get("dut1_seconds")
+    if not isinstance(dut1_req, (int, float)):
+        dut1_req = CFG.dut1_seconds
+    try:
+        dut1_used = float(dut1_req)
+    except Exception:
+        dut1_used = 0.0
+    if abs(dut1_used) > 0.9:
+        _warn_add(warnings, seen, _W.DUT1_CLAMPED, f"{dut1_used}")
+        dut1_used = max(-0.9, min(0.9, dut1_used))
 
-    if all(isinstance(x, (int, float)) for x in (jd_ut, jd_tt, jd_ut1)):
-        dut1_used = float(payload.get("dut1") if isinstance(payload.get("dut1"), (int, float))
-                          else payload.get("dut1_seconds") if isinstance(payload.get("dut1_seconds"), (int, float))
-                          else CFG.dut1_seconds)
-        return float(jd_ut), float(jd_tt), float(jd_ut1), float(dut1_used)
+    # --- accept provided JDs; prefer jd_utc over jd_ut for UTC JD ---
+    jd_utc_in = payload.get("jd_utc")
+    jd_ut_in  = payload.get("jd_ut")
+    jd_tt_in  = payload.get("jd_tt")
+    jd_ut1_in = payload.get("jd_ut1")
 
+    ju = jd_utc_in if isinstance(jd_utc_in, (int, float)) else jd_ut_in
+    if all(isinstance(x, (int, float)) for x in (ju, jd_tt_in, jd_ut1_in)):
+        ju = float(ju)
+        jt = float(jd_tt_in)
+        # If caller *explicitly* provided DUT1, recompute UT1 from UTC
+        if isinstance(payload.get("dut1"), (int, float)) or isinstance(payload.get("dut1_seconds"), (int, float)):
+            j1 = ju + (dut1_used / 86400.0)
+            return ju, jt, j1, dut1_used
+        # Otherwise honor incoming UT1
+        return ju, jt, float(jd_ut1_in), dut1_used
+
+    # --- civil path (date/time/tz) ---
     d = payload.get("date")
     t = payload.get("time")
     tz = payload.get("place_tz") or payload.get("tz") or "UTC"
@@ -386,23 +411,9 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
         _warn_add(warnings, seen, _W.LEAP_SECOND)
         t = _normalize_time_for_leap_second(str(t))
 
-    # DUT1 selection (and clamp)
-    dut1_val = payload.get("dut1")
-    if not isinstance(dut1_val, (int, float)):
-        dut1_val = payload.get("dut1_seconds")
-    if not isinstance(dut1_val, (int, float)):
-        dut1_val = CFG.dut1_seconds
-    try:
-        dut1_used = float(dut1_val)
-    except Exception:
-        dut1_used = 0.0
-    if abs(dut1_used) > 0.9:
-        _warn_add(warnings, seen, _W.DUT1_CLAMPED, f"{dut1_used}")
-        dut1_used = max(-0.9, min(0.9, dut1_used))
-
-    # Preferred: time_kernel (dynamic)
+    # Preferred: time_kernel (all forwarders)
     if _tk is not None:
-        for fname in ("timescales_from_civil", "compute_timescales", "build_timescales", "to_timescales", "from_civil"):
+        for fname in ("timescales_from_civil","compute_timescales","build_timescales","to_timescales","from_civil"):
             fn = getattr(_tk, fname, None)
             if not callable(fn):
                 continue
@@ -412,26 +423,19 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
                 params = {}
 
             kwargs: Dict[str, Any] = {}
-            if "date" in params:
-                kwargs["date"] = d
-            if "time" in params:
-                kwargs["time"] = t
-            if "tz" in params:
-                kwargs["tz"] = tz
-            if "place_tz" in params:
-                kwargs["place_tz"] = tz
-            # pass DUT1 under whatever name the forwarder accepts
-            if "dut1" in params:
-                kwargs["dut1"] = float(dut1_used)
-            if "dut1_seconds" in params:
-                kwargs["dut1_seconds"] = float(dut1_used)
+            if "date" in params:     kwargs["date"] = d
+            if "time" in params:     kwargs["time"] = t
+            if "tz" in params:       kwargs["tz"] = tz
+            if "place_tz" in params: kwargs["place_tz"] = tz
+            if "dut1" in params:           kwargs["dut1"] = float(dut1_used)
+            if "dut1_seconds" in params:   kwargs["dut1_seconds"] = float(dut1_used)
 
             out = None
             try:
                 out = fn(**kwargs)
             except TypeError:
                 try:
-                    if "dut1" in params or "dut1_seconds" in params:
+                    if ("dut1" in params) or ("dut1_seconds" in params):
                         out = fn(d, t, tz, float(dut1_used))
                     else:
                         out = fn(d, t, tz)
@@ -439,75 +443,74 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
                     out = None
             except Exception:
                 out = None
-
             if out is None:
                 continue
 
-            # collect forwarder warnings (best-effort)
+            # soak up any forwarder warnings
             try:
-                ow = out.get("warnings") if isinstance(out, dict) else None
-                if isinstance(ow, (list, tuple)):
-                    for w in ow:
-                        if isinstance(w, str) and w:
-                            _warn_add(warnings, seen, w)
+                for w in (out.get("warnings") or []):
+                    if isinstance(w, str) and w:
+                        _warn_add(warnings, seen, w)
             except Exception:
                 pass
 
-            # IMPORTANT: prefer jd_utc
+            # Extract UTC/TT/UT1. Prefer jd_utc; fall back to jd_ut (both mean UTC JD here).
             if isinstance(out, dict):
-                ju = out.get("jd_utc", None)
-                if not isinstance(ju, (int, float)):
-                    ju = out.get("jd_ut", None)  # fallback only if jd_utc absent
-                jt = out.get("jd_tt", None)
-                j1 = out.get("jd_ut1", None)
-                if not all(isinstance(x, (int, float)) for x in (ju, jt, j1)):
-                    continue
-                # If forwarder exposes its own dut1, keep it
-                if isinstance(out.get("dut1"), (int, float)):
-                    dut1_used = float(out["dut1"])
-                return float(ju), float(jt), float(j1), float(dut1_used)
-
+                ju = out.get("jd_utc", out.get("jd_ut"))
+                jt = out.get("jd_tt")
+                j1 = out.get("jd_ut1")
+                if all(isinstance(x, (int, float)) for x in (ju, jt, j1)):
+                    ju = float(ju); jt = float(jt); j1 = float(j1)
+                    # If forwarder provided its own dut1, reflect it
+                    if isinstance(out.get("dut1"), (int, float)):
+                        dut1_used = float(out["dut1"])
+                    # If caller explicitly set DUT1, override UT1 consistently
+                    if isinstance(payload.get("dut1"), (int, float)) or isinstance(payload.get("dut1_seconds"), (int, float)):
+                        j1 = ju + (dut1_used / 86400.0)
+                    return ju, jt, j1, dut1_used
+            # tuple form: (jd_utc, jd_tt, jd_ut1, ...)
             if isinstance(out, (list, tuple)) and len(out) >= 3:
                 ju, jt, j1 = map(float, out[:3])
-                return float(ju), float(jt), float(j1), float(dut1_used)
+                # explicit DUT1 override
+                if isinstance(payload.get("dut1"), (int, float)) or isinstance(payload.get("dut1_seconds"), (int, float)):
+                    j1 = ju + (dut1_used / 86400.0)
+                return float(ju), float(jt), float(j1), dut1_used
 
-    # Next: timescales module for UTC JD and ΔT
+    # Fallbacks: compute UTC JD then derive TT & UT1
     def _jd_utc_via_ts(d_: str, t_: str, z_: str) -> float:
         if _ts is None:
-            raise RuntimeError("timescales module not available")
+            raise AstronomyError("timescales_missing", "timescales module not available")
         return float(_ts.julian_day_utc(d_, t_, z_))
 
-    # stdlib fallback (hardened)
     def _jd_utc_via_stdlib(d_: str, t_: str, z_: str) -> float:
         from datetime import datetime, timezone
         from zoneinfo import ZoneInfo
         parts = t_.split(":")
-        timestr = t_ if len(parts) >= 3 else (t_ + ":00")
+        timestr = t_ if len(parts) >= 3 else t_ + ":00"
         try:
             dt_local = datetime.fromisoformat(f"{d_}T{timestr}").replace(tzinfo=ZoneInfo(z_))
         except Exception as e:
             raise AstronomyError("timescales_missing", f"Invalid tz '{z_}': {e}")
         dt_utc = dt_local.astimezone(timezone.utc)
         Y, M, D = dt_utc.year, dt_utc.month, dt_utc.day
-        h = dt_utc.hour + dt_utc.minute / 60 + dt_utc.second / 3600 + dt_utc.microsecond / 3.6e9
+        h = dt_utc.hour + dt_utc.minute/60 + dt_utc.second/3600 + dt_utc.microsecond/3.6e9
         if M <= 2:
-            Y -= 1
-            M += 12
+            Y -= 1; M += 12
         A = Y // 100
         B = 2 - A + A // 4
-        JD0 = int(365.25 * (Y + 4716)) + int(30.6001 * (M + 1)) + D + B - 1524.5
-        return JD0 + h / 24.0
+        JD0 = int(365.25*(Y + 4716)) + int(30.6001*(M + 1)) + D + B - 1524.5
+        return JD0 + h/24.0
 
-    if not isinstance(d, str) or not isinstance(t, str):
-        missing = [k for k, v in (("jd_ut", jd_ut), ("jd_tt", jd_tt), ("jd_ut1", jd_ut1)) if not isinstance(v, (int, float))]
+    if not (isinstance(d, str) and isinstance(t, str)):
+        missing = [k for k, v in (("jd_ut/jd_utc", ju), ("jd_tt", jd_tt_in), ("jd_ut1", jd_ut1_in)) if not isinstance(v, (int, float))]
         raise AstronomyError("timescales_missing", f"Supply {', '.join(missing)} or provide date/time/tz")
 
     used_stdlib = False
     try:
-        jd_utc = _jd_utc_via_ts(d, t, tz)
+        ju = _jd_utc_via_ts(d, t, tz)
     except Exception:
         try:
-            jd_utc = _jd_utc_via_stdlib(d, t, tz)
+            ju = _jd_utc_via_stdlib(d, t, tz)
             used_stdlib = True
             _warn_add(warnings, seen, _W.TIME_STD_FALLBACK)
         except AstronomyError:
@@ -522,18 +525,17 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
 
     if _ts is not None:
         try:
-            jd_tt_calc = float(_ts.jd_tt_from_utc_jd(jd_utc, y, m))
+            jt = float(_ts.jd_tt_from_utc_jd(ju, y, m))
         except Exception:
-            jd_tt_calc = jd_utc + 69.0 / 86400.0
+            jt = ju + 69.0/86400.0
             _warn_add(warnings, seen, _W.DELTAT_CONST)
     else:
-        jd_tt_calc = jd_utc + 69.0 / 86400.0
+        jt = ju + 69.0/86400.0
         if not used_stdlib:
             _warn_add(warnings, seen, _W.DELTAT_CONST)
 
-    jd_ut_calc = float(jd_utc)
-    jd_ut1_calc = float(jd_utc) + (float(dut1_used) / 86400.0)
-    return jd_ut_calc, jd_tt_calc, jd_ut1_calc, float(dut1_used)
+    j1 = float(ju) + (dut1_used / 86400.0)
+    return float(ju), float(jt), float(j1), float(dut1_used)
 
 
 # ───────────────────────────── Geo / Topocentric ──────────────────────
