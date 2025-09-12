@@ -1,4 +1,5 @@
 # app/api/routes.py
+# -*- coding: utf-8 -*-
 """
 Ops & Diagnostics routes (mounted with NO prefix by main.py)
 
@@ -10,7 +11,7 @@ Single dispatcher for shared/core ops:
 
 Diagnostics & health:
 - GET  /ops/health
-- GET  /api/health                  (back-compat; main.py adds Deprecation header)
+- GET  /api/health                  (back-compat; main.py may add Deprecation header)
 - GET  /ops/version
 - GET  /ops/config
 - GET  /ops/diag/cores              (includes leap-seconds + ephemeris diagnostics)
@@ -70,9 +71,11 @@ _, _ea_diag, _EA_DIAG_ERR                  = _try_import("app.core.ephemeris_ada
 _, _ea_ecl, _EA_ECL_ERR                    = _try_import("app.core.ephemeris_adapter", "ecliptic_longitudes")
 _, _ea_many, _EA_MANY_ERR                  = _try_import("app.core.ephemeris_adapter", "ecliptic_longitudes_many")
 
-# Astronomy/House cores (presence + compute)
+# Astronomy core (THIS is the one we call for charts)
 _ast_mod, _, _AST_ERR                      = _try_import("app.core.astronomy")
 _, _compute_chart, _ASTRO_ERR              = _try_import("app.core.astronomy", "compute_chart")
+
+# Houses (presence/diag only; routing doesn’t call directly)
 _h_mod,   _, _H_ERR                        = _try_import("app.core.house")
 _hs_mod,  _, _HS_ERR                       = _try_import("app.core.houses")
 _hsa_mod, _, _HSA_ERR                      = _try_import("app.core.houses_advanced")
@@ -85,7 +88,7 @@ _, _normalize_for_vedic, _NV_ERR               = _try_import("app.core.validator
 _, _normalize_for_western, _NW_ERR             = _try_import("app.core.validator", "normalize_for_western")
 _, _normalize_chart_payload, _NC_ERR           = _try_import("app.core.validator", "normalize_chart_payload")
 
-# Presence-only (for diagnostics visibility; routing doesn’t call these directly)
+# Presence-only (diagnostics visibility)
 _wval_mod, _, _WVAL_ERR                    = _try_import("app.core.western_validator")
 _ved_val_mod, _, _VEDVAL_ERR               = _try_import("app.core.vedic_validator")
 
@@ -209,7 +212,7 @@ def ops_health():
 
 @ops_api.get("/api/health")
 def api_health_backcompat():
-    # Deprecation headers are added in main.py after_request
+    # Deprecation headers are added in main.py after_request (if any)
     return jsonify(ok=True, service="astro-backend", scope="api", status="ok"), 200
 
 @ops_api.get("/ops/version")
@@ -254,7 +257,6 @@ def ops_diag_cores():
             "forwarders_ok": all([_tk_build_ts, _tk_jd_utc, _tk_tt_from_utc, _tk_ut1_from_utc]),
             "build_timescales_sig": _sig(_tk_build_ts) if _tk_build_ts else None,
         },
-        # ── Ephemeris: wire BOTH files and expose signatures/diags
         "ephem_singleton": {
             "loaded": _es_mod is not None,
             "error": _ES_ERR,
@@ -540,7 +542,7 @@ def ops_calculate():
             return _err(400, "ut1_from_utc_jd_failed", str(e), op=op)
         return _ok(
             {"jd_ut1": jd_ut1,
-             "input": {"jd_utc": float(params["jd_utc"]), "dut1_seconds": float(params["dut1_seconds"])}},
+             "input": {"jd_utc": float(params["jd_utc"]), "dut1_seconds": float(params["dut1_seconds"])}} ,
             op=op
         )
 
@@ -618,16 +620,13 @@ def ops_calculate():
         try:
             out = _compute_chart(norm)  # dict as defined by astronomy.compute_chart
         except Exception as e:
-            # If astronomy.AstronomyError was raised, surface its code/message if present
             code = getattr(e, "code", None)
             msg = str(e)
             if code:
-                # Treat validation-ish errors as 400; engine unavailability as 503
-                status = 400 if "invalid" in code or "unsupported" in code or "missing" in code else 500
+                status = 400 if any(s in code for s in ("invalid", "unsupported", "missing")) else 500
                 return _err(status, code, msg, op=op)
             return _err(500, "chart_compute_error", msg, op=op)
 
-        # Merge validator warns with engine warns (engine already returns its own warning list)
         engine_warns = list(out.get("warnings", []) or [])
         merged_warns = list(dict.fromkeys((warns or []) + engine_warns))  # de-dup, preserve order
         out["warnings"] = merged_warns
