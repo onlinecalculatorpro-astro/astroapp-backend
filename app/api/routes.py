@@ -64,11 +64,23 @@ _vval_mod, _normalize_vim_payload, _VVAL_ERR = _try_import("app.core.vedic_valid
 # ───────────────────────── ops basics ─────────────────────────
 @ops_api.get("/ops/health")
 def ops_health():
+    """Ops-only health."""
     return jsonify(ok=True, service="astro-backend", scope="ops", status="ok"), 200
 
 @ops_api.get("/api/health")
 def api_health_backcompat():
-    return jsonify(ok=True, service="astro-backend", scope="api", status="ok"), 200
+    """
+    Back-compat health endpoint. Prefer `/healthz`.
+    main.py also sets Deprecation & Link headers in after_request,
+    but we include them here too for robustness.
+    """
+    resp = jsonify(ok=True, service="astro-backend", scope="api", status="ok", deprecated=True)
+    try:
+        resp.headers["Deprecation"] = "true"
+        resp.headers["Link"] = "</healthz>; rel=\"successor-version\""
+    except Exception:
+        pass
+    return resp, 200
 
 @ops_api.get("/ops/version")
 def ops_version():
@@ -188,4 +200,8 @@ def ops_timescales():
         "precision": ts_dict.get("precision"),
     }
 
-    return jsonify(ok=True, input={"date": date, "time": time_str, "tz": tz, "dut1_seconds": float(dut1)}, timescales=ts_out), 200
+    return jsonify(
+        ok=True,
+        input={"date": date, "time": time_str, "tz": tz, "dut1_seconds": float(dut1)},
+        timescales=ts_out
+    ), 200
