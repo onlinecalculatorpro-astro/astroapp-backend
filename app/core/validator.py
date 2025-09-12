@@ -27,7 +27,7 @@ Exports (stable)
 - normalize_timescales_input(...) -> alias of normalize_common_payload with defaults
 - normalize_body(payload|name) -> (canonical_body_or_None, warnings)
 
-Domain-aware helpers (new)
+Domain-aware helpers
 - normalize_for_vedic(payload, **opts) -> (dict, warnings, tz)
 - normalize_for_western(payload, **opts) -> (dict, warnings, tz)
 - normalize_for_domain(domain, payload, **opts) -> (dict, warnings, tz)
@@ -37,7 +37,7 @@ from typing import Any, Dict, List, Optional, Tuple, Callable
 import os
 
 # ───────────────────────── optional domain normalizers ─────────────────────────
-# We discover the best available function signature at import time.
+# Discover the best available function signature at import time.
 # Accepted names inside each module, in order of preference:
 #   normalize_payload, normalize, normalize_common_payload
 def _discover_normalizer(mod_name: str) -> Optional[Callable[..., Tuple[Dict[str, Any], List[str], str]]]:
