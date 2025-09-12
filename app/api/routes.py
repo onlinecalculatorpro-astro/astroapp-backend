@@ -6,7 +6,7 @@ Single dispatcher for shared/core ops:
 - POST /ops/calculate
   • op: "timescales" | "jd_utc" | "tt_from_utc_jd" | "ut1_from_utc_jd"
   • op: "ephem_vector" | "ephem_equatorial" | "ephem_ecliptic" | "ephem_sidereal"
-  • op: "chart" (astrology.compute_chart)
+  • op: "chart" (astronomy.compute_chart)
 
 Diagnostics & health:
 - GET  /ops/health
@@ -70,14 +70,12 @@ _, _ea_diag, _EA_DIAG_ERR                  = _try_import("app.core.ephemeris_ada
 _, _ea_ecl, _EA_ECL_ERR                    = _try_import("app.core.ephemeris_adapter", "ecliptic_longitudes")
 _, _ea_many, _EA_MANY_ERR                  = _try_import("app.core.ephemeris_adapter", "ecliptic_longitudes_many")
 
-# Astronomy/House cores (presence only; shown in /ops/diag/cores)
+# Astronomy/House cores (presence + compute)
 _ast_mod, _, _AST_ERR                      = _try_import("app.core.astronomy")
+_, _compute_chart, _ASTRO_ERR              = _try_import("app.core.astronomy", "compute_chart")
 _h_mod,   _, _H_ERR                        = _try_import("app.core.house")
 _hs_mod,  _, _HS_ERR                       = _try_import("app.core.houses")
 _hsa_mod, _, _HSA_ERR                      = _try_import("app.core.houses_advanced")
-
-# Astrology core (NEW)
-_astrology_mod, _compute_chart, _ASTRO_ERR = _try_import("app.core.astrology", "compute_chart")
 
 # Validators (ALL validation flows go through validator.py)
 _val_mod, _normalize_common, _VAL_ERR          = _try_import("app.core.validator", "normalize_common_payload")
@@ -271,19 +269,17 @@ def ops_diag_cores():
             "ecliptic_longitudes_many_sig": _sig(_ea_many) if _ea_many else None,
             "diagnostics_sig": _sig(_ea_diag) if _ea_diag else None,
         },
-        "astronomy":        {"loaded": _ast_mod is not None, "error": _AST_ERR},
+        "astronomy": {
+            "loaded": _ast_mod is not None,
+            "error": _AST_ERR or _ASTRO_ERR,
+            "compute_chart_sig": _sig(_compute_chart) if _compute_chart else None,
+        },
         "house":            {"loaded": _h_mod   is not None, "error": _H_ERR},
         "houses":           {"loaded": _hs_mod  is not None, "error": _HS_ERR},
         "houses_advanced":  {"loaded": _hsa_mod is not None, "error": _HSA_ERR},
         "leapseconds": {
             "loaded": (_ls_mod is not None) or (_ls_delta_at is not None),
             "error": _LS_ERR,
-        },
-        # NEW: astrology module presence
-        "astrology": {
-            "loaded": _astrology_mod is not None,
-            "error": _ASTRO_ERR,
-            "compute_chart_sig": _sig(_compute_chart) if _compute_chart else None,
         },
     }
 
@@ -604,10 +600,10 @@ def ops_calculate():
             op=op, body=body_norm
         )
 
-    # ── Astrology chart (compute_chart) ──────────────────────────────────────
+    # ── Astronomy chart (compute_chart) ──────────────────────────────────────
     if op in ("chart", "astro_chart", "compute_chart"):
         if not (_normalize_chart_payload and _compute_chart):
-            return _err(503, "astrology_unavailable", "astrology module or validator not loaded", op=op)
+            return _err(503, "astronomy_unavailable", "astronomy module or validator not loaded", op=op)
 
         try:
             # allow include_jd_utc to influence normalization (handy for debugging)
@@ -620,9 +616,9 @@ def ops_calculate():
             return _err(400, "bad_request", f"normalize_chart_payload failed: {e}", op=op)
 
         try:
-            out = _compute_chart(norm)  # dict as defined by astrology.compute_chart
+            out = _compute_chart(norm)  # dict as defined by astronomy.compute_chart
         except Exception as e:
-            # If astrology.AstronomyError was raised, surface its code/message if present
+            # If astronomy.AstronomyError was raised, surface its code/message if present
             code = getattr(e, "code", None)
             msg = str(e)
             if code:
