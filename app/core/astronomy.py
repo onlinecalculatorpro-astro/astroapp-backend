@@ -627,7 +627,7 @@ def _ayanamsa_deg_cached(jd_tt_q: float, ay_key: str) -> Tuple[float, str]:
 
 def _resolve_ayanamsa(
     jd_tt: float, ayanamsa: Any, warnings: List[str], seen: set[str]
-) -> Tuple[Optional[float], Optional[str]]]:
+) -> Tuple[Optional[float], Optional[str]]:
     """
     Resolve ayanamsa using the external module. If `ayanamsa` is numeric, return it directly.
     Otherwise, use `CFG.ayanamsa_default` when empty/None.
