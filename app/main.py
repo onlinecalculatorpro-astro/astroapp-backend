@@ -42,11 +42,10 @@ GAUGE_DUT1: Final = Gauge("astro_dut1_broadcast_seconds", "DUT1 broadcast second
 _ops_bp = None
 _ops_import_err: Optional[str] = None
 try:
-    # Preferred: routes.py exposes ops_api (ops+debug)
     from app.api.routes import ops_api as _ops_bp  # type: ignore
 except Exception as e_ops_primary:
     _ops_import_err = repr(e_ops_primary)
-    # Backward-compat: some codebases expose "api" in routes.py; mount it at /api if present.
+    # Legacy fallback: routes.py may expose "api"; if so, we can mount at /api.
     try:
         from app.api.routes import api as _legacy_api_bp  # type: ignore
     except Exception:
@@ -138,7 +137,16 @@ def create_app() -> Flask:
                 REQ_LATENCY.labels(route=(request.path or "")).observe(perf_counter() - t0)
         except Exception:
             pass
-        return resp
+
+        # Add **deprecation headers** for legacy /api/health (regardless of which blueprint serves it)
+        try:
+            if request.path == "/api/health":
+                # Only set if not already set by the handler
+                resp.headers.setdefault("Deprecation", "true")
+                resp.headers.setdefault("Link", '</healthz>; rel="successor-version"')
+            return resp
+        except Exception:
+            return resp
 
     # ───── Root & Health ─────
     @app.get("/")
@@ -153,7 +161,7 @@ def create_app() -> Flask:
     @app.get("/metrics")
     def metrics_endpoint():
         if not _metrics_auth_ok():
-            return Response("Unauthorized", 401, {"WWW-Authenticate": 'Basic realm="metrics"'})
+            return Response("Unauthorized", 401, {"WWW-Authenticate": 'Basic realm="metrics'"})
         try:
             GAUGE_DUT1.set(float(os.environ.get("ASTRO_DUT1_BROADCAST", os.environ.get("ASTRO_DUT1", "0.0")) or 0.0))
         except Exception:
