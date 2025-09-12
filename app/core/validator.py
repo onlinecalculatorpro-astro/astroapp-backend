@@ -4,13 +4,22 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 import os
 
-# Only light dependency: your ERFA-aligned timescales
+# ───────────────────────── prefer the time_kernel forwarder ─────────────────────────
+# time_kernel.build_timescales → always returns a plain dict
 try:
-    from app.core.timescales import build_timescales, TimeScales  # type: ignore
+    from app.core.time_kernel import build_timescales as tk_build_timescales  # type: ignore
+    _TK_AVAILABLE = True
+except Exception:
+    tk_build_timescales = None  # type: ignore
+    _TK_AVAILABLE = False
+
+# canonical engine (dataclass TimeScales); kept as fallback/compat
+try:
+    from app.core.timescales import build_timescales as ts_build_timescales, TimeScales  # type: ignore
     _TS_AVAILABLE = True
 except Exception:
-    build_timescales = None  # type: ignore
-    TimeScales = None        # type: ignore
+    ts_build_timescales = None  # type: ignore
+    TimeScales = None           # type: ignore
     _TS_AVAILABLE = False
 
 __all__ = [
@@ -20,6 +29,7 @@ __all__ = [
     "parse_latlon",
     "sanitize_timescales",
     "normalize_common_payload",
+    "normalize_timescales_input",  # thin alias used by /ops/calculate
 ]
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -87,7 +97,7 @@ def parse_latlon(payload: Dict[str, Any]) -> Tuple[Optional[float], Optional[flo
 
 def env_dut1_seconds() -> float:
     """
-    Pull DUT1 from env (broadcast) with a safe default. Enforced again by build_timescales.
+    Pull DUT1 from env (broadcast) with a safe default. Enforced again by ERFA.
     """
     try:
         return float(os.environ.get("ASTRO_DUT1_BROADCAST", os.environ.get("ASTRO_DUT1", "0.0")) or 0.0)
@@ -98,6 +108,9 @@ def sanitize_timescales(ts: TimeScales | Dict[str, Any], *, include_jd_utc: bool
     """
     Return a safe dict view of TimeScales. By default, **omits jd_utc** to avoid downstream
     reliance (fits Vedic requirements). Western flows can set include_jd_utc=True if needed.
+    Accepts either:
+      • dict (as returned by time_kernel.build_timescales)
+      • TimeScales dataclass (from timescales engine)
     """
     if isinstance(ts, dict):
         d = dict(ts)
@@ -136,9 +149,41 @@ def _extract_civil(payload: Dict[str, Any], *, default_time: str = "12:00:00") -
         warns.append("missing_date")
 
     time_str = str(payload.get("time") or payload.get("birth_time") or default_time).strip()
-    tz_name = normalize_tz(payload.get("tz") or payload.get("place_tz") or "UTC")
+    tz_name = normalize_tz(payload.get("tz") or payload.get("tz_name") or payload.get("place_tz") or "UTC")
 
     return date, time_str, tz_name, warns
+
+def _compute_timescales_dict(
+    date: str,
+    time_str: str,
+    tz_name: str,
+    dut1: float,
+    *,
+    include_jd_utc: bool = False,
+) -> Tuple[Optional[Dict[str, Any]], List[str]]:
+    """
+    Compute timescales using the preferred forwarder. Returns (ts_dict|None, warnings[]).
+    - Prefers time_kernel.build_timescales (dict)
+    - Falls back to timescales.build_timescales (dataclass → dict via sanitize)
+    """
+    warns: List[str] = []
+    # Preferred: time_kernel forwarder (dict)
+    if _TK_AVAILABLE and tk_build_timescales is not None:
+        ts = tk_build_timescales(date, time_str, tz_name, dut1)  # type: ignore[misc]
+        ts_dict = sanitize_timescales(ts, include_jd_utc=include_jd_utc)
+        warns.extend(ts_dict.get("warnings", []) or [])
+        return ts_dict, warns
+
+    # Fallback: canonical engine (dataclass)
+    if _TS_AVAILABLE and ts_build_timescales is not None and date:
+        ts = ts_build_timescales(date, time_str, tz_name, dut1)  # type: ignore[misc]
+        ts_dict = sanitize_timescales(ts, include_jd_utc=include_jd_utc)
+        warns.extend(ts_dict.get("warnings", []) or [])
+        return ts_dict, warns
+
+    # Neither available
+    warns.append("timescales_engine_unavailable")
+    return None, warns
 
 def normalize_common_payload(
     payload: Dict[str, Any],
@@ -158,8 +203,7 @@ def normalize_common_payload(
     - Injects friendly aliases (tz_name, ayanamsa_key, birth_date, birth_time, depth).
     - Coerces 'levels/depth/max_levels' into [1..max_levels].
     - Adds latitude/longitude if numeric.
-    - If compute_timescales=True and build_timescales is available, computes jd_tt/jd_ut1,
-      **not** jd_utc (unless include_jd_utc=True).
+    - If compute_timescales=True, computes jd_tt/jd_ut1 (and jd_utc only if include_jd_utc=True).
     - Always sets 'dut1_seconds' (env or provided).
     """
     warns: List[str] = []
@@ -201,19 +245,38 @@ def normalize_common_payload(
     norm["dut1_seconds"] = dut1
 
     # Compute TimeScales (optional)
-    if compute_timescales and _TS_AVAILABLE and date:
+    if compute_timescales and date:
         try:
-            ts = build_timescales(date, time_str, tz_name, dut1)  # type: ignore[misc]
-            ts_dict = sanitize_timescales(ts, include_jd_utc=include_jd_utc)
-            # Attach only jd_tt / jd_ut1 by default (no jd_utc for Vedic)
-            norm.update({
-                "jd_tt": ts_dict.get("jd_tt"),
-                "jd_ut1": ts_dict.get("jd_ut1"),
-                # keep full sanitized view for advanced consumers
-                "timescales": ts_dict,
-            })
-            warns.extend(ts_dict.get("warnings", []) or [])
+            ts_dict, wz_ts = _compute_timescales_dict(
+                date, time_str, tz_name, dut1, include_jd_utc=include_jd_utc
+            )
+            warns.extend(wz_ts)
+            if ts_dict:
+                # Attach only jd_tt / jd_ut1 by default (no jd_utc unless asked)
+                norm.update({
+                    "jd_tt": ts_dict.get("jd_tt"),
+                    "jd_ut1": ts_dict.get("jd_ut1"),
+                    "timescales": ts_dict,
+                })
         except Exception as e:
             warns.append(f"timescales_failed:{e!s}")
 
     return norm, warns, tz_name
+
+# Thin alias for ops dispatcher (keeps its name stable)
+def normalize_timescales_input(
+    payload: Dict[str, Any],
+    *,
+    default_time: str = "12:00:00",
+    compute_timescales: bool = False,  # ops/calculate computes via kernel after normalization
+    include_jd_utc: bool = False,
+    dut1_seconds: Optional[float] = None,
+) -> Tuple[Dict[str, Any], List[str], str]:
+    return normalize_common_payload(
+        payload,
+        default_time=default_time,
+        compute_timescales=compute_timescales,
+        include_jd_utc=include_jd_utc,
+        dut1_seconds=dut1_seconds,
+        max_levels=5,
+    )
