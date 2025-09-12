@@ -10,7 +10,7 @@ Diagnostics & health:
 - GET  /api/health                  (back-compat; main.py adds Deprecation header)
 - GET  /ops/version
 - GET  /ops/config
-- GET  /ops/diag/cores
+- GET  /ops/diag/cores              (includes leap-seconds diagnostics)
 - GET  /ops/diag/validators
 """
 
@@ -53,6 +53,9 @@ _, _tk_jd_utc, _TK_JDU_ERR                 = _try_import("app.core.time_kernel",
 _, _tk_tt_from_utc, _TK_TT_ERR             = _try_import("app.core.time_kernel", "jd_tt_from_utc_jd")
 _, _tk_ut1_from_utc, _TK_UT1_ERR           = _try_import("app.core.time_kernel", "jd_ut1_from_utc_jd")
 
+# Leap-seconds (diagnostics)
+_ls_mod, _ls_delta_at, _LS_ERR             = _try_import("app.core.leapseconds", "delta_at")
+
 # Other shared cores (presence only; useful for diag)
 _es_mod, _, _ES_ERR                        = _try_import("app.core.ephem_singleton")
 _ea_mod, _, _EA_ERR                        = _try_import("app.core.ephemeris_adapter")
@@ -61,9 +64,8 @@ _h_mod, _, _H_ERR                          = _try_import("app.core.house")
 _hs_mod, _, _HS_ERR                        = _try_import("app.core.houses")
 _hsa_mod, _, _HSA_ERR                      = _try_import("app.core.houses_advanced")
 
-# Validators
-_val_mod, _, _VAL_ERR                      = _try_import("app.core.validator")
-_vval_mod, _normalize_times_input, _VVAL_ERR = _try_import("app.core.validator", "normalize_timescales_input")
+# Validators (common)
+_val_mod, _normalize_common, _VAL_ERR      = _try_import("app.core.validator", "normalize_common_payload")
 _wval_mod, _, _WVAL_ERR                    = _try_import("app.core.western_validator")
 _ved_val_mod, _normalize_vim_payload, _VEDVAL_ERR = _try_import("app.core.vedic_validator", "normalize_vim_payload")
 
@@ -118,8 +120,12 @@ def ops_config():
 # ───────────────────────── diagnostics ─────────────────────────
 @ops_api.get("/ops/diag/cores")
 def ops_diag_cores():
-    """Report presence and key signatures of shared core modules."""
-    return jsonify({
+    """
+    Report presence and signatures for shared core modules.
+    Optionally, if query provides ?date=&time=&tz=, include a leap-seconds
+    sample probe comparing timescales.dat vs leapseconds.delta_at(MJD).
+    """
+    payload: Dict[str, Any] = {
         "ok": True,
         "timescales": {
             "loaded": _ts_mod is not None,
@@ -140,7 +146,58 @@ def ops_diag_cores():
         "house": {"loaded": _h_mod is not None, "error": _H_ERR},
         "houses": {"loaded": _hs_mod is not None, "error": _HS_ERR},
         "houses_advanced": {"loaded": _hsa_mod is not None, "error": _HSA_ERR},
-    }), 200
+        "leapseconds": {
+            "loaded": (_ls_mod is not None) or (_ls_delta_at is not None),
+            "error": _LS_ERR,
+        },
+    }
+
+    # Optional sample probe if date/time/tz provided
+    q = request.args or {}
+    date = q.get("date")
+    time_str = q.get("time")
+    tz = q.get("tz")
+    dut1 = q.get("dut1_seconds", _env_dut1_seconds())
+
+    if date and time_str and tz and _tk_build_ts:
+        try:
+            ts = _tk_build_ts(str(date), str(time_str), str(tz), float(dut1))  # dict via time_kernel
+            jd_utc = ts.get("jd_utc")
+            dat_ts = ts.get("dat")
+            sample = {"input": {"date": date, "time": time_str, "tz": tz, "dut1_seconds": float(dut1)}}
+
+            if isinstance(jd_utc, (int, float)) and _ls_delta_at:
+                mjd = float(jd_utc) - 2400000.5
+                try:
+                    li = _ls_delta_at(mjd)  # type: ignore[misc]
+                    li_dict = {
+                        "delta_at": float(getattr(li, "delta_at", None)),
+                        "source": getattr(li, "source", None),
+                        "status": getattr(li, "status", None),
+                        "last_known_mjd": float(getattr(li, "last_known_mjd", 0.0) or 0.0),
+                        "erfa_status_code": getattr(li, "erfa_status_code", None),
+                        "notes": getattr(li, "notes", None),
+                    }
+                    sample.update({
+                        "jd_utc": float(jd_utc),
+                        "dat_from_timescales": float(dat_ts) if isinstance(dat_ts, (int, float)) else None,
+                        "delta_at_probe": li_dict,
+                        "delta_diff_seconds": (
+                            (float(dat_ts) - float(li_dict["delta_at"]))
+                            if isinstance(dat_ts, (int, float)) and isinstance(li_dict["delta_at"], (int, float))
+                            else None
+                        ),
+                    })
+                except Exception as e:
+                    sample.update({"probe_error": str(e)})
+            else:
+                sample.update({"note": "jd_utc or leapseconds not available"})
+
+            payload["leapseconds"]["sample"] = sample
+        except Exception as e:
+            payload["leapseconds"]["sample_error"] = str(e)
+
+    return jsonify(payload), 200
 
 @ops_api.get("/ops/diag/validators")
 def ops_diag_validators():
@@ -157,7 +214,7 @@ def ops_diag_validators():
         "validator": {
             "loaded": _val_mod is not None,
             "error": _VAL_ERR,
-            "normalize_timescales_input_sig": _sig(_normalize_times_input) if _normalize_times_input else None,
+            "normalize_common_payload_sig": _sig(_normalize_common) if _normalize_common else None,
             "functions": list_callables(_val_mod) if _val_mod else None,
         },
         "western_validator": {
@@ -232,26 +289,25 @@ def ops_calculate():
     include_jd_utc = bool(body.get("include_jd_utc"))
 
     # Allow multiple body shapes
-    params = _unwrap_params(body)
+    raw_params = _unwrap_params(body)
 
     # ── TIMESCALES ────────────────────────────────────────────────────────────
     if op == "timescales":
-        # Normalize inputs using common validator if present
-        if _normalize_times_input:
+        # Normalize via common validator if present
+        if _normalize_common:
             try:
-                norm, warns, tz_norm = _normalize_times_input(params)  # type: ignore[misc]
+                norm, warns, tz_norm = _normalize_common(raw_params, compute_timescales=False)  # type: ignore[misc]
             except Exception as e:
-                return _err(400, "bad_request", f"normalize_timescales_input failed: {e}", op=op)
+                return _err(400, "bad_request", f"normalize_common_payload failed: {e}", op=op)
             date = norm.get("date"); time_str = norm.get("time"); tz = norm.get("tz")
             dut1 = norm.get("dut1_seconds", _env_dut1_seconds())
             if not (date and time_str and tz):
                 return _err(400, "bad_request", "Missing keys: date, time, tz", op=op)
         else:
-            # Best-effort fallback
-            date = params.get("date")
-            time_str = params.get("time")
-            tz = params.get("tz") or params.get("tz_name") or params.get("place_tz")
-            dut1 = params.get("dut1_seconds", _env_dut1_seconds())
+            date = raw_params.get("date")
+            time_str = raw_params.get("time")
+            tz = raw_params.get("tz") or raw_params.get("tz_name") or raw_params.get("place_tz")
+            dut1 = raw_params.get("dut1_seconds", _env_dut1_seconds())
             if not (date and time_str and tz):
                 return _err(400, "bad_request", "Missing keys: date, time, tz", op=op)
 
@@ -288,6 +344,7 @@ def ops_calculate():
 
     # ── JD_UTC (deprecated helper) ───────────────────────────────────────────
     if op == "jd_utc":
+        params = raw_params
         date = params.get("date")
         time_str = params.get("time")
         tz = params.get("tz") or params.get("tz_name") or params.get("place_tz")
@@ -301,6 +358,7 @@ def ops_calculate():
 
     # ── TT from UTC JD ───────────────────────────────────────────────────────
     if op == "tt_from_utc_jd":
+        params = raw_params
         if "jd_utc" not in params:
             return _err(400, "bad_request", "Missing key: jd_utc", op=op)
         try:
@@ -311,6 +369,7 @@ def ops_calculate():
 
     # ── UT1 from UTC JD ──────────────────────────────────────────────────────
     if op == "ut1_from_utc_jd":
+        params = raw_params
         missing = [k for k in ("jd_utc", "dut1_seconds") if k not in params]
         if missing:
             return _err(400, "bad_request", f"Missing keys: {', '.join(missing)}", op=op)
