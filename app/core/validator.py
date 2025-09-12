@@ -140,16 +140,19 @@ def sanitize_timescales(ts: TimeScales | Dict[str, Any], *, include_jd_utc: bool
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _extract_civil(payload: Dict[str, Any], *, default_time: str = "12:00:00") -> Tuple[str, str, str, List[str]]:
-    """
-    Extract civil inputs (date, time, tz) using relaxed keys and provide warnings.
-    """
     warns: List[str] = []
     date = str(payload.get("date") or payload.get("birth_date") or "").strip()
     if not date:
         warns.append("missing_date")
 
     time_str = str(payload.get("time") or payload.get("birth_time") or default_time).strip()
-    tz_name = normalize_tz(payload.get("tz") or payload.get("tz_name") or payload.get("place_tz") or "UTC")
+    # ADD `timezone` here:
+    tz_name = normalize_tz(
+        payload.get("tz")
+        or payload.get("timezone")      # <— new alias
+        or payload.get("place_tz")
+        or "UTC"
+    )
 
     return date, time_str, tz_name, warns
 
