@@ -67,6 +67,12 @@ _, _ea_diag, _EA_DIAG_ERR                  = _try_import("app.core.ephemeris_ada
 _, _ea_ecl, _EA_ECL_ERR                    = _try_import("app.core.ephemeris_adapter", "ecliptic_longitudes")
 _, _ea_many, _EA_MANY_ERR                  = _try_import("app.core.ephemeris_adapter", "ecliptic_longitudes_many")
 
+# Astronomy/House cores (presence only; shown in /ops/diag/cores)
+_ast_mod, _, _AST_ERR                      = _try_import("app.core.astronomy")
+_h_mod,   _, _H_ERR                        = _try_import("app.core.house")
+_hs_mod,  _, _HS_ERR                       = _try_import("app.core.houses")
+_hsa_mod, _, _HSA_ERR                      = _try_import("app.core.houses_advanced")
+
 # Validators (ALL validation flows go through validator.py)
 _val_mod, _normalize_common, _VAL_ERR      = _try_import("app.core.validator", "normalize_common_payload")
 _, _normalize_timescales_input, _VAL_ALIAS_ERR = _try_import("app.core.validator", "normalize_timescales_input")
@@ -74,7 +80,7 @@ _, _normalize_body, _NB_ERR                = _try_import("app.core.validator", "
 _, _normalize_for_vedic, _NV_ERR           = _try_import("app.core.validator", "normalize_for_vedic")
 _, _normalize_for_western, _NW_ERR         = _try_import("app.core.validator", "normalize_for_western")
 
-# Presence-only (for diagnostics visibility; routing doesn’t use these directly)
+# Presence-only (for diagnostics visibility; routing doesn’t call these directly)
 _wval_mod, _, _WVAL_ERR                    = _try_import("app.core.western_validator")
 _ved_val_mod, _, _VEDVAL_ERR               = _try_import("app.core.vedic_validator")
 
@@ -148,11 +154,6 @@ def _ephem_status() -> Dict[str, Any]:
             info["loaded"] = False
             info["error"] = f"{type(e).__name__}: {e}"
     return info
-
-def _ep_time_from_jd_tt(jd_tt: float):
-    if not _ep_get_ts:
-        raise RuntimeError("ephemeris timescale unavailable")
-    return _ep_get_ts().tt_jd(float(jd_tt))
 
 def _compute_vector(eph, t, body_norm: str) -> Dict[str, float]:
     earth = eph["earth"]
@@ -265,10 +266,10 @@ def ops_diag_cores():
             "ecliptic_longitudes_many_sig": _sig(_ea_many) if _ea_many else None,
             "diagnostics_sig": _sig(_ea_diag) if _ea_diag else None,
         },
-        "astronomy": {"loaded": _ast_mod is not None, "error": _AST_ERR} if (_ast_mod := _try_import("app.core.astronomy")[0]) else {"loaded": False, "error": _try_import("app.core.astronomy")[2]},
-        "house": {"loaded": _h_mod is not None, "error": _H_ERR} if (_h_mod := _try_import("app.core.house")[0]) else {"loaded": False, "error": _try_import("app.core.house")[2]},
-        "houses": {"loaded": _hs_mod is not None, "error": _HS_ERR} if (_hs_mod := _try_import("app.core.houses")[0]) else {"loaded": False, "error": _try_import("app.core.houses")[2]},
-        "houses_advanced": {"loaded": _hsa_mod is not None, "error": _HSA_ERR} if (_hsa_mod := _try_import("app.core.houses_advanced")[0]) else {"loaded": False, "error": _try_import("app.core.houses_advanced")[2]},
+        "astronomy":        {"loaded": _ast_mod is not None, "error": _AST_ERR},
+        "house":            {"loaded": _h_mod   is not None, "error": _H_ERR},
+        "houses":           {"loaded": _hs_mod  is not None, "error": _HS_ERR},
+        "houses_advanced":  {"loaded": _hsa_mod is not None, "error": _HSA_ERR},
         "leapseconds": {
             "loaded": (_ls_mod is not None) or (_ls_delta_at is not None),
             "error": _LS_ERR,
@@ -278,7 +279,7 @@ def ops_diag_cores():
     # Optional: include a trimmed ephemeris_adapter diagnostics block if callable
     try:
         if _ea_diag:
-            diag = _ea_diag()
+            diag = _ea_diag()  # may include coverage, node cache, etc.
             payload["ephemeris_adapter"]["diagnostics_sample"] = {
                 "ephemeris_name": diag.get("ephemeris_name"),
                 "kernels": diag.get("kernels"),
@@ -527,7 +528,7 @@ def ops_calculate():
             op=op
         )
 
-    # ── NEW: Ephemeris ops (validator-backed) ────────────────────────────────
+    # ── Ephemeris ops (validator-backed) ─────────────────────────────────────
     if op in ("ephem_vector", "ephem_equatorial", "ephem_ecliptic", "ephem_sidereal"):
         if not _normalize_common or not _normalize_body:
             return _err(503, "validator_unavailable", "validator functions not loaded", op=op)
