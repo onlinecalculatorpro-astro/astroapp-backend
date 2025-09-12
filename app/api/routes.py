@@ -174,6 +174,43 @@ def ops_diag_validators():
     }), 200
 
 # ───────────────────────── unified dispatcher ─────────────────────────
+def _unwrap_params(body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Accepts multiple shapes and returns a flat params dict:
+
+    - { op, params: {date,time,tz,...}, include_jd_utc? }
+    - { op, date, time, tz, ... }
+    - { op, timescales: {date,time,tz,...} }
+    - { op, data: { timescales: { ... } } }
+    """
+    if not isinstance(body, dict):
+        return {}
+
+    params = body.get("params")
+    if isinstance(params, dict):
+        return params
+
+    # Flat top-level keys
+    if any(k in body for k in ("date", "time", "tz", "timezone", "place_tz")):
+        return {
+            "date": body.get("date"),
+            "time": body.get("time"),
+            "tz": body.get("tz") or body.get("timezone") or body.get("place_tz"),
+            "dut1_seconds": body.get("dut1_seconds"),
+        }
+
+    # timescales envelope
+    ts = body.get("timescales")
+    if isinstance(ts, dict):
+        return ts
+
+    # data.timescales envelope
+    data = body.get("data")
+    if isinstance(data, dict) and isinstance(data.get("timescales"), dict):
+        return data["timescales"]
+
+    return {}
+
 @ops_api.post("/ops/calculate")
 @rate_limit(RL_OPS_CALCULATE, key_fn=_ops_bucket)
 def ops_calculate():
@@ -183,8 +220,8 @@ def ops_calculate():
     Body:
     {
       "op": "<timescales|jd_utc|tt_from_utc_jd|ut1_from_utc_jd>",
-      "params": {...},
-      "include_jd_utc": false  // only used by op="timescales"
+      "params": {...}                  // optional; also supports flat or {timescales:{...}}
+      "include_jd_utc": false          // only used by op="timescales"
     }
     """
     if _tk_mod is None or _tk_build_ts is None:
@@ -192,8 +229,10 @@ def ops_calculate():
 
     body = request.get_json(silent=True) or {}
     op = str(body.get("op") or "").strip().lower()
-    params = body.get("params") or {}
     include_jd_utc = bool(body.get("include_jd_utc"))
+
+    # Allow multiple body shapes
+    params = _unwrap_params(body)
 
     # ── TIMESCALES ────────────────────────────────────────────────────────────
     if op == "timescales":
@@ -203,8 +242,10 @@ def ops_calculate():
                 norm, warns, tz_norm = _normalize_times_input(params)  # type: ignore[misc]
             except Exception as e:
                 return _err(400, "bad_request", f"normalize_timescales_input failed: {e}", op=op)
-            date = norm["date"]; time_str = norm["time"]; tz = norm["tz"]
+            date = norm.get("date"); time_str = norm.get("time"); tz = norm.get("tz")
             dut1 = norm.get("dut1_seconds", _env_dut1_seconds())
+            if not (date and time_str and tz):
+                return _err(400, "bad_request", "Missing keys: date, time, tz", op=op)
         else:
             # Best-effort fallback
             date = params.get("date")
@@ -213,7 +254,6 @@ def ops_calculate():
             dut1 = params.get("dut1_seconds", _env_dut1_seconds())
             if not (date and time_str and tz):
                 return _err(400, "bad_request", "Missing keys: date, time, tz", op=op)
-            warns, tz_norm = [], str(tz)
 
         try:
             dut1 = float(dut1)
@@ -240,8 +280,11 @@ def ops_calculate():
         if include_jd_utc:
             ts_out["jd_utc"] = ts.get("jd_utc")
 
-        return _ok({"timescales": ts_out, "input": {"date": date, "time": time_str, "tz": tz, "dut1_seconds": float(dut1)}},
-                   op=op)
+        return _ok(
+            {"timescales": ts_out,
+             "input": {"date": date, "time": time_str, "tz": tz, "dut1_seconds": float(dut1)}},
+            op=op
+        )
 
     # ── JD_UTC (deprecated helper) ───────────────────────────────────────────
     if op == "jd_utc":
@@ -275,11 +318,16 @@ def ops_calculate():
             jd_ut1 = float(_tk_ut1_from_utc(float(params["jd_utc"]), float(params["dut1_seconds"])))  # type: ignore[misc]
         except Exception as e:
             return _err(400, "ut1_from_utc_jd_failed", str(e), op=op)
-        return _ok({"jd_ut1": jd_ut1,
-                    "input": {"jd_utc": float(params["jd_utc"]), "dut1_seconds": float(params["dut1_seconds"])}},
-                   op=op)
+        return _ok(
+            {"jd_ut1": jd_ut1,
+             "input": {"jd_utc": float(params["jd_utc"]), "dut1_seconds": float(params["dut1_seconds"])}},
+            op=op
+        )
 
     # Unknown op
-    return _err(400, "unsupported_op",
-                "op must be one of: timescales, jd_utc, tt_from_utc_jd, ut1_from_utc_jd",
-                op=op or None)
+    return _err(
+        400,
+        "unsupported_op",
+        "op must be one of: timescales, jd_utc, tt_from_utc_jd, ut1_from_utc_jd",
+        op=op or None
+    )
