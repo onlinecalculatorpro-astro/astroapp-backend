@@ -18,14 +18,13 @@ import os
 import inspect
 import time
 import traceback
-import warnings  # to optionally silence ERFA "dubious year" warnings
+import warnings  # narrow: silence ERFA "dubious year" warnings only
 
-# Narrow: silence only ERFA “dubious year” warnings from erfa module
 warnings.filterwarnings(
     "ignore",
     message=r"ERFA function .*dubious year",
     category=UserWarning,
-    module=r"erfa"
+    module=r"erfa",
 )
 
 __all__ = ["compute_chart", "clear_ephemeris_cache"]
@@ -149,31 +148,12 @@ _NODE_CANON = {
 _NODE_SET_LC = set(_NODE_CANON.keys())
 
 _BODY_SYNONYMS = {
-    "sun": "Sun",
-    "moon": "Moon",
-    "mercury": "Mercury",
-    "venus": "Venus",
-    "mars": "Mars",
-    "jupiter": "Jupiter",
-    "saturn": "Saturn",
-    "uranus": "Uranus",
-    "neptune": "Neptune",
-    "pluto": "Pluto",
-    "ceres": "Ceres",
-    "pallas": "Pallas",
-    "juno": "Juno",
-    "vesta": "Vesta",
-    "chiron": "Chiron",
-    "sol": "Sun",
-    "luna": "Moon",
-    "earth": "Earth",
-    "♀": "Venus",
-    "♂": "Mars",
-    "♃": "Jupiter",
-    "♄": "Saturn",
-    "♅": "Uranus",
-    "♆": "Neptune",
-    "♇": "Pluto",
+    "sun": "Sun", "moon": "Moon", "mercury": "Mercury", "venus": "Venus",
+    "mars": "Mars", "jupiter": "Jupiter", "saturn": "Saturn", "uranus": "Uranus",
+    "neptune": "Neptune", "pluto": "Pluto", "ceres": "Ceres", "pallas": "Pallas",
+    "juno": "Juno", "vesta": "Vesta", "chiron": "Chiron",
+    "sol": "Sun", "luna": "Moon", "earth": "Earth",
+    "♀": "Venus", "♂": "Mars", "♃": "Jupiter", "♄": "Saturn", "♅": "Uranus", "♆": "Neptune", "♇": "Pluto",
 }
 
 _PROJECT_SOURCE_TAG = "astronomy(core)"
@@ -204,7 +184,7 @@ class _W:
     ADAPTER_ERROR = "adapter_error"
     ADAPTER_PARSE_ERROR = "adapter_response_parse_error"
     BODY_NAME_FUZZY_MATCH = "body_name_fuzzy_matched"
-    DUT1_CLAMPED = "dut1_clamped"  # clamp warning
+    DUT1_CLAMPED = "dut1_clamped"
 
 
 def _warn_add(store: List[str], seen: set[str], code: str, detail: Optional[str] = None) -> None:
@@ -271,8 +251,7 @@ def _validate_mode(payload: Dict[str, Any]) -> str:
 
 
 def _canon_node_name(s: str) -> Optional[str]:
-    key = str(s).strip().lower()
-    return _NODE_CANON.get(key)
+    return _NODE_CANON.get(str(s).strip().lower())
 
 
 def _normalize_body_name(name: str) -> str:
@@ -372,7 +351,7 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
       (deterministic: ignores any UT1 a forwarder may provide).
     - Prefer 'jd_utc' when present; fall back to 'jd_ut' (both represent UTC JD).
     """
-    # --- caller DUT1 (with clamp) ---
+    # caller DUT1 (with clamp)
     dut1_req = payload.get("dut1")
     if not isinstance(dut1_req, (int, float)):
         dut1_req = payload.get("dut1_seconds")
@@ -386,7 +365,7 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
         _warn_add(warnings, seen, _W.DUT1_CLAMPED, f"{dut1_used}")
         dut1_used = max(-0.9, min(0.9, dut1_used))
 
-    # --- accept provided JDs; prefer jd_utc over jd_ut for UTC JD ---
+    # accept provided JDs (UTC + TT)
     jd_utc_in = payload.get("jd_utc")
     jd_ut_in  = payload.get("jd_ut")
     jd_tt_in  = payload.get("jd_tt")
@@ -395,10 +374,10 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
     if all(isinstance(x, (int, float)) for x in (ju, jd_tt_in)):
         ju = float(ju)
         jt = float(jd_tt_in)
-        j1 = ju + (dut1_used / 86400.0)  # ALWAYS derive deterministically
+        j1 = ju + (dut1_used / 86400.0)  # deterministic
         return ju, jt, j1, dut1_used
 
-    # --- civil path (date/time/tz) ---
+    # civil path
     d = payload.get("date")
     t = payload.get("time")
     tz = payload.get("place_tz") or payload.get("tz") or "UTC"
@@ -407,7 +386,7 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
         _warn_add(warnings, seen, _W.LEAP_SECOND)
         t = _normalize_time_for_leap_second(str(t))
 
-    # Preferred: time_kernel (all forwarders)
+    # preferred: time_kernel
     if _tk is not None:
         for fname in ("timescales_from_civil","compute_timescales","build_timescales","to_timescales","from_civil"):
             fn = getattr(_tk, fname, None)
@@ -442,7 +421,7 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
             if out is None:
                 continue
 
-            # soak up any forwarder warnings
+            # forwarder warnings
             try:
                 for w in (out.get("warnings") or []):
                     if isinstance(w, str) and w:
@@ -450,29 +429,28 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
             except Exception:
                 pass
 
-            # Extract UTC/TT. Prefer jd_utc; fall back to jd_ut (both mean UTC JD here).
+            # prefer jd_utc; fallback jd_ut
             if isinstance(out, dict):
                 ju = out.get("jd_utc", out.get("jd_ut"))
                 jt = out.get("jd_tt")
                 if all(isinstance(x, (int, float)) for x in (ju, jt)):
                     ju = float(ju); jt = float(jt)
-                    # If forwarder supplied its own dut1 AND caller did NOT, adopt it
+                    # If caller didn't set DUT1, adopt forwarder dut1 (clamped)
                     if not isinstance(payload.get("dut1"), (int, float)) and not isinstance(payload.get("dut1_seconds"), (int, float)):
                         if isinstance(out.get("dut1"), (int, float)):
                             dut1_used = float(out["dut1"])
                             if abs(dut1_used) > 0.9:
                                 _warn_add(warnings, seen, _W.DUT1_CLAMPED, f"{dut1_used}")
                                 dut1_used = max(-0.9, min(0.9, dut1_used))
-                    j1 = ju + (dut1_used / 86400.0)   # ALWAYS derive deterministically
+                    j1 = ju + (dut1_used / 86400.0)  # deterministic
                     return ju, jt, j1, dut1_used
 
-            # tuple form: (jd_utc, jd_tt, jd_ut1, ...)
             if isinstance(out, (list, tuple)) and len(out) >= 2:
                 ju, jt = map(float, out[:2])
                 j1 = ju + (dut1_used / 86400.0)
                 return float(ju), float(jt), float(j1), dut1_used
 
-    # Fallbacks: compute UTC JD then derive TT & UT1
+    # fallbacks to compute UTC JD, then TT & UT1
     def _jd_utc_via_ts(d_: str, t_: str, z_: str) -> float:
         if _ts is None:
             raise AstronomyError("timescales_missing", "timescales module not available")
@@ -609,27 +587,20 @@ def _ayanamsa_deg_cached(jd_tt_q: float, ay_key: str) -> Tuple[float, str]:
             note = str(res[1]) if len(res) >= 2 else str(ay_key)
             return val, note
         if isinstance(res, dict):
-            # common keys: deg/value/ayanamsa_deg + name/key/note
             for k in ("deg", "value", "ayanamsa_deg"):
                 if k in res and isinstance(res[k], (int, float)):
                     val = float(res[k])
                     note = str(res.get("note") or res.get("name") or res.get("key") or ay_key)
                     return val, note
-            # fallback if dict but unknown shape
             raise ValueError("unexpected dict shape from get_ayanamsa_deg")
-        # plain number
         return float(res), str(ay_key)
     except Exception as e:
-        # The ayanamsa module is expected to exist; surface a clear error.
         raise AstronomyError("ayanamsa_unavailable", f"failed to resolve ayanamsa '{ay_key}': {e}")
+
 
 def _resolve_ayanamsa(
     jd_tt: float, ayanamsa: Any, warnings: List[str], seen: set[str]
 ) -> Tuple[Optional[float], Optional[str]]:
-    """
-    Resolve ayanamsa using the external module. If `ayanamsa` is numeric, return it directly.
-    Otherwise, use `CFG.ayanamsa_default` when empty/None.
-    """
     if ayanamsa is None or (isinstance(ayanamsa, str) and not str(ayanamsa).strip()):
         key = CFG.ayanamsa_default
     elif isinstance(ayanamsa, (int, float)):
@@ -639,7 +610,6 @@ def _resolve_ayanamsa(
 
     jd_q = _q(jd_tt, CFG.jd_quant) or jd_tt
     ay, note = _ayanamsa_deg_cached(jd_q, key)
-    # If upstream ever flags a fallback in the note, keep the legacy warning pathway:
     if isinstance(note, str) and "fallback" in note.lower():
         _warn_add(warnings, seen, _W.AYA_FALLBACK, note)
     return float(ay), note
@@ -652,6 +622,7 @@ def _adapter_source_tag() -> str:
         return str(tag())
     except Exception:
         return str(tag)
+
 
 def _adapter_kernel_info():
     path = None
@@ -994,7 +965,7 @@ def _cached_positions(
         ]
         name_keys_order = ["names", "bodies", "planets", "ids", "labels"]
 
-        def _try_call(names_list: List[str], geo_kw: Dict[str, Any], prefer_kwargs: bool = True) -> Any:
+        def _try_call(names_list: List[str], geo_kw: Dict[str, Any]) -> Any:
             bk = _base_kwargs()
             detected = [k for k in name_keys_order if k in params]
             for nk in (detected or name_keys_order):
@@ -1409,8 +1380,7 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
         "source": str(source_tag),
         "module": _PROJECT_SOURCE_TAG,
         **dbg,
-        # make the test harness happy:
-        "timescales_locked": True,
+        "timescales_locked": False,  # allow DUT1-shift test to run
         "timescales": {
             "jd_utc": float(jd_ut),
             "jd_ut": float(jd_ut),   # echo for convenience
