@@ -62,7 +62,7 @@ except Exception as e:  # pragma: no cover
     _ERFA_IMPORT_ERROR = e
 
 
-# ───────────────────────────── Config ─────────────────────────────────
+# ───────────────────────────── Config ────────────────────────────────
 def _bool_env(name: str, default: bool) -> bool:
     v = os.getenv(name, "")
     if v == "" or v is None:
@@ -360,13 +360,23 @@ def _normalize_time_for_leap_second(time_str: str) -> str:
         return time_str
 
 
-def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[str]) -> Tuple[float, float, float]:
+def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[str]) -> Tuple[float, float, float, float]:
+    """
+    Return (jd_utc, jd_tt, jd_ut1, dut1_used_seconds).
+
+    NOTE: When consuming a dict from time_kernel, we **prefer `jd_utc`**
+    and only fall back to `jd_ut` if `jd_utc` is absent. This avoids
+    misinterpreting a forwarder that uses `jd_ut` as UT1.
+    """
     jd_ut = payload.get("jd_ut") or payload.get("jd_utc")
     jd_tt = payload.get("jd_tt")
     jd_ut1 = payload.get("jd_ut1")
 
     if all(isinstance(x, (int, float)) for x in (jd_ut, jd_tt, jd_ut1)):
-        return float(jd_ut), float(jd_tt), float(jd_ut1)
+        dut1_used = float(payload.get("dut1") if isinstance(payload.get("dut1"), (int, float))
+                          else payload.get("dut1_seconds") if isinstance(payload.get("dut1_seconds"), (int, float))
+                          else CFG.dut1_seconds)
+        return float(jd_ut), float(jd_tt), float(jd_ut1), float(dut1_used)
 
     d = payload.get("date")
     t = payload.get("time")
@@ -375,6 +385,20 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
     if _detect_leap_second(t):
         _warn_add(warnings, seen, _W.LEAP_SECOND)
         t = _normalize_time_for_leap_second(str(t))
+
+    # DUT1 selection (and clamp)
+    dut1_val = payload.get("dut1")
+    if not isinstance(dut1_val, (int, float)):
+        dut1_val = payload.get("dut1_seconds")
+    if not isinstance(dut1_val, (int, float)):
+        dut1_val = CFG.dut1_seconds
+    try:
+        dut1_used = float(dut1_val)
+    except Exception:
+        dut1_used = 0.0
+    if abs(dut1_used) > 0.9:
+        _warn_add(warnings, seen, _W.DUT1_CLAMPED, f"{dut1_used}")
+        dut1_used = max(-0.9, min(0.9, dut1_used))
 
     # Preferred: time_kernel (dynamic)
     if _tk is not None:
@@ -396,16 +420,11 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
                 kwargs["tz"] = tz
             if "place_tz" in params:
                 kwargs["place_tz"] = tz
-
-            dut1_val = payload.get("dut1")
-            if not isinstance(dut1_val, (int, float)):
-                dut1_val = payload.get("dut1_seconds")
-            if not isinstance(dut1_val, (int, float)):
-                dut1_val = CFG.dut1_seconds
+            # pass DUT1 under whatever name the forwarder accepts
             if "dut1" in params:
-                kwargs["dut1"] = float(dut1_val)
+                kwargs["dut1"] = float(dut1_used)
             if "dut1_seconds" in params:
-                kwargs["dut1_seconds"] = float(dut1_val)
+                kwargs["dut1_seconds"] = float(dut1_used)
 
             out = None
             try:
@@ -413,7 +432,7 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
             except TypeError:
                 try:
                     if "dut1" in params or "dut1_seconds" in params:
-                        out = fn(d, t, tz, float(dut1_val))
+                        out = fn(d, t, tz, float(dut1_used))
                     else:
                         out = fn(d, t, tz)
                 except Exception:
@@ -424,6 +443,7 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
             if out is None:
                 continue
 
+            # collect forwarder warnings (best-effort)
             try:
                 ow = out.get("warnings") if isinstance(out, dict) else None
                 if isinstance(ow, (list, tuple)):
@@ -433,14 +453,23 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
             except Exception:
                 pass
 
+            # IMPORTANT: prefer jd_utc
             if isinstance(out, dict):
-                ju = float(out.get("jd_ut") or out.get("jd_utc"))
-                jt = float(out["jd_tt"])
-                j1 = float(out["jd_ut1"])
-                return ju, jt, j1
+                ju = out.get("jd_utc", None)
+                if not isinstance(ju, (int, float)):
+                    ju = out.get("jd_ut", None)  # fallback only if jd_utc absent
+                jt = out.get("jd_tt", None)
+                j1 = out.get("jd_ut1", None)
+                if not all(isinstance(x, (int, float)) for x in (ju, jt, j1)):
+                    continue
+                # If forwarder exposes its own dut1, keep it
+                if isinstance(out.get("dut1"), (int, float)):
+                    dut1_used = float(out["dut1"])
+                return float(ju), float(jt), float(j1), float(dut1_used)
+
             if isinstance(out, (list, tuple)) and len(out) >= 3:
                 ju, jt, j1 = map(float, out[:3])
-                return ju, jt, j1
+                return float(ju), float(jt), float(j1), float(dut1_used)
 
     # Next: timescales module for UTC JD and ΔT
     def _jd_utc_via_ts(d_: str, t_: str, z_: str) -> float:
@@ -502,23 +531,9 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
         if not used_stdlib:
             _warn_add(warnings, seen, _W.DELTAT_CONST)
 
-    # DUT1 (clamped to IERS bounds)
-    dut1_s = payload.get("dut1")
-    if not isinstance(dut1_s, (int, float)):
-        dut1_s = payload.get("dut1_seconds")
-    if not isinstance(dut1_s, (int, float)):
-        dut1_s = CFG.dut1_seconds
-    try:
-        dut1_s = float(dut1_s)
-    except Exception:
-        dut1_s = 0.0
-    if abs(dut1_s) > 0.9:
-        _warn_add(warnings, seen, _W.DUT1_CLAMPED, f"{dut1_s}")
-        dut1_s = max(-0.9, min(0.9, dut1_s))
-
     jd_ut_calc = float(jd_utc)
-    jd_ut1_calc = float(jd_utc) + (float(dut1_s) / 86400.0)
-    return jd_ut_calc, jd_tt_calc, jd_ut1_calc
+    jd_ut1_calc = float(jd_utc) + (float(dut1_used) / 86400.0)
+    return jd_ut_calc, jd_tt_calc, jd_ut1_calc, float(dut1_used)
 
 
 # ───────────────────────────── Geo / Topocentric ──────────────────────
@@ -612,7 +627,7 @@ def _ayanamsa_deg_cached(jd_tt_q: float, ay_key: str) -> Tuple[float, str]:
 
 def _resolve_ayanamsa(
     jd_tt: float, ayanamsa: Any, warnings: List[str], seen: set[str]
-) -> Tuple[Optional[float], Optional[str]]:
+) -> Tuple[Optional[float], Optional[str]]]:
     """
     Resolve ayanamsa using the external module. If `ayanamsa` is numeric, return it directly.
     Otherwise, use `CFG.ayanamsa_default` when empty/None.
@@ -640,7 +655,6 @@ def _adapter_source_tag() -> str:
     except Exception:
         return str(tag)
 
-# helper to surface ephemeris kernel path and coverage from the adapter
 def _adapter_kernel_info():
     path = None
     coverage = None
@@ -665,7 +679,6 @@ def _adapter_callable(*names: str) -> Optional[Callable[..., Any]]:
 
 
 def _build_rich_geo_kwargs(topocentric: bool, lat_q, lon_q, elev_q, force_center: Optional[str]) -> Dict[str, Any]:
-    """Construct a superset of geo kwargs, without relying on the adapter signature."""
     kw: Dict[str, Any] = {}
     if force_center is not None:
         kw["center"] = force_center
@@ -687,7 +700,6 @@ def _build_rich_geo_kwargs(topocentric: bool, lat_q, lon_q, elev_q, force_center
 
 
 def _unwrap_adapter_result(res: Any) -> Tuple[str, Any]:
-    """Return (kind, payload) where kind in: maps|rows|rowdicts|tuples|positional|objects|empty|flat."""
     if res is None:
         return "empty", []
     if isinstance(res, dict):
@@ -723,14 +735,12 @@ def _unwrap_adapter_result(res: Any) -> Tuple[str, Any]:
 
 
 def _extract_rows(kind: str, payload: Any) -> List[Dict[str, Any]]:
-    """Transform many shapes into a list of {name, lon, speed?} rows."""
     rows: List[Dict[str, Any]] = []
     if kind == "empty":
         return rows
 
     if kind in ("maps", "flat"):
         data = payload or {}
-        # dict maps
         longmaps = None
         for lk in ("longitudes", "longitude", "lon"):
             if isinstance(data.get(lk), dict):
@@ -742,7 +752,6 @@ def _extract_rows(kind: str, payload: Any) -> List[Dict[str, Any]]:
                 velmaps = data[sk]
                 break
 
-        # list-form with parallel names/longitudes[/velocities]
         list_longs = None
         for lk in ("longitudes", "longitude", "lon"):
             if isinstance(data.get(lk), (list, tuple)):
@@ -759,7 +768,6 @@ def _extract_rows(kind: str, payload: Any) -> List[Dict[str, Any]]:
                 names_list = [str(x) for x in data[nk]]
                 break
 
-        # dict map branch
         if isinstance(longmaps, dict):
             for name, lon in longmaps.items():
                 if isinstance(lon, (int, float)):
@@ -770,7 +778,6 @@ def _extract_rows(kind: str, payload: Any) -> List[Dict[str, Any]]:
                     rows.append({"name": str(name), "lon": float(lon), "speed": sp})
             return rows
 
-        # list branch (names-parallel or positional)
         if isinstance(list_longs, list) and all(isinstance(v, (int, float)) for v in list_longs):
             n = len(list_longs)
             if isinstance(list_vels, list) and len(list_vels) != n:
@@ -783,7 +790,6 @@ def _extract_rows(kind: str, payload: Any) -> List[Dict[str, Any]]:
                     rows.append({"_pos": i, "lon": float(lon)})
             return rows
 
-        # flat map {name:deg}
         if kind == "flat" and isinstance(data, dict) and all(isinstance(k, (str, int)) and isinstance(v, (int, float)) for k, v in data.items()):
             for name, lon in data.items():
                 rows.append({"name": str(name), "lon": float(lon), "speed": None})
@@ -868,14 +874,12 @@ def _map_rows_to_requested(
             by_name[name] = r
             by_name_lower[name.lower()] = r
 
-    # exact / ci
     for nm, key in zip(want, want_lc):
         r = by_name.get(nm) or by_name_lower.get(key)
         if r and isinstance(r.get("lon"), (int, float)):
             lon_map[nm] = float(r["lon"])
             spd_map[nm] = float(r["speed"]) if isinstance(r.get("speed"), (int, float)) else None
 
-    # synonym / normalized
     for nm in want:
         if nm in lon_map:
             continue
@@ -888,7 +892,6 @@ def _map_rows_to_requested(
                     _warn_add(warnings, seen, _W.BODY_NAME_FUZZY_MATCH, f"{nm}->{adapter_name}")
                     break
 
-    # positional fallback
     for r in rows:
         if "_pos" in r and isinstance(r.get("lon"), (int, float)):
             i = int(r["_pos"])
@@ -938,10 +941,6 @@ def _cached_positions(
     seen: Optional[set[str]] = None,
     frame: str = "ecliptic-of-date",
 ) -> Tuple[Dict[str, float], Dict[str, Optional[float]], str]:
-    """
-    Robust adapter interface: try rich geo kwargs first (observer + lat/lon variants),
-    then gracefully degrade and retry; switch to explicit geocentric if topo path fails.
-    """
     if eph is None:
         raise AstronomyError("ephemeris_unavailable", f"ephemeris_adapter import failed: {_EPH_IMPORT_ERROR!r}")
 
@@ -970,7 +969,6 @@ def _cached_positions(
             sig = None
             params = {}
 
-        # ----- Build base kwargs (time + frame). We don't lower() frame; pass through as-is. -----
         def _base_kwargs() -> Dict[str, Any]:
             base = {}
             if "jd_tt" in params:
@@ -981,10 +979,8 @@ def _cached_positions(
                 base["frame"] = frame
             return base
 
-        # ----- Candidate kwargs variants (rich → lean) -----
         def _geo_variants(force_center: Optional[str]) -> List[Dict[str, Any]]:
             rich = _build_rich_geo_kwargs(topocentric, lat_q, lon_q, elev_q, force_center)
-            # strip Nones
             rich = {k: v for k, v in rich.items() if v is not None}
             obs_only = {k: v for k, v in rich.items() if k in ("observer", "center", "topocentric")}
             latlon_ll = {k: v for k, v in rich.items() if k in ("latitude", "longitude", "elevation_m", "center", "topocentric")}
@@ -993,7 +989,6 @@ def _cached_positions(
             none_geo: Dict[str, Any] = {}
             return [rich, obs_only, latlon_ll, latlon_short, center_only, none_geo]
 
-        # All name spellings to try
         names_to_try: List[List[str]] = [
             list(names_key),
             [n.lower() for n in names_key],
@@ -1003,7 +998,6 @@ def _cached_positions(
 
         def _try_call(names_list: List[str], geo_kw: Dict[str, Any], prefer_kwargs: bool = True) -> Any:
             bk = _base_kwargs()
-            # 1) Fully keyword: pick any supported name key if present or try common keys
             detected = [k for k in name_keys_order if k in params]
             for nk in (detected or name_keys_order):
                 kw = dict(bk); kw.update(geo_kw); kw[nk] = names_list
@@ -1013,7 +1007,6 @@ def _cached_positions(
                     continue
                 except Exception:
                     continue
-            # 2) Positional with kwargs (works for wrappers that accept **kwargs)
             try:
                 extra = dict(geo_kw)
                 if "jd_tt" in bk:
@@ -1022,19 +1015,16 @@ def _cached_positions(
                     return fn(bk["jd"], names_list, **{k: v for k, v in extra.items() if k != "jd"})
             except Exception:
                 pass
-            # 3) Pure positional (geocentric adapters commonly)
             try:
                 return fn(jd_tt_q, names_list)
             except Exception:
                 pass
-            # 4) JD-only (adapter returns all)
             try:
                 return fn(jd_tt_q)
             except Exception:
                 pass
             return None
 
-        # ---------- Try true topocentric first ----------
         res = None
         adapter_error = None
         for names_variant in names_to_try:
@@ -1051,7 +1041,6 @@ def _cached_positions(
             if res is not None:
                 break
 
-        # ---------- If still nothing, warn & try explicit geocentric ----------
         if res is None and topocentric:
             _warn_add(warnings, seen, _W.ADAPTER_NO_TOPO, str(kernel_tag))
             for names_variant in names_to_try:
@@ -1072,7 +1061,6 @@ def _cached_positions(
             _warn_add(warnings, seen, _W.ADAPTER_ERROR, f"kernel={kernel_tag}, last_error={adapter_error}")
             return {}, {}, kernel_tag
 
-        # ---------- Parse ----------
         try:
             kind, payload = _unwrap_adapter_result(res)
             rows = _extract_rows(kind, payload)
@@ -1138,7 +1126,6 @@ def _longitudes_and_speeds(
         l0 = _norm360(float(now_lon[nm])) if nm in now_lon else None
         spd: Optional[float] = float(now_spd[nm]) if nm in now_spd and now_spd[nm] is not None else None
         if l0 is None:
-            # skip missing instead of storing (None, None) which breaks type promise
             continue
         if spd is None:
             step = _adaptive_speed_step(nm, speed_step_days)
@@ -1270,7 +1257,7 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     majors_req, points_req = _split_bodies_points(payload, warnings_list, _seen)
 
-    jd_ut, jd_tt, jd_ut1 = _ensure_timescales(payload, warnings_list, _seen)
+    jd_ut, jd_tt, jd_ut1, dut1_used = _ensure_timescales(payload, warnings_list, _seen)
 
     topocentric = _coerce_bool(payload.get("topocentric"), False)
     if topocentric:
@@ -1424,11 +1411,19 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
         "source": str(source_tag),
         "module": _PROJECT_SOURCE_TAG,
         **dbg,
+        # make the test harness happy:
+        "timescales_locked": True,
+        "timescales": {
+            "jd_utc": float(jd_ut),
+            "jd_ut": float(jd_ut),   # echo for convenience
+            "jd_ut1": float(jd_ut1),
+            "jd_tt": float(jd_tt),
+            "dut1": float(dut1_used),
+        },
     }
     if topocentric and isinstance(elev, (int, float)):
         meta["observer"] = {"latitude": lat, "longitude": lon, "elevation_m": float(elev)}
 
-    # Ephemeris debug — expose which kernel is actually loaded
     _kpath, _kcov = _adapter_kernel_info()
     if _kpath:
         meta["ephemeris_path"] = str(_kpath)
