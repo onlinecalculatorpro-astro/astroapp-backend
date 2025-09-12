@@ -58,7 +58,7 @@ _, _tk_ut1_from_utc, _TK_UT1_ERR           = _try_import("app.core.time_kernel",
 _ls_mod, _ls_delta_at, _LS_ERR             = _try_import("app.core.leapseconds", "delta_at")
 
 # Ephemeris cores (diagnostics + runtime access)
-_es_mod, _es_dummy, _ES_ERR                = _try_import("app.core.ephem_singleton")  # presence + internals
+_es_mod, _es_dummy, _ES_ERR                = _try_import("app.core.ephem_singleton")
 _, _ep_get_ts, _ES_TS_ERR                  = _try_import("app.core.ephem_singleton", "get_timescale")
 _, _ep_get_eph, _ES_EPH_ERR                = _try_import("app.core.ephem_singleton", "get_planets")
 
@@ -98,19 +98,31 @@ def _ops_bucket(*_a, **_k) -> str:
     return "ops-calc"
 
 # ───────────────────────── Ephemeris helpers ─────────────────────────
-_BODY_LABELS: Dict[str, str] = {
-    "sun": "sun",
-    "moon": "moon",
-    "mercury": "mercury",
-    "venus": "venus",
-    "earth": "earth",
-    "mars": "mars",
-    "jupiter": "jupiter barycenter",
-    "saturn": "saturn barycenter",
-    "uranus": "uranus barycenter",
-    "neptune": "neptune barycenter",
-    "pluto": "pluto barycenter",
+# Candidate resolution table: labels + NAIF IDs, with barycenters
+_BODY_KEY_CANDIDATES: Dict[str, List[Any]] = {
+    "sun":      ["sun", 10],
+    "moon":     ["moon", 301],
+    "mercury":  ["mercury", "mercury barycenter", 199, 1],
+    "venus":    ["venus", "venus barycenter", 299, 2],
+    "earth":    ["earth", "earth barycenter", 399, 3],
+    "mars":     ["mars", "mars barycenter", 499, 4],
+    "jupiter":  ["jupiter", "jupiter barycenter", 599, 5],
+    "saturn":   ["saturn", "saturn barycenter", 699, 6],
+    "uranus":   ["uranus", "uranus barycenter", 799, 7],
+    "neptune":  ["neptune", "neptune barycenter", 899, 8],
+    "pluto":    ["pluto", "pluto barycenter", 999, 9],
 }
+
+def _resolve_kernel_body(eph, body_norm: str):
+    """Try multiple candidate labels/NAIF IDs for a canonical body name."""
+    if not eph or not body_norm:
+        return None
+    for key in _BODY_KEY_CANDIDATES.get(body_norm, []):
+        try:
+            return eph[key]
+        except Exception:
+            continue
+    return None
 
 def _ephem_status() -> Dict[str, Any]:
     info: Dict[str, Any] = {
@@ -142,49 +154,43 @@ def _ep_time_from_jd_tt(jd_tt: float):
         raise RuntimeError("ephemeris timescale unavailable")
     return _ep_get_ts().tt_jd(float(jd_tt))
 
-def _resolve_target(eph, body_key: str):
-    label = _BODY_LABELS.get((body_key or "").lower())
-    if not label:
-        raise ValueError(f"Unsupported body: {body_key!r}")
-    try:
-        return eph[label]
-    except Exception:
-        try:
-            return eph[label.split()[0]]
-        except Exception as e:
-            raise ValueError(f"Body not present in kernel: {body_key!r}") from e
-
-def _compute_vector(eph, t, body_key: str) -> Dict[str, float]:
+def _compute_vector(eph, t, body_norm: str) -> Dict[str, float]:
     earth = eph["earth"]
-    if (body_key or "").lower() == "earth":
+    if body_norm == "earth":
         return {"x_au": 0.0, "y_au": 0.0, "z_au": 0.0, "distance_au": 0.0}
-    target = _resolve_target(eph, body_key)
+    target = _resolve_kernel_body(eph, body_norm)
+    if target is None:
+        raise ValueError(f"Body not present in kernel: '{body_norm}'")
     g = earth.at(t).observe(target)  # geometric (ICRS)
     x, y, z = (float(g.position.au[0]), float(g.position.au[1]), float(g.position.au[2]))
     dist = math.sqrt(x*x + y*y + z*z)
     return {"x_au": x, "y_au": y, "z_au": z, "distance_au": dist}
 
-def _compute_equatorial(eph, t, body_key: str) -> Dict[str, float]:
+def _compute_equatorial(eph, t, body_norm: str) -> Dict[str, float]:
     earth = eph["earth"]
-    if (body_key or "").lower() == "earth":
+    if body_norm == "earth":
         return {"ra_deg": float("nan"), "dec_deg": float("nan"), "distance_au": 0.0}
-    target = _resolve_target(eph, body_key)
+    target = _resolve_kernel_body(eph, body_norm)
+    if target is None:
+        raise ValueError(f"Body not present in kernel: '{body_norm}'")
     a = earth.at(t).observe(target).apparent()  # apparent RA/Dec
     ra, dec, dist = a.radec()
     return {"ra_deg": float(ra.hours) * 15.0, "dec_deg": float(dec.degrees), "distance_au": float(dist.au)}
 
-def _compute_ecliptic_true(eph, t, body_key: str) -> Dict[str, float]:
-    if (body_key or "").lower() == "earth":
+def _compute_ecliptic_true(eph, t, body_norm: str) -> Dict[str, float]:
+    if body_norm == "earth":
         return {"lon_deg": float("nan"), "lat_deg": float("nan"), "distance_au": 0.0}
     from skyfield import framelib as _fl
     earth = eph["earth"]
-    target = _resolve_target(eph, body_key)
+    target = _resolve_kernel_body(eph, body_norm)
+    if target is None:
+        raise ValueError(f"Body not present in kernel: '{body_norm}'")
     a = earth.at(t).observe(target).apparent()
     lat, lon, dist = a.frame_latlon(_fl.ecliptic_frame)  # true-of-date
     return {"lon_deg": float(lon.degrees) % 360.0, "lat_deg": float(lat.degrees), "distance_au": float(dist.au)}
 
-def _compute_sidereal(eph, t, body_key: str, ayanamsa_offset_deg: float = 0.0) -> Dict[str, float]:
-    base = _compute_ecliptic_true(eph, t, body_key)
+def _compute_sidereal(eph, t, body_norm: str, ayanamsa_offset_deg: float = 0.0) -> Dict[str, float]:
+    base = _compute_ecliptic_true(eph, t, body_norm)
     true_lon = float(base["lon_deg"])
     try:
         off = float(ayanamsa_offset_deg)
@@ -259,10 +265,10 @@ def ops_diag_cores():
             "ecliptic_longitudes_many_sig": _sig(_ea_many) if _ea_many else None,
             "diagnostics_sig": _sig(_ea_diag) if _ea_diag else None,
         },
-        "astronomy": {"loaded": _ast_mod is not None, "error": _AST_ERR},
-        "house": {"loaded": _h_mod is not None, "error": _H_ERR},
-        "houses": {"loaded": _hs_mod is not None, "error": _HS_ERR},
-        "houses_advanced": {"loaded": _hsa_mod is not None, "error": _HSA_ERR},
+        "astronomy": {"loaded": _ast_mod is not None, "error": _AST_ERR} if (_ast_mod := _try_import("app.core.astronomy")[0]) else {"loaded": False, "error": _try_import("app.core.astronomy")[2]},
+        "house": {"loaded": _h_mod is not None, "error": _H_ERR} if (_h_mod := _try_import("app.core.house")[0]) else {"loaded": False, "error": _try_import("app.core.house")[2]},
+        "houses": {"loaded": _hs_mod is not None, "error": _HS_ERR} if (_hs_mod := _try_import("app.core.houses")[0]) else {"loaded": False, "error": _try_import("app.core.houses")[2]},
+        "houses_advanced": {"loaded": _hsa_mod is not None, "error": _HSA_ERR} if (_hsa_mod := _try_import("app.core.houses_advanced")[0]) else {"loaded": False, "error": _try_import("app.core.houses_advanced")[2]},
         "leapseconds": {
             "loaded": (_ls_mod is not None) or (_ls_delta_at is not None),
             "error": _LS_ERR,
@@ -272,7 +278,7 @@ def ops_diag_cores():
     # Optional: include a trimmed ephemeris_adapter diagnostics block if callable
     try:
         if _ea_diag:
-            diag = _ea_diag()  # may include coverage, node cache, etc.
+            diag = _ea_diag()
             payload["ephemeris_adapter"]["diagnostics_sample"] = {
                 "ephemeris_name": diag.get("ephemeris_name"),
                 "kernels": diag.get("kernels"),
@@ -384,7 +390,7 @@ def _unwrap_params(body: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(params, dict):
         return params
 
-    # Flat top-level keys
+    # Flat top-level keys (also collect ephem bits)
     if any(k in body for k in ("date", "time", "tz", "timezone", "place_tz", "body", "ayanamsa_offset_deg")):
         return {
             "date": body.get("date"),
@@ -547,6 +553,7 @@ def ops_calculate():
             ts = _ep_get_ts() if _ep_get_ts else None
             if eph is None or ts is None:
                 return _err(503, "ephem_core_unavailable", "Skyfield/JPL ephemeris not available", op=op)
+
             t = ts.tt_jd(float(jd_tt))
             if op == "ephem_vector":
                 result = _compute_vector(eph, t, body_norm)
@@ -561,8 +568,12 @@ def ops_calculate():
                 except Exception:
                     off = 0.0
                 result = _compute_sidereal(eph, t, body_norm, ayanamsa_offset_deg=off)
+
+        except ValueError as e:
+            # Missing/unknown body for the loaded kernel → client error
+            return _err(400, "bad_body", str(e), op=op)
         except Exception as e:
-            # Surface missing kernel/Skyfield distinctly
+            # Distinguish core-unavailable from compute issues
             msg = str(e)
             if "ephemeris" in msg.lower() or "skyfield" in msg.lower():
                 return _err(503, "ephem_core_unavailable", msg, op=op)
