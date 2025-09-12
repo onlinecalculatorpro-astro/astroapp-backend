@@ -237,7 +237,7 @@ def _compute_timescales_dict(
     dut1: float,
     *,
     include_jd_utc: bool = False,
-) -> Tuple[Optional[Dict[str, Any]], List[str]]:
+) -> Tuple[Optional[Dict[str, Any]], List[str]]]:
     warns: List[str] = []
     if _TK_AVAILABLE and tk_build_timescales is not None:
         ts = tk_build_timescales(date, time_str, tz_name, dut1)  # type: ignore[misc]
@@ -425,9 +425,6 @@ def normalize_chart_payload(
     # Normalize lists
     bodies = _coerce_list_of_str(payload.get("bodies"))
     points = _coerce_list_of_str(payload.get("points"))
-
-    # If user mistakenly put nodes into bodies, let compute_chart handle it,
-    # but we can gently pass through; compute_chart will move/repair as needed.
 
     out: Dict[str, Any] = dict(base)
     out.update({
