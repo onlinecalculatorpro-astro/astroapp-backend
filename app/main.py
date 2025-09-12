@@ -131,10 +131,18 @@ def create_app() -> Flask:
 
     @app.after_request
     def _after_request(resp: Response):
+        # Metrics + Server-Timing header
         try:
             t0 = getattr(request, "_t0", None)
             if t0 is not None:
-                REQ_LATENCY.labels(route=(request.path or "")).observe(perf_counter() - t0)
+                dur_s = perf_counter() - t0
+                REQ_LATENCY.labels(route=(request.path or "")).observe(dur_s)
+                dur_ms = int(dur_s * 1000)
+                # Add standard Server-Timing + X-Response-Time headers
+                prev = resp.headers.get("Server-Timing")
+                this = f"app;dur={dur_ms}"
+                resp.headers["Server-Timing"] = (f"{prev}, {this}" if prev else this)
+                resp.headers["X-Response-Time"] = f"{dur_ms} ms"
         except Exception:
             pass
 
@@ -160,7 +168,6 @@ def create_app() -> Flask:
     @app.get("/metrics")
     def metrics_endpoint():
         if not _metrics_auth_ok():
-            # NOTE: fixed quoting bug here
             return Response("Unauthorized", 401, {"WWW-Authenticate": 'Basic realm="metrics"'})
         try:
             GAUGE_DUT1.set(float(os.environ.get("ASTRO_DUT1_BROADCAST", os.environ.get("ASTRO_DUT1", "0.0")) or 0.0))
@@ -176,7 +183,7 @@ def create_app() -> Flask:
             methods = sorted(m for m in (r.methods or []) if m not in ("HEAD", "OPTIONS"))
             rules.append({"rule": str(r), "endpoint": r.endpoint, "methods": methods})
         rules.sort(key=lambda x: x["rule"])
-        return jsonify({"count": len(rules), "rules": rules}), 200
+        return jsonify({"count": len(rules), "routes": rules}), 200
 
     @app.get("/__debug/imports")
     def __debug_imports():
