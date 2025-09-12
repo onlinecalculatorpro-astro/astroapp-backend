@@ -15,7 +15,7 @@ Responsibilities
   If present, their exported normalizer functions are used; otherwise
   we fall back to the common base normalization in this module.
 
-New (for astrology.compute_chart):
+For astronomy.compute_chart (FINAL engine):
 - normalize_chart_payload(payload, ...) -> (normalized: dict, warnings: list[str], tz_normalized: str)
 
 Stable Exports
@@ -82,7 +82,7 @@ __all__ = [
     "normalize_for_vedic",
     "normalize_for_western",
     "normalize_for_domain",
-    # NEW
+    # FINAL astronomy wiring
     "normalize_chart_payload",
 ]
 
@@ -237,7 +237,7 @@ def _compute_timescales_dict(
     dut1: float,
     *,
     include_jd_utc: bool = False,
-) -> Tuple[Optional[Dict[str, Any]], List[str]]]:
+) -> Tuple[Optional[Dict[str, Any]], List[str]]:
     warns: List[str] = []
     if _TK_AVAILABLE and tk_build_timescales is not None:
         ts = tk_build_timescales(date, time_str, tz_name, dut1)  # type: ignore[misc]
@@ -334,7 +334,7 @@ def normalize_timescales_input(
     )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Astrology chart normalization (for astrology.compute_chart)
+# Astronomy chart normalization (for astronomy.compute_chart)
 # ──────────────────────────────────────────────────────────────────────────────
 
 _NODE_KEYS = {
@@ -378,17 +378,18 @@ def normalize_chart_payload(
     *,
     default_time: str = "12:00:00",
     compute_timescales: bool = True,
-    include_jd_utc: bool = False,
+    include_jd_utc: bool = True,  # make jd_utc available for astronomy.compute_chart
     dut1_seconds: Optional[float] = None,
 ) -> Tuple[Dict[str, Any], List[str], str]:
     """
-    Prepare a request for app.core.astrology.compute_chart.
+    Prepare a request for app.core.astronomy.compute_chart (FINAL).
 
     - Normalizes civil fields + (optionally) precomputes timescales.
+      (include_jd_utc=True by default so astronomy receives jd_ut/jd_utc + jd_tt + jd_ut1.)
     - Coerces mode ('tropical'|'sidereal') and frame (default 'ecliptic-of-date').
     - Coerces topocentric flag from 'topocentric' or 'center'=='topocentric'.
     - Extracts latitude/longitude and unifies elevation to 'elevation_m'.
-    - Bodies/points coerced to list[str] if present (left empty otherwise).
+    - Bodies/points coerced to list[str] if present (left as-is otherwise).
     - Always exposes both 'dut1_seconds' and 'dut1'.
     """
     base, warns, tz_name = normalize_common_payload(
@@ -435,7 +436,7 @@ def normalize_chart_payload(
         "latitude": lat,
         "longitude": lon,
         "elevation_m": elev_m,
-        "elev_m": elev_m,  # mirror, since astrology.py accepts several variants
+        "elev_m": elev_m,  # mirror, astronomy accepts several variants
         "bodies": bodies if bodies is not None else payload.get("bodies"),
         "points": points if points is not None else payload.get("points"),
         # expose DUT1 under both keys
