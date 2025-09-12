@@ -37,25 +37,39 @@ REQ_LATENCY: Final = Histogram("astro_request_seconds", "API request latency", [
 GAUGE_APP_UP: Final = Gauge("astro_app_up", "1 if app is running")
 GAUGE_DUT1: Final = Gauge("astro_dut1_broadcast_seconds", "DUT1 broadcast seconds")
 
-# ───────────────────────── routes blueprint import (Western) ─────────────────────────
-_routes_bp = None
-_routes_import_err: Optional[str] = None
+# ───────────────────────── Blueprint imports ─────────────────────────
+# ops / diagnostics (no prefix)
+_ops_bp = None
+_ops_import_err: Optional[str] = None
 try:
-    from app.api import routes as _routes_mod  # type: ignore
-    _routes_bp = _routes_mod.api
-except Exception as e:  # pragma: no cover
-    _routes_import_err = repr(e)
-    print("WARNING: routes blueprint failed to import:", _routes_import_err, file=sys.stderr)
+    # Preferred: routes.py exposes ops_api (ops+debug)
+    from app.api.routes import ops_api as _ops_bp  # type: ignore
+except Exception as e_ops_primary:
+    _ops_import_err = repr(e_ops_primary)
+    # Backward-compat: some codebases expose "api" in routes.py; mount it at /api if present.
+    try:
+        from app.api.routes import api as _legacy_api_bp  # type: ignore
+    except Exception:
+        _legacy_api_bp = None  # type: ignore
+
+# western (mounted at /api/western)
+_western_bp = None
+_western_import_err: Optional[str] = None
+try:
+    from app.api.western_routes import western_api as _western_bp  # type: ignore
+except Exception as e:
+    _western_import_err = repr(e)
+    print("WARNING: western_routes blueprint failed to import:", _western_import_err, file=sys.stderr)
     traceback.print_exc()
 
-# ───────────────────────── Vedic routes blueprint import (optional) ─────────────────────────
+# vedic (mounted at /api/vedic) — feature-gated
 _vedic_bp = None
 _vedic_import_err: Optional[str] = None
 _ENABLE_VEDIC = os.getenv("ENABLE_VEDIC_API", "1").lower() in ("1", "true", "yes", "on")
 if _ENABLE_VEDIC:
     try:
         from app.api.vedic_routes import vedic_api as _vedic_bp  # type: ignore
-    except Exception as e:  # pragma: no cover
+    except Exception as e:
         _vedic_import_err = repr(e)
         print("WARNING: vedic_routes blueprint failed to import:", _vedic_import_err, file=sys.stderr)
         traceback.print_exc()
@@ -126,7 +140,7 @@ def create_app() -> Flask:
             pass
         return resp
 
-    # ───── Health & root ─────
+    # ───── Root & Health ─────
     @app.get("/")
     def _root():
         return jsonify(ok=True, service="astro-backend", health="/healthz"), 200
@@ -146,7 +160,7 @@ def create_app() -> Flask:
             pass
         return Response(generate_latest(REGISTRY), mimetype=CONTENT_TYPE_LATEST)
 
-    # ───── Debug helpers (minimal, non-sensitive) ─────
+    # ───── Debug helpers ─────
     @app.get("/__debug/routes")
     def __debug_routes():
         rules: list[Dict[str, Any]] = []
@@ -159,43 +173,66 @@ def create_app() -> Flask:
     @app.get("/__debug/imports")
     def __debug_imports():
         return jsonify({
-            "routes_blueprint_loaded": _routes_bp is not None,
-            "routes_import_error": _routes_import_err,
+            # ops / legacy
+            "ops_blueprint_loaded": _ops_bp is not None,
+            "ops_import_error": _ops_import_err,
+            "legacy_api_present": ('_legacy_api_bp' in globals()) and (globals().get('_legacy_api_bp') is not None),
+            # western
+            "western_blueprint_loaded": (_western_bp is not None),
+            "western_import_error": _western_import_err,
+            # vedic
+            "vedic_enabled_flag": _ENABLE_VEDIC,
             "vedic_blueprint_loaded": (_vedic_bp is not None),
             "vedic_import_error": _vedic_import_err,
-            "vedic_enabled_flag": _ENABLE_VEDIC,
+            # registry of mounted blueprints
             "blueprints": list(app.blueprints.keys()),
+            "mounts": {
+                "ops": "(no prefix)",
+                "western": "/api/western",
+                "vedic": "/api/vedic" if _ENABLE_VEDIC else "(disabled)",
+                "legacy_api": "/api (only if ops_api missing and routes.py exposes 'api')",
+            },
         }), 200
 
     @app.get("/favicon.ico")
     def _noop_favicon():
         return ("", 204)
 
-    # ───── Register the core API blueprint (Western; canonical) ─────
-    if _routes_bp is not None:
-        # routes.py uses absolute '/api/...' paths; no url_prefix needed
-        app.register_blueprint(_routes_bp)
+    # ───── Register blueprints (ROUTE FILES USE RELATIVE PATHS) ─────
+    # 1) ops / diagnostics (preferred)
+    if _ops_bp is not None:
+        app.register_blueprint(_ops_bp)  # no prefix
     else:
-        @app.get("/api/health")
-        def _health_fallback():
-            return jsonify(ok=False, error="routes_blueprint_not_loaded", detail=_routes_import_err), 500
+        # 1a) legacy compatibility: if routes.py exposes "api" (absolute/relative unknown), mount at /api
+        if globals().get('_legacy_api_bp') is not None:
+            app.register_blueprint(globals()['_legacy_api_bp'], url_prefix="/api")
+        else:
+            @app.get("/ops_missing")
+            def _ops_missing():
+                return jsonify(ok=False, error="ops_blueprint_not_loaded", detail=_ops_import_err), 500
 
-    # ───── Register the Vedic API blueprint ─────
+    # 2) western at /api/western
+    if _western_bp is not None:
+        app.register_blueprint(_western_bp, url_prefix="/api/western")
+    else:
+        @app.get("/api/western/health")
+        def _western_missing():
+            return jsonify(ok=False, error="western_blueprint_not_loaded", detail=_western_import_err), 500
+
+    # 3) vedic at /api/vedic (feature-gated)
     if _ENABLE_VEDIC and _vedic_bp is not None:
-        # IMPORTANT:
-        # Your vedic_routes.py defines ABSOLUTE paths (e.g. '/api/vedic/dasha/vimshottari').
-        # Therefore we DO NOT set url_prefix here. If you later convert vedic routes to
-        # relative paths (e.g. '/dasha/vimshottari'), change the next line to:
-        #     app.register_blueprint(_vedic_bp, url_prefix="/api/vedic")
-        app.register_blueprint(_vedic_bp)
-    elif _ENABLE_VEDIC and _vedic_bp is None:
+        app.register_blueprint(_vedic_bp, url_prefix="/api/vedic")
+    elif _ENABLE_VEDIC:
         @app.get("/api/vedic/health")
         def _vedic_health_fallback():
             return jsonify(ok=False, error="vedic_blueprint_not_loaded", detail=_vedic_import_err), 500
 
     app.logger.info(
-        "App initialized; routes_loaded=%s vedic_enabled=%s vedic_loaded=%s",
-        bool(_routes_bp), _ENABLE_VEDIC, bool(_vedic_bp),
+        "App initialized; ops=%s western=%s vedic_enabled=%s vedic=%s",
+        bool(_ops_bp) or bool(globals().get('_legacy_api_bp')),
+        bool(_western_bp),
+        _ENABLE_VEDIC,
+        bool(_vedic_bp),
     )
     return app
 
