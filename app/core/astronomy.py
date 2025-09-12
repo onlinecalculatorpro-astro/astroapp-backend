@@ -569,50 +569,65 @@ def _validate_and_normalize_geo_for_topo(
     return latf, lonf, elev_m, downgraded
 
 
-# ───────────────────────────── Ayanāṁśa ───────────────────────────────
+# ───────────────────────────── Ayanāṁśa (delegated) ───────────────────
 @lru_cache(maxsize=4096)
 def _ayanamsa_deg_cached(jd_tt_q: float, ay_key: str) -> Tuple[float, str]:
-    for modpath, fn in (("app.core.ayanamsa", "get_ayanamsa_deg"), ("app.core.astro_extras", "get_ayanamsa_deg")):
+    """
+    Thin wrapper around external ayanamsa module.
+
+    Expects a function `get_ayanamsa_deg(jd_tt, key)` in `app.core.ayanamsa`
+    (also supports the swapped-arg signature).
+    Returns (degrees, note). The note is best-effort and may simply echo the key.
+    """
+    try:
+        mod = __import__("app.core.ayanamsa", fromlist=["get_ayanamsa_deg"])
+        fn = getattr(mod, "get_ayanamsa_deg", None)
+        if not callable(fn):
+            raise AttributeError("get_ayanamsa_deg not found")
         try:
-            mod = __import__(modpath, fromlist=[fn])
-            fnobj = getattr(mod, fn, None)
-            if callable(fnobj):
-                try:
-                    return float(fnobj(jd_tt_q, ay_key)), ay_key
-                except TypeError:
-                    return float(fnobj(ay_key, jd_tt_q)), ay_key
-                except Exception:
-                    pass
-        except Exception:
-            pass
+            res = fn(jd_tt_q, ay_key)
+        except TypeError:
+            # support (key, jd_tt) ordering
+            res = fn(ay_key, jd_tt_q)
 
-    AY_J2000_DEG = (23 + 51 / 60 + 26.26 / 3600)
-    RATE_AS_PER_YR = 50.290966
-    Tcent = (jd_tt_q - 2451545.0) / 36525.0
-    years = Tcent * 100.0
-    base = AY_J2000_DEG + (RATE_AS_PER_YR * years) / 3600.0
-    name = (ay_key or CFG.ayanamsa_default or "lahiri").lower()
-    if name in ("lahiri", "chitrapaksha", "default", "sidereal"):
-        return base, "lahiri(fallback)"
-    if name in ("fagan", "fagan_bradley", "fagan/bradley", "fagan/allen"):
-        return base + (0.83 / 60.0), "fagan_bradley(fallback)"
-    if name in ("krishnamurti", "kp"):
-        return base - (20.0 / 3600.0), "krishnamurti(fallback)"
-    return base, f"ayanamsa_fallback_to_lahiri({name})"
-
+        # Normalize possible return shapes
+        if isinstance(res, (tuple, list)) and len(res) >= 1:
+            val = float(res[0])
+            note = str(res[1]) if len(res) >= 2 else str(ay_key)
+            return val, note
+        if isinstance(res, dict):
+            # common keys: deg/value/ayanamsa_deg + name/key/note
+            for k in ("deg", "value", "ayanamsa_deg"):
+                if k in res and isinstance(res[k], (int, float)):
+                    val = float(res[k])
+                    note = str(res.get("note") or res.get("name") or res.get("key") or ay_key)
+                    return val, note
+            # fallback if dict but unknown shape
+            raise ValueError("unexpected dict shape from get_ayanamsa_deg")
+        # plain number
+        return float(res), str(ay_key)
+    except Exception as e:
+        # The ayanamsa module is expected to exist; surface a clear error.
+        raise AstronomyError("ayanamsa_unavailable", f"failed to resolve ayanamsa '{ay_key}': {e}")
 
 def _resolve_ayanamsa(
     jd_tt: float, ayanamsa: Any, warnings: List[str], seen: set[str]
-) -> Tuple[Optional[float], Optional[str]]:  # degree value, note
+) -> Tuple[Optional[float], Optional[str]]:
+    """
+    Resolve ayanamsa using the external module. If `ayanamsa` is numeric, return it directly.
+    Otherwise, use `CFG.ayanamsa_default` when empty/None.
+    """
     if ayanamsa is None or (isinstance(ayanamsa, str) and not str(ayanamsa).strip()):
         key = CFG.ayanamsa_default
     elif isinstance(ayanamsa, (int, float)):
         return float(ayanamsa), "explicit"
     else:
         key = str(ayanamsa).strip().lower()
+
     jd_q = _q(jd_tt, CFG.jd_quant) or jd_tt
     ay, note = _ayanamsa_deg_cached(jd_q, key)
-    if note and "fallback" in note:
+    # If upstream ever flags a fallback in the note, keep the legacy warning pathway:
+    if isinstance(note, str) and "fallback" in note.lower():
         _warn_add(warnings, seen, _W.AYA_FALLBACK, note)
     return float(ay), note
 
