@@ -138,15 +138,14 @@ def create_app() -> Flask:
         except Exception:
             pass
 
-        # Add **deprecation headers** for legacy /api/health (regardless of which blueprint serves it)
+        # Add deprecation headers for legacy /api/health
         try:
             if request.path == "/api/health":
-                # Only set if not already set by the handler
                 resp.headers.setdefault("Deprecation", "true")
                 resp.headers.setdefault("Link", '</healthz>; rel="successor-version"')
-            return resp
         except Exception:
-            return resp
+            pass
+        return resp
 
     # ───── Root & Health ─────
     @app.get("/")
@@ -161,7 +160,8 @@ def create_app() -> Flask:
     @app.get("/metrics")
     def metrics_endpoint():
         if not _metrics_auth_ok():
-            return Response("Unauthorized", 401, {"WWW-Authenticate": 'Basic realm="metrics'"})
+            # NOTE: fixed quoting bug here
+            return Response("Unauthorized", 401, {"WWW-Authenticate": 'Basic realm="metrics"'})
         try:
             GAUGE_DUT1.set(float(os.environ.get("ASTRO_DUT1_BROADCAST", os.environ.get("ASTRO_DUT1", "0.0")) or 0.0))
         except Exception:
