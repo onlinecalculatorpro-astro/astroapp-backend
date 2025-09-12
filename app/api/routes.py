@@ -4,6 +4,9 @@ Ops & Diagnostics routes (mounted with NO prefix by main.py)
 
 Single dispatcher for shared/core ops:
 - POST /ops/calculate
+  • op: "timescales" | "jd_utc" | "tt_from_utc_jd" | "ut1_from_utc_jd"
+  • op: "ephem_vector" | "ephem_equatorial" | "ephem_ecliptic" | "ephem_sidereal"
+  • op: "chart" (astrology.compute_chart)
 
 Diagnostics & health:
 - GET  /ops/health
@@ -73,12 +76,16 @@ _h_mod,   _, _H_ERR                        = _try_import("app.core.house")
 _hs_mod,  _, _HS_ERR                       = _try_import("app.core.houses")
 _hsa_mod, _, _HSA_ERR                      = _try_import("app.core.houses_advanced")
 
+# Astrology core (NEW)
+_astrology_mod, _compute_chart, _ASTRO_ERR = _try_import("app.core.astrology", "compute_chart")
+
 # Validators (ALL validation flows go through validator.py)
-_val_mod, _normalize_common, _VAL_ERR      = _try_import("app.core.validator", "normalize_common_payload")
+_val_mod, _normalize_common, _VAL_ERR          = _try_import("app.core.validator", "normalize_common_payload")
 _, _normalize_timescales_input, _VAL_ALIAS_ERR = _try_import("app.core.validator", "normalize_timescales_input")
-_, _normalize_body, _NB_ERR                = _try_import("app.core.validator", "normalize_body")
-_, _normalize_for_vedic, _NV_ERR           = _try_import("app.core.validator", "normalize_for_vedic")
-_, _normalize_for_western, _NW_ERR         = _try_import("app.core.validator", "normalize_for_western")
+_, _normalize_body, _NB_ERR                    = _try_import("app.core.validator", "normalize_body")
+_, _normalize_for_vedic, _NV_ERR               = _try_import("app.core.validator", "normalize_for_vedic")
+_, _normalize_for_western, _NW_ERR             = _try_import("app.core.validator", "normalize_for_western")
+_, _normalize_chart_payload, _NC_ERR           = _try_import("app.core.validator", "normalize_chart_payload")
 
 # Presence-only (for diagnostics visibility; routing doesn’t call these directly)
 _wval_mod, _, _WVAL_ERR                    = _try_import("app.core.western_validator")
@@ -104,7 +111,6 @@ def _ops_bucket(*_a, **_k) -> str:
     return "ops-calc"
 
 # ───────────────────────── Ephemeris helpers ─────────────────────────
-# Candidate resolution table: labels + NAIF IDs, with barycenters
 _BODY_KEY_CANDIDATES: Dict[str, List[Any]] = {
     "sun":      ["sun", 10],
     "moon":     ["moon", 301],
@@ -120,7 +126,6 @@ _BODY_KEY_CANDIDATES: Dict[str, List[Any]] = {
 }
 
 def _resolve_kernel_body(eph, body_norm: str):
-    """Try multiple candidate labels/NAIF IDs for a canonical body name."""
     if not eph or not body_norm:
         return None
     for key in _BODY_KEY_CANDIDATES.get(body_norm, []):
@@ -274,6 +279,12 @@ def ops_diag_cores():
             "loaded": (_ls_mod is not None) or (_ls_delta_at is not None),
             "error": _LS_ERR,
         },
+        # NEW: astrology module presence
+        "astrology": {
+            "loaded": _astrology_mod is not None,
+            "error": _ASTRO_ERR,
+            "compute_chart_sig": _sig(_compute_chart) if _compute_chart else None,
+        },
     }
 
     # Optional: include a trimmed ephemeris_adapter diagnostics block if callable
@@ -357,6 +368,7 @@ def ops_diag_validators():
             "normalize_timescales_input_sig": _sig(_normalize_timescales_input) if _normalize_timescales_input else None,
             "normalize_for_vedic_sig": _sig(_normalize_for_vedic) if _normalize_for_vedic else None,
             "normalize_for_western_sig": _sig(_normalize_for_western) if _normalize_for_western else None,
+            "normalize_chart_payload_sig": _sig(_normalize_chart_payload) if _normalize_chart_payload else None,
             "normalize_body_sig": _sig(_normalize_body) if _normalize_body else None,
             "functions": list_callables(_val_mod) if _val_mod else None,
         },
@@ -391,7 +403,6 @@ def _unwrap_params(body: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(params, dict):
         return params
 
-    # Flat top-level keys (also collect ephem bits)
     if any(k in body for k in ("date", "time", "tz", "timezone", "place_tz", "body", "ayanamsa_offset_deg")):
         return {
             "date": body.get("date"),
@@ -400,14 +411,25 @@ def _unwrap_params(body: Dict[str, Any]) -> Dict[str, Any]:
             "dut1_seconds": body.get("dut1_seconds"),
             "body": body.get("body"),
             "ayanamsa_offset_deg": body.get("ayanamsa_offset_deg"),
+            # chart-related passthroughs if user goes flat
+            "mode": body.get("mode"),
+            "frame": body.get("frame"),
+            "center": body.get("center"),
+            "topocentric": body.get("topocentric"),
+            "latitude": body.get("latitude"),
+            "longitude": body.get("longitude"),
+            "elevation_m": body.get("elevation_m"),
+            "elev_m": body.get("elev_m"),
+            "elevation": body.get("elevation"),
+            "bodies": body.get("bodies"),
+            "points": body.get("points"),
+            "ayanamsa": body.get("ayanamsa"),
         }
 
-    # timescales envelope
     ts = body.get("timescales")
     if isinstance(ts, dict):
         return ts
 
-    # data.timescales envelope
     data = body.get("data")
     if isinstance(data, dict) and isinstance(data.get("timescales"), dict):
         return data["timescales"]
@@ -422,9 +444,9 @@ def ops_calculate():
 
     Body:
     {
-      "op": "<timescales|jd_utc|tt_from_utc_jd|ut1_from_utc_jd|ephem_vector|ephem_equatorial|ephem_ecliptic|ephem_sidereal>",
+      "op": "<timescales|jd_utc|tt_from_utc_jd|ut1_from_utc_jd|ephem_vector|ephem_equatorial|ephem_ecliptic|ephem_sidereal|chart>",
       "params": {...}                  // optional; also supports flat or {timescales:{...}}
-      "include_jd_utc": false          // only used by op="timescales"
+      "include_jd_utc": false          // only used by op="timescales" (and normalization if chart needs it)
     }
     """
     if _tk_mod is None or _tk_build_ts is None:
@@ -434,12 +456,10 @@ def ops_calculate():
     op = str(body.get("op") or "").strip().lower()
     include_jd_utc = bool(body.get("include_jd_utc"))
 
-    # Allow multiple body shapes
     raw_params = _unwrap_params(body)
 
     # ── TIMESCALES ────────────────────────────────────────────────────────────
     if op == "timescales":
-        # Validate via central validator (wired to vfiles internally)
         if _normalize_common:
             try:
                 norm, _warns, _tz_norm = _normalize_common(raw_params, compute_timescales=False)  # type: ignore[misc]
@@ -533,7 +553,6 @@ def ops_calculate():
         if not _normalize_common or not _normalize_body:
             return _err(503, "validator_unavailable", "validator functions not loaded", op=op)
 
-        # Validate + compute jd_tt via validator
         try:
             norm, warns, _tz = _normalize_common(raw_params, compute_timescales=True, include_jd_utc=False)  # type: ignore[misc]
         except Exception as e:
@@ -543,12 +562,10 @@ def ops_calculate():
         if not isinstance(jd_tt, (int, float)):
             return _err(400, "bad_request", "jd_tt not available after normalization", op=op)
 
-        # Body normalization (through validator)
         body_norm, bwarn = _normalize_body(raw_params)  # type: ignore[misc]
         if not body_norm:
             return _err(400, "bad_body", "Missing or unsupported 'body'", op=op)
 
-        # Run compute using ephem_singleton
         try:
             eph = _ep_get_eph() if _ep_get_eph else None
             ts = _ep_get_ts() if _ep_get_ts else None
@@ -571,10 +588,8 @@ def ops_calculate():
                 result = _compute_sidereal(eph, t, body_norm, ayanamsa_offset_deg=off)
 
         except ValueError as e:
-            # Missing/unknown body for the loaded kernel → client error
             return _err(400, "bad_body", str(e), op=op)
         except Exception as e:
-            # Distinguish core-unavailable from compute issues
             msg = str(e)
             if "ephemeris" in msg.lower() or "skyfield" in msg.lower():
                 return _err(503, "ephem_core_unavailable", msg, op=op)
@@ -589,10 +604,62 @@ def ops_calculate():
             op=op, body=body_norm
         )
 
+    # ── Astrology chart (compute_chart) ──────────────────────────────────────
+    if op in ("chart", "astro_chart", "compute_chart"):
+        if not (_normalize_chart_payload and _compute_chart):
+            return _err(503, "astrology_unavailable", "astrology module or validator not loaded", op=op)
+
+        try:
+            # allow include_jd_utc to influence normalization (handy for debugging)
+            norm, warns, tz_norm = _normalize_chart_payload(
+                raw_params,
+                compute_timescales=True,
+                include_jd_utc=include_jd_utc
+            )  # type: ignore[misc]
+        except Exception as e:
+            return _err(400, "bad_request", f"normalize_chart_payload failed: {e}", op=op)
+
+        try:
+            out = _compute_chart(norm)  # dict as defined by astrology.compute_chart
+        except Exception as e:
+            # If astrology.AstronomyError was raised, surface its code/message if present
+            code = getattr(e, "code", None)
+            msg = str(e)
+            if code:
+                # Treat validation-ish errors as 400; engine unavailability as 503
+                status = 400 if "invalid" in code or "unsupported" in code or "missing" in code else 500
+                return _err(status, code, msg, op=op)
+            return _err(500, "chart_compute_error", msg, op=op)
+
+        # Merge validator warns with engine warns (engine already returns its own warning list)
+        engine_warns = list(out.get("warnings", []) or [])
+        merged_warns = list(dict.fromkeys((warns or []) + engine_warns))  # de-dup, preserve order
+        out["warnings"] = merged_warns
+
+        return _ok(
+            {
+                "chart": out,
+                "input": {
+                    "date": norm.get("date"),
+                    "time": norm.get("time"),
+                    "tz": norm.get("tz"),
+                    "mode": norm.get("mode"),
+                    "frame": norm.get("frame"),
+                    "center": norm.get("center"),
+                    "topocentric": bool(norm.get("topocentric")),
+                    "latitude": norm.get("latitude"),
+                    "longitude": norm.get("longitude"),
+                    "elevation_m": norm.get("elevation_m"),
+                },
+            },
+            op=op,
+            timezone=tz_norm
+        )
+
     # Unknown op
     return _err(
         400,
         "unsupported_op",
-        "op must be one of: timescales, jd_utc, tt_from_utc_jd, ut1_from_utc_jd, ephem_vector, ephem_equatorial, ephem_ecliptic, ephem_sidereal",
+        "op must be one of: timescales, jd_utc, tt_from_utc_jd, ut1_from_utc_jd, ephem_vector, ephem_equatorial, ephem_ecliptic, ephem_sidereal, chart",
         op=op or None
     )
