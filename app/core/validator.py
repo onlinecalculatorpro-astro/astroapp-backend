@@ -1,8 +1,58 @@
-# app/core/validator.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+"""
+Central validator wiring for AstroApp.
+
+Responsibilities
+- Common normalization used by ALL routes (central, Vedic, Western).
+- Preferred timescale forwarder to time_kernel.build_timescales (dict),
+  with a safe fallback to timescales.build_timescales (dataclass).
+- Optional, pluggable domain-specific normalizers:
+    • app.core.vedic_validator
+    • app.core.western_validator
+  If present, their exported normalizer functions are used; otherwise
+  we fall back to the common base normalization in this module.
+
+Exports (stable)
+- normalize_tz(tz, default="UTC") -> str
+- env_dut1_seconds() -> float
+- clamp_levels(val, default=5, min_v=1, max_v=5) -> int
+- parse_latlon(payload) -> (lat, lon)
+- sanitize_timescales(ts, include_jd_utc=False) -> dict
+- normalize_common_payload(payload, *, default_time="12:00:00",
+                           compute_timescales=True, include_jd_utc=False,
+                           dut1_seconds=None, max_levels=5)
+    -> (normalized: dict, warnings: list[str], tz_normalized: str)
+- normalize_timescales_input(...) -> alias of normalize_common_payload with defaults
+- normalize_body(payload|name) -> (canonical_body_or_None, warnings)
+
+Domain-aware helpers (new)
+- normalize_for_vedic(payload, **opts) -> (dict, warnings, tz)
+- normalize_for_western(payload, **opts) -> (dict, warnings, tz)
+- normalize_for_domain(domain, payload, **opts) -> (dict, warnings, tz)
+"""
+
+from typing import Any, Dict, List, Optional, Tuple, Callable
 import os
+
+# ───────────────────────── optional domain normalizers ─────────────────────────
+# We discover the best available function signature at import time.
+# Accepted names inside each module, in order of preference:
+#   normalize_payload, normalize, normalize_common_payload
+def _discover_normalizer(mod_name: str) -> Optional[Callable[..., Tuple[Dict[str, Any], List[str], str]]]:
+    try:
+        mod = __import__(mod_name, fromlist=["*"])
+    except Exception:
+        return None
+    for attr in ("normalize_payload", "normalize", "normalize_common_payload"):
+        fn = getattr(mod, attr, None)
+        if callable(fn):
+            return fn  # type: ignore[return-value]
+    return None
+
+_VEDIC_NORMALIZER = _discover_normalizer("app.core.vedic_validator")
+_WESTERN_NORMALIZER = _discover_normalizer("app.core.western_validator")
 
 # ───────────────────────── prefer the time_kernel forwarder ─────────────────────────
 # time_kernel.build_timescales → always returns a plain dict
@@ -29,7 +79,11 @@ __all__ = [
     "parse_latlon",
     "sanitize_timescales",
     "normalize_common_payload",
-    "normalize_timescales_input",  # thin alias used by /ops/calculate
+    "normalize_timescales_input",
+    "normalize_body",
+    "normalize_for_vedic",
+    "normalize_for_western",
+    "normalize_for_domain",
 ]
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -37,11 +91,10 @@ __all__ = [
 # ──────────────────────────────────────────────────────────────────────────────
 
 _TZ_ALIAS = {
-    # Common aliases (keep small + conservative)
+    # small, conservative alias set
     "utc": "UTC",
     "gmt": "UTC",
     "ist": "Asia/Kolkata",
-    "asia/patna": "Asia/Kolkata",
     "asia/calcutta": "Asia/Kolkata",
 }
 
@@ -92,6 +145,42 @@ def parse_latlon(payload: Dict[str, Any]) -> Tuple[Optional[float], Optional[flo
     return lat_f, lon_f
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Body helper
+# ──────────────────────────────────────────────────────────────────────────────
+
+_BODY_ALIAS_MAP = {
+    "sun": "sun", "sol": "sun",
+    "moon": "moon", "luna": "moon",
+    "mercury": "mercury",
+    "venus": "venus",
+    "earth": "earth",
+    "mars": "mars",
+    "jupiter": "jupiter",
+    "saturn": "saturn",
+    "uranus": "uranus",
+    "neptune": "neptune",
+    "pluto": "pluto",
+}
+
+def normalize_body(payload_or_name: Dict[str, Any] | str) -> Tuple[Optional[str], List[str]]:
+    """
+    Normalize an ephemeris 'body' name. Accepts either the payload dict (with key 'body')
+    or a raw string body name. Returns (canonical_or_None, warnings[]).
+    """
+    warnings: List[str] = []
+    if isinstance(payload_or_name, dict):
+        raw = payload_or_name.get("body")
+    else:
+        raw = payload_or_name
+    if not isinstance(raw, str) or not raw.strip():
+        return None, ["missing_body"]
+    k = raw.strip().lower()
+    if k in _BODY_ALIAS_MAP:
+        return _BODY_ALIAS_MAP[k], warnings
+    warnings.append(f"unknown_body:{raw}")
+    return None, warnings
+
+# ──────────────────────────────────────────────────────────────────────────────
 # TimeScales helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -104,10 +193,10 @@ def env_dut1_seconds() -> float:
     except Exception:
         return 0.0
 
-def sanitize_timescales(ts: TimeScales | Dict[str, Any], *, include_jd_utc: bool = False) -> Dict[str, Any]:
+def sanitize_timescales(ts: "TimeScales | Dict[str, Any]", *, include_jd_utc: bool = False) -> Dict[str, Any]:
     """
     Return a safe dict view of TimeScales. By default, **omits jd_utc** to avoid downstream
-    reliance (fits Vedic requirements). Western flows can set include_jd_utc=True if needed.
+    reliance. Western flows can set include_jd_utc=True if needed.
     Accepts either:
       • dict (as returned by time_kernel.build_timescales)
       • TimeScales dataclass (from timescales engine)
@@ -146,10 +235,9 @@ def _extract_civil(payload: Dict[str, Any], *, default_time: str = "12:00:00") -
         warns.append("missing_date")
 
     time_str = str(payload.get("time") or payload.get("birth_time") or default_time).strip()
-    # ADD `timezone` here:
     tz_name = normalize_tz(
         payload.get("tz")
-        or payload.get("timezone")      # <— new alias
+        or payload.get("timezone")      # alias
         or payload.get("place_tz")
         or "UTC"
     )
@@ -217,7 +305,7 @@ def normalize_common_payload(
     levels_in = payload.get("levels", payload.get("depth", payload.get("max_levels", max_levels)))
     levels = clamp_levels(levels_in, default=max_levels, min_v=1, max_v=max_levels)
 
-    # ayanamsa (neutral default 'lahiri' is harmless on Western flows)
+    # ayanamsa (neutral default 'lahiri' is safe for Vedic, harmless for Western)
     ayanamsa = str(payload.get("ayanamsa") or "lahiri").lower()
 
     # lat/lon (optional)
@@ -255,7 +343,6 @@ def normalize_common_payload(
             )
             warns.extend(wz_ts)
             if ts_dict:
-                # Attach only jd_tt / jd_ut1 by default (no jd_utc unless asked)
                 norm.update({
                     "jd_tt": ts_dict.get("jd_tt"),
                     "jd_ut1": ts_dict.get("jd_ut1"),
@@ -271,7 +358,7 @@ def normalize_timescales_input(
     payload: Dict[str, Any],
     *,
     default_time: str = "12:00:00",
-    compute_timescales: bool = False,  # ops/calculate computes via kernel after normalization
+    compute_timescales: bool = False,  # routes may call computing later
     include_jd_utc: bool = False,
     dut1_seconds: Optional[float] = None,
 ) -> Tuple[Dict[str, Any], List[str], str]:
@@ -283,3 +370,84 @@ def normalize_timescales_input(
         dut1_seconds=dut1_seconds,
         max_levels=5,
     )
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Domain-aware wrappers (wire-in Vedic/Western normalizers if present)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _invoke_or_fallback(
+    fn: Optional[Callable[..., Tuple[Dict[str, Any], List[str], str]]],
+    payload: Dict[str, Any],
+    **opts: Any
+) -> Tuple[Dict[str, Any], List[str], str]:
+    if callable(fn):
+        try:
+            return fn(payload, **opts)  # type: ignore[misc]
+        except Exception as e:
+            # If the domain module blows up, fall back to common but preserve context
+            base, w, tz = normalize_common_payload(payload, **opts)
+            w = list(w) + [f"domain_normalizer_failed:{type(e).__name__}"]
+            return base, w, tz
+    # no domain module → fallback
+    return normalize_common_payload(payload, **opts)
+
+def normalize_for_vedic(
+    payload: Dict[str, Any],
+    *,
+    default_time: str = "12:00:00",
+    compute_timescales: bool = True,
+    include_jd_utc: bool = False,
+    dut1_seconds: Optional[float] = None,
+    max_levels: int = 5,
+) -> Tuple[Dict[str, Any], List[str], str]:
+    """
+    Use app.core.vedic_validator if available; else fall back to common normalization.
+    The options mirror normalize_common_payload.
+    """
+    return _invoke_or_fallback(
+        _VEDIC_NORMALIZER,
+        payload,
+        default_time=default_time,
+        compute_timescales=compute_timescales,
+        include_jd_utc=include_jd_utc,
+        dut1_seconds=dut1_seconds,
+        max_levels=max_levels,
+    )
+
+def normalize_for_western(
+    payload: Dict[str, Any],
+    *,
+    default_time: str = "12:00:00",
+    compute_timescales: bool = True,
+    include_jd_utc: bool = False,
+    dut1_seconds: Optional[float] = None,
+    max_levels: int = 5,
+) -> Tuple[Dict[str, Any], List[str], str]:
+    """
+    Use app.core.western_validator if available; else fall back to common normalization.
+    """
+    return _invoke_or_fallback(
+        _WESTERN_NORMALIZER,
+        payload,
+        default_time=default_time,
+        compute_timescales=compute_timescales,
+        include_jd_utc=include_jd_utc,
+        dut1_seconds=dut1_seconds,
+        max_levels=max_levels,
+    )
+
+def normalize_for_domain(
+    domain: str,
+    payload: Dict[str, Any],
+    **opts: Any
+) -> Tuple[Dict[str, Any], List[str], str]:
+    """
+    Generic dispatcher: domain in {"vedic", "western"} (case-insensitive).
+    Unknown domain falls back to common normalization.
+    """
+    d = (domain or "").strip().lower()
+    if d == "vedic":
+        return normalize_for_vedic(payload, **opts)
+    if d == "western":
+        return normalize_for_western(payload, **opts)
+    return normalize_common_payload(payload, **opts)
