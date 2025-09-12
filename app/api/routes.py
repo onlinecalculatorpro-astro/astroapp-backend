@@ -10,7 +10,7 @@ Diagnostics & health:
 - GET  /api/health                  (back-compat; main.py adds Deprecation header)
 - GET  /ops/version
 - GET  /ops/config
-- GET  /ops/diag/cores              (includes leap-seconds diagnostics)
+- GET  /ops/diag/cores              (includes leap-seconds + ephemeris diagnostics)
 - GET  /ops/diag/validators
 """
 
@@ -19,6 +19,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, List
 import os
 import inspect
+import math
 
 from flask import Blueprint, jsonify, request
 from app.utils.ratelimit import rate_limit
@@ -56,18 +57,26 @@ _, _tk_ut1_from_utc, _TK_UT1_ERR           = _try_import("app.core.time_kernel",
 # Leap-seconds (diagnostics)
 _ls_mod, _ls_delta_at, _LS_ERR             = _try_import("app.core.leapseconds", "delta_at")
 
-# Other shared cores (presence only; useful for diag)
-_es_mod, _, _ES_ERR                        = _try_import("app.core.ephem_singleton")
-_ea_mod, _, _EA_ERR                        = _try_import("app.core.ephemeris_adapter")
-_ast_mod, _, _AST_ERR                      = _try_import("app.core.astronomy")
-_h_mod, _, _H_ERR                          = _try_import("app.core.house")
-_hs_mod, _, _HS_ERR                        = _try_import("app.core.houses")
-_hsa_mod, _, _HSA_ERR                      = _try_import("app.core.houses_advanced")
+# Ephemeris cores (diagnostics + runtime access)
+_es_mod, _es_dummy, _ES_ERR                = _try_import("app.core.ephem_singleton")  # presence + internals
+_, _ep_get_ts, _ES_TS_ERR                  = _try_import("app.core.ephem_singleton", "get_timescale")
+_, _ep_get_eph, _ES_EPH_ERR                = _try_import("app.core.ephem_singleton", "get_planets")
 
-# Validators (common)
+_ea_mod, _ea_dummy, _EA_ERR                = _try_import("app.core.ephemeris_adapter")
+_, _ea_diag, _EA_DIAG_ERR                  = _try_import("app.core.ephemeris_adapter", "ephemeris_diagnostics")
+_, _ea_ecl, _EA_ECL_ERR                    = _try_import("app.core.ephemeris_adapter", "ecliptic_longitudes")
+_, _ea_many, _EA_MANY_ERR                  = _try_import("app.core.ephemeris_adapter", "ecliptic_longitudes_many")
+
+# Validators (ALL validation flows go through validator.py)
 _val_mod, _normalize_common, _VAL_ERR      = _try_import("app.core.validator", "normalize_common_payload")
+_, _normalize_timescales_input, _VAL_ALIAS_ERR = _try_import("app.core.validator", "normalize_timescales_input")
+_, _normalize_body, _NB_ERR                = _try_import("app.core.validator", "normalize_body")
+_, _normalize_for_vedic, _NV_ERR           = _try_import("app.core.validator", "normalize_for_vedic")
+_, _normalize_for_western, _NW_ERR         = _try_import("app.core.validator", "normalize_for_western")
+
+# Presence-only (for diagnostics visibility; routing doesn’t use these directly)
 _wval_mod, _, _WVAL_ERR                    = _try_import("app.core.western_validator")
-_ved_val_mod, _normalize_vim_payload, _VEDVAL_ERR = _try_import("app.core.vedic_validator", "normalize_vim_payload")
+_ved_val_mod, _, _VEDVAL_ERR               = _try_import("app.core.vedic_validator")
 
 # ───────────────────────── helpers ─────────────────────────
 def _env_dut1_seconds() -> float:
@@ -87,6 +96,101 @@ def _err(status: int, code: str, detail: str, **meta):
 RL_OPS_CALCULATE = int(os.getenv("ASTRO_RL_OPS_CALCULATE_PER_MIN", "60"))
 def _ops_bucket(*_a, **_k) -> str:
     return "ops-calc"
+
+# ───────────────────────── Ephemeris helpers ─────────────────────────
+_BODY_LABELS: Dict[str, str] = {
+    "sun": "sun",
+    "moon": "moon",
+    "mercury": "mercury",
+    "venus": "venus",
+    "earth": "earth",
+    "mars": "mars",
+    "jupiter": "jupiter barycenter",
+    "saturn": "saturn barycenter",
+    "uranus": "uranus barycenter",
+    "neptune": "neptune barycenter",
+    "pluto": "pluto barycenter",
+}
+
+def _ephem_status() -> Dict[str, Any]:
+    info: Dict[str, Any] = {
+        "loaded": False,
+        "error": _ES_ERR or _ES_TS_ERR or _ES_EPH_ERR,
+        "data_dir": None,
+        "kernel_candidates": None,
+        "kernel_active": None,
+    }
+    if _es_mod:
+        info["data_dir"] = getattr(_es_mod, "_EPHEM_DIR", None)
+        info["kernel_candidates"] = list(getattr(_es_mod, "_CANDIDATES", ()) or ())
+        try:
+            ts = _ep_get_ts() if _ep_get_ts else None
+            eph = _ep_get_eph() if _ep_get_eph else None
+            if ts and eph:
+                meta = getattr(_es_mod, "_META", None)
+                if isinstance(meta, dict):
+                    info["kernel_active"] = meta.get("kernel")
+                info["loaded"] = True
+                info["error"] = None
+        except Exception as e:
+            info["loaded"] = False
+            info["error"] = f"{type(e).__name__}: {e}"
+    return info
+
+def _ep_time_from_jd_tt(jd_tt: float):
+    if not _ep_get_ts:
+        raise RuntimeError("ephemeris timescale unavailable")
+    return _ep_get_ts().tt_jd(float(jd_tt))
+
+def _resolve_target(eph, body_key: str):
+    label = _BODY_LABELS.get((body_key or "").lower())
+    if not label:
+        raise ValueError(f"Unsupported body: {body_key!r}")
+    try:
+        return eph[label]
+    except Exception:
+        try:
+            return eph[label.split()[0]]
+        except Exception as e:
+            raise ValueError(f"Body not present in kernel: {body_key!r}") from e
+
+def _compute_vector(eph, t, body_key: str) -> Dict[str, float]:
+    earth = eph["earth"]
+    if (body_key or "").lower() == "earth":
+        return {"x_au": 0.0, "y_au": 0.0, "z_au": 0.0, "distance_au": 0.0}
+    target = _resolve_target(eph, body_key)
+    g = earth.at(t).observe(target)  # geometric (ICRS)
+    x, y, z = (float(g.position.au[0]), float(g.position.au[1]), float(g.position.au[2]))
+    dist = math.sqrt(x*x + y*y + z*z)
+    return {"x_au": x, "y_au": y, "z_au": z, "distance_au": dist}
+
+def _compute_equatorial(eph, t, body_key: str) -> Dict[str, float]:
+    earth = eph["earth"]
+    if (body_key or "").lower() == "earth":
+        return {"ra_deg": float("nan"), "dec_deg": float("nan"), "distance_au": 0.0}
+    target = _resolve_target(eph, body_key)
+    a = earth.at(t).observe(target).apparent()  # apparent RA/Dec
+    ra, dec, dist = a.radec()
+    return {"ra_deg": float(ra.hours) * 15.0, "dec_deg": float(dec.degrees), "distance_au": float(dist.au)}
+
+def _compute_ecliptic_true(eph, t, body_key: str) -> Dict[str, float]:
+    if (body_key or "").lower() == "earth":
+        return {"lon_deg": float("nan"), "lat_deg": float("nan"), "distance_au": 0.0}
+    from skyfield import framelib as _fl
+    earth = eph["earth"]
+    target = _resolve_target(eph, body_key)
+    a = earth.at(t).observe(target).apparent()
+    lat, lon, dist = a.frame_latlon(_fl.ecliptic_frame)  # true-of-date
+    return {"lon_deg": float(lon.degrees) % 360.0, "lat_deg": float(lat.degrees), "distance_au": float(dist.au)}
+
+def _compute_sidereal(eph, t, body_key: str, ayanamsa_offset_deg: float = 0.0) -> Dict[str, float]:
+    base = _compute_ecliptic_true(eph, t, body_key)
+    true_lon = float(base["lon_deg"])
+    try:
+        off = float(ayanamsa_offset_deg)
+    except Exception:
+        off = 0.0
+    return {"lon_sidereal_deg": (true_lon - off) % 360.0, "lon_true_deg": true_lon, "ayanamsa_offset_deg": off}
 
 # ───────────────────────── basic ops & health ─────────────────────────
 @ops_api.get("/ops/health")
@@ -140,8 +244,21 @@ def ops_diag_cores():
             "forwarders_ok": all([_tk_build_ts, _tk_jd_utc, _tk_tt_from_utc, _tk_ut1_from_utc]),
             "build_timescales_sig": _sig(_tk_build_ts) if _tk_build_ts else None,
         },
-        "ephem_singleton": {"loaded": _es_mod is not None, "error": _ES_ERR},
-        "ephemeris_adapter": {"loaded": _ea_mod is not None, "error": _EA_ERR},
+        # ── Ephemeris: wire BOTH files and expose signatures/diags
+        "ephem_singleton": {
+            "loaded": _es_mod is not None,
+            "error": _ES_ERR,
+            "get_timescale_sig": _sig(_ep_get_ts) if _ep_get_ts else None,
+            "get_planets_sig": _sig(_ep_get_eph) if _ep_get_eph else None,
+            "status": _ephem_status(),
+        },
+        "ephemeris_adapter": {
+            "loaded": _ea_mod is not None,
+            "error": _EA_ERR,
+            "ecliptic_longitudes_sig": _sig(_ea_ecl) if _ea_ecl else None,
+            "ecliptic_longitudes_many_sig": _sig(_ea_many) if _ea_many else None,
+            "diagnostics_sig": _sig(_ea_diag) if _ea_diag else None,
+        },
         "astronomy": {"loaded": _ast_mod is not None, "error": _AST_ERR},
         "house": {"loaded": _h_mod is not None, "error": _H_ERR},
         "houses": {"loaded": _hs_mod is not None, "error": _HS_ERR},
@@ -151,6 +268,20 @@ def ops_diag_cores():
             "error": _LS_ERR,
         },
     }
+
+    # Optional: include a trimmed ephemeris_adapter diagnostics block if callable
+    try:
+        if _ea_diag:
+            diag = _ea_diag()  # may include coverage, node cache, etc.
+            payload["ephemeris_adapter"]["diagnostics_sample"] = {
+                "ephemeris_name": diag.get("ephemeris_name"),
+                "kernels": diag.get("kernels"),
+                "node_model": diag.get("node_model"),
+                "smalls_enabled": diag.get("smalls_enabled"),
+                "coverage_jd": diag.get("coverage_jd"),
+            }
+    except Exception as e:
+        payload["ephemeris_adapter"]["diagnostics_error"] = str(e)
 
     # Optional sample probe if date/time/tz provided
     q = request.args or {}
@@ -211,21 +342,27 @@ def ops_diag_validators():
             return []
     return jsonify({
         "ok": True,
+        # Routing uses ONLY validator.py; vfiles presence shown for visibility.
         "validator": {
             "loaded": _val_mod is not None,
             "error": _VAL_ERR,
             "normalize_common_payload_sig": _sig(_normalize_common) if _normalize_common else None,
+            "normalize_timescales_input_sig": _sig(_normalize_timescales_input) if _normalize_timescales_input else None,
+            "normalize_for_vedic_sig": _sig(_normalize_for_vedic) if _normalize_for_vedic else None,
+            "normalize_for_western_sig": _sig(_normalize_for_western) if _normalize_for_western else None,
+            "normalize_body_sig": _sig(_normalize_body) if _normalize_body else None,
             "functions": list_callables(_val_mod) if _val_mod else None,
         },
         "western_validator": {
             "loaded": _wval_mod is not None,
             "error": _WVAL_ERR,
+            "note": "routes use app.core.validator wrappers; this module is optional",
             "functions": list_callables(_wval_mod) if _wval_mod else None,
         },
         "vedic_validator": {
             "loaded": _ved_val_mod is not None,
             "error": _VEDVAL_ERR,
-            "normalize_vim_payload_sig": _sig(_normalize_vim_payload) if _normalize_vim_payload else None,
+            "note": "routes use app.core.validator wrappers; this module is optional",
             "functions": list_callables(_ved_val_mod) if _ved_val_mod else None,
         },
     }), 200
@@ -248,12 +385,14 @@ def _unwrap_params(body: Dict[str, Any]) -> Dict[str, Any]:
         return params
 
     # Flat top-level keys
-    if any(k in body for k in ("date", "time", "tz", "timezone", "place_tz")):
+    if any(k in body for k in ("date", "time", "tz", "timezone", "place_tz", "body", "ayanamsa_offset_deg")):
         return {
             "date": body.get("date"),
             "time": body.get("time"),
             "tz": body.get("tz") or body.get("timezone") or body.get("place_tz"),
             "dut1_seconds": body.get("dut1_seconds"),
+            "body": body.get("body"),
+            "ayanamsa_offset_deg": body.get("ayanamsa_offset_deg"),
         }
 
     # timescales envelope
@@ -272,11 +411,11 @@ def _unwrap_params(body: Dict[str, Any]) -> Dict[str, Any]:
 @rate_limit(RL_OPS_CALCULATE, key_fn=_ops_bucket)
 def ops_calculate():
     """
-    Unified common ops endpoint (backed by time_kernel forwarders).
+    Unified common ops endpoint.
 
     Body:
     {
-      "op": "<timescales|jd_utc|tt_from_utc_jd|ut1_from_utc_jd>",
+      "op": "<timescales|jd_utc|tt_from_utc_jd|ut1_from_utc_jd|ephem_vector|ephem_equatorial|ephem_ecliptic|ephem_sidereal>",
       "params": {...}                  // optional; also supports flat or {timescales:{...}}
       "include_jd_utc": false          // only used by op="timescales"
     }
@@ -293,10 +432,10 @@ def ops_calculate():
 
     # ── TIMESCALES ────────────────────────────────────────────────────────────
     if op == "timescales":
-        # Normalize via common validator if present
+        # Validate via central validator (wired to vfiles internally)
         if _normalize_common:
             try:
-                norm, warns, tz_norm = _normalize_common(raw_params, compute_timescales=False)  # type: ignore[misc]
+                norm, _warns, _tz_norm = _normalize_common(raw_params, compute_timescales=False)  # type: ignore[misc]
             except Exception as e:
                 return _err(400, "bad_request", f"normalize_common_payload failed: {e}", op=op)
             date = norm.get("date"); time_str = norm.get("time"); tz = norm.get("tz")
@@ -321,7 +460,6 @@ def ops_calculate():
         except Exception as e:
             return _err(400, "timescales_failed", str(e), op=op)
 
-        # Sanitize (hide jd_utc unless explicitly requested)
         ts_out = {
             "jd_tt": ts.get("jd_tt"),
             "jd_ut1": ts.get("jd_ut1"),
@@ -383,10 +521,66 @@ def ops_calculate():
             op=op
         )
 
+    # ── NEW: Ephemeris ops (validator-backed) ────────────────────────────────
+    if op in ("ephem_vector", "ephem_equatorial", "ephem_ecliptic", "ephem_sidereal"):
+        if not _normalize_common or not _normalize_body:
+            return _err(503, "validator_unavailable", "validator functions not loaded", op=op)
+
+        # Validate + compute jd_tt via validator
+        try:
+            norm, warns, _tz = _normalize_common(raw_params, compute_timescales=True, include_jd_utc=False)  # type: ignore[misc]
+        except Exception as e:
+            return _err(400, "bad_request", f"normalize_common_payload failed: {e}", op=op)
+
+        jd_tt = norm.get("jd_tt") or (norm.get("timescales") or {}).get("jd_tt")
+        if not isinstance(jd_tt, (int, float)):
+            return _err(400, "bad_request", "jd_tt not available after normalization", op=op)
+
+        # Body normalization (through validator)
+        body_norm, bwarn = _normalize_body(raw_params)  # type: ignore[misc]
+        if not body_norm:
+            return _err(400, "bad_body", "Missing or unsupported 'body'", op=op)
+
+        # Run compute using ephem_singleton
+        try:
+            eph = _ep_get_eph() if _ep_get_eph else None
+            ts = _ep_get_ts() if _ep_get_ts else None
+            if eph is None or ts is None:
+                return _err(503, "ephem_core_unavailable", "Skyfield/JPL ephemeris not available", op=op)
+            t = ts.tt_jd(float(jd_tt))
+            if op == "ephem_vector":
+                result = _compute_vector(eph, t, body_norm)
+            elif op == "ephem_equatorial":
+                result = _compute_equatorial(eph, t, body_norm)
+            elif op == "ephem_ecliptic":
+                result = _compute_ecliptic_true(eph, t, body_norm)
+            else:  # ephem_sidereal
+                off = raw_params.get("ayanamsa_offset_deg", 0.0)
+                try:
+                    off = float(off)
+                except Exception:
+                    off = 0.0
+                result = _compute_sidereal(eph, t, body_norm, ayanamsa_offset_deg=off)
+        except Exception as e:
+            # Surface missing kernel/Skyfield distinctly
+            msg = str(e)
+            if "ephemeris" in msg.lower() or "skyfield" in msg.lower():
+                return _err(503, "ephem_core_unavailable", msg, op=op)
+            return _err(500, "ephem_compute_error", msg, op=op)
+
+        return _ok(
+            {
+                "result": result,
+                "input": {"date": norm.get("date"), "time": norm.get("time"), "tz": norm.get("tz"), "body": body_norm},
+                "warnings": list(warns or []) + list(bwarn or []),
+            },
+            op=op, body=body_norm
+        )
+
     # Unknown op
     return _err(
         400,
         "unsupported_op",
-        "op must be one of: timescales, jd_utc, tt_from_utc_jd, ut1_from_utc_jd",
+        "op must be one of: timescales, jd_utc, tt_from_utc_jd, ut1_from_utc_jd, ephem_vector, ephem_equatorial, ephem_ecliptic, ephem_sidereal",
         op=op or None
     )
