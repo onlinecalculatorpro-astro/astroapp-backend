@@ -352,15 +352,15 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
     - Prefer 'jd_utc' when present; fall back to 'jd_ut' (both represent UTC JD).
     """
     # caller DUT1 (with clamp)
-    dut1_req = payload.get("dut1")
-    if not isinstance(dut1_req, (int, float)):
-        dut1_req = payload.get("dut1_seconds")
-    if not isinstance(dut1_req, (int, float)):
-        dut1_req = 0.0
+    # caller DUT1 (with clamp) — accept numeric strings; use CFG default
+    dut1_raw = payload.get("dut1", payload.get("dut1_seconds", None))
+    if dut1_raw is None or (isinstance(dut1_raw, str) and not dut1_raw.strip()):
+        dut1_raw = CFG.dut1_seconds
     try:
-        dut1_used = float(dut1_req)
+        dut1_used = float(dut1_raw)
     except Exception:
-        dut1_used = 0.0
+        dut1_used = float(CFG.dut1_seconds)
+
     if abs(dut1_used) > 0.9:
         _warn_add(warnings, seen, _W.DUT1_CLAMPED, f"{dut1_used}")
         dut1_used = max(-0.9, min(0.9, dut1_used))
