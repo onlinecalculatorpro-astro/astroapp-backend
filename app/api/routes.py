@@ -604,57 +604,70 @@ def ops_calculate():
 
     # ── Astronomy chart (compute_chart) ──────────────────────────────────────
     if op in ("chart", "astro_chart", "compute_chart"):
-        if not (_normalize_chart_payload and _compute_chart):
-            return _err(503, "astronomy_unavailable", "astronomy module or validator not loaded", op=op)
+    # Ensure dependencies are available
+    if not (callable(_normalize_chart_payload) and callable(_compute_chart)):
+        return _err(503, "astronomy_unavailable", "astronomy module or validator not loaded", op=op)
 
-        try:
-            # allow include_jd_utc to influence normalization (handy for debugging)
-            norm, warns, tz_norm = _normalize_chart_payload(
-                raw_params,
-                compute_timescales=True,
-                include_jd_utc=include_jd_utc
-            )  # type: ignore[misc]
-        except Exception as e:
-            return _err(400, "bad_request", f"normalize_chart_payload failed: {e}", op=op)
+    # Normalize incoming params (optionally include jd_utc for debugging)
+    try:
+        norm, warns, tz_norm = _normalize_chart_payload(
+            raw_params,
+            compute_timescales=True,
+            include_jd_utc=bool(include_jd_utc),
+        )  # type: ignore[misc]
+    except Exception as e:
+        return _err(400, "bad_request", f"normalize_chart_payload failed: {e}", op=op)
 
-        try:
-            out = _compute_chart(norm)  # dict as defined by astronomy.compute_chart
-        except Exception as e:
-            code = getattr(e, "code", None)
-            msg = str(e)
-            if code:
-                status = 400 if any(s in code for s in ("invalid", "unsupported", "missing")) else 500
-                return _err(status, code, msg, op=op)
-            return _err(500, "chart_compute_error", msg, op=op)
+    # Make sure DUT1 survives normalization if the client provided it
+    try:
+        if "dut1_seconds" in raw_params and "dut1_seconds" not in norm:
+            norm["dut1_seconds"] = raw_params["dut1_seconds"]
+        if "dut1" in raw_params and "dut1" not in norm:
+            norm["dut1"] = raw_params["dut1"]
+    except Exception:
+        # best-effort passthrough; don't block on this
+        pass
 
-        engine_warns = list(out.get("warnings", []) or [])
-        merged_warns = list(dict.fromkeys((warns or []) + engine_warns))  # de-dup, preserve order
-        out["warnings"] = merged_warns
+    # Compute the chart
+    try:
+        out = _compute_chart(norm)  # dict as defined by astronomy.compute_chart
+    except Exception as e:
+        code = getattr(e, "code", None)
+        msg = str(e)
+        if code:
+            status = 400 if any(tok in code for tok in ("invalid", "unsupported", "missing", "bad", "not_")) else 500
+            return _err(status, code, msg, op=op)
+        return _err(500, "chart_compute_error", msg, op=op)
 
-        return _ok(
-            {
-                "chart": out,
-                "input": {
-                    "date": norm.get("date"),
-                    "time": norm.get("time"),
-                    "tz": norm.get("tz"),
-                    "mode": norm.get("mode"),
-                    "frame": norm.get("frame"),
-                    "center": norm.get("center"),
-                    "topocentric": bool(norm.get("topocentric")),
-                    "latitude": norm.get("latitude"),
-                    "longitude": norm.get("longitude"),
-                    "elevation_m": norm.get("elevation_m"),
-                },
-            },
-            op=op,
-            timezone=tz_norm
-        )
+    # Merge warnings from normalization + engine (dedupe, preserve order)
+    engine_warns = list(out.get("warnings") or [])
+    merged_warns = list(dict.fromkeys((warns or []) + engine_warns))
+    out["warnings"] = merged_warns
 
-    # Unknown op
-    return _err(
-        400,
-        "unsupported_op",
-        "op must be one of: timescales, jd_utc, tt_from_utc_jd, ut1_from_utc_jd, ephem_vector, ephem_equatorial, ephem_ecliptic, ephem_sidereal, chart",
-        op=op or None
-    )
+    # Echo back the key input fields (plus DUT1 if present) for transparency
+    input_echo = {
+        "date": norm.get("date"),
+        "time": norm.get("time"),
+        "tz": norm.get("tz") or norm.get("place_tz"),
+        "mode": norm.get("mode"),
+        "frame": norm.get("frame"),
+        "center": norm.get("center"),
+        "topocentric": bool(norm.get("topocentric")),
+        "latitude": norm.get("latitude"),
+        "longitude": norm.get("longitude"),
+        "elevation_m": norm.get("elevation_m"),
+    }
+    if "dut1_seconds" in norm:
+        input_echo["dut1_seconds"] = norm["dut1_seconds"]
+    if "dut1" in norm:
+        input_echo["dut1"] = norm["dut1"]
+
+    return _ok({"chart": out, "input": input_echo}, op=op, timezone=tz_norm)
+
+# Unknown op
+return _err(
+    400,
+    "unsupported_op",
+    "op must be one of: timescales, jd_utc, tt_from_utc_jd, ut1_from_utc_jd, ephem_vector, ephem_equatorial, ephem_ecliptic, ephem_sidereal, chart",
+    op=op or None
+)
