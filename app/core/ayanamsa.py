@@ -3,37 +3,31 @@
 """
 Ayanāṁśa (sidereal–tropical offset) — GOLD-READY CORE (v1.3)
 
-This module provides an auditable, fast, and deterministic ayanāṁśa engine
-that integrates directly with astronomy/compute_chart via `get_ayanamsa_deg(jd_tt, scheme)`.
+Deterministic, dependency-free ayanāṁśa engine that integrates with
+astronomy/compute_chart via `get_ayanamsa_deg(jd_tt, scheme)`.
 
-Design goals
+Key features
 ------------
-- Exact compatibility with astronomy fallback behavior:
-  * Linear model: base@J2000 + constant drift (50.290966 arcsec / tropical year)
-  * TT input (Julian Day in Terrestrial Time)
-  * Wrap to [0, 360)
-- Deterministic, dependency-free, and cached (LRU).
-- Extensible: runtime registration/override of schemes.
-- **New**: explicit resolution helpers so callers can warn on unknown keys.
+- Linear model: base@J2000 + constant drift (50.290966 arcsec / tropical year)
+- TT input (Julian Day in Terrestrial Time)
+- Output wrapped to [0, 360)
+- LRU caching for speed
+- Runtime registration/override of schemes
+- Resolution helpers to detect alias/unknown (fallback) keys
 
 Public API
 ----------
 get_ayanamsa_deg(jd_tt: float, scheme: str = "lahiri") -> float
+get_ayanamsa_with_resolution(jd_tt: float, scheme: Optional[str]) -> Tuple[float, str, bool, bool]
 ayanamsa_info(jd_tt: float, scheme: str = "lahiri") -> dict
 list_ayanamsa_schemes() -> list[str]
 register_ayanamsa(name: str, base_at_j2000_deg: float) -> None
-
-# Extra helpers (non-breaking additions):
-resolve_ayanamsa_scheme(scheme: str | None) -> tuple[str, bool, bool]
-get_ayanamsa_with_resolution(jd_tt: float, scheme: str | None) -> tuple[float, str, bool, bool]
+resolve_ayanamsa_scheme(scheme: Optional[str]) -> Tuple[str, bool, bool]
 
 Notes
 -----
-- Your sidereal identity test:
-    sidereal_lon ≈ normalize(tropical_lon - ayanamsa_deg, 0..360)
-  holds with this implementation.
-- To emit a fallback-warning in compute_chart(), call `resolve_ayanamsa_scheme()`
-  or `get_ayanamsa_with_resolution()` and warn if `is_unknown` is True.
+For sidereal longitudes:
+    sidereal_lon = (tropical_lon - ayanamsa_deg) % 360
 """
 
 from __future__ import annotations
@@ -41,6 +35,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
+
+__all__ = [
+    "get_ayanamsa_deg",
+    "get_ayanamsa_with_resolution",
+    "ayanamsa_info",
+    "list_ayanamsa_schemes",
+    "register_ayanamsa",
+    "resolve_ayanamsa_scheme",
+    "get_ayanamsa",  # backward-compat alias
+]
 
 # ---------------------------------------------------------------------
 # Core constants (kept consistent with astronomy fallback)
@@ -137,8 +141,7 @@ def _resolve_scheme_core(scheme: Optional[str]) -> Tuple[str, bool, bool]:
         return (raw, False, False)
     if raw in _ALIASES:
         return (_ALIASES[raw], True, False)
-    # Graceful default for unknown keys: match astronomy fallback by selecting Lahiri,
-    # but surface `is_unknown=True` so callers can warn.
+    # Unknown: default to Lahiri but flag as unknown so caller can warn.
     return ("lahiri", False, True)
 
 
@@ -165,7 +168,6 @@ def register_ayanamsa(name: str, base_at_j2000_deg: float) -> None:
     if not isinstance(name, str) or not name.strip():
         raise ValueError("Scheme name must be a non-empty string.")
     key = name.strip().lower()
-    # mutate registry (dataclass is frozen; registry is not)
     _SCHEMES[key] = _Scheme(key, float(base_at_j2000_deg))
 
 
@@ -187,8 +189,6 @@ def resolve_ayanamsa_scheme(scheme: Optional[str]) -> Tuple[str, bool, bool]:
 def get_ayanamsa_deg(jd_tt: float, scheme: str = "lahiri") -> float:
     """
     Compute ayanāṁśa (degrees in [0,360)) for a given TT Julian Day and scheme.
-
-    This is the exact function astronomy/compute_chart tries to import and call.
 
     Parameters
     ----------
