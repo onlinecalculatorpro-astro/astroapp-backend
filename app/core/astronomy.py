@@ -356,7 +356,7 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
     if not isinstance(dut1_req, (int, float)):
         dut1_req = payload.get("dut1_seconds")
     if not isinstance(dut1_req, (int, float)):
-        dut1_req = CFG.dut1_seconds
+        dut1_req = 0.0
     try:
         dut1_used = float(dut1_req)
     except Exception:
