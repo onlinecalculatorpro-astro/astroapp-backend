@@ -566,26 +566,52 @@ def _ayanamsa_deg_cached(jd_tt_q: float, ay_key: str) -> Tuple[float, str]:
     """
     Thin wrapper around external ayanamsa module.
 
-    Expects a function `get_ayanamsa_deg(jd_tt, key)` in `app.core.ayanamsa`
-    (also supports the swapped-arg signature).
-    Returns (degrees, note). The note is best-effort and may simply echo the key.
+    Prefer the new helper `get_ayanamsa_with_resolution(jd_tt, scheme)` if present
+    to detect alias/unknown (fallback) cases. Otherwise, fall back to
+    `get_ayanamsa_deg` with the legacy shape handling.
+
+    Returns
+    -------
+    (degrees, note)
+      note will include "fallback" when an unknown key defaulted to Lahiri,
+      which lets _resolve_ayanamsa() add _W.AYA_FALLBACK automatically.
     """
     try:
-        mod = __import__("app.core.ayanamsa", fromlist=["get_ayanamsa_deg"])
+        mod = __import__("app.core.ayanamsa", fromlist=[
+            "get_ayanamsa_with_resolution", "get_ayanamsa_deg"
+        ])
+
+        # 1) Preferred path: new helper with resolution flags
+        helper = getattr(mod, "get_ayanamsa_with_resolution", None)
+        if callable(helper):
+            try:
+                val, canonical, is_alias, is_unknown = helper(jd_tt_q, ay_key)
+                note_bits = [str(canonical)]
+                if is_alias:
+                    note_bits.append("alias")
+                if is_unknown:
+                    note_bits.append("fallback")
+                return float(val), ",".join(note_bits)
+            except Exception:
+                # fall through to legacy path
+                pass
+
+        # 2) Legacy path: get_ayanamsa_deg (various return shapes supported)
         fn = getattr(mod, "get_ayanamsa_deg", None)
         if not callable(fn):
             raise AttributeError("get_ayanamsa_deg not found")
+
         try:
             res = fn(jd_tt_q, ay_key)
         except TypeError:
-            # support (key, jd_tt) ordering
+            # support swapped-arg signature (key, jd_tt)
             res = fn(ay_key, jd_tt_q)
 
-        # Normalize possible return shapes
         if isinstance(res, (tuple, list)) and len(res) >= 1:
             val = float(res[0])
             note = str(res[1]) if len(res) >= 2 else str(ay_key)
             return val, note
+
         if isinstance(res, dict):
             for k in ("deg", "value", "ayanamsa_deg"):
                 if k in res and isinstance(res[k], (int, float)):
@@ -593,26 +619,12 @@ def _ayanamsa_deg_cached(jd_tt_q: float, ay_key: str) -> Tuple[float, str]:
                     note = str(res.get("note") or res.get("name") or res.get("key") or ay_key)
                     return val, note
             raise ValueError("unexpected dict shape from get_ayanamsa_deg")
+
+        # simple float
         return float(res), str(ay_key)
+
     except Exception as e:
         raise AstronomyError("ayanamsa_unavailable", f"failed to resolve ayanamsa '{ay_key}': {e}")
-
-
-def _resolve_ayanamsa(
-    jd_tt: float, ayanamsa: Any, warnings: List[str], seen: set[str]
-) -> Tuple[Optional[float], Optional[str]]:
-    if ayanamsa is None or (isinstance(ayanamsa, str) and not str(ayanamsa).strip()):
-        key = CFG.ayanamsa_default
-    elif isinstance(ayanamsa, (int, float)):
-        return float(ayanamsa), "explicit"
-    else:
-        key = str(ayanamsa).strip().lower()
-
-    jd_q = _q(jd_tt, CFG.jd_quant) or jd_tt
-    ay, note = _ayanamsa_deg_cached(jd_q, key)
-    if isinstance(note, str) and "fallback" in note.lower():
-        _warn_add(warnings, seen, _W.AYA_FALLBACK, note)
-    return float(ay), note
 
 
 # ─────────────────────── Adapter I/O & normalization ──────────────────
