@@ -1307,9 +1307,24 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
         frame=frame,
     )
 
+    # ── Ayanāṁśa resolution (with meta details in sidereal mode) ────────────
     ay_deg: Optional[float] = None
+    aya_meta: Optional[Dict[str, Any]] = None
     if mode == "sidereal":
         ay_deg, _ = _resolve_ayanamsa(jd_tt, payload.get("ayanamsa"), warnings_list, _seen)
+        # Best-effort: expose canonical / alias / unknown flags if helper exists
+        try:
+            from app.core.ayanamsa import get_ayanamsa_with_resolution  # v1.3 helper
+            val, canonical, is_alias, is_unknown = get_ayanamsa_with_resolution(jd_tt, payload.get("ayanamsa"))
+            if ay_deg is None:
+                ay_deg = float(val)
+            aya_meta = {
+                "canonical": canonical,
+                "is_alias": bool(is_alias),
+                "is_unknown": bool(is_unknown),
+            }
+        except Exception:
+            pass  # helper may not exist; ignore
 
     out_bodies: List[Dict[str, Any]] = []
     missing_bodies: List[str] = []
@@ -1436,6 +1451,8 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
             "dut1": float(dut1_used),
         },
     }
+    if aya_meta:
+        meta["ayanamsa"] = aya_meta
     if topocentric and isinstance(elev, (int, float)):
         meta["observer"] = {"latitude": lat, "longitude": lon, "elevation_m": float(elev)}
 
