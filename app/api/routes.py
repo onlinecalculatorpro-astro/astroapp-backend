@@ -607,7 +607,7 @@ def ops_calculate():
         # Ensure dependencies are available
         if not (callable(_normalize_chart_payload) and callable(_compute_chart)):
             return _err(503, "astronomy_unavailable", "astronomy module or validator not loaded", op=op)
-    
+
         # Normalize incoming params (optionally include jd_utc for debugging)
         try:
             norm, warns, tz_norm = _normalize_chart_payload(
@@ -617,12 +617,12 @@ def ops_calculate():
             )  # type: ignore[misc]
         except Exception as e:
             return _err(400, "bad_request", f"normalize_chart_payload failed: {e}", op=op)
-    
+
         # If caller sent a non-list 'points', surface the engine-style warning (validator may coerce it)
         if "points" in raw_params and not isinstance(raw_params["points"], (list, tuple)):
             warns = list(warns or [])
             warns.append("points_ignored_non_list")
-    
+
         # Make sure DUT1 survives normalization if the client provided it
         try:
             if "dut1_seconds" in raw_params and "dut1_seconds" not in norm:
@@ -631,7 +631,27 @@ def ops_calculate():
                 norm["dut1"] = raw_params["dut1"]
         except Exception:
             pass  # best-effort passthrough
-    
+
+        # ── Optional: inject default coordinates for Asc/MC (silence angles_missing_geography)
+        # Set env: ASTRO_DEFAULT_LAT, ASTRO_DEFAULT_LON, and optionally ASTRO_DEFAULT_TOPO=1
+        try:
+            lat_missing = norm.get("latitude") is None
+            lon_missing = norm.get("longitude") is None
+            if lat_missing and lon_missing:
+                env_lat = os.getenv("ASTRO_DEFAULT_LAT")
+                env_lon = os.getenv("ASTRO_DEFAULT_LON")
+                if env_lat is not None and env_lon is not None:
+                    norm["latitude"] = float(env_lat)
+                    norm["longitude"] = float(env_lon)
+                    if str(os.getenv("ASTRO_DEFAULT_TOPO", "0")).strip().lower() in ("1", "true", "yes", "on"):
+                        norm["topocentric"] = True
+                    # annotate so clients can see why angles appeared without providing coords
+                    warns = list(warns or [])
+                    warns.append("angles_default_coords_injected")
+        except Exception:
+            # If anything goes wrong reading env or casting, we simply skip injection
+            pass
+
         # Compute the chart
         try:
             out = _compute_chart(norm)  # dict as defined by astronomy.compute_chart
@@ -642,12 +662,12 @@ def ops_calculate():
                 status = 400 if any(tok in code for tok in ("invalid", "unsupported", "missing", "bad", "not_")) else 500
                 return _err(status, code, msg, op=op)
             return _err(500, "chart_compute_error", msg, op=op)
-    
+
         # Merge warnings from normalization + engine (dedupe, preserve order)
         engine_warns = list(out.get("warnings") or [])
         merged_warns = list(dict.fromkeys((warns or []) + engine_warns))
         out["warnings"] = merged_warns
-    
+
         # Echo back key input fields (plus DUT1 if present) for transparency
         input_echo = {
             "date": norm.get("date"),
@@ -665,9 +685,9 @@ def ops_calculate():
             input_echo["dut1_seconds"] = norm["dut1_seconds"]
         if "dut1" in norm:
             input_echo["dut1"] = norm["dut1"]
-    
+
         return _ok({"chart": out, "input": input_echo}, op=op, timezone=tz_norm)
-    
+
     # Unknown op
     return _err(
         400,
