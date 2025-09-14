@@ -8,6 +8,7 @@ Single dispatcher for shared/core ops:
   • op: "timescales" | "jd_utc" | "tt_from_utc_jd" | "ut1_from_utc_jd"
   • op: "ephem_vector" | "ephem_equatorial" | "ephem_ecliptic" | "ephem_sidereal"
   • op: "chart" (astronomy.compute_chart)
+  • op: "houses" (house policy façade)
 
 Diagnostics & health:
 - GET  /ops/health
@@ -41,11 +42,13 @@ def _try_import(modpath: str, attr: Optional[str] = None):
         err = repr(e)
     return mod, obj, err
 
+
 def _sig(obj) -> Optional[str]:
     try:
         return str(inspect.signature(obj))
     except Exception:
         return None
+
 
 # ───────────────────────── core modules ─────────────────────────
 # Canonical engine
@@ -75,10 +78,11 @@ _, _ea_many, _EA_MANY_ERR                  = _try_import("app.core.ephemeris_ada
 _ast_mod, _, _AST_ERR                      = _try_import("app.core.astronomy")
 _, _compute_chart, _ASTRO_ERR              = _try_import("app.core.astronomy", "compute_chart")
 
-# Houses (presence/diag only; routing doesn’t call directly)
+# Houses (presence/diag + runtime via façade)
 _h_mod,   _, _H_ERR                        = _try_import("app.core.house")
 _hs_mod,  _, _HS_ERR                       = _try_import("app.core.houses")
 _hsa_mod, _, _HSA_ERR                      = _try_import("app.core.houses_advanced")
+_, _compute_houses_with_policy, _HCOMP_ERR = _try_import("app.core.house", "compute_houses_with_policy")
 
 # Validators (ALL validation flows go through validator.py)
 _val_mod, _normalize_common, _VAL_ERR          = _try_import("app.core.validator", "normalize_common_payload")
@@ -87,10 +91,12 @@ _, _normalize_body, _NB_ERR                    = _try_import("app.core.validator
 _, _normalize_for_vedic, _NV_ERR               = _try_import("app.core.validator", "normalize_for_vedic")
 _, _normalize_for_western, _NW_ERR             = _try_import("app.core.validator", "normalize_for_western")
 _, _normalize_chart_payload, _NC_ERR           = _try_import("app.core.validator", "normalize_chart_payload")
+_, _normalize_houses_payload, _NH_ERR          = _try_import("app.core.validator", "normalize_houses_payload")  # optional
 
 # Presence-only (diagnostics visibility)
 _wval_mod, _, _WVAL_ERR                    = _try_import("app.core.western_validator")
 _ved_val_mod, _, _VEDVAL_ERR               = _try_import("app.core.vedic_validator")
+
 
 # ───────────────────────── helpers ─────────────────────────
 def _env_dut1_seconds() -> float:
@@ -100,16 +106,22 @@ def _env_dut1_seconds() -> float:
     except Exception:
         return 0.0
 
+
 def _ok(data: Dict[str, Any], **meta):
     return jsonify({"ok": True, **data, "meta": meta}), 200
+
 
 def _err(status: int, code: str, detail: str, **meta):
     return jsonify({"ok": False, "error": code, "detail": detail, "meta": meta}), status
 
+
 # One shared bucket for /ops/calculate (env overridable)
 RL_OPS_CALCULATE = int(os.getenv("ASTRO_RL_OPS_CALCULATE_PER_MIN", "60"))
+
+
 def _ops_bucket(*_a, **_k) -> str:
     return "ops-calc"
+
 
 # ───────────────────────── Ephemeris helpers ─────────────────────────
 _BODY_KEY_CANDIDATES: Dict[str, List[Any]] = {
@@ -126,6 +138,7 @@ _BODY_KEY_CANDIDATES: Dict[str, List[Any]] = {
     "pluto":    ["pluto", "pluto barycenter", 999, 9],
 }
 
+
 def _resolve_kernel_body(eph, body_norm: str):
     if not eph or not body_norm:
         return None
@@ -135,6 +148,7 @@ def _resolve_kernel_body(eph, body_norm: str):
         except Exception:
             continue
     return None
+
 
 def _ephem_status() -> Dict[str, Any]:
     info: Dict[str, Any] = {
@@ -161,6 +175,7 @@ def _ephem_status() -> Dict[str, Any]:
             info["error"] = f"{type(e).__name__}: {e}"
     return info
 
+
 def _compute_vector(eph, t, body_norm: str) -> Dict[str, float]:
     earth = eph["earth"]
     if body_norm == "earth":
@@ -170,8 +185,9 @@ def _compute_vector(eph, t, body_norm: str) -> Dict[str, float]:
         raise ValueError(f"Body not present in kernel: '{body_norm}'")
     g = earth.at(t).observe(target)  # geometric (ICRS)
     x, y, z = (float(g.position.au[0]), float(g.position.au[1]), float(g.position.au[2]))
-    dist = math.sqrt(x*x + y*y + z*z)
+    dist = math.sqrt(x * x + y * y + z * z)
     return {"x_au": x, "y_au": y, "z_au": z, "distance_au": dist}
+
 
 def _compute_equatorial(eph, t, body_norm: str) -> Dict[str, float]:
     earth = eph["earth"]
@@ -183,6 +199,7 @@ def _compute_equatorial(eph, t, body_norm: str) -> Dict[str, float]:
     a = earth.at(t).observe(target).apparent()  # apparent RA/Dec
     ra, dec, dist = a.radec()
     return {"ra_deg": float(ra.hours) * 15.0, "dec_deg": float(dec.degrees), "distance_au": float(dist.au)}
+
 
 def _compute_ecliptic_true(eph, t, body_norm: str) -> Dict[str, float]:
     if body_norm == "earth":
@@ -196,6 +213,7 @@ def _compute_ecliptic_true(eph, t, body_norm: str) -> Dict[str, float]:
     lat, lon, dist = a.frame_latlon(_fl.ecliptic_frame)  # true-of-date
     return {"lon_deg": float(lon.degrees) % 360.0, "lat_deg": float(lat.degrees), "distance_au": float(dist.au)}
 
+
 def _compute_sidereal(eph, t, body_norm: str, ayanamsa_offset_deg: float = 0.0) -> Dict[str, float]:
     base = _compute_ecliptic_true(eph, t, body_norm)
     true_lon = float(base["lon_deg"])
@@ -205,15 +223,18 @@ def _compute_sidereal(eph, t, body_norm: str, ayanamsa_offset_deg: float = 0.0) 
         off = 0.0
     return {"lon_sidereal_deg": (true_lon - off) % 360.0, "lon_true_deg": true_lon, "ayanamsa_offset_deg": off}
 
+
 # ───────────────────────── basic ops & health ─────────────────────────
 @ops_api.get("/ops/health")
 def ops_health():
     return jsonify(ok=True, service="astro-backend", scope="ops", status="ok"), 200
 
+
 @ops_api.get("/api/health")
 def api_health_backcompat():
     # Deprecation headers are added in main.py after_request (if any)
     return jsonify(ok=True, service="astro-backend", scope="api", status="ok"), 200
+
 
 @ops_api.get("/ops/version")
 def ops_version():
@@ -224,6 +245,7 @@ def ops_version():
     git_sha = os.environ.get("GIT_SHA") or os.environ.get("COMMIT_SHA")
     return jsonify(ok=True, service="astro-backend", version=str(VERSION), git_sha=git_sha), 200
 
+
 @ops_api.get("/ops/config")
 def ops_config():
     cfg: Dict[str, Any] = {
@@ -233,6 +255,7 @@ def ops_config():
         "env": os.getenv("ENVIRONMENT") or os.getenv("ENV") or "unknown",
     }
     return jsonify(ok=True, config=cfg), 200
+
 
 # ───────────────────────── diagnostics ─────────────────────────
 @ops_api.get("/ops/diag/cores")
@@ -346,6 +369,7 @@ def ops_diag_cores():
 
     return jsonify(payload), 200
 
+
 @ops_api.get("/ops/diag/validators")
 def ops_diag_validators():
     """Report presence of validator modules and important callables."""
@@ -367,6 +391,7 @@ def ops_diag_validators():
             "normalize_for_vedic_sig": _sig(_normalize_for_vedic) if _normalize_for_vedic else None,
             "normalize_for_western_sig": _sig(_normalize_for_western) if _normalize_for_western else None,
             "normalize_chart_payload_sig": _sig(_normalize_chart_payload) if _normalize_chart_payload else None,
+            "normalize_houses_payload_sig": _sig(_normalize_houses_payload) if _normalize_houses_payload else None,
             "normalize_body_sig": _sig(_normalize_body) if _normalize_body else None,
             "functions": list_callables(_val_mod) if _val_mod else None,
         },
@@ -383,6 +408,7 @@ def ops_diag_validators():
             "functions": list_callables(_ved_val_mod) if _ved_val_mod else None,
         },
     }), 200
+
 
 # ───────────────────────── unified dispatcher ─────────────────────────
 def _unwrap_params(body: Dict[str, Any]) -> Dict[str, Any]:
@@ -401,7 +427,15 @@ def _unwrap_params(body: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(params, dict):
         return params
 
-    if any(k in body for k in ("date", "time", "tz", "timezone", "place_tz", "body", "ayanamsa_offset_deg")):
+    if any(k in body for k in (
+        "date", "time", "tz", "timezone", "place_tz", "body", "ayanamsa_offset_deg",
+        # new: houses + policy
+        "house_system", "system", "polar_policy", "polar_soft_limit", "polar_hard_limit",
+        "diagnostics", "validation",
+        # common geo + chart bits
+        "mode", "frame", "center", "topocentric", "latitude", "longitude",
+        "elevation_m", "elev_m", "elevation", "bodies", "points", "ayanamsa",
+    )):
         return {
             "date": body.get("date"),
             "time": body.get("time"),
@@ -422,6 +456,14 @@ def _unwrap_params(body: Dict[str, Any]) -> Dict[str, Any]:
             "bodies": body.get("bodies"),
             "points": body.get("points"),
             "ayanamsa": body.get("ayanamsa"),
+            # houses-related passthroughs
+            "house_system": body.get("house_system") or body.get("system"),
+            "system": body.get("system"),
+            "polar_policy": body.get("polar_policy"),
+            "polar_soft_limit": body.get("polar_soft_limit"),
+            "polar_hard_limit": body.get("polar_hard_limit"),
+            "diagnostics": body.get("diagnostics"),
+            "validation": body.get("validation"),
         }
 
     ts = body.get("timescales")
@@ -434,6 +476,7 @@ def _unwrap_params(body: Dict[str, Any]) -> Dict[str, Any]:
 
     return {}
 
+
 @ops_api.post("/ops/calculate")
 @rate_limit(RL_OPS_CALCULATE, key_fn=_ops_bucket)
 def ops_calculate():
@@ -442,7 +485,7 @@ def ops_calculate():
 
     Body:
     {
-      "op": "<timescales|jd_utc|tt_from_utc_jd|ut1_from_utc_jd|ephem_vector|ephem_equatorial|ephem_ecliptic|ephem_sidereal|chart>",
+      "op": "<timescales|jd_utc|tt_from_utc_jd|ut1_from_utc_jd|ephem_vector|ephem_equatorial|ephem_ecliptic|ephem_sidereal|chart|houses>",
       "params": {...}                  // optional; also supports flat or {timescales:{...}}
       "include_jd_utc": false          // only used by op="timescales" (and normalization if chart needs it)
     }
@@ -470,7 +513,7 @@ def ops_calculate():
         else:
             date = raw_params.get("date")
             time_str = raw_params.get("time")
-            tz = raw_params.get("tz") or raw_params.get("tz_name") or raw_params.get("place_tz")
+            tz = raw_params.get("tz") or raw_params.get("tz_name") or body.get("place_tz")
             dut1 = raw_params.get("dut1_seconds", _env_dut1_seconds())
             if not (date and time_str and tz):
                 return _err(400, "bad_request", "Missing keys: date, time, tz", op=op)
@@ -602,12 +645,91 @@ def ops_calculate():
             op=op, body=body_norm
         )
 
+    # ── Houses (policy façade) ────────────────────────────────────────────────
+    if op in ("houses", "compute_houses", "astro_houses"):
+        # Ensure dependencies are available (fall back if houses normalizer missing)
+        if not callable(_compute_houses_with_policy):
+            return _err(503, "houses_unavailable", "house module not loaded", op=op)
+
+        try:
+            if callable(_normalize_houses_payload):
+                norm, warns, tz_norm = _normalize_houses_payload(  # type: ignore[misc]
+                    raw_params, compute_timescales=True, include_jd_utc=False
+                )
+            elif callable(_normalize_chart_payload):
+                # Fallback: chart normalizer provides lat/lon + jd_tt/jd_ut1
+                norm, warns, tz_norm = _normalize_chart_payload(  # type: ignore[misc]
+                    raw_params, compute_timescales=True, include_jd_utc=False
+                )
+            else:
+                # Last resort: common + compute timescales
+                norm, warns, tz_norm = _normalize_common(  # type: ignore[misc]
+                    raw_params, compute_timescales=True, include_jd_utc=False
+                )
+        except Exception as e:
+            return _err(400, "bad_request", f"houses normalization failed: {e}", op=op)
+
+        lat = norm.get("latitude"); lon = norm.get("longitude")
+        if lat is None or lon is None:
+            return _err(400, "bad_request", "Missing keys: latitude, longitude", op=op)
+
+        ts_dict = norm.get("timescales") or {}
+        jd_tt = norm.get("jd_tt") or ts_dict.get("jd_tt")
+        jd_ut1 = norm.get("jd_ut1") or ts_dict.get("jd_ut1")
+        jd_ut = ts_dict.get("jd_utc")  # echoed only
+
+        if not isinstance(jd_tt, (int, float)) or not isinstance(jd_ut1, (int, float)):
+            return _err(400, "bad_request", "houses requires jd_tt and jd_ut1 (timescales missing)", op=op)
+
+        system = norm.get("house_system") or norm.get("system") or "placidus"
+
+        kwargs = {
+            "lat": float(lat),
+            "lon": float(lon),
+            "system": str(system),
+            "jd_tt": float(jd_tt),
+            "jd_ut1": float(jd_ut1),
+            "jd_ut": float(jd_ut) if isinstance(jd_ut, (int, float)) else None,
+            "diagnostics": bool(norm.get("diagnostics")) if "diagnostics" in norm else None,
+            "validation": bool(norm.get("validation")) if "validation" in norm else None,
+            "polar_policy": norm.get("polar_policy"),
+            "polar_soft_limit": norm.get("polar_soft_limit"),
+            "polar_hard_limit": norm.get("polar_hard_limit"),
+        }
+
+        try:
+            houses_payload = _compute_houses_with_policy(**kwargs)  # dict from façade
+        except NotImplementedError as e:
+            return _err(501, "house_system_not_implemented", str(e), op=op, system=system)
+        except ValueError as e:
+            return _err(400, "invalid_input", str(e), op=op, system=system)
+        except RuntimeError as e:
+            return _err(500, "houses_engine_failed", str(e), op=op, system=system)
+        except Exception as e:
+            return _err(500, "houses_unknown_error", str(e), op=op, system=system)
+
+        # Merge warnings
+        engine_warns = list(houses_payload.get("warnings") or [])
+        merged_warns = list(dict.fromkeys((warns or []) + engine_warns))
+        houses_payload["warnings"] = merged_warns
+
+        input_echo = {
+            "date": norm.get("date"),
+            "time": norm.get("time"),
+            "tz": norm.get("tz") or norm.get("place_tz"),
+            "latitude": float(lat),
+            "longitude": float(lon),
+            "system": system,
+        }
+
+        return _ok({"houses": houses_payload, "input": input_echo}, op=op, timezone=tz_norm)
+
     # ── Astronomy chart (compute_chart) ──────────────────────────────────────
     if op in ("chart", "astro_chart", "compute_chart"):
         # Ensure dependencies are available
         if not (callable(_normalize_chart_payload) and callable(_compute_chart)):
             return _err(503, "astronomy_unavailable", "astronomy module or validator not loaded", op=op)
-    
+
         # Normalize incoming params (optionally include jd_utc for debugging)
         try:
             norm, warns, tz_norm = _normalize_chart_payload(
@@ -617,12 +739,12 @@ def ops_calculate():
             )  # type: ignore[misc]
         except Exception as e:
             return _err(400, "bad_request", f"normalize_chart_payload failed: {e}", op=op)
-    
+
         # If caller sent a non-list 'points', surface the engine-style warning (validator may coerce it)
         if "points" in raw_params and not isinstance(raw_params["points"], (list, tuple)):
             warns = list(warns or [])
             warns.append("points_ignored_non_list")
-    
+
         # Make sure DUT1 survives normalization if the client provided it
         try:
             if "dut1_seconds" in raw_params and "dut1_seconds" not in norm:
@@ -631,15 +753,14 @@ def ops_calculate():
                 norm["dut1"] = raw_params["dut1"]
         except Exception:
             pass  # best-effort passthrough
-    
-        # Preserve the caller's original ayanamsa string so astronomy.compute_chart can
-        # detect aliases/unknowns and emit AYA_FALLBACK + resolution flags.
+
+        # Preserve caller's original ayanamsa string so engine can resolve alias/unknown
         try:
             if "ayanamsa" in raw_params:
                 norm["ayanamsa"] = raw_params["ayanamsa"]
         except Exception:
             pass
-    
+
         # ── Optional: inject default coordinates for Asc/MC (silence angles_missing_geography)
         # Set env: ASTRO_DEFAULT_LAT, ASTRO_DEFAULT_LON, and optionally ASTRO_DEFAULT_TOPO=1
         try:
@@ -653,13 +774,11 @@ def ops_calculate():
                     norm["longitude"] = float(env_lon)
                     if str(os.getenv("ASTRO_DEFAULT_TOPO", "0")).strip().lower() in ("1", "true", "yes", "on"):
                         norm["topocentric"] = True
-                    # annotate so clients can see why angles appeared without providing coords
                     warns = list(warns or [])
                     warns.append("angles_default_coords_injected")
         except Exception:
-            # If anything goes wrong reading env or casting, we simply skip injection
-            pass
-    
+            pass  # best-effort; ignore env issues
+
         # Compute the chart
         try:
             out = _compute_chart(norm)  # dict as defined by astronomy.compute_chart
@@ -670,12 +789,12 @@ def ops_calculate():
                 status = 400 if any(tok in code for tok in ("invalid", "unsupported", "missing", "bad", "not_")) else 500
                 return _err(status, code, msg, op=op)
             return _err(500, "chart_compute_error", msg, op=op)
-    
+
         # Merge warnings from normalization + engine (dedupe, preserve order)
         engine_warns = list(out.get("warnings") or [])
         merged_warns = list(dict.fromkeys((warns or []) + engine_warns))
         out["warnings"] = merged_warns
-    
+
         # Echo back key input fields (plus DUT1/ayanamsa if present) for transparency
         input_echo = {
             "date": norm.get("date"),
@@ -695,13 +814,13 @@ def ops_calculate():
             input_echo["dut1"] = norm["dut1"]
         if "ayanamsa" in norm:
             input_echo["ayanamsa"] = norm["ayanamsa"]
-    
+
         return _ok({"chart": out, "input": input_echo}, op=op, timezone=tz_norm)
-    
+
     # Unknown op
     return _err(
         400,
         "unsupported_op",
-        "op must be one of: timescales, jd_utc, tt_from_utc_jd, ut1_from_utc_jd, ephem_vector, ephem_equatorial, ephem_ecliptic, ephem_sidereal, chart",
+        "op must be one of: timescales, jd_utc, tt_from_utc_jd, ut1_from_utc_jd, ephem_vector, ephem_equatorial, ephem_ecliptic, ephem_sidereal, chart, houses",
         op=op or None
     )
