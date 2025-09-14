@@ -249,6 +249,9 @@ def ashtottari_schedule(
     # Nested tree (linear)
     tree = _to_nested_linear(spans, max_level=levels)
 
+    # Nested tree (linear)
+    tree = _to_nested_linear(spans, max_level=levels)
+
     return {
         "ok": True,
         "scheme": "ashtottari",
