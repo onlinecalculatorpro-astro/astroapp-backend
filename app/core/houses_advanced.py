@@ -234,7 +234,7 @@ def _fill_opposites(cusps: List[Optional[float]]) -> List[float]:
         result[i] = float(_norm_deg(v))
 
     return result
- 
+
 
 # ───────────────────────── exact house engines (closed/solved) ─────────────────────────
 
@@ -526,13 +526,19 @@ def _sripati(_phi: float, _eps: float, asc: float, mc: float) -> List[float]:
         next_cusp = (i + 1) % 12
         cusps[i] = _midpoint_wrap(por[i], por[next_cusp])
     return _fill_opposites(cusps)
- 
+
 def _equal_from_mc(mc: float) -> List[float]:
+    """
+    Equal-from-MC: start at MC (10th cusp) and step forward by 30°.
+    This yields:
+      cusp10 = MC
+      cusp 1 = MC + 90°
+      cusp 4 = MC + 180°  (IC)
+    """
     cusps = _blank()
-    cusps[9] = _norm_deg(mc)            # 10th
-    cusps[0] = _norm_deg(mc - 90.0)     # 1st = MC − 90°
-    for i in (1, 2, 3, 4, 5, 6, 7, 8, 10, 11):
-        cusps[i] = _norm_deg(cusps[0] + 30.0 * i)
+    for k in range(12):
+        idx = (9 + k) % 12  # 9 is the 10th cusp (0-based)
+        cusps[idx] = _norm_deg(mc + 30.0 * k)
     return _fill_opposites(cusps)
 
 def _natural_houses() -> List[float]:
