@@ -140,12 +140,58 @@ def _timescales_from_civil(date: str, time: str, tz: str) -> Tuple[float, float,
     return jd_ut, jd_tt, jd_ut  # no UT1 drift by default
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Ephemeris compatibility factory
+# ─────────────────────────────────────────────────────────────────────────────
+def _make_ephem(frame: str = "ecliptic-of-date"):
+    """
+    Build EphemerisAdapter regardless of whether 'timescale'/'planets'
+    are accepted by EphemConfig/EphemerisAdapter in this deployment.
+    Tries several signatures gracefully.
+    """
+    # Try Config(frame=..., timescale=TS, planets=PLANETS) → Adapter(cfg)
+    try:
+        cfg = EphemConfig(frame=frame, timescale=TS, planets=PLANETS)  # type: ignore[arg-type]
+        try:
+            return EphemerisAdapter(cfg)  # type: ignore[call-arg]
+        except TypeError:
+            pass
+    except TypeError:
+        cfg = None  # type: ignore[assignment]
+
+    # Try Config(frame) only, then pass extras to Adapter(...)
+    if cfg is None:
+        try:
+            cfg = EphemConfig(frame=frame)  # type: ignore[call-arg]
+        except TypeError:
+            cfg = None  # type: ignore[assignment]
+
+    if cfg is not None:
+        # Adapter(cfg, timescale=TS, planets=PLANETS)
+        try:
+            return EphemerisAdapter(cfg, timescale=TS, planets=PLANETS)  # type: ignore[call-arg]
+        except TypeError:
+            # Adapter(cfg) only
+            try:
+                return EphemerisAdapter(cfg)  # type: ignore[call-arg]
+            except TypeError:
+                pass
+
+    # Last resort: call Adapter with kwargs directly (with and without extras)
+    try:
+        return EphemerisAdapter(frame=frame, timescale=TS, planets=PLANETS)  # type: ignore[call-arg]
+    except TypeError:
+        try:
+            return EphemerisAdapter(frame=frame)  # type: ignore[call-arg]
+        except TypeError as e:
+            raise RuntimeError(f"EphemerisAdapter incompatible signatures: {e}")
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Moon nirāyaṇa longitude & nakṣatra / balance
 # ─────────────────────────────────────────────────────────────────────────────
 def _moon_longitude_tropical(jd_tt: float) -> float:
     if not _EPH_OK:
         raise RuntimeError("EphemerisAdapter unavailable; enable app.core.ephemeris_adapter")
-    ep = EphemerisAdapter(EphemConfig(frame="ecliptic-of-date", timescale=TS, planets=PLANETS))  # type: ignore
+    ep = _make_ephem("ecliptic-of-date")
     rows = ep.ecliptic_longitudes(float(jd_tt), ["Moon"]).get("results", [])
     if not rows:
         raise RuntimeError("ephemeris returned no Moon longitude")
@@ -183,7 +229,7 @@ def nakshatra_info_from_jd(jd_tt: float, *, ayanamsa: Optional[Any] = "lahiri") 
     idx0 = int(math.floor(moon_nira / _NAK_WIDTH))  # 0..26
     start = idx0 * _NAK_WIDTH
     offset = moon_nira - start
-    frac_left = max(0.0, min(1.0, ( _NAK_WIDTH - offset ) / _NAK_WIDTH))
+    frac_left = max(0.0, min(1.0, (_NAK_WIDTH - offset) / _NAK_WIDTH))
     lord = _nak_lord_from_index(idx0)
     return NakshatraInfo(
         index=idx0 + 1, lord=lord, start_deg=start, offset_deg=offset,
@@ -300,17 +346,6 @@ def generate_vimshottari_tree(
       - If end_jd_tt is provided, window = [birth_jd_tt, end_jd_tt)
       - Else if span_years is provided, window = [birth_jd_tt, birth_jd_tt + span_years*year_days)
       - Else default span_years=120.
-
-    Returns:
-      {
-        "ok": True,
-        "birth_jd_tt": ...,
-        "moon_nirayana_deg": ...,
-        "nakshatra": {"index":..,"lord":..,"fraction_left":..},
-        "year_days": ...,
-        "levels": 5,
-        "periods": [ {Mahā node with nested children (to 'levels')} ... ]
-      }
     """
     if levels < 1 or levels > 5:
         raise ValueError("levels must be between 1 and 5")
