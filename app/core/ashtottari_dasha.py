@@ -262,7 +262,7 @@ def ashtottari_schedule(
         },
         "year_days": float(year_days),
         "levels": int(levels),
-        "spans": [s.__dict__ for s in spans],
+        "spans": [_span_dict(s) for s in spans],
         "nested": tree,
     }
 
