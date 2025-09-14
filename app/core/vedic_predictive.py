@@ -23,7 +23,7 @@ try:
 except Exception:
     _VIM_ENGINE_OK = False
 
-# (Still import EphemerisAdapter for back-compat: vimsottari_dasha() below uses it)
+# (Still import EphemerisAdapter for back-compat: vimsottari_dasha() fallback uses it)
 try:
     from app.core.ephemeris_adapter import EphemerisAdapter, Config as EphemConfig
     _EPH_OK = True
