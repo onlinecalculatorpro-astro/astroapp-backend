@@ -18,6 +18,10 @@ Responsibilities
 For astronomy.compute_chart (FINAL engine):
 - normalize_chart_payload(payload, ...) -> (normalized: dict, warnings: list[str], tz_normalized: str)
 
+For houses (policy façade):
+- normalize_house_system(name) -> (canonical_public_label|None, warnings)
+- normalize_houses_payload(payload, ...) -> (normalized: dict, warnings: list[str], tz_normalized: str)
+
 Stable Exports
 - normalize_tz(tz, default="UTC") -> str
 - env_dut1_seconds() -> float
@@ -33,6 +37,8 @@ Stable Exports
 - normalize_for_vedic(payload, **opts) -> (dict, warnings, tz)
 - normalize_for_western(payload, **opts) -> (dict, warnings, tz)
 - normalize_for_domain(domain, payload, **opts) -> (dict, warnings, tz)
+- normalize_house_system(name) -> (canonical|None, warnings)
+- normalize_houses_payload(payload, **opts) -> (dict, warnings, tz)
 """
 
 from typing import Any, Dict, List, Optional, Tuple, Callable
@@ -70,6 +76,16 @@ except Exception:
     TimeScales = None           # type: ignore
     _TS_AVAILABLE = False
 
+# Houses façade discovery (for normalization only)
+try:
+    from app.core.house import canonicalize_system as _house_canonicalize  # type: ignore
+    from app.core.house import list_supported_house_systems as _house_list  # type: ignore
+    _HOUSE_AVAILABLE = True
+except Exception:
+    _house_canonicalize = None  # type: ignore
+    _house_list = None          # type: ignore
+    _HOUSE_AVAILABLE = False
+
 __all__ = [
     "normalize_tz",
     "env_dut1_seconds",
@@ -84,6 +100,9 @@ __all__ = [
     "normalize_for_domain",
     # FINAL astronomy wiring
     "normalize_chart_payload",
+    # Houses wiring
+    "normalize_house_system",
+    "normalize_houses_payload",
 ]
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -450,6 +469,83 @@ def normalize_chart_payload(
         if isinstance(elev_m, (int, float)):
             obs["elevation_m"] = float(elev_m)
         out["observer"] = obs
+
+    return out, warns, tz_name
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Houses normalization
+# ──────────────────────────────────────────────────────────────────────────────
+
+def normalize_house_system(name: Optional[str]) -> Tuple[Optional[str], List[str]]:
+    """
+    Canonicalize a user-facing house-system name to the public label used by `house.py`.
+
+    Returns:
+        (canonical_public_label|None, warnings)
+
+    Behavior:
+      - If `house.py` is available, uses its `canonicalize_system` (raises on unsupported).
+      - If unavailable, returns a lowercased guess and warns.
+      - On unsupported input, returns (None, ["unsupported_house_system:<name>"]).
+      - If name is missing/blank, defaults to 'placidus'.
+    """
+    warns: List[str] = []
+    if not isinstance(name, str) or not name.strip():
+        return "placidus", warns
+
+    if not _HOUSE_AVAILABLE or not callable(_house_canonicalize):
+        # Best-effort fallback
+        warns.append("house_module_unavailable")
+        return name.strip().lower(), warns
+
+    try:
+        canon = _house_canonicalize(name)  # may raise ValueError with suggestions
+        return canon, warns
+    except Exception:
+        warns.append(f"unsupported_house_system:{name}")
+        return None, warns
+
+def normalize_houses_payload(
+    payload: Dict[str, Any],
+    *,
+    default_time: str = "12:00:00",
+    compute_timescales: bool = True,   # houses façade requires jd_tt & jd_ut1 strictly
+    include_jd_utc: bool = False,
+    dut1_seconds: Optional[float] = None,
+) -> Tuple[Dict[str, Any], List[str], str]:
+    """
+    Prepare a request for app.core.house.compute_houses_with_policy.
+
+    - Reuses normalize_common_payload (so tz/date/time + timescales are normalized).
+    - Ensures 'latitude' and 'longitude' are present in the normalized dict.
+    - Resolves 'house_system' (or 'system') → canonical public label via house.py.
+    - Returns (normalized_dict, warnings, tz_normalized).
+    """
+    base, warns, tz_name = normalize_common_payload(
+        payload,
+        default_time=default_time,
+        compute_timescales=compute_timescales,
+        include_jd_utc=include_jd_utc,
+        dut1_seconds=dut1_seconds,
+        max_levels=5,
+    )
+
+    # Geography (required by façade; route will enforce and 400 if missing)
+    lat, lon = base.get("latitude"), base.get("longitude")
+    if lat is None or lon is None:
+        warns.append("houses_missing_geography")
+
+    # System
+    raw_system = payload.get("house_system", payload.get("system"))
+    canon, wsys = normalize_house_system(raw_system)
+    warns.extend(wsys)
+
+    out = dict(base)
+    out.update({
+        "house_system": canon,          # preferred key for routes → façade
+        "system": canon,                # mirror for convenience
+        "requested_house_system": raw_system,  # for echo/diag if needed
+    })
 
     return out, warns, tz_name
 
