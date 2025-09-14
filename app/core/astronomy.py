@@ -351,7 +351,6 @@ def _ensure_timescales(payload: Dict[str, Any], warnings: List[str], seen: set[s
       (deterministic: ignores any UT1 a forwarder may provide).
     - Prefer 'jd_utc' when present; fall back to 'jd_ut' (both represent UTC JD).
     """
-    # caller DUT1 (with clamp)
     # caller DUT1 (with clamp) — accept numeric strings; use CFG default
     dut1_raw = payload.get("dut1", payload.get("dut1_seconds", None))
     if dut1_raw is None or (isinstance(dut1_raw, str) and not dut1_raw.strip()):
@@ -1259,6 +1258,27 @@ def _compute_angles(
     return float(asc), float(mc), dbg
 
 
+# ───────────────────────────── Elevation helper ───────────────────────
+def _pick_elev(p: Dict[str, Any]) -> Optional[float]:
+    """
+    Robustly read elevation value, preserving 0.0.
+    Accept any of: elev_m, elevation_m, elevation.
+    Returns float or None (if absent / blank / non-numeric).
+    """
+    for k in ("elev_m", "elevation_m", "elevation"):
+        if k in p:
+            v = p[k]
+            if v is None:
+                continue
+            try:
+                # Allow numeric strings; keep zeros
+                return float(str(v).strip()) if isinstance(v, str) else float(v)
+            except Exception:
+                # Ignore non-numeric garbage and continue
+                continue
+    return None
+
+
 # ───────────────────────────── Main API ───────────────────────────────
 def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
     if eph is None:
@@ -1279,7 +1299,7 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
     if topocentric:
         lat_in = payload.get("latitude")
         lon_in = payload.get("longitude")
-        elev_in = payload.get("elev_m") or payload.get("elevation_m") or payload.get("elevation")
+        elev_in = _pick_elev(payload)  # ← preserves 0.0
         if not (_is_finite(lat_in) and _is_finite(lon_in)):
             _warn_add(warnings_list, _seen, _W.TOPO_MISSING_COORDS)
             topocentric = False
@@ -1313,7 +1333,7 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
     if mode == "sidereal":
         # Primary path: use engine resolver (emits fallback warning when needed)
         ay_deg, _ = _resolve_ayanamsa(jd_tt, payload.get("ayanamsa"), warnings_list, _seen)
-    
+
         # Best-effort meta enrichment from ayanamsa module (v1.3+ helpers).
         try:
             from app.core.ayanamsa import get_ayanamsa_with_resolution, resolve_ayanamsa_scheme  # type: ignore
@@ -1339,16 +1359,16 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
                 }
             except Exception:
                 aya_meta = None
-    
+
     out_bodies: List[Dict[str, Any]] = []
     missing_bodies: List[str] = []
-    
+
     def _is_num(x: Any) -> bool:
         try:
             return isinstance(x, (int, float)) and math.isfinite(float(x))
         except Exception:
             return False
-    
+
     for nm in majors_req:
         tup = results.get(nm)
         lon_deg: Optional[float] = None
@@ -1377,10 +1397,10 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "lat": None,
             }
         )
-    
+
     if missing_bodies:
         _warn_add(warnings_list, _seen, _W.ADAPTER_MISS_BODIES, ", ".join(missing_bodies))
-    
+
     out_points: List[Dict[str, Any]] = []
     if points_req:
         lon_map_nodes, source_nodes = _longitudes_only_geocentric(jd_tt, points_req, frame=frame)
@@ -1397,7 +1417,7 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
                 if need_s: missing_pts.append("South Node")
                 extra_map, _ = _longitudes_only_geocentric(jd_tt, missing_pts, frame=frame)
                 lon_map_nodes.update(extra_map)
-    
+
         for nm in points_req:
             if nm not in lon_map_nodes:
                 _warn_add(warnings_list, _seen, _W.ADAPTER_MISS_POINTS, nm)
@@ -1427,10 +1447,10 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
                     "lat": None,
                 }
             )
-    
+
         if source_nodes and source_nodes != source_tag:
             _warn_add(warnings_list, _seen, _W.PTS_SOURCE_MISMATCH, source_nodes)
-    
+
     asc_deg, mc_deg, dbg = _compute_angles(
         jd_ut1=jd_ut1,
         jd_tt=jd_tt,
@@ -1441,7 +1461,7 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
         warnings=warnings_list,
         seen=_seen,
     )
-    
+
     center = "topocentric" if topocentric else "geocentric"
     meta: Dict[str, Any] = {
         "mode": mode,
@@ -1465,9 +1485,13 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
     if aya_meta:
         meta["ayanamsa"] = aya_meta
-    if topocentric and isinstance(elev, (int, float)):
-        meta["observer"] = {"latitude": lat, "longitude": lon, "elevation_m": float(elev)}
-    
+
+    # Always echo observer when topocentric and lat/lon are finite; include elevation when numeric
+    if topocentric and _is_finite(lat) and _is_finite(lon):
+        meta["observer"] = {"latitude": float(lat), "longitude": float(lon)}
+        if isinstance(elev, (int, float)):
+            meta["observer"]["elevation_m"] = float(elev)
+
     _kpath, _kcov = _adapter_kernel_info()
     if _kpath:
         meta["ephemeris_path"] = str(_kpath)
@@ -1476,7 +1500,7 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
             meta["ephemeris_coverage_jd"] = {"start": float(_kcov[0]), "end": float(_kcov[1])}
         except Exception:
             pass
-    
+
     out: Dict[str, Any] = {
         "mode": mode,
         "ayanamsa_deg": float(ay_deg) if ay_deg is not None else None,
