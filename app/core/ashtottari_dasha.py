@@ -249,9 +249,6 @@ def ashtottari_schedule(
     # Nested tree (linear)
     tree = _to_nested_linear(spans, max_level=levels)
 
-    # Nested tree (linear)
-    tree = _to_nested_linear(spans, max_level=levels)
-
     return {
         "ok": True,
         "scheme": "ashtottari",
@@ -265,7 +262,15 @@ def ashtottari_schedule(
         },
         "year_days": float(year_days),
         "levels": int(levels),
-        "spans": [_span_dict(s) for s in spans],
+        "spans": [
+            {
+                "level": s.level,
+                "lord": s.lord,
+                "start_jd_tt": float(s.start_jd_tt),
+                "end_jd_tt": float(s.end_jd_tt),
+            }
+            for s in spans
+        ],
         "nested": tree,
     }
 
@@ -355,7 +360,7 @@ def _to_nested_linear(spans: List[DashaSpan], *, max_level: int) -> List[Dict[st
         if not parents or not kids:
             continue
         parent_nodes = nodes_by_level[lvl - 1]
-        # two-pointer sweep
+        # two-pointer sweep through time
         p = 0
         cur_parent = parents[p] if parents else None
         for child in kids:
@@ -366,7 +371,6 @@ def _to_nested_linear(spans: List[DashaSpan], *, max_level: int) -> List[Dict[st
                 break
             if (child.start_jd_tt + 1e-12) >= cur_parent.start_jd_tt and (child.end_jd_tt - 1e-12) <= cur_parent.end_jd_tt:
                 node = mk_node(child)
-                # find the corresponding parent node (same index p)
                 parent_nodes[p]["children"].append(node)
                 nodes_by_level.setdefault(lvl, []).append(node)
 
