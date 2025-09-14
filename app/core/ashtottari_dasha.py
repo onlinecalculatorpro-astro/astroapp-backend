@@ -6,14 +6,13 @@ from __future__ import annotations
 Aṣṭottarī Daśā — 108-year cycle with five nested levels
 (Mahā → Antar → Pratyantar → Sūkṣma → Prāṇa)
 
-- Canonical order (years): Sun(6), Moon(15), Mars(8), Mercury(17), Saturn(10), Jupiter(19), Rahu(12), Venus(21).
-- Start lord from Moon’s *birth* nakṣatra via Kṛttikādi mapping.
-- Birth balance = remaining fraction in current nakṣatra × mahādaśā years of start lord.
-- Sub-level durations scale by years(sub-lord)/108 within each parent span.
-- start_mode="after" (default) begins sublevels with the planet AFTER the parent;
-  start_mode="same" begins with the parent itself.
+Optimizations:
+- Fixed-point time arithmetic in ticks (1 tick = 1e-7 day) → no Decimal in hot path.
+- Largest-remainder partition for sub-spans → stable, drift-free, children sum to parent.
+- Linear-time tree construction (per-level two-pointer) → avoids O(N^2) filtering.
+- Spans are generated in order → no final sorting pass.
 
-Public surface:
+Public surface (unchanged):
   compute_dasha(jd_tt_birth, ayanamsa_key="lahiri", ayanamsa_deg=None, depth=None, options=None) -> dict
   compute_ashtottari(payload: dict) -> dict
   ashtottari_schedule(...)
@@ -21,7 +20,6 @@ Public surface:
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
-from decimal import Decimal, getcontext
 import math
 
 __all__ = [
@@ -55,9 +53,7 @@ from app.core.ayanamsa import get_ayanamsa_deg
 from app.core.constants_vedic import NAKSHATRAS_27
 
 # ───────────────────────── numerics / helpers ─────────────────────────
-getcontext().prec = 34  # deep fractional stability
-
-_JD_QUANT = 1e-7  # ~0.009 s
+_JD_QUANT = 1e-7  # ~0.00864 s
 def _q(x: float) -> float:
     return round(float(x) / _JD_QUANT) * _JD_QUANT
 
@@ -106,8 +102,62 @@ def _nak_offset_in_deg(nirayana_lon: float) -> float:
     base = (_nak_index(nirayana_lon) - 1) * _NAK_WIDTH
     return _norm360(nirayana_lon) - base
 
-def _years_to_days(years: Decimal, year_days: Decimal) -> Decimal:
+# ───────────────────────── fixed-point time helpers ─────────────────────────
+# 1 tick = 1e-7 day (matches _JD_QUANT)
+_TICK_PER_DAY = int(round(1.0 / _JD_QUANT))  # 10_000_000
+_FRACTION = {k: ASHTOTTARI_YEARS[k] / ASHTOTTARI_TOTAL_YEARS for k in ASHTOTTARI_ORDER}
+
+def _years_to_days(years: float, year_days: float) -> float:
     return years * year_days
+
+def _to_ticks(days: float) -> int:
+    return int(round(days * _TICK_PER_DAY))
+
+def _from_ticks(ticks: int) -> float:
+    return ticks / _TICK_PER_DAY
+
+def _append_span_ticks(
+    spans: List["DashaSpan"],
+    *,
+    level: int,
+    lord: str,
+    base_jd: float,
+    t_start: int,
+    dur_ticks: int,
+    limit_ticks: Optional[int],
+) -> int:
+    """
+    Append a span [t_start, t_start+dur_ticks) (intersected with limit).
+    Returns t_next in ticks (t_start + dur_ticks).
+    """
+    t_end = t_start + dur_ticks
+    if limit_ticks is not None and t_start >= limit_ticks:
+        return t_end
+    end_eff = min(t_end, limit_ticks) if limit_ticks is not None else t_end
+    s_jd = _q(base_jd + _from_ticks(t_start))
+    e_jd = _q(base_jd + _from_ticks(end_eff))
+    if abs(e_jd - s_jd) < 1e-12:  # closed-open safety
+        e_jd = _q(s_jd + 1e-9)
+    spans.append(DashaSpan(level, lord, s_jd, e_jd))
+    return t_end
+
+def _partition_ticks(parent_ticks: int, seq: List[str]) -> List[int]:
+    """
+    Largest-remainder partition: proportional to ASHTOTTARI_YEARS.
+    Guarantees sum(child_ticks) == parent_ticks and stable boundaries.
+    """
+    if parent_ticks <= 0:
+        return [0] * len(seq)
+    mults = [_FRACTION[l] for l in seq]
+    raw = [parent_ticks * m for m in mults]
+    base = [int(math.floor(x)) for x in raw]
+    rems = [x - b for x, b in zip(raw, base)]
+    need = parent_ticks - sum(base)
+    if need > 0:
+        order = sorted(range(len(rems)), key=lambda i: rems[i], reverse=True)
+        for i in range(need):
+            base[order[i]] += 1
+    return base
 
 def _lord_after(lord: str) -> str:
     i = ASHTOTTARI_ORDER.index(lord)
@@ -115,42 +165,24 @@ def _lord_after(lord: str) -> str:
 
 def _cycle_from(after_lord: str, *, start_mode: str) -> List[str]:
     """
-    start_mode="after": sequence begins from the planet AFTER parent.
+    start_mode="after": sequence begins from the planet AFTER the parent (default).
     start_mode="same":  sequence begins from the parent planet itself.
     """
     base = list(ASHTOTTARI_ORDER)
-    start = after_lord if start_mode == "same" else _lord_after(after_lord)
+    start = after_lord if str(start_mode).lower().strip() == "same" else _lord_after(after_lord)
     i = base.index(start)
     return base[i:] + base[:i]
 
 # ───────────────────────── data types ─────────────────────────
 @dataclass
 class DashaSpan:
+    __slots__ = ("level", "lord", "start_jd_tt", "end_jd_tt")
     level: int
     lord: str
     start_jd_tt: float
     end_jd_tt: float
 
 # ───────────────────────── schedule core ─────────────────────────
-def _birth_balance_days_for_lord(nak_offset_deg: float, lord: str, *, year_days: Decimal) -> Decimal:
-    rem_frac = Decimal((_NAK_WIDTH - nak_offset_deg) / _NAK_WIDTH)
-    years = Decimal(ASHTOTTARI_YEARS[lord])
-    return _years_to_days(rem_frac * years, year_days)
-
-def _span_days_for_lord(parent_days: Decimal, lord: str) -> Decimal:
-    return parent_days * (Decimal(ASHTOTTARI_YEARS[lord]) / Decimal(ASHTOTTARI_TOTAL_YEARS))
-
-def _append_span(spans: List[DashaSpan], level: int, lord: str, t0: Decimal, dur_days: Decimal, *, limit: Optional[Decimal]) -> Decimal:
-    t1 = t0 + dur_days
-    if limit is not None and t0 >= limit:
-        return t1
-    end = min(t1, limit) if limit is not None else t1
-    s = _q(float(t0)); e = _q(float(end))
-    if abs(e - s) < 1e-12:  # closed-open safety
-        e = _q(s + 1e-9)
-    spans.append(DashaSpan(level, lord, s, e))
-    return t1
-
 def ashtottari_schedule(
     *,
     jd_start_tt: float,
@@ -160,13 +192,13 @@ def ashtottari_schedule(
     year_days: float = 365.24219,
     limit_jd_tt: float | None = None
 ) -> Dict[str, Any]:
+    """
+    Build flat spans + nested tree. Public signature unchanged.
+    """
     levels = max(1, min(5, int(levels)))
     start_mode = "after" if str(start_mode).lower().strip() != "same" else "same"
-    year_days_D = Decimal(str(year_days))
-    t0 = Decimal(str(jd_start_tt))
-    t_limit = Decimal(str(limit_jd_tt)) if isinstance(limit_jd_tt, (int, float)) else None
 
-    # Start lord
+    # Start lord from birth nakṣatra
     nak_idx = _nak_index(moon_nirayana_deg)
     nak_off = _nak_offset_in_deg(moon_nirayana_deg)
     start_lord = _KRITTIKADI_MAP[nak_idx]
@@ -176,29 +208,47 @@ def ashtottari_schedule(
     i0 = order.index(start_lord)
     maha_cycle = order[i0:] + order[:i0]
 
-    # Birth balance for first Mahā
-    balance_days = _birth_balance_days_for_lord(nak_off, start_lord, year_days=year_days_D)
+    # Fixed-point timeline anchored at jd_start_tt
+    base_jd = float(jd_start_tt)
+    t0 = 0  # ticks from base_jd
+    limit_ticks = None if limit_jd_tt is None else _to_ticks(float(limit_jd_tt) - base_jd)
 
     spans: List[DashaSpan] = []
 
-    # First (partial) Mahā
-    _ = _years_to_days(Decimal(ASHTOTTARI_YEARS[start_lord]), year_days_D)
-    t1 = _append_span(spans, 1, start_lord, t0, balance_days, limit=t_limit)
+    # First (partial) Mahā balance
+    rem_frac = (_NAK_WIDTH - nak_off) / _NAK_WIDTH
+    first_years = ASHTOTTARI_YEARS[start_lord]
+    first_days = _years_to_days(first_years, year_days) * rem_frac
+    t1 = _append_span_ticks(
+        spans, level=1, lord=start_lord, base_jd=base_jd,
+        t_start=t0, dur_ticks=_to_ticks(first_days), limit_ticks=limit_ticks
+    )
     t_cur = t1
 
     # Remaining Mahā in this 108-year cycle
     for lord in maha_cycle[1:]:
-        dur = _years_to_days(Decimal(ASHTOTTARI_YEARS[lord]), year_days_D)
-        t_next = _append_span(spans, 1, lord, t_cur, dur, limit=t_limit)
-        t_cur = t_next
-        if t_limit is not None and t_cur >= t_limit:
+        dur_days = _years_to_days(ASHTOTTARI_YEARS[lord], year_days)
+        t_nxt = _append_span_ticks(
+            spans, level=1, lord=lord, base_jd=base_jd,
+            t_start=t_cur, dur_ticks=_to_ticks(dur_days), limit_ticks=limit_ticks
+        )
+        t_cur = t_nxt
+        if limit_ticks is not None and t_cur >= limit_ticks:
             break
 
-    # Sublevels
-    if levels >= 2:
-        _expand_sublevels(spans, start_mode=start_mode, levels=levels, t_limit=t_limit)
+    # Sublevels (levels >= 2)
+    if levels >= 2 and spans:
+        _expand_sublevels_ticks(
+            spans_level1=spans,
+            base_jd=base_jd,
+            start_mode=start_mode,
+            levels=levels,
+            limit_ticks=limit_ticks,
+        )
 
-    tree = _to_nested(spans, max_level=levels)
+    # Nested tree (linear)
+    tree = _to_nested_linear(spans, max_level=levels)
+
     return {
         "ok": True,
         "scheme": "ashtottari",
@@ -216,63 +266,117 @@ def ashtottari_schedule(
         "nested": tree,
     }
 
-def _expand_sublevels(
-    spans_level1: List[DashaSpan],
+def _expand_sublevels_ticks(
     *,
+    spans_level1: List[DashaSpan],
+    base_jd: float,
     start_mode: str,
     levels: int,
-    t_limit: Optional[Decimal]
+    limit_ticks: Optional[int],
 ) -> None:
+    """
+    Expand sublevels in-place using fixed-point ticks.
+    Generates spans in (level, start) order so no final sorting is needed.
+    """
+    # We'll append to this master list in increasing level order.
     all_spans: List[DashaSpan] = list(spans_level1)
 
-    def _span_children(parent: DashaSpan, level: int) -> List[DashaSpan]:
-        p_dur = Decimal(str(parent.end_jd_tt)) - Decimal(str(parent.start_jd_tt))
-        seq = _cycle_from(parent.lord, start_mode=start_mode)
-        t = Decimal(str(parent.start_jd_tt))
-        kids: List[DashaSpan] = []
-        for lord in seq:
-            dur = _span_days_for_lord(p_dur, lord)
-            t_next = t + dur
-            if t_limit is not None and t >= t_limit:
-                t = t_next
-                continue
-            s = _q(float(t)); e = _q(float(min(t_next, t_limit) if t_limit is not None else t_next))
-            if abs(e - s) < 1e-12:
-                e = _q(s + 1e-9)
-            kids.append(DashaSpan(level, lord, s, e))
-            t = t_next
-        return kids
+    # Convenience: convert a JD boundary back to ticks relative to base
+    def jd_to_ticks(jd: float) -> int:
+        return _to_ticks(jd - base_jd)
 
-    current = [s for s in all_spans if s.level == 1]
-    for level in range(2, levels + 1):
+    current: List[DashaSpan] = [s for s in all_spans if s.level == 1]
+    for lvl in range(2, levels + 1):
         next_level: List[DashaSpan] = []
         for parent in current:
-            next_level.extend(_span_children(parent, level))
+            p_start = jd_to_ticks(parent.start_jd_tt)
+            p_end   = jd_to_ticks(parent.end_jd_tt)
+            p_ticks = max(0, p_end - p_start)
+            if p_ticks == 0:
+                continue
+            seq = _cycle_from(parent.lord, start_mode=start_mode)
+            parts = _partition_ticks(p_ticks, seq)
+
+            t = p_start
+            for lord, dur in zip(seq, parts):
+                if dur <= 0:
+                    continue
+                t_next = _append_span_ticks(
+                    next_level, level=lvl, lord=lord, base_jd=base_jd,
+                    t_start=t, dur_ticks=dur, limit_ticks=limit_ticks
+                )
+                t = t_next
+        # Append in order; current becomes next_level for deeper expansion
         all_spans.extend(next_level)
         current = next_level
 
+    # Replace incoming level-1 buffer with the full ordered set
     spans_level1.clear()
-    spans_level1.extend(sorted(all_spans, key=lambda s: (s.level, s.start_jd_tt, ASHTOTTARI_ORDER.index(s.lord))))
+    spans_level1.extend(all_spans)
 
-def _to_nested(spans: List[DashaSpan], *, max_level: int) -> List[Dict[str, Any]]:
-    level1 = [s for s in spans if s.level == 1]
+def _to_nested_linear(spans: List[DashaSpan], *, max_level: int) -> List[Dict[str, Any]]:
+    """
+    Linear-time nesting:
+    - Group spans by level (they are already in level order).
+    - For each level L>1, sweep once with a pointer over parents (L-1) to attach children.
+    """
+    if not spans:
+        return []
 
-    def children_of(parent: DashaSpan, level: int) -> List[DashaSpan]:
-        return [
-            s for s in spans
-            if s.level == level
-            and parent.start_jd_tt <= s.start_jd_tt + 1e-12
-            and s.end_jd_tt <= parent.end_jd_tt + 1e-12
-        ]
+    by_level: Dict[int, List[DashaSpan]] = {}
+    for s in spans:
+        if s.level > max_level:
+            continue
+        by_level.setdefault(s.level, []).append(s)
 
-    def node_for(span: DashaSpan, level: int) -> Dict[str, Any]:
-        node = {"level": level, "lord": span.lord, "start_jd_tt": float(span.start_jd_tt), "end_jd_tt": float(span.end_jd_tt)}
-        if level < max_level:
-            kids = children_of(span, level + 1)
-            node["children"] = [node_for(k, level + 1) for k in kids]
-        return node
+    # Build node objects mirroring DashaSpan
+    def mk_node(s: DashaSpan) -> Dict[str, Any]:
+        return {
+            "level": s.level,
+            "lord": s.lord,
+            "start_jd_tt": float(s.start_jd_tt),
+            "end_jd_tt": float(s.end_jd_tt),
+            "children": [] if s.level < max_level else None,
+        }
 
-    return [node_for(s, 1) for s in level1]
+    # Level 1 nodes (roots)
+    level1_spans = by_level.get(1, [])
+    if not level1_spans:
+        return []
+    nodes_by_level: Dict[int, List[Dict[str, Any]]] = {1: [mk_node(s) for s in level1_spans]}
+
+    # Attach deeper levels
+    for lvl in range(2, max_level + 1):
+        parents = by_level.get(lvl - 1, [])
+        kids    = by_level.get(lvl, [])
+        if not parents or not kids:
+            continue
+        parent_nodes = nodes_by_level[lvl - 1]
+        # two-pointer sweep
+        p = 0
+        cur_parent = parents[p] if parents else None
+        for child in kids:
+            while cur_parent and child.start_jd_tt >= cur_parent.end_jd_tt - 1e-12 and p + 1 < len(parents):
+                p += 1
+                cur_parent = parents[p]
+            if not cur_parent:
+                break
+            if (child.start_jd_tt + 1e-12) >= cur_parent.start_jd_tt and (child.end_jd_tt - 1e-12) <= cur_parent.end_jd_tt:
+                node = mk_node(child)
+                # find the corresponding parent node (same index p)
+                parent_nodes[p]["children"].append(node)
+                nodes_by_level.setdefault(lvl, []).append(node)
+
+    # Strip empty children lists at leaves for cleanliness
+    def strip_none_children(n: Dict[str, Any]) -> Dict[str, Any]:
+        if "children" in n:
+            if n["children"] is None or len(n["children"]) == 0 or n["level"] >= max_level:
+                n.pop("children", None)
+            else:
+                n["children"] = [strip_none_children(k) for k in n["children"]]
+        return n
+
+    return [strip_none_children(n) for n in nodes_by_level[1]]
 
 # ───────────────────────── moon longitude + timescales ─────────────────────────
 def _moon_nirayana_deg_at(jd_tt: float, *, ayanamsa_key: str) -> float:
@@ -340,7 +444,7 @@ def compute_dasha(
     options: Dict[str, Any] | None = None
 ) -> Dict[str, Any]:
     """
-    Registry-compatible entrypoint.
+    Registry-compatible entrypoint. (Signature unchanged)
 
     options:
       - start_mode: "after" | "same"
@@ -375,7 +479,7 @@ def compute_dasha(
 
 def compute_ashtottari(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Route-friendly wrapper.
+    Route-friendly wrapper. (Signature & behavior unchanged)
 
     Input:
       - jd_tt OR {date,time,tz}
