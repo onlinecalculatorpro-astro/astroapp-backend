@@ -197,10 +197,10 @@ _ENGINE_SPECS: Tuple[_DashaSpec, ...] = (
     ),
     _DashaSpec(
         key="ashtottari",
-        title="Aṣṭottarī (108y)",
-        module="app.core.dasha_ashtottari",
+        title="Aṣṭottarī (108y) — 5 levels",
+        module="app.core.ashtottari_dasha",  # fixed module path
         fn_candidates=("compute_dasha", "compute_ashtottari", "build_dasha_tree", "generate_dasha"),
-        levels=("maha", "antara", "pratyantara", "sookshma"),
+        levels=("maha", "antara", "pratyantara", "sookshma", "prana"),  # 5-level capability
         anchor="moon_nakshatra",
     ),
     _DashaSpec(
@@ -244,7 +244,6 @@ def list_supported_dashas() -> List[Dict[str, Any]]:
 
 
 # ───────────────────────────── Tree schema helpers ────────────────────────────
-
 # Standard node keys: level(int, 1..N), lord(str), label(str), start_jd_tt, end_jd_tt, children(list)
 
 def _norm_node(n: Dict[str, Any]) -> Dict[str, Any]:
@@ -282,7 +281,47 @@ def _norm_tree(tree: Dict[str, Any]) -> Dict[str, Any]:
     return root
 
 
+def _envelope_from_forest(nodes: List[Dict[str, Any]], *, label: str = "Dasha", level_hint: int | None = None) -> Dict[str, Any]:
+    """Wrap a list of sibling level-1 nodes into a single envelope tree node."""
+    if not nodes:
+        return {"level": 1, "lord": None, "label": label, "start_jd_tt": 0.0, "end_jd_tt": 0.0, "children": []}
+    s0 = min(float(n.get("start_jd_tt") or n.get("start") or 0.0) for n in nodes)
+    e1 = max(float(n.get("end_jd_tt") or n.get("end") or 0.0) for n in nodes)
+    # Keep envelope out of semantic levels by choosing 0 if children are 1+, else 1.
+    child_levels = [int(n.get("level") or 1) for n in nodes]
+    env_level = (min(child_levels) - 1) if min(child_levels) > 0 else 1
+    if isinstance(level_hint, int):
+        env_level = level_hint
+    return {
+        "level": int(env_level),
+        "lord": None,
+        "label": str(label),
+        "start_jd_tt": _q_jd(s0),
+        "end_jd_tt": _q_jd(e1),
+        "children": nodes,
+    }
+
+
 # ───────────────────────────── Engine dispatch ────────────────────────────────
+
+def _coerce_engine_tree(res: Dict[str, Any], spec: _DashaSpec) -> Dict[str, Any]:
+    """
+    Accept multiple engine shapes and return a normalized single 'tree' node:
+      - {'tree': {...}} → normalize
+      - {'nested': [...]} → wrap into an envelope and normalize
+      - direct node {'start_jd_tt', 'end_jd_tt', ...} → normalize
+    """
+    # Native 'tree'
+    if isinstance(res, dict) and "tree" in res:
+        return _norm_tree(res["tree"])
+    # Forest 'nested' (e.g., Ashtottari engine)
+    if isinstance(res, dict) and "nested" in res and isinstance(res["nested"], list):
+        env = _envelope_from_forest(res["nested"], label=(res.get("scheme") or spec.key or "Dasha"))
+        return _norm_tree(env)
+    # Direct node
+    if isinstance(res, dict) and all(k in res for k in ("start_jd_tt", "end_jd_tt")):
+        return _norm_tree(res)
+    raise ValueError(f"Engine returned unsupported shape for {spec.key}")
 
 def _call_engine(spec: _DashaSpec, jd_tt_birth: float, ay_key: str, ay_deg: float, *, depth: Optional[int], options: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -293,8 +332,8 @@ def _call_engine(spec: _DashaSpec, jd_tt_birth: float, ay_key: str, ay_deg: floa
         compute_dasha(jd_tt_birth, ayanamsa_key, depth=None, options=None) -> dict
         compute_dasha(jd_tt_birth, depth=None, **options) -> dict
 
-    Engine should return dict with keys at least: {'levels': [...], 'tree': {...}}
-    If engine returns only 'tree', we will attach levels from spec.
+    Engine should return dict with keys at least: {'levels': [...], 'tree': {...}}  OR
+    may return {'nested': [...]} which we will envelope into a single tree node.
     """
     mod = importlib.import_module(spec.module)
     fn = None
@@ -316,7 +355,6 @@ def _call_engine(spec: _DashaSpec, jd_tt_birth: float, ay_key: str, ay_deg: floa
     res = None
     last_err = None
     for kw in kwargs_variants:
-        # Strip Nones the engine may not accept
         k2 = {k: v for k, v in kw.items() if v is not None}
         try:
             res = fn(**k2)
@@ -345,19 +383,16 @@ def _call_engine(spec: _DashaSpec, jd_tt_birth: float, ay_key: str, ay_deg: floa
     if res is None:
         raise RuntimeError(f"Engine call failed for {spec.key}: {last_err}")
 
-    # Normalize engine output
-    if isinstance(res, dict) and "tree" in res:
-        out = dict(res)
-        out["tree"] = _norm_tree(res["tree"])
-        if "levels" not in out or not out["levels"]:
-            out["levels"] = list(spec.levels)
-        return out
-
-    # If engine directly returned a node (tree), wrap
-    if isinstance(res, dict) and all(k in res for k in ("start_jd_tt", "end_jd_tt")):
-        return {"levels": list(spec.levels), "tree": _norm_tree(res)}
-
-    raise ValueError(f"Engine returned unsupported shape for {spec.key}")
+    # Normalize engine output → single tree + levels
+    tree = _coerce_engine_tree(res, spec)
+    out_levels = None
+    if isinstance(res, dict):
+        lv = res.get("levels")
+        if isinstance(lv, (list, tuple)) and lv:
+            out_levels = list(lv)
+    if not out_levels:
+        out_levels = list(spec.levels)
+    return {"levels": out_levels, "tree": tree}
 
 
 def _find_spec(system: str) -> _DashaSpec:
@@ -497,7 +532,7 @@ def _options_key(options: Dict[str, Any]) -> Tuple[Tuple[str, Any], ...]:
     if not options:
         return tuple()
     # Sort keys for stable cache key; coerce floats/ints/strs
-    items = []
+    items: List[Tuple[str, Any]] = []
     for k in sorted(options.keys()):
         v = options[k]
         if isinstance(v, (float, int, str, bool)) or v is None:
