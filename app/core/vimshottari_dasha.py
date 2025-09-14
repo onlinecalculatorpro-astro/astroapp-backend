@@ -1,45 +1,20 @@
 # app/core/vimshottari_dasha.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-
 """
 Vimśottarī Daśā — Mahā → Antar → Pratyantar → Sūkṣma → Prāṇa
 
-Features
-- Full 5-tier sub-period structure with exact parent→child proportional timing.
-- Sidereal-first: Moon’s nirāyaṇa longitude at birth sets the starting Mahādaśā
-  (nakṣatra lord) and the running balance (nakṣatra remainder).
-- Deterministic boundary policy: half-open intervals [start, end); last child in
-  each tier snaps to the parent’s end to avoid floating drift.
-- Windowed generation: build from a requested time window (e.g., from birth for
-  N years, or up to a given end JD).
-- Utilities:
-    • current_dasha_at(birth, query) → lords at all 5 levels
-    • flatten(periods, level=n) → flat timeline lists for UI
-
-Conventions
-- Year length for Vimśottarī is configurable (default 365.25 days) via parameter
-  or environment variable VIM_YEAR_DAYS.
-- Order & years (canonical Parāśara/KP):
-    Ketu 7, Venus 20, Sun 6, Moon 10, Mars 7, Rahu 18, Jupiter 16, Saturn 19, Mercury 17.
-- Antardaśā sequence inside a Mahādaśā starts with the Mahādaśā lord, then follows
-  the standard 9-lord cycle; child durations are proportional to parent × (years/120).
-
-Inputs
-- You can pass a birth JD_TT directly, or civil date/time/tz (uses timescales).
-- Ayanāṁśa: pass a float (deg) or a key (e.g., "lahiri"). If a key is provided,
-  we call app.core.ayanamsa.get_ayanamsa_deg(jd_tt, key).
-- Ephemeris: app.core.ephemeris_adapter.EphemerisAdapter (ecliptic-of-date).
-
-Outputs
-- Period dicts have: {'level':1..5,'lord':"Ketu"..,"start_jd_tt","end_jd_tt","children":[...]}
-- Flatteners return rows with 'path' = [maha,antar,...] and clipped [start,end).
+- Exact proportional timing with half-open intervals [start, end)
+- Sidereal-first (nakṣatra lord + remainder from Moon nirāyaṇa at birth)
+- Window-aware generation (build only what overlaps your window)
+- Utilities: current_dasha_at, flatten_periods
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Iterable, Literal
+from typing import Any, Dict, List, Optional, Tuple, Iterable
 import os
 import math
+from functools import lru_cache
 
 # ── Optional time helpers (same pattern as panchanga.py) ──
 try:
@@ -71,6 +46,7 @@ except Exception:
 # ─────────────────────────────────────────────────────────────────────────────
 VIM_ORDER: Tuple[str, ...] = ("Ketu","Venus","Sun","Moon","Mars","Rahu","Jupiter","Saturn","Mercury")
 VIM_YEARS: Dict[str, int] = {"Ketu":7,"Venus":20,"Sun":6,"Moon":10,"Mars":7,"Rahu":18,"Jupiter":16,"Saturn":19,"Mercury":17}
+_RATIOS: Dict[str, float] = {k: VIM_YEARS[k] / 120.0 for k in VIM_ORDER}
 _NAK_WIDTH = 360.0 / 27.0  # 13°20'
 
 # Default year length (days) for Vimśottarī arithmetic; configurable via env
@@ -91,12 +67,17 @@ def _kahan_sum(vals: Iterable[float]) -> float:
         s = t
     return s
 
-def _rotate_cycle(start_lord: str) -> List[str]:
+@lru_cache(maxsize=16)
+def _cycle(start_lord: str) -> Tuple[str, ...]:
     s = start_lord.strip().title()
     if s not in VIM_ORDER:
         raise ValueError(f"unknown dasha lord: {start_lord}")
     i = VIM_ORDER.index(s)
-    return list(VIM_ORDER[i:] + VIM_ORDER[:i])
+    return tuple(VIM_ORDER[i:] + VIM_ORDER[:i])
+
+@lru_cache(maxsize=16)
+def _cycle_ratios(order: Tuple[str, ...]) -> Tuple[float, ...]:
+    return tuple(_RATIOS[l] for l in order)
 
 # Optional constants_vedic override for nakṣatra lords (27-long list)
 try:
@@ -126,22 +107,22 @@ def _timescales_from_civil(date: str, time: str, tz: str) -> Tuple[float, float,
                     jd_ut = float(out.get("jd_ut") or out.get("jd_utc"))
                     return jd_ut, float(out["jd_tt"]), float(out.get("jd_ut1", jd_ut))
                 if isinstance(out, (list, tuple)) and len(out) >= 3:
-                    ju, jt, j1 = map(float, out[:3])
-                    return ju, jt, j1
+                    ju, jt, j1 = map(float, out[:3]); return ju, jt, j1
     if _ts is None:
         raise ValueError("timescales module not available")
     jd_ut = float(_ts.julian_day_utc(date, time, tz))
-    # monthly ΔT if available
     try:
         y, m = map(int, date.split("-")[:2])
         jd_tt = float(_ts.jd_tt_from_utc_jd(jd_ut, y, m))
     except Exception:
         jd_tt = jd_ut + 69.0/86400.0
-    return jd_ut, jd_tt, jd_ut  # no UT1 drift by default
+    return jd_ut, jd_tt, jd_ut
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Ephemeris compatibility factory
+# Ephemeris compatibility + cache
 # ─────────────────────────────────────────────────────────────────────────────
+_EPH_ADAPTER = None  # cached instance
+
 def _make_ephem(frame: str = "ecliptic-of-date"):
     """
     Build EphemerisAdapter regardless of whether 'timescale'/'planets'
@@ -166,11 +147,9 @@ def _make_ephem(frame: str = "ecliptic-of-date"):
             cfg = None  # type: ignore[assignment]
 
     if cfg is not None:
-        # Adapter(cfg, timescale=TS, planets=PLANETS)
         try:
             return EphemerisAdapter(cfg, timescale=TS, planets=PLANETS)  # type: ignore[call-arg]
         except TypeError:
-            # Adapter(cfg) only
             try:
                 return EphemerisAdapter(cfg)  # type: ignore[call-arg]
             except TypeError:
@@ -185,13 +164,19 @@ def _make_ephem(frame: str = "ecliptic-of-date"):
         except TypeError as e:
             raise RuntimeError(f"EphemerisAdapter incompatible signatures: {e}")
 
+def _get_ephem():
+    global _EPH_ADAPTER
+    if _EPH_ADAPTER is None:
+        _EPH_ADAPTER = _make_ephem("ecliptic-of-date")
+    return _EPH_ADAPTER
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Moon nirāyaṇa longitude & nakṣatra / balance
 # ─────────────────────────────────────────────────────────────────────────────
 def _moon_longitude_tropical(jd_tt: float) -> float:
     if not _EPH_OK:
         raise RuntimeError("EphemerisAdapter unavailable; enable app.core.ephemeris_adapter")
-    ep = _make_ephem("ecliptic-of-date")
+    ep = _get_ephem()
     rows = ep.ecliptic_longitudes(float(jd_tt), ["Moon"]).get("results", [])
     if not rows:
         raise RuntimeError("ephemeris returned no Moon longitude")
@@ -210,8 +195,7 @@ def _ayanamsa_deg(jd_tt: float, ayanamsa: Optional[Any]) -> float:
 def _nak_lord_from_index(idx0: int) -> str:
     if _NAK_LORDS:
         return _NAK_LORDS[idx0]
-    # Cycle by 9, starting Ashwini → Ketu
-    return VIM_ORDER[idx0 % 9]
+    return VIM_ORDER[idx0 % 9]  # Ashwini → Ketu
 
 @dataclass
 class NakshatraInfo:
@@ -239,43 +223,45 @@ def nakshatra_info_from_jd(jd_tt: float, *, ayanamsa: Optional[Any] = "lahiri") 
 # ─────────────────────────────────────────────────────────────────────────────
 # Core partitioning
 # ─────────────────────────────────────────────────────────────────────────────
-def _partition_by_weights(start: float, end: float, order: List[str]) -> List[Tuple[str, float, float]]:
+def _partition_by_weights(start: float, end: float, order: Tuple[str, ...]) -> List[Tuple[str, float, float]]:
     """
     Partition [start,end) into 9 children according to Vim years / 120.
     The last child snaps to 'end' to ensure exact coverage.
     """
     span = float(end - start)
-    weights = [VIM_YEARS[l] / 120.0 for l in order]
-    # raw durations
-    durs = [span * w for w in weights]
-    # adjust last
+    ratios = _cycle_ratios(order)
+    durs = [span * r for r in ratios]
     tail = span - _kahan_sum(durs[:-1])
     durs[-1] = tail
     out = []
     t = start
     for lord, d in zip(order, durs):
-        a = t
-        b = t + d
+        a = t; b = t + d
         out.append((lord, a, b))
         t = b
-    # numerical guard
     out[-1] = (out[-1][0], out[-1][1], end)
     return out
 
-def _build_children(parent_lord: str, start: float, end: float, level: int, max_level: int) -> List[Dict[str, Any]]:
+def _build_children_windowed(parent_lord: str, a: float, b: float, level: int, max_level: int, w0: float, w1: float) -> List[Dict[str, Any]]:
     """
-    Recursively build 9-way subperiods down to max_level (<=5).
+    Recursively build 9-way subperiods down to max_level (<=5), but only keep
+    segments overlapping [w0, w1). Children are generated from the un-clipped
+    parent bounds to preserve exact proportional timing, then clipped once.
     """
     if level >= max_level:
         return []
-    order = _rotate_cycle(parent_lord)
-    parts = _partition_by_weights(start, end, order)
-    children: List[Dict[str, Any]] = []
-    for lord, a, b in parts:
-        node = {"level": level + 1, "lord": lord, "start_jd_tt": a, "end_jd_tt": b, "children": []}
-        node["children"] = _build_children(lord, a, b, level + 1, max_level)
-        children.append(node)
-    return children
+    order = _cycle(parent_lord)
+    parts = _partition_by_weights(a, b, order)
+    out: List[Dict[str, Any]] = []
+    for lord, aa, bb in parts:
+        c = _clip_interval(aa, bb, w0, w1)
+        if c is None:
+            continue
+        ca, cb = c
+        node = {"level": level + 1, "lord": lord, "start_jd_tt": ca, "end_jd_tt": cb, "children": []}
+        node["children"] = _build_children_windowed(lord, aa, bb, level + 1, max_level, ca, cb)
+        out.append(node)
+    return out
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Top-level generation (Mahādaśā stream with clipping)
@@ -288,41 +274,22 @@ def _maha_stream(start_maha_lord: str, maha0_start: float, jd_end: float, *, yea
     seq = []
     t = float(maha0_start)
     lord_idx = VIM_ORDER.index(start_maha_lord)
-    # Generate up to two full cycles worst-case
-    cap = 9 * 2 + 2
+    cap = 9 * 2 + 2  # two cycles worst-case
     for _ in range(cap):
         lord = VIM_ORDER[(lord_idx) % 9]
         dur_days = VIM_YEARS[lord] * year_days
-        a = t
-        b = a + dur_days
+        a = t; b = a + dur_days
         seq.append((lord, a, b))
-        t = b
-        lord_idx += 1
-        if a > jd_end + 365.0:  # guard break
+        t = b; lord_idx += 1
+        if a > jd_end + 365.0:
             break
     return seq
 
 def _clip_interval(a: float, b: float, w0: float, w1: float) -> Optional[Tuple[float, float]]:
-    aa = max(a, w0)
-    bb = min(b, w1)
+    aa = max(a, w0); bb = min(b, w1)
     if bb <= aa + _EPS:
         return None
     return (aa, bb)
-
-def _clip_tree(node: Dict[str, Any], w0: float, w1: float) -> Optional[Dict[str, Any]]:
-    c = _clip_interval(node["start_jd_tt"], node["end_jd_tt"], w0, w1)
-    if c is None:
-        return None
-    a, b = c
-    out = dict(node)
-    out["start_jd_tt"] = a
-    out["end_jd_tt"] = b
-    out["children"] = []
-    for ch in node.get("children", []):
-        cc = _clip_tree(ch, a, b)  # child window within clipped parent
-        if cc is not None:
-            out["children"].append(cc)
-    return out
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Public API
@@ -377,19 +344,16 @@ def generate_vimshottari_tree(
     # Build Mahādaśā stream (may start before birth)
     maha_seq = _maha_stream(maha_lord0, maha0_start, jd1, year_days=yd)
 
-    # Assemble tree with clipping to [jd0, jd1)
+    # Assemble tree with clipping to [jd0, jd1) and window-aware children
     out_periods: List[Dict[str, Any]] = []
     for lord, a, b in maha_seq:
-        # skip if no overlap
         clipped = _clip_interval(a, b, jd0, jd1)
         if clipped is None:
             continue
-        # build full nested tree for the COMPLETE parent, then clip tree to window
-        root = {"level": 1, "lord": lord, "start_jd_tt": a, "end_jd_tt": b, "children": []}
-        root["children"] = _build_children(lord, a, b, level=1, max_level=levels)
-        clipped_root = _clip_tree(root, jd0, jd1)
-        if clipped_root:
-            out_periods.append(clipped_root)
+        ca, cb = clipped
+        root = {"level": 1, "lord": lord, "start_jd_tt": ca, "end_jd_tt": cb, "children": []}
+        root["children"] = _build_children_windowed(lord, a, b, level=1, max_level=levels, w0=ca, w1=cb)
+        out_periods.append(root)
 
     return {
         "ok": True,
@@ -419,8 +383,7 @@ def current_dasha_at(
     """
     Return current (Mahā..Prāṇa) at the query moment.
 
-    If a prebuilt 'tree' (from generate_vimshottari_tree) is not provided, we’ll
-    build a minimal window spanning the needed time.
+    If a prebuilt 'tree' is not provided, a 130y window is built around birth.
     """
     if query_jd_tt is None:
         if not (isinstance(date, str) and isinstance(time, str) and isinstance(tz, str)):
@@ -431,37 +394,33 @@ def current_dasha_at(
     if tree is None:
         if birth_jd_tt is None:
             raise ValueError("Provide tree or birth_jd_tt")
-        # minimal window around query: ±1 day; we’ll extend if it lands outside
         yd = float(year_days if isinstance(year_days, (int, float)) else VIM_YEAR_DAYS)
-        # Build 130 years to be safe
         tree = generate_vimshottari_tree(birth_jd_tt=float(birth_jd_tt), ayanamsa=ayanamsa, levels=int(levels),
                                          span_years=130.0, year_days=yd)
 
     out: Dict[str, Any] = {"ok": False, "levels": int(levels)}
     path: List[str] = []
 
-    def find_level(nodes: List[Dict[str, Any]], when: float, depth: int) -> Optional[Dict[str, Any]]:
+    def find_level(nodes: List[Dict[str, Any]], when: float) -> Optional[Dict[str, Any]]:
         for n in nodes:
             if n["start_jd_tt"] - _EPS <= when < n["end_jd_tt"] - _EPS:
                 return n
         return None
 
     periods = tree.get("periods", []) if isinstance(tree, dict) else []
-    n1 = find_level(periods, t, 1)
-    if not n1:
+    n = find_level(periods, t)
+    if not n:
         return {"ok": False, "error": "query_outside_window"}
-    path.append(n1["lord"])
-    n = n1
+    path.append(n["lord"])
     for _lvl in range(2, int(levels) + 1):
         kids = n.get("children", [])
-        n2 = find_level(kids, t, _lvl)
+        n2 = find_level(kids, t)
         if not n2:
             break
         path.append(n2["lord"])
         n = n2
 
     out.update({"ok": True, "path": path, "start_jd_tt": n["start_jd_tt"], "end_jd_tt": n["end_jd_tt"]})
-    # Also expose each level explicitly if present
     keys = ["maha","antar","pratyantar","sukshma","prana"]
     for i, lord in enumerate(path):
         out[keys[i]] = lord
@@ -504,8 +463,9 @@ def compute_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
         span_years: float       default 120
         end_jd_tt: float        optional
         year_days: float        default env VIM_YEAR_DAYS or 365.25
-        query_jd_tt | (q_date,q_time,q_tz)   optional → return 'current' in response
-        flatten_level: 1..5     optional → return flattened list too
+        query_jd_tt | (q_date,q_time,q_tz)   optional → 'current'
+        flatten_level: 1..5     optional → also return flattened list;
+                                 if provided and < levels, we build only to flatten_level for speed.
     """
     birth_jd_tt = payload.get("birth_jd_tt")
     date = payload.get("date"); time = payload.get("time"); tz = payload.get("tz")
@@ -515,10 +475,17 @@ def compute_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
     end_jd_tt = payload.get("end_jd_tt")
     year_days = payload.get("year_days")
 
+    # If caller only needs flatten_level = L (and L < levels), cap build depth for performance.
+    build_levels = levels
+    flat_level = payload.get("flatten_level")
+    if isinstance(flat_level, int) and 1 <= flat_level <= 5:
+        build_levels = max(1, min(5, int(flat_level)))
+
     tree = generate_vimshottari_tree(
         birth_jd_tt=birth_jd_tt,
         date=date, time=time, tz=tz,
-        ayanamsa=ay, levels=levels, span_years=span_years, end_jd_tt=end_jd_tt, year_days=year_days
+        ayanamsa=ay, levels=build_levels,
+        span_years=span_years, end_jd_tt=end_jd_tt, year_days=year_days
     )
     out: Dict[str, Any] = {"ok": True, "tree": tree}
 
@@ -532,8 +499,7 @@ def compute_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
         )
 
     # Flatten (optional)
-    flat_level = payload.get("flatten_level")
-    if isinstance(flat_level, int) and 1 <= flat_level <= levels:
+    if isinstance(flat_level, int) and 1 <= flat_level <= 5:
         out["flat"] = flatten_periods(tree.get("periods", []), level=int(flat_level))
 
     return out
@@ -542,11 +508,10 @@ def compute_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
 # Self-checks
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Quick numeric sanity (no I/O): synthetic birth at J2000 TT
-    jd0 = 2451545.0
+    # Quick numeric sanity (no external I/O beyond ephemeris singleton)
+    jd0 = 2451545.0  # J2000 TT
     t = generate_vimshottari_tree(birth_jd_tt=jd0, ayanamsa="lahiri", levels=5, span_years=120.0)
     assert t["ok"] and t["periods"], "Tree generation failed"
-    # Flatten one level and check coverage continuity
     L1 = flatten_periods(t["periods"], level=1)
     for i in range(1, len(L1)):
         assert abs(L1[i-1]["end_jd_tt"] - L1[i]["start_jd_tt"]) < 1e-6
