@@ -98,19 +98,36 @@ def _timescales_from_payload(payload: Dict[str, Any]) -> _TSOut:
     t = payload.get("time") or birth.get("time") or "12:00:00"
     tz = payload.get("tz") or payload.get("place_tz") or birth.get("tz") or "UTC"
 
-    # Preferred: time_kernel dynamic helpers
+    # DUT1 from payload (seconds) with safe default
+    try:
+        dut1_sec = float(payload.get("dut1_seconds", payload.get("dut1", 0.0)) or 0.0)
+    except Exception:
+        dut1_sec = 0.0
+
+    # Preferred: time_kernel dynamic helpers (try signatures that include DUT1)
     if _tk is not None:
         for fname in ("timescales_from_civil", "compute_timescales", "build_timescales", "to_timescales", "from_civil"):
             fn = getattr(_tk, fname, None)
-            if callable(fn):
+            if not callable(fn):
+                continue
+            attempts = (
+                lambda: fn(date=d, time=t, tz=tz, dut1_seconds=dut1_sec),
+                lambda: fn(date=d, time=t, tz=tz, dut1=dut1_sec),
+                lambda: fn(d, t, tz, dut1_sec),
+                lambda: fn(d, t, tz),                          # legacy 3-arg
+                lambda: fn(date=d, time=t, tz=tz),              # legacy kw
+            )
+            for call in attempts:
                 try:
-                    out = fn(date=d, time=t, tz=tz)
+                    out = call()
                 except TypeError:
-                    out = fn(d, t, tz)
+                    continue
+                except Exception:
+                    continue
                 if isinstance(out, dict):
-                    ju = float(out.get("jd_ut") or out.get("jd_utc"))
-                    jt = float(out["jd_tt"])
-                    j1 = float(out["jd_ut1"])
+                    ju = float(out.get("jd_ut") or out.get("jd_utc") or out.get("jd_utc"))
+                    jt = float(out.get("jd_tt") or out.get("tt") or out.get("jdtt"))
+                    j1 = float(out.get("jd_ut1") or (ju + dut1_sec / 86400.0))
                     return _TSOut(_q_jd(ju), _q_jd(jt), _q_jd(j1), warns)
                 if isinstance(out, (list, tuple)) and len(out) >= 3:
                     ju, jt, j1 = map(float, out[:3])
@@ -133,13 +150,9 @@ def _timescales_from_payload(payload: Dict[str, Any]) -> _TSOut:
     except Exception:
         jd_tt = jd_ut + 69.0 / 86400.0  # constant ΔT fallback
         warns.append("deltaT_fallback_69s")
-    # If DUT1 is known in payload, respect it
-    dut1 = payload.get("dut1") or payload.get("dut1_seconds") or 0.0
-    try:
-        jd_ut1 = jd_ut + float(dut1) / 86400.0
-    except Exception:
-        jd_ut1 = jd_ut
 
+    # Respect DUT1 if present
+    jd_ut1 = jd_ut + dut1_sec / 86400.0
     return _TSOut(_q_jd(jd_ut), _q_jd(jd_tt), _q_jd(jd_ut1), warns)
 
 
