@@ -259,13 +259,18 @@ def _porphyry(asc: float, mc: float) -> List[float]:
     return _fill_opposites(cusps)
 
 def _morinus(ramc: float, eps: float) -> List[float]:
-    # tan λ = cos ε · tan(ramc + ad), ad ∈ {0, 30, 60, 90, 120, 150}
+    # tan λ = cos ε · tan(F)  ⇒  use atan2(sinF·cosε, cosF) to keep quadrant
     def cusp(ad: float) -> float:
         F = _norm_deg(ramc + ad)
-        return _atan2d(_tand(F) * _cosd(eps), 1.0)
+        return _atan2d(_sind(F) * _cosd(eps), _cosd(F))
+
     cusps = _blank()
-    cusps[9] = cusp(0.0);  cusps[10] = cusp(30.0); cusps[11] = cusp(60.0)
-    cusps[0] = cusp(90.0); cusps[1]  = cusp(120.0); cusps[2]  = cusp(150.0)
+    cusps[9]  = cusp(0.0)    # 10th = MC
+    cusps[10] = cusp(30.0)
+    cusps[11] = cusp(60.0)
+    cusps[0]  = cusp(90.0)
+    cusps[1]  = cusp(120.0)
+    cusps[2]  = cusp(150.0)
     return _fill_opposites(cusps)
 
 def _regiomontanus(phi: float, ramc: float, eps: float, asc: float, mc: float) -> List[float]:
