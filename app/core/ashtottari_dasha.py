@@ -3,39 +3,53 @@
 from __future__ import annotations
 
 """
-Ashtottari Daśā — 108-year cycle with five nested levels (Mahā → Antar → Pratyantar → Sūkṣma → Prāṇa)
+Ashtottari Daśā — 108-year cycle with five nested levels
+(Mahā → Antar → Pratyantar → Sūkṣma → Prāṇa)
 
-Scope & targets
-- Gold-standard numerics: deterministic, no hidden randomness, high-precision time handling via time_kernel/timescales if available.
-- 8-lord sequence totaling 108 years:
-    Order (cyclic): Sun(6), Moon(15), Mars(8), Mercury(17), Saturn(10), Jupiter(19), Rahu(12), Venus(21).
-- Start lord from Moon’s birth nakṣatra using the standard Kr̥ttikādi mapping (see _KRITTIKADI_MAP).
-- Balance at birth: remaining fraction of the *current nakṣatra* × mahādaśā years of its lord.
-- Sub-periods: each lower level scales proportionally by (years_of_sub_lord / 108) and follows the same 8-lord order.
-  Default Antar sequence begins with the planet *after* the mahādaśā lord (per Asṭottarī convention);
-  set start_mode="same" to begin each level with its parent lord.
+Gold-ready core (v2.0)
+----------------------
+- Deterministic numerics with high-precision Decimal where multiplicative depth matters.
+- Canonical 8-lord order totaling 108 years:
+    Sun(6), Moon(15), Mars(8), Mercury(17), Saturn(10), Jupiter(19), Rahu(12), Venus(21).
+- Start lord from Moon’s *birth* nakṣatra via Kṛttikādi mapping.
+- Birth balance: remaining fraction of the current nakṣatra × mahādaśā years of the start lord.
+- Sub-periods at every deeper level scale by (years(sub-lord) / 108) and follow the same 8-lord order.
+  start_mode="after" (default) begins each sublevel with the planet AFTER the parent;
+  start_mode="same" begins with the parent planet itself.
 
 Public API
-    compute_ashtottari(payload: dict) -> dict
-      Inputs (either jd_tt directly OR civil date/time/tz):
-        - jd_tt (float); optionally date="YYYY-MM-DD", time="HH:MM[:SS]", tz="Area/City"
-        - ayanamsa (str) default "lahiri"
-        - start_mode: "after" (default) or "same"  # antar/pratyantar… start policy
-        - levels: 1..5 (default 5)
-        - year_days: float (days per year, default 365.24219)
-        - limit_jd_tt: optional end JD_TT to stop schedule
-      Returns nested timeline with exact JD_TT boundaries for all requested levels.
+----------
+- compute_dasha(jd_tt_birth, ayanamsa_key="lahiri", ayanamsa_deg=None, depth=None, options=None) -> dict
+  Registry-friendly wrapper. Returns {"tree": <root>, "levels": ("maha","antara","pratyantara","sookshma","prana")[:k]}.
 
-    ashtottari_schedule(jd_start_tt: float, moon_nirayana_deg: float, *, ayanamsa_key="lahiri",
-                        start_mode="after", levels=5, year_days=365.24219, limit_jd_tt=None) -> dict
+- compute_ashtottari(payload: dict) -> dict
+  Route-friendly wrapper that accepts jd_tt OR {date,time,tz}. Returns a rich schedule object.
+
+- ashtottari_schedule(jd_start_tt, moon_nirayana_deg, start_mode="after", levels=5, year_days=365.24219, limit_jd_tt=None) -> dict
+  Core timeline builder.
+
+Notes
+-----
+- Times are in TT (Terrestrial Time) Julian Days; intervals are conceptually closed-open [start, end).
+- For sidereal lon: nirāyaṇa = (tropical - ayanāṁśa) % 360.
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Iterable
+from typing import Any, Dict, List, Optional, Tuple
 from decimal import Decimal, getcontext
 import math
 
-# High-precision ephemeris / timescales (optional but recommended)
+__all__ = [
+    "ASHTOTTARI_ORDER",
+    "ASHTOTTARI_YEARS",
+    "ASHTOTTARI_TOTAL_YEARS",
+    "compute_dasha",
+    "compute_ashtottari",
+    "ashtottari_schedule",
+]
+
+# ───────────────────────── Optional ephemeris / timescales ─────────────────────────
+
 try:
     from app.core.ephemeris_adapter import EphemerisAdapter, Config as EphemConfig
     from app.core.ephem_singleton import TS, PLANETS
@@ -58,9 +72,15 @@ except Exception:
 from app.core.ayanamsa import get_ayanamsa_deg
 from app.core.constants_vedic import NAKSHATRAS_27
 
-# ───────────────────────── constants / helpers ─────────────────────────
+# ───────────────────────── numerics / helpers ─────────────────────────
 
-getcontext().prec = 34  # ample headroom for nested Decimal products
+# Plenty of precision for nested fractional products
+getcontext().prec = 34
+
+# JD quantization to keep boundary equality stable across engines (~0.009 s)
+_JD_QUANT = 1e-7
+def _q(x: float) -> float:
+    return round(float(x) / _JD_QUANT) * _JD_QUANT
 
 def _norm360(x: float) -> float:
     r = math.fmod(float(x), 360.0)
@@ -69,7 +89,7 @@ def _norm360(x: float) -> float:
 _NAK_WIDTH = 360.0 / 27.0  # 13°20′
 
 ASHTOTTARI_ORDER: Tuple[str, ...] = (
-    "Sun","Moon","Mars","Mercury","Saturn","Jupiter","Rahu","Venus"
+    "Sun", "Moon", "Mars", "Mercury", "Saturn", "Jupiter", "Rahu", "Venus"
 )
 ASHTOTTARI_YEARS: Dict[str, int] = {
     "Sun": 6, "Moon": 15, "Mars": 8, "Mercury": 17,
@@ -77,22 +97,22 @@ ASHTOTTARI_YEARS: Dict[str, int] = {
 }
 ASHTOTTARI_TOTAL_YEARS = 108
 
-# Kr̥ttikādi nakṣatra→start-lord mapping (nak index 1..27):
+# Kṛttikādi nakṣatra→start-lord mapping (nak index 1..27):
 # Sun: 3–5; Moon: 6–9; Mars: 10–12; Mercury: 13–16; Saturn: 17–19; Jupiter: 20–22; Rahu: 23–25; Venus: 26–27,1–2
 _KRITTIKADI_MAP: Dict[int, str] = {}
 _KRITTIKADI_RANGES = {
-    "Sun":     [3,4,5],
-    "Moon":    [6,7,8,9],
-    "Mars":    [10,11,12],
-    "Mercury": [13,14,15,16],
-    "Saturn":  [17,18,19],
-    "Jupiter": [20,21,22],
-    "Rahu":    [23,24,25],
-    "Venus":   [26,27,1,2],
+    "Sun":     [3, 4, 5],
+    "Moon":    [6, 7, 8, 9],
+    "Mars":    [10, 11, 12],
+    "Mercury": [13, 14, 15, 16],
+    "Saturn":  [17, 18, 19],
+    "Jupiter": [20, 21, 22],
+    "Rahu":    [23, 24, 25],
+    "Venus":   [26, 27, 1, 2],
 }
-for lord, arr in _KRITTIKADI_RANGES.items():
-    for i in arr:
-        _KRITTIKADI_MAP[int(i)] = lord
+for _lord, _arr in _KRITTIKADI_RANGES.items():
+    for _i in _arr:
+        _KRITTIKADI_MAP[int(_i)] = _lord
 
 def _nak_index(nirayana_lon: float) -> int:
     """1..27 (Aśvinī=1)."""
@@ -114,13 +134,10 @@ def _cycle_from(after_lord: str, *, start_mode: str) -> List[str]:
     Returns the 8-lord sequence for a sublevel.
     start_mode="after": sequence begins from the planet AFTER parent.
     start_mode="same":  sequence begins from the parent planet itself.
-    Always cycles in the canonical ASHTOTTARI_ORDER and spans 8 entries.
+    Always cycles in canonical ASHTOTTARI_ORDER and spans 8 entries.
     """
     base = list(ASHTOTTARI_ORDER)
-    if start_mode == "same":
-        start = after_lord
-    else:
-        start = _lord_after(after_lord)
+    start = after_lord if start_mode == "same" else _lord_after(after_lord)
     i = base.index(start)
     return base[i:] + base[:i]
 
@@ -150,11 +167,18 @@ def _span_days_for_lord(parent_days: Decimal, lord: str) -> Decimal:
     return parent_days * (Decimal(ASHTOTTARI_YEARS[lord]) / Decimal(ASHTOTTARI_TOTAL_YEARS))
 
 def _append_span(spans: List[DashaSpan], level: int, lord: str, t0: Decimal, dur_days: Decimal, *, limit: Optional[Decimal]) -> Decimal:
+    """
+    Append a span, respecting optional limit, and quantize endpoints for stability.
+    """
     t1 = t0 + dur_days
     if limit is not None and t0 >= limit:
         return t1
     end = min(t1, limit) if limit is not None else t1
-    spans.append(DashaSpan(level, lord, float(t0), float(end)))
+    s = _q(float(t0)); e = _q(float(end))
+    # closed-open safety: nudge end if equal to start due to rounding
+    if abs(e - s) < 1e-12:
+        e = _q(s + 1e-9)
+    spans.append(DashaSpan(level, lord, s, e))
     return t1
 
 def ashtottari_schedule(
@@ -167,17 +191,16 @@ def ashtottari_schedule(
     limit_jd_tt: float | None = None
 ) -> Dict[str, Any]:
     """
-    Build a full Ashtottari timeline from a starting epoch and Moon’s nirayana longitude.
+    Build a full Ashtottari timeline from a starting epoch and Moon’s nirāyaṇa longitude.
     Returns nested spans for 1..levels (max 5).
     """
     levels = max(1, min(5, int(levels)))
     start_mode = "after" if str(start_mode).lower().strip() != "same" else "same"
-
     year_days_D = Decimal(str(year_days))
     t0 = Decimal(str(jd_start_tt))
-    t_limit = Decimal(str(limit_jd_tt)) if isinstance(limit_jd_tt, (int,float)) else None
+    t_limit = Decimal(str(limit_jd_tt)) if isinstance(limit_jd_tt, (int, float)) else None
 
-    # Determine start lord by Kr̥ttikādi map
+    # Determine start lord by Kṛttikādi map
     nak_idx = _nak_index(moon_nirayana_deg)
     nak_off = _nak_offset_in_deg(moon_nirayana_deg)  # degrees into current nakṣatra
     start_lord = _KRITTIKADI_MAP[nak_idx]
@@ -189,16 +212,15 @@ def ashtottari_schedule(
 
     # Balance at birth for the very first Mahādaśā
     balance_days = _birth_balance_days_for_lord(nak_off, start_lord, year_days=year_days_D)
-    # Then continue through the rest of the cycle with full durations
+
     spans: List[DashaSpan] = []
 
-    # 1) Mahā
-    # First (partial)
-    dur_first = _years_to_days(Decimal(ASHTOTTARI_YEARS[start_lord]), year_days_D)
+    # 1) Mahā: first (partial)
+    _ = _years_to_days(Decimal(ASHTOTTARI_YEARS[start_lord]), year_days_D)  # duration of full first (not used directly)
     t1 = _append_span(spans, 1, start_lord, t0, balance_days, limit=t_limit)
     t_cur = t1
 
-    # Remaining Mahā in this cycle (full)
+    # Remaining Mahā in this 108y cycle (full durations)
     for lord in maha_cycle[1:]:
         dur = _years_to_days(Decimal(ASHTOTTARI_YEARS[lord]), year_days_D)
         t_next = _append_span(spans, 1, lord, t_cur, dur, limit=t_limit)
@@ -206,12 +228,9 @@ def ashtottari_schedule(
         if t_limit is not None and t_cur >= t_limit:
             break
 
-    # If a limit is given and exceeded, we can stop here (optional)
-    # Else, we keep cycling Mahā periods once more if no limit (rarely needed from a birth context).
-    # Implementation keeps one cycle which is standard for most use-cases.
-
+    # Optionally expand sublevels
     if levels >= 2:
-        _expand_sublevels(spans, start_mode=start_mode, levels=levels, year_days_D=year_days_D, t_limit=t_limit)
+        _expand_sublevels(spans, start_mode=start_mode, levels=levels, t_limit=t_limit)
 
     # Group into nested tree for convenience
     tree = _to_nested(spans, max_level=levels)
@@ -220,8 +239,12 @@ def ashtottari_schedule(
         "scheme": "ashtottari",
         "order": list(ASHTOTTARI_ORDER),
         "years": dict(ASHTOTTARI_YEARS),
-        "start": {"nakshatra_index": nak_idx, "nakshatra_name": NAKSHATRAS_27[nak_idx - 1],
-                  "start_lord": start_lord, "nakshatra_offset_deg": float(nak_off)},
+        "start": {
+            "nakshatra_index": nak_idx,
+            "nakshatra_name": NAKSHATRAS_27[nak_idx - 1],
+            "start_lord": start_lord,
+            "nakshatra_offset_deg": float(nak_off),
+        },
         "year_days": float(year_days),
         "levels": int(levels),
         "spans": [s.__dict__ for s in spans],
@@ -233,22 +256,17 @@ def _expand_sublevels(
     *,
     start_mode: str,
     levels: int,
-    year_days_D: Decimal,
     t_limit: Optional[Decimal]
 ) -> None:
     """
     Populate sublevels in-place up to 'levels' under each Mahā span.
     """
-    # We will collect and append new spans while iterating safely
     all_spans: List[DashaSpan] = list(spans_level1)
 
-    # Helper to add spans under a parent
-    def add_children(parent: DashaSpan, level: int) -> List[DashaSpan]:
+    def _span_children(parent: DashaSpan, level: int) -> List[DashaSpan]:
         # parent duration in Decimal
         p_dur = Decimal(str(parent.end_jd_tt)) - Decimal(str(parent.start_jd_tt))
-        # level sequence
         seq = _cycle_from(parent.lord, start_mode=start_mode)
-        # iterate 8 parts
         t = Decimal(str(parent.start_jd_tt))
         kids: List[DashaSpan] = []
         for lord in seq:
@@ -257,36 +275,41 @@ def _expand_sublevels(
             if t_limit is not None and t >= t_limit:
                 t = t_next
                 continue
-            end = min(t_next, t_limit) if t_limit is not None else t_next
-            kids.append(DashaSpan(level, lord, float(t), float(end)))
+            s = _q(float(t)); e = _q(float(min(t_next, t_limit) if t_limit is not None else t_next))
+            if abs(e - s) < 1e-12:
+                e = _q(s + 1e-9)
+            kids.append(DashaSpan(level, lord, s, e))
             t = t_next
         return kids
 
-    # Level 2..N
-    current_level_spans = [s for s in all_spans if s.level == 1]
+    current = [s for s in all_spans if s.level == 1]
     for level in range(2, levels + 1):
-        next_level_spans: List[DashaSpan] = []
-        for parent in current_level_spans:
-            next_level_spans.extend(add_children(parent, level))
-        all_spans.extend(next_level_spans)
-        current_level_spans = next_level_spans
+        next_level: List[DashaSpan] = []
+        for parent in current:
+            next_level.extend(_span_children(parent, level))
+        all_spans.extend(next_level)
+        current = next_level
 
-    # Replace originals with the full set (sorted)
     spans_level1.clear()
+    # Sort for stable nesting: by level, start time, canonical order index
     spans_level1.extend(sorted(all_spans, key=lambda s: (s.level, s.start_jd_tt, ASHTOTTARI_ORDER.index(s.lord))))
 
 def _to_nested(spans: List[DashaSpan], *, max_level: int) -> List[Dict[str, Any]]:
     """
-    Convert flat spans to a nested tree up to max_level.
+    Convert flat spans to a nested (list of Mahā roots) up to max_level.
     """
-    # Build Mahā buckets
     level1 = [s for s in spans if s.level == 1]
-    # index by (level, parent tuple)
+
     def children_of(parent: DashaSpan, level: int) -> List[DashaSpan]:
-        return [s for s in spans if s.level == level and parent.start_jd_tt <= s.start_jd_tt + 1e-12 and s.end_jd_tt <= parent.end_jd_tt + 1e-12]
+        return [
+            s for s in spans
+            if s.level == level
+            and parent.start_jd_tt <= s.start_jd_tt + 1e-12
+            and s.end_jd_tt <= parent.end_jd_tt + 1e-12
+        ]
 
     def node_for(span: DashaSpan, level: int) -> Dict[str, Any]:
-        node = {"level": level, "lord": span.lord, "start_jd_tt": span.start_jd_tt, "end_jd_tt": span.end_jd_tt}
+        node = {"level": level, "lord": span.lord, "start_jd_tt": float(span.start_jd_tt), "end_jd_tt": float(span.end_jd_tt)}
         if level < max_level:
             kids = children_of(span, level + 1)
             node["children"] = [node_for(k, level + 1) for k in kids]
@@ -297,6 +320,9 @@ def _to_nested(spans: List[DashaSpan], *, max_level: int) -> List[Dict[str, Any]
 # ───────────────────────── orchestration (moon longitude + timescales) ─────────────────────────
 
 def _moon_nirayana_deg_at(jd_tt: float, *, ayanamsa_key: str) -> float:
+    """
+    Compute Moon's nirāyaṇa longitude at jd_tt using ephemeris + chosen ayanāṁśa.
+    """
     if not _EPH_OK:
         raise RuntimeError("EphemerisAdapter unavailable; enable app.core.ephemeris_adapter")
     ephem = EphemerisAdapter(EphemConfig(frame="ecliptic-of-date", timescale=TS, planets=PLANETS))  # type: ignore
@@ -312,7 +338,7 @@ def _timescales_from_civil(date: str, time: str, tz: str) -> Tuple[float, float,
     Returns (jd_ut, jd_tt, jd_ut1). Uses time_kernel if present, else timescales.
     """
     if _tk is not None:
-        for fname in ("timescales_from_civil","compute_timescales","build_timescales","to_timescales","from_civil"):
+        for fname in ("timescales_from_civil", "compute_timescales", "build_timescales", "to_timescales", "from_civil"):
             fn = getattr(_tk, fname, None)
             if callable(fn):
                 try:
@@ -328,9 +354,77 @@ def _timescales_from_civil(date: str, time: str, tz: str) -> Tuple[float, float,
     jd_ut = float(_ts.julian_day_utc(date, time, tz))
     # ΔT estimate by month; fallback constant if needed
     y, m = map(int, date.split("-")[:2])
-    jd_tt = float(_ts.jd_tt_from_utc_jd(jd_ut, y, m)) if hasattr(_ts, "jd_tt_from_utc_jd") else jd_ut + 69.0/86400.0
+    jd_tt = float(_ts.jd_tt_from_utc_jd(jd_ut, y, m)) if hasattr(_ts, "jd_tt_from_utc_jd") else jd_ut + 69.0 / 86400.0
     jd_ut1 = jd_ut
     return jd_ut, jd_tt, jd_ut1
+
+# ───────────────────────── Wrappers ─────────────────────────
+
+_LEVEL_NAMES_5 = ("maha", "antara", "pratyantara", "sookshma", "prana")
+
+def _wrap_root(nested_nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Registry expects a single tree node; wrap the list of Mahā nodes under a synthetic root.
+    """
+    if not nested_nodes:
+        return {"level": 0, "lord": "Ashtottari", "label": "Ashtottari",
+                "start_jd_tt": 0.0, "end_jd_tt": 0.0, "children": []}
+    start = min(n["start_jd_tt"] for n in nested_nodes)
+    end   = max(n["end_jd_tt"] for n in nested_nodes)
+    return {
+        "level": 0,
+        "lord": "Ashtottari",
+        "label": "Ashtottari",
+        "start_jd_tt": float(start),
+        "end_jd_tt": float(end),
+        "children": nested_nodes,
+    }
+
+def compute_dasha(
+    jd_tt_birth: float,
+    ayanamsa_key: str = "lahiri",
+    ayanamsa_deg: float | None = None,   # accepted for signature parity; not used (ayanamsa_key drives ephemeris correction)
+    depth: int | None = None,
+    options: Dict[str, Any] | None = None
+) -> Dict[str, Any]:
+    """
+    Registry-compatible entrypoint (called by dasha_registry).
+
+    options:
+      - start_mode: "after" (default) or "same"
+      - levels: 1..5 (default 5)  # override for depth
+      - year_days: float (default 365.24219)
+      - limit_jd_tt: float | None
+      - moon_nirayana_deg: float (optional override; avoids ephemeris call)
+
+    Returns:
+      {"tree": <root node>, "levels": <tuple of level names>[:k]}
+    """
+    opts = dict(options or {})
+    start_mode = str(opts.get("start_mode", "after")).lower()
+    levels = int(opts.get("levels", depth or 5))
+    levels = max(1, min(5, levels))
+    year_days = float(opts.get("year_days", 365.24219))
+    limit = opts.get("limit_jd_tt")
+    limit = float(limit) if isinstance(limit, (int, float)) else None
+
+    # If caller already computed nirāyaṇa Moon, accept it; else compute via ephemeris.
+    if isinstance(opts.get("moon_nirayana_deg"), (int, float)):
+        moon_nira = float(opts["moon_nirayana_deg"])
+    else:
+        moon_nira = _moon_nirayana_deg_at(float(jd_tt_birth), ayanamsa_key=ayanamsa_key)
+
+    sched = ashtottari_schedule(
+        jd_start_tt=float(jd_tt_birth),
+        moon_nirayana_deg=moon_nira,
+        start_mode=start_mode,
+        levels=levels,
+        year_days=year_days,
+        limit_jd_tt=limit,
+    )
+
+    tree = _wrap_root(sched["nested"])
+    return {"tree": tree, "levels": _LEVEL_NAMES_5[:levels]}
 
 def compute_ashtottari(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -343,6 +437,7 @@ def compute_ashtottari(payload: Dict[str, Any]) -> Dict[str, Any]:
       - levels: 1..5 (default 5)
       - year_days: float (default 365.24219)
       - limit_jd_tt: optional float
+      - moon_nirayana_deg: optional float (override ephemeris)
 
     Returns:
       { ok, scheme, order, years, start:{...}, levels, year_days, spans:[...], nested:[...] }
@@ -360,11 +455,13 @@ def compute_ashtottari(payload: Dict[str, Any]) -> Dict[str, Any]:
         levels = int(payload.get("levels", 5))
         year_days = float(payload.get("year_days", 365.24219))
         limit_jd_tt = payload.get("limit_jd_tt")
-        limit = float(limit_jd_tt) if isinstance(limit_jd_tt, (int,float)) else None
+        limit = float(limit_jd_tt) if isinstance(limit_jd_tt, (int, float)) else None
 
-        # Moon nirayana at jd_tt
-        moon_nira = float(payload.get("moon_nirayana_deg")) if isinstance(payload.get("moon_nirayana_deg"), (int,float)) \
-                    else _moon_nirayana_deg_at(float(jd_tt), ayanamsa_key=ay_key)
+        # Moon nirayana at jd_tt (ephemeris or override)
+        if isinstance(payload.get("moon_nirayana_deg"), (int, float)):
+            moon_nira = float(payload["moon_nirayana_deg"])
+        else:
+            moon_nira = _moon_nirayana_deg_at(float(jd_tt), ayanamsa_key=ay_key)
 
         sched = ashtottari_schedule(
             jd_start_tt=float(jd_tt),
