@@ -320,15 +320,32 @@ def _to_nested(spans: List[DashaSpan], *, max_level: int) -> List[Dict[str, Any]
 # ───────────────────────── orchestration (moon longitude + timescales) ─────────────────────────
 
 def _moon_nirayana_deg_at(jd_tt: float, *, ayanamsa_key: str) -> float:
-    """
-    Compute Moon's nirāyaṇa longitude at jd_tt using ephemeris + chosen ayanāṁśa.
-    """
     if not _EPH_OK:
         raise RuntimeError("EphemerisAdapter unavailable; enable app.core.ephemeris_adapter")
-    ephem = EphemerisAdapter(EphemConfig(frame="ecliptic-of-date", timescale=TS, planets=PLANETS))  # type: ignore
+
+    # Try several Config signatures to avoid kwarg mismatch (timescale/ts/none).
+    last_err = None
+    ephem = None
+    for cfg_kwargs in (
+        {"frame": "ecliptic-of-date", "ts": TS, "planets": PLANETS},
+        {"frame": "ecliptic-of-date", "timescales": TS, "planets": PLANETS},
+        {"frame": "ecliptic-of-date", "planets": PLANETS},
+        {"frame": "ecliptic-of-date"},
+        {},
+    ):
+        try:
+            ephem = EphemerisAdapter(EphemConfig(**cfg_kwargs))  # type: ignore
+            break
+        except TypeError as e:
+            last_err = e
+            continue
+    if ephem is None:
+        raise RuntimeError(f"ephemeris Config init failed: {last_err}")
+
     rows = ephem.ecliptic_longitudes(float(jd_tt), ["Moon"]).get("results", [])
     if not rows:
         raise RuntimeError("ephemeris returned no Moon longitude")
+
     moon_trop = float(rows[0]["longitude"])
     ay = float(get_ayanamsa_deg(float(jd_tt), ayanamsa_key))
     return _norm360(moon_trop - ay)
