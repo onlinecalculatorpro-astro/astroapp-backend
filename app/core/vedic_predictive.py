@@ -55,26 +55,36 @@ __all__ = [
 _VIM_ORDER = ["ketu","venus","sun","moon","mars","rahu","jupiter","saturn","mercury"]
 _VIM_YEARS = {"ketu":7,"venus":20,"sun":6,"moon":10,"mars":7,"rahu":18,"jupiter":16,"saturn":19,"mercury":17}
 _TOTAL_YEARS = 120.0
-_NAK_WIDTH = 360.0/27.0
+_MEAN_YEAR_DAYS = 365.2425
+_NAK_WIDTH = 360.0 / 27.0
 
 def _nirayana(lon_tropical: float, ayanamsa_deg: float) -> float:
     return norm360(lon_tropical - ayanamsa_deg)
 
 def _nak_index(nirayana_lon: float) -> int:
-    return int(math.floor(nirayana_lon / _NAK_WIDTH)) % 27
+    # 0..26 (Aśvinī = 0)
+    x = nirayana_lon / _NAK_WIDTH
+    i = int(x)
+    if i >= 27:
+        i %= 27
+    elif i < 0:
+        i = i % 27
+    return i
 
 def _nak_lord(idx: int) -> str:
     return _VIM_ORDER[idx % 9]
 
 def _cycle_from(lord: str) -> List[str]:
     i = _VIM_ORDER.index(lord)
-    return _VIM_ORDER[i:] + _VIM_ORDER[:i]
+    base = _VIM_ORDER
+    return base[i:] + base[:i]
 
 def _years_to_days(years: float) -> float:
-    # sidereal calendar is debated; we adopt mean tropical year for API stability
-    return float(years) * 365.2425
+    # mean tropical year for API stability
+    return float(years) * _MEAN_YEAR_DAYS
 
-@dataclass(frozen=True)
+# Faster, smaller dataclass (slots) with same fields
+@dataclass(slots=True, frozen=True)
 class DashaPeriod:
     start_jd_tt: float
     end_jd_tt: float
@@ -101,13 +111,18 @@ def vimsottari_dasha(
     moon_nir = _nirayana(moon_lon_tropical_deg, ayanamsa_deg)
     idx = _nak_index(moon_nir)
     lord0 = _nak_lord(idx)
-    pos_in_nak = moon_nir - idx * _NAK_WIDTH
-    rem_frac = max(0.0, min(1.0, (_NAK_WIDTH - pos_in_nak) / _NAK_WIDTH))
+    pos_in_nak = moon_nir - (idx * _NAK_WIDTH)
+    rem_frac = (_NAK_WIDTH - pos_in_nak) / _NAK_WIDTH
+    if rem_frac < 0.0: rem_frac = 0.0
+    elif rem_frac > 1.0: rem_frac = 1.0
 
     cycle = _cycle_from(lord0)
     t = birth_jd_tt
     max_days = _years_to_days(span_years)
+
+    # Level 1 periods, generated in order (no later sort needed for these)
     periods_lvl1: List[DashaPeriod] = []
+    append_lvl1 = periods_lvl1.append
 
     for i, lord in enumerate(cycle):
         full_years = float(_VIM_YEARS[lord])
@@ -115,70 +130,70 @@ def vimsottari_dasha(
         dur_days = _years_to_days(full_years * frac)
         start = t
         end = start + dur_days
-        periods_lvl1.append(
-            DashaPeriod(start, end, 1, lord, (lord,), {"years": full_years, "frac": frac})
-        )
+        append_lvl1(DashaPeriod(start, end, 1, lord, (lord,), {"years": full_years, "frac": frac}))
         t = end
         if (end - birth_jd_tt) >= (max_days - 1e-9):
             break
 
+    # Expand sublevels with proportional split; last child snaps to parent end
     def expand(parent: DashaPeriod, level: int) -> List[DashaPeriod]:
         subs = _cycle_from(parent.lord)
         out: List[DashaPeriod] = []
         total_days = parent.end_jd_tt - parent.start_jd_tt
-        if total_days <= 0:
+        if total_days <= 0.0:
             return out
         t0 = parent.start_jd_tt
+        frac_unit = 1.0 / _TOTAL_YEARS
+        append = out.append
+        # Loop unroll avoids repeated dict lookups
         for lord in subs:
-            frac = _VIM_YEARS[lord] / _TOTAL_YEARS
-            dur = total_days * frac
+            part = _VIM_YEARS[lord] * frac_unit
+            dur = total_days * part
             chain = parent.parent_chain + (lord,)
-            seg = DashaPeriod(t0, t0 + dur, level, lord, chain, {"frac": frac})
-            out.append(seg)
-            t0 += dur
+            t1 = t0 + dur
+            append(DashaPeriod(t0, t1, level, lord, chain, {"frac": part}))
+            t0 = t1
+        # snap last to exact parent end (avoids tiny drift)
         if out:
             last = out[-1]
-            if abs((out[-1].end_jd_tt - parent.end_jd_tt)) > 1e-12:
+            if abs(last.end_jd_tt - parent.end_jd_tt) > 1e-12:
                 out[-1] = DashaPeriod(
-                    last.start_jd_tt, parent.end_jd_tt, last.level, last.lord, last.parent_chain, dict(last.meta)
+                    last.start_jd_tt, parent.end_jd_tt, last.level, last.lord, last.parent_chain, last.meta
                 )
         return out
 
     result = list(periods_lvl1)
-
     if levels >= 2:
         lvl2: List[DashaPeriod] = []
-        for p in periods_lvl1:
-            lvl2.extend(expand(p, 2))
+        for p in periods_lvl1: lvl2.extend(expand(p, 2))
         result.extend(lvl2)
-
         if levels >= 3:
             lvl3: List[DashaPeriod] = []
-            for p in lvl2:
-                lvl3.extend(expand(p, 3))
+            for p in lvl2: lvl3.extend(expand(p, 3))
             result.extend(lvl3)
-
             if levels >= 4:
                 lvl4: List[DashaPeriod] = []
-                for p in lvl3:
-                    lvl4.extend(expand(p, 4))
+                for p in lvl3: lvl4.extend(expand(p, 4))
                 result.extend(lvl4)
-
                 if levels >= 5:
                     lvl5: List[DashaPeriod] = []
-                    for p in lvl4:
-                        lvl5.extend(expand(p, 5))
+                    for p in lvl4: lvl5.extend(expand(p, 5))
                     result.extend(lvl5)
 
-    result.sort(key=lambda d: (d.start_jd_tt, d.level))
+    # Clip to requested span (keep order; optional final light sort by (start, level))
     if span_years < _TOTAL_YEARS:
         cut = birth_jd_tt + max_days + 1e-9
-        result = [DashaPeriod(
-            p.start_jd_tt,
-            min(p.end_jd_tt, cut),
-            p.level, p.lord, p.parent_chain, p.meta
-        ) for p in result if p.start_jd_tt < cut]
+        keep: List[DashaPeriod] = []
+        append_keep = keep.append
+        for p in result:
+            if p.start_jd_tt >= cut:
+                break
+            end = p.end_jd_tt if p.end_jd_tt <= cut else cut
+            append_keep(DashaPeriod(p.start_jd_tt, end, p.level, p.lord, p.parent_chain, p.meta))
+        result = keep
 
+    # Ensure stable ordering in rare edge cases
+    result.sort(key=lambda d: (d.start_jd_tt, d.level))
     return result
 
 # ───────────────────────────── Time helpers (TT↔UTC) ──────────────────────────
@@ -195,6 +210,7 @@ def _datetime_to_jd_tt(dt: datetime) -> float:
             t = TS.utc(dt.astimezone(timezone.utc))
         return float(t.tt)
     except Exception:
+        # Fallback (approx): POSIX epoch → JD UTC, then +Δ(UTC→TT) ~ 69s baked into callers if needed
         epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
@@ -245,7 +261,7 @@ def predict_dasha_periods(
         ts = timescales_from_civil(d, t, tz)
         birth_jd_tt = float(ts["jd_tt"])
 
-    # Window bounds in TT
+    # Window bounds in TT (order-agnostic)
     jd0_tt = _datetime_to_jd_tt(start_date)
     jd1_tt = _datetime_to_jd_tt(end_date)
     if jd1_tt < jd0_tt:
@@ -253,14 +269,15 @@ def predict_dasha_periods(
 
     # Levels
     L = int(levels) if isinstance(levels, int) else (3 if include_antardasha else 1)
-    L = max(1, min(5, L))
+    if L < 1: L = 1
+    elif L > 5: L = 5
 
     # Prefer central Vimśottarī engine
     if _VIM_ENGINE_OK:
-        # ayanamsa can be a key or a number; use provided if present
         ay = natal_chart.get("ayanamsa")
         if ay is None:
             ay = natal_chart.get("ayanamsa_deg", "lahiri")
+
         tree = generate_vimshottari_tree(
             birth_jd_tt=float(birth_jd_tt),
             ayanamsa=ay,
@@ -269,24 +286,31 @@ def predict_dasha_periods(
         )
         periods = tree.get("periods", [])
         rows: List[Dict[str, Any]] = []
-        # Collect flattened rows for each depth 1..L, then clip to [jd0_tt, jd1_tt]
+        rows_append = rows.append
+        clip_a = jd0_tt; clip_b = jd1_tt
+
+        # Flatten per depth (keeps API contract), but avoid ISO work for non-intersections
         for depth in range(1, L + 1):
             flat = flatten_periods(periods, level=depth)
             for r in flat:
                 a = float(r["start_jd_tt"]); b = float(r["end_jd_tt"])
-                if b <= jd0_tt or a >= jd1_tt:
+                if b <= clip_a or a >= clip_b:
                     continue
-                rows.append({
+                path = r.get("path")
+                lord = r["lord"]
+                chain = list(path) if path else [lord]
+                rows_append({
                     "start_jd_tt": a,
                     "end_jd_tt": b,
                     "start_date": _jd_tt_to_iso_utc(a),
                     "end_date": _jd_tt_to_iso_utc(b),
                     "level": depth,
-                    "mahadasha_lord": r["path"][0] if r.get("path") else r["lord"],
-                    "chain": list(r.get("path") or [r["lord"]]),
-                    "lord": r["lord"],
+                    "mahadasha_lord": chain[0],
+                    "chain": chain,
+                    "lord": lord,
                     "meta": {},
                 })
+
         rows.sort(key=lambda d: (d["start_jd_tt"], d["level"]))
         return {"ok": True, "periods": rows, "system": "vimshottari", "levels": L}
 
@@ -311,14 +335,17 @@ def predict_dasha_periods(
     )
 
     out: List[Dict[str, Any]] = []
+    out_append = out.append
+    a0 = jd0_tt; b0 = jd1_tt
     for p in all_periods:
-        if p.end_jd_tt < jd0_tt or p.start_jd_tt > jd1_tt:
+        a = p.start_jd_tt; b = p.end_jd_tt
+        if b <= a0 or a >= b0:
             continue
-        out.append({
-            "start_jd_tt": p.start_jd_tt,
-            "end_jd_tt": p.end_jd_tt,
-            "start_date": _jd_tt_to_iso_utc(p.start_jd_tt),
-            "end_date": _jd_tt_to_iso_utc(p.end_jd_tt),
+        out_append({
+            "start_jd_tt": a,
+            "end_jd_tt": b,
+            "start_date": _jd_tt_to_iso_utc(a),
+            "end_date": _jd_tt_to_iso_utc(b),
             "level": p.level,
             "mahadasha_lord": p.parent_chain[0] if p.parent_chain else p.lord,
             "chain": list(p.parent_chain),
@@ -329,13 +356,19 @@ def predict_dasha_periods(
     return {"ok": True, "periods": out, "system": "vimshottari", "levels": L}
 
 # =============================================================================
-# VARGAS (DIVISIONAL CHARTS) — same as before
+# VARGAS (DIVISIONAL CHARTS) — same API, micro-optimized internals
 # =============================================================================
 EXALT_SIGN = {"sun":0,"moon":1,"mars":9,"mercury":5,"jupiter":3,"venus":11,"saturn":6}
 OWN_SIGNS = {
     "sun":[4],"moon":[3],"mars":[0,7],"mercury":[2,5],"jupiter":[8,11],"venus":[1,6],"saturn":[9,10]
 }
 DEBIL_SIGN = {"sun":6,"moon":7,"mars":3,"mercury":11,"jupiter":9,"venus":5,"saturn":0}
+
+# Precompute a reverse owner map once (used in multiple yogas)
+_OWNER_BY_SIGN: Dict[int, str] = {}
+for _pl, _signs in OWN_SIGNS.items():
+    for _s in _signs:
+        _OWNER_BY_SIGN[_s] = _pl
 
 def _to_nirayana(lon: float, zodiac_mode: Literal["tropical","sidereal"] = "sidereal", ayanamsa_deg: float = 0.0) -> float:
     return norm360(lon - (ayanamsa_deg if zodiac_mode.startswith("sidereal") else 0.0))
@@ -355,8 +388,7 @@ def _drekkana_d3_sign(L: float) -> int:
 
 def _chaturthamsa_d4_sign(L: float) -> int:
     s = sign_index(L); part = int((L % 30.0) // 7.5)
-    base = s
-    return (base + part) % 12
+    return (s + part) % 12
 
 def _saptamsa_d7_sign(L: float) -> int:
     s = sign_index(L); part = int((L % 30.0) // (30.0/7.0)); odd = (s % 2 == 0)
@@ -438,10 +470,10 @@ def compute_vargas_for_point(
 ) -> Dict[str, int]:
     L = _to_nirayana(lon_deg, zodiac_mode, ayanamsa_deg)
     out: Dict[str, int] = {}
+    add = out.__setitem__
     for code in include:
-        if code not in _SUPPORTED_VARGAS:
-            continue
-        out[code] = int(_VARGA_MAP[code](L))
+        if code in _SUPPORTED_VARGAS:
+            add(code, int(_VARGA_MAP[code](L)))
     return out
 
 def compute_vargas(
@@ -451,7 +483,7 @@ def compute_vargas(
     ayanamsa_deg: float = 0.0,
     include: Iterable[str] = ("D1","D2","D3","D9","D10","D12"),
 ) -> Dict[str, Dict[str, int]]:
-    include_set = set(code for code in include if code in _SUPPORTED_VARGAS)
+    include_set = {code for code in include if code in _SUPPORTED_VARGAS}
     return {
         name: compute_vargas_for_point(
             lon_deg=lon, zodiac_mode=zodiac_mode, ayanamsa_deg=ayanamsa_deg, include=include_set
@@ -460,17 +492,18 @@ def compute_vargas(
     }
 
 # =============================================================================
-# YOGAS — unchanged
+# YOGAS — unchanged API, small speed-ups
 # =============================================================================
 
 def house_index_for_longitude(cusps_deg: List[float], lon_deg: float) -> int:
     if len(cusps_deg) != 12:
         raise ValueError("cusps_deg must be 12 values")
-    c = [norm360(x) for x in cusps_deg]
+    c0 = [norm360(x) for x in cusps_deg]
     lam = norm360(lon_deg)
+    # single pass; closed-open [start, end)
     for i in range(12):
-        start = c[i]
-        end = norm360(c[(i + 1) % 12])
+        start = c0[i]
+        end = norm360(c0[(i + 1) % 12])
         span = norm360(end - start)
         delta = norm360(lam - start)
         if span == 0.0 or delta < span:
@@ -488,124 +521,132 @@ def in_own_or_exaltation(planet: str, sign_idx: int) -> bool:
 
 def detect_panch_mahapurusha(points_deg: Dict[str, float], cusps_deg: List[float]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
-    for p, name in [("mars","Ruchaka"), ("mercury","Bhadra"), ("jupiter","Hamsa"),
-                    ("venus","Malavya"), ("saturn","Shasha")]:
-        if p not in points_deg: continue
-        lon = points_deg[p]; s = sign_index(lon); h = house_index_for_longitude(cusps_deg, lon)
+    add = out.append
+    for p, name in (("mars","Ruchaka"), ("mercury","Bhadra"), ("jupiter","Hamsa"),
+                    ("venus","Malavya"), ("saturn","Shasha")):
+        lon = points_deg.get(p)
+        if lon is None: 
+            continue
+        s = sign_index(lon); h = house_index_for_longitude(cusps_deg, lon)
         if is_kendra(h) and in_own_or_exaltation(p, s):
-            out.append({"yoga": name, "planet": p, "house": h, "sign_index": s})
+            add({"yoga": name, "planet": p, "house": h, "sign_index": s})
     return out
 
 def detect_gajakesari(points_deg: Dict[str, float], cusps_deg: List[float]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
-    if "moon" in points_deg and "jupiter" in points_deg:
-        fm = house_index_for_longitude(cusps_deg, points_deg["moon"])
-        fj = house_index_for_longitude(cusps_deg, points_deg["jupiter"])
-        diff = ((fj - fm) % 12) or 12
-        if diff in (1,4,7,10):
-            out.append({"yoga": "Gajakesari", "from": "moon", "to": "jupiter", "offset_houses": diff})
+    moon = points_deg.get("moon"); jup = points_deg.get("jupiter")
+    if moon is None or jup is None:
+        return out
+    fm = house_index_for_longitude(cusps_deg, moon)
+    fj = house_index_for_longitude(cusps_deg, jup)
+    diff = ((fj - fm) % 12) or 12
+    if diff in (1,4,7,10):
+        out.append({"yoga": "Gajakesari", "from": "moon", "to": "jupiter", "offset_houses": diff})
     return out
 
 def detect_chandra_mangal(points_deg: Dict[str, float], max_orb_deg: float = 8.0) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
-    if "moon" in points_deg and "mars" in points_deg:
-        sep = abs(angdiff(points_deg["moon"], points_deg["mars"]))
-        if sep <= max_orb_deg:
-            out.append({"yoga": "Chandra-Mangal", "orb_deg": float(sep)})
+    moon = points_deg.get("moon"); mars = points_deg.get("mars")
+    if moon is None or mars is None:
+        return out
+    sep = abs(angdiff(moon, mars))
+    if sep <= max_orb_deg:
+        out.append({"yoga": "Chandra-Mangal", "orb_deg": float(sep)})
     return out
 
 def detect_parivartana(points_deg: Dict[str, float]) -> List[Dict[str, Any]]:
-    owner: Dict[int, str] = {}
-    for pl, signs in OWN_SIGNS.items():
-        for s in signs:
-            owner[s] = pl
+    # map each sign → owner (precomputed) and each planet → sign owner of its location
     loc_owner: Dict[str, str] = {}
+    setitem = loc_owner.__setitem__
     for pl, lon in points_deg.items():
-        s = sign_index(lon)
-        loc_owner[pl] = owner.get(s, "")
+        setitem(pl, _OWNER_BY_SIGN.get(sign_index(lon), ""))
     out: List[Dict[str, Any]] = []
-    checked: Set[Tuple[str, str]] = set()
+    seen: Set[Tuple[str, str]] = set()
+    add = out.append
     for a, lord_b in loc_owner.items():
         if not lord_b or lord_b == a:
             continue
-        if (a, lord_b) in checked or (lord_b, a) in checked:
+        if (a, lord_b) in seen or (lord_b, a) in seen:
             continue
         if loc_owner.get(lord_b) == a:
-            out.append({"yoga": "Parivartana", "pair": (a, lord_b)})
-            checked.add((a, lord_b))
+            add({"yoga": "Parivartana", "pair": (a, lord_b)})
+            seen.add((a, lord_b))
     return out
 
 def detect_adhi(points_deg: Dict[str, float], cusps_deg: List[float]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
-    need = {"jupiter","venus","mercury"}
-    if "moon" not in points_deg:
+    moon = points_deg.get("moon")
+    if moon is None:
         return out
-    moon_h = house_index_for_longitude(cusps_deg, points_deg["moon"])
+    moon_h = house_index_for_longitude(cusps_deg, moon)
     houses = {pl: house_index_for_longitude(cusps_deg, lon) for pl, lon in points_deg.items()}
-    present = []
-    for pl in need:
-        if pl in houses:
-            diff = ((houses[pl] - moon_h) % 12) or 12
-            if diff in (6,7,8):
-                present.append(pl)
+    present: List[str] = []
+    for pl in ("jupiter","venus","mercury"):
+        h = houses.get(pl)
+        if h is None:
+            continue
+        diff = ((h - moon_h) % 12) or 12
+        if diff in (6,7,8):
+            present.append(pl)
     if present:
         out.append({"yoga": "Adhi", "planets": sorted(present), "from_moon_house": moon_h})
     return out
 
 def detect_vesi_vasi_ubhayachari(points_deg: Dict[str, float], sun_orb_block_deg: float = 12.0) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
-    if "sun" not in points_deg:
+    sun = points_deg.get("sun")
+    if sun is None:
         return out
-    s = sign_index(points_deg["sun"])
+    s = sign_index(sun)
     two = (s + 1) % 12
     twelve = (s - 1) % 12
-    res = {"vesi": [], "vasi": []}
+    vesi: List[str] = []
+    vasi: List[str] = []
     for pl, lon in points_deg.items():
         if pl == "sun":
             continue
-        if abs(angdiff(points_deg["sun"], lon)) < sun_orb_block_deg:
+        if abs(angdiff(sun, lon)) < sun_orb_block_deg:
             continue
         sp = sign_index(lon)
         if sp == two:
-            res["vesi"].append(pl)
-        if sp == twelve:
-            res["vasi"].append(pl)
-    if res["vesi"] and res["vasi"]:
-        out.append({"yoga": "Ubhayachari", "planets_2nd": sorted(res["vesi"]), "planets_12th": sorted(res["vasi"])})
-    elif res["vesi"] :
-        out.append({"yoga": "Vesi", "planets": sorted(res["vesi"])})
-    elif res["vasi"] :
-        out.append({"yoga": "Vasi", "planets": sorted(res["vasi"])})
+            vesi.append(pl)
+        elif sp == twelve:
+            vasi.append(pl)
+    if vesi and vasi:
+        out.append({"yoga": "Ubhayachari", "planets_2nd": sorted(vesi), "planets_12th": sorted(vasi)})
+    elif vesi:
+        out.append({"yoga": "Vesi", "planets": sorted(vesi)})
+    elif vasi:
+        out.append({"yoga": "Vasi", "planets": sorted(vasi)})
     return out
 
 def detect_viparita_rajayoga_basic(points_deg: Dict[str, float], cusps_deg: List[float]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
-    owner: Dict[int, str] = {}
-    for pl, signs in OWN_SIGNS.items():
-        for s in signs:
-            owner[s] = pl
     houses = {pl: house_index_for_longitude(cusps_deg, lon) for pl, lon in points_deg.items()}
+    add = out.append
     for pl, lon in points_deg.items():
-        lord = owner.get(sign_index(lon))
+        lord = _OWNER_BY_SIGN.get(sign_index(lon))
         if not lord:
             continue
-        h = houses.get(pl, None)
+        h = houses.get(pl)
         if h in (6,8,12):
-            out.append({"yoga": "Viparita-Rajayoga (basic)", "planet": pl, "house": h, "owner": lord})
+            add({"yoga": "Viparita-Rajayoga (basic)", "planet": pl, "house": h, "owner": lord})
     return out
 
 def detect_neecha_bhanga_basic(points_deg: Dict[str, float]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
+    add = out.append
     for pl, lon in points_deg.items():
         if DEBIL_SIGN.get(pl, -1) == sign_index(lon):
-            out.append({"yoga": "Neecha (debilitation)", "planet": pl, "sign_index": sign_index(lon)})
+            add({"yoga": "Neecha (debilitation)", "planet": pl, "sign_index": sign_index(lon)})
     return out
 
 def detect_kemadruma_basic(points_deg: Dict[str, float]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
-    if "moon" not in points_deg:
+    moon = points_deg.get("moon")
+    if moon is None:
         return out
-    sm = sign_index(points_deg["moon"])
+    sm = sign_index(moon)
     second = (sm + 1) % 12
     twelfth = (sm - 1) % 12
     planets = [pl for pl in points_deg.keys() if pl != "sun"]
@@ -651,18 +692,19 @@ def feature_dasha_lords_onehot(periods: List[Dict[str, Any]], *, levels: int = 2
     Output shape: [n_periods x (levels*9)].
     Order per level is fixed as _VIM_ORDER.
     """
-    L = max(1, min(5, int(levels)))
+    L = levels if 1 <= int(levels) <= 5 else 2
     idx = {p:i for i,p in enumerate(_VIM_ORDER)}
     out: List[List[int]] = []
+    out_append = out.append
     for p in periods:
         chain = [str(x).lower() for x in (p.get("chain") or [])]
-        row = [0] * (9 * L)
+        n = 9 * L
+        row = [0] * n
         for lev in range(min(L, len(chain))):
-            lord = chain[lev]
-            j = idx.get(lord)
+            j = idx.get(chain[lev])
             if j is not None:
                 row[lev*9 + j] = 1
-        out.append(row)
+        out_append(row)
     return out
 
 def feature_yoga_flags(yogas: List[Dict[str, Any]], *, include: Optional[Iterable[str]] = None) -> Dict[str, int]:
@@ -671,11 +713,12 @@ def feature_yoga_flags(yogas: List[Dict[str, Any]], *, include: Optional[Iterabl
     """
     inc = set(include) if include else None
     flags: Dict[str, int] = {}
+    setflag = flags.__setitem__
     for y in yogas:
         name = str(y.get("yoga","")).strip()
         if not name:
             continue
         if inc and name not in inc:
             continue
-        flags[name] = 1
+        setflag(name, 1)
     return flags
