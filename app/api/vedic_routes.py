@@ -93,38 +93,41 @@ def _levels_from(norm: Dict[str, Any]) -> int:
 
 def _build_civic_payload(original: Dict[str, Any], norm: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Prepare the payload for the module-level API compute_vimshottari(payload_dict).
+    Prepare payload for compute_vimshottari(payload_dict).
 
-    Accept either civil triplet (date,time,tz) or birth_jd_tt (derived from norm.jd_tt if available).
-    Carry optional user fields like span_years, end_jd_tt, year_days, query_jd_tt, etc.
+    Accept either civil (date,time,tz) or a direct birth_jd_tt. Prefer the *original*
+    birth_jd_tt if the client sent it; otherwise use norm.jd_tt if available.
     """
     civ: Dict[str, Any] = {}
 
-    # Prefer a concrete birth JD_TT if normalization provided one
-    if isinstance(norm.get("jd_tt"), (int, float)):
+    # 1) Prefer client-provided birth_jd_tt
+    if isinstance(original.get("birth_jd_tt"), (int, float)):
+        civ["birth_jd_tt"] = float(original["birth_jd_tt"])
+    # 2) Else, use normalized jd_tt (if validator computed it)
+    elif isinstance(norm.get("jd_tt"), (int, float)):
         civ["birth_jd_tt"] = float(norm["jd_tt"])
 
-    # Civil triplet (safe: strings only if present)
+    # Civil triplet (strings only)
     for k_src, k_dst in (("date", "date"), ("time", "time"), ("tz", "tz")):
         v = norm.get(k_src)
         if isinstance(v, str) and v.strip():
             civ[k_dst] = v.strip()
 
-    # Ayanamsa string or float from normalization
+    # Ayanamsa (float or str)
     if norm.get("ayanamsa") is not None:
         civ["ayanamsa"] = norm["ayanamsa"]
 
     # Levels (clamped)
     civ["levels"] = _levels_from(norm)
 
-    # Optional client-provided extras from the ORIGINAL body (not produced by validator)
+    # Optional extras (from the original body)
     for k in ("span_years", "end_jd_tt", "year_days",
               "query_jd_tt", "q_date", "q_time", "q_tz",
               "flatten_level"):
         if k in original and original[k] is not None:
             civ[k] = original[k]
 
-    # NEVER pass validator internals that the module doesn’t expect
+    # Never pass validator internals
     for k in ("timescales", "jd_tt", "jd_ut1", "dut1_seconds"):
         civ.pop(k, None)
 
