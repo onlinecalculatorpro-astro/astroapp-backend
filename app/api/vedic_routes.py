@@ -1,7 +1,7 @@
 # app/api/vedic_routes.py
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 import inspect
 import os
 
@@ -86,7 +86,7 @@ def _coerce_int(v: Any, default: int) -> int:
 
 
 def _levels_from(norm: Dict[str, Any]) -> int:
-    # clamp to [1..5]
+    """Clamp requested depth to [1..5]."""
     L = _coerce_int(norm.get("levels", norm.get("depth", norm.get("max_levels", 5))), 5)
     return max(1, min(5, L))
 
@@ -100,10 +100,9 @@ def _build_civic_payload(original: Dict[str, Any], norm: Dict[str, Any]) -> Dict
     """
     civ: Dict[str, Any] = {}
 
-    # 1) Prefer client-provided birth_jd_tt
+    # Prefer client-provided birth_jd_tt; else fallback to normalized jd_tt (if computed).
     if isinstance(original.get("birth_jd_tt"), (int, float)):
         civ["birth_jd_tt"] = float(original["birth_jd_tt"])
-    # 2) Else, use normalized jd_tt (if validator computed it)
     elif isinstance(norm.get("jd_tt"), (int, float)):
         civ["birth_jd_tt"] = float(norm["jd_tt"])
 
@@ -121,9 +120,11 @@ def _build_civic_payload(original: Dict[str, Any], norm: Dict[str, Any]) -> Dict
     civ["levels"] = _levels_from(norm)
 
     # Optional extras (from the original body)
-    for k in ("span_years", "end_jd_tt", "year_days",
-              "query_jd_tt", "q_date", "q_time", "q_tz",
-              "flatten_level"):
+    for k in (
+        "span_years", "end_jd_tt", "year_days",
+        "query_jd_tt", "q_date", "q_time", "q_tz",
+        "flatten_level",
+    ):
         if k in original and original[k] is not None:
             civ[k] = original[k]
 
@@ -150,8 +151,10 @@ def _call_vim_module(civ: Dict[str, Any]) -> Dict[str, Any]:
         # If we cannot inspect, use the canonical/expected API (single dict positional)
         return _compute_vim_module(civ)  # type: ignore[misc]
 
-    if len(params) == 1 and params[0].kind in (inspect.Parameter.POSITIONAL_ONLY,
-                                               inspect.Parameter.POSITIONAL_OR_KEYWORD):
+    if len(params) == 1 and params[0].kind in (
+        inspect.Parameter.POSITIONAL_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    ):
         return _compute_vim_module(civ)  # type: ignore[misc]
     else:
         return _compute_vim_module(**civ)  # type: ignore[misc]
@@ -176,7 +179,7 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
     if "dut1_seconds" not in norm or norm["dut1_seconds"] is None:
         norm["dut1_seconds"] = _env_dut1_seconds()
 
-    # ── 1) Registry (preferred)
+    # 1) Registry (preferred)
     if _compute_dasha_registry is not None:
         try:
             depth_val = _levels_from(norm)
@@ -194,7 +197,7 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
                     "meta": {"route": "vimshottari", "tz_normalized": tz_norm, "branch": "registry.compute_dasha"},
                 }
 
-    # ── 2) Legacy registry alias (if present)
+    # 2) Legacy registry alias (if present)
     if _run_dasha is not None:
         try:
             out = _run_dasha("vimshottari", norm)
@@ -208,7 +211,7 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "meta": {"route": "vimshottari", "tz_normalized": tz_norm, "branch": "registry.run_dasha"},
             }
 
-    # ── 3) Module fallback (clean civic payload; signature-aware call)
+    # 3) Module fallback (clean civic payload; signature-aware call)
     if _compute_vim_module is not None:
         try:
             civ = _build_civic_payload(payload, norm)
@@ -229,7 +232,7 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "meta": {"route": "vimshottari", "tz_normalized": tz_norm, "branch": "module.compute_vimshottari"},
             }
 
-    # ── 4) No engine available
+    # 4) No engine available
     return {
         "ok": False,
         "error": "vimshottari_engine_unavailable",
