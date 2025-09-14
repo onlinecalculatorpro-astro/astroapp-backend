@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from app.core.common_predictive import (
     norm360, sign_index, angdiff, compute_houses, timescales_from_civil
 )
-from app.core.ephem_singleton import TS, PLANETS
+from app.core.ephem_singleton import TS, PLANETS  # TS is used for TT<->UTC conversions
 
 # Preferred Vimśottarī engine
 try:
@@ -23,14 +23,13 @@ try:
 except Exception:
     _VIM_ENGINE_OK = False
 
-# (Still import EphemerisAdapter for back-compat: vimsottari_dasha() fallback uses it)
+# Ephemeris access (module-level helper; avoids Config kwargs mismatches)
 try:
-    from app.core.ephemeris_adapter import EphemerisAdapter, Config as EphemConfig
+    from app.core.ephemeris_adapter import ecliptic_longitudes  # type: ignore
     _EPH_OK = True
 except Exception:
     _EPH_OK = False
-    EphemerisAdapter = object  # type: ignore
-    EphemConfig = object       # type: ignore
+    ecliptic_longitudes = None  # type: ignore
 
 
 __all__ = [
@@ -291,13 +290,16 @@ def predict_dasha_periods(
         rows.sort(key=lambda d: (d["start_jd_tt"], d["level"]))
         return {"ok": True, "periods": rows, "system": "vimshottari", "levels": L}
 
-    # Fallback to legacy path (shouldn’t be hit in normal setups)
-    if not _EPH_OK:
+    # Fallback to legacy path (only if the central engine is unavailable)
+    if not _EPH_OK or ecliptic_longitudes is None:
         return {"ok": False, "error": "ephemeris_unavailable"}
 
-    ep = EphemerisAdapter(EphemConfig(frame="ecliptic-of-date", timescale=TS, planets=PLANETS))  # type: ignore
-    mm_rows = ep.ecliptic_longitudes(birth_jd_tt, ["Moon"]).get("results", [])
-    moon_lon_trop = float(mm_rows[0]["longitude"]) if mm_rows else 0.0
+    # Get Moon tropical longitude at birth via ephemeris (no Config kwargs!)
+    moon_rows = (ecliptic_longitudes(float(birth_jd_tt), names=["Moon"]) or {}).get("results", [])
+    if not moon_rows:
+        return {"ok": False, "error": "moon_longitude_unavailable"}
+    moon_lon_trop = float(moon_rows[0]["longitude"])
+
     ay_deg = float(natal_chart.get("ayanamsa_deg", 0.0))
 
     all_periods = vimsottari_dasha(
@@ -570,9 +572,9 @@ def detect_vesi_vasi_ubhayachari(points_deg: Dict[str, float], sun_orb_block_deg
             res["vasi"].append(pl)
     if res["vesi"] and res["vasi"]:
         out.append({"yoga": "Ubhayachari", "planets_2nd": sorted(res["vesi"]), "planets_12th": sorted(res["vasi"])})
-    elif res["vesi"]:
+    elif res["vesi"] :
         out.append({"yoga": "Vesi", "planets": sorted(res["vesi"])})
-    elif res["vasi"]:
+    elif res["vasi"] :
         out.append({"yoga": "Vasi", "planets": sorted(res["vasi"])})
     return out
 
