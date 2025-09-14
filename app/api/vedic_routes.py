@@ -15,7 +15,7 @@ vedic_api = Blueprint("vedic_api", __name__)
 RL_VEDIC_PREDICTIVE = int(os.getenv("ASTRO_RL_VEDIC_PREDICTIVE_PER_MIN", "20"))
 
 def fixed_key(*_a, **_k) -> str:
-    """Shared bucket key ('20') used by all Vimśottarī calls."""
+    """Shared bucket key ('20') used by all dasha calls."""
     return "20"
 
 
@@ -45,11 +45,18 @@ except Exception:
     except Exception:
         _run_dasha = None  # type: ignore
 
+# Optional module fallbacks
 try:
-    # Preferred module surface: compute_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]
+    # Vimśottarī module surface
     from app.core.vimshottari_dasha import compute_vimshottari as _compute_vim_module  # type: ignore
 except Exception:
     _compute_vim_module = None  # type: ignore
+
+try:
+    # Aṣṭottarī module surface
+    from app.core.ashtottari_dasha import compute_ashtottari as _compute_ashto_module  # type: ignore
+except Exception:
+    _compute_ashto_module = None  # type: ignore
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -63,10 +70,10 @@ def _env_dut1_seconds() -> float:
         return 0.0
 
 
-def _wrap_ok(out: Dict[str, Any], warns: List[str], tz_norm: str, branch: str) -> Dict[str, Any]:
+def _wrap_ok(out: Dict[str, Any], warns: List[str], tz_norm: str, branch: str, *, route_name: str = "vimshottari") -> Dict[str, Any]:
     out.setdefault("ok", True)
     out.setdefault("meta", {})
-    out["meta"].update({"route": "vimshottari", "tz_normalized": tz_norm, "branch": branch})
+    out["meta"].update({"route": route_name, "tz_normalized": tz_norm, "branch": branch})
     if warns:
         out.setdefault("warnings", [])
         seen = set(map(str, out["warnings"]))
@@ -91,7 +98,8 @@ def _levels_from(norm: Dict[str, Any]) -> int:
     return max(1, min(5, L))
 
 
-def _build_civic_payload(original: Dict[str, Any], norm: Dict[str, Any]) -> Dict[str, Any]:
+# ---- civic payload builders ---------------------------------------------------
+def _build_civic_payload_vim(original: Dict[str, Any], norm: Dict[str, Any]) -> Dict[str, Any]:
     """
     Prepare payload for compute_vimshottari(payload_dict).
 
@@ -135,33 +143,89 @@ def _build_civic_payload(original: Dict[str, Any], norm: Dict[str, Any]) -> Dict
     return civ
 
 
-def _call_vim_module(civ: Dict[str, Any]) -> Dict[str, Any]:
+def _build_civic_payload_ashto(original: Dict[str, Any], norm: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Call the module function with signature awareness:
-      - If it takes a single parameter (payload), call positionally.
-      - Else, call with **kwargs.
+    Prepare payload for compute_ashtottari(payload_dict).
+    Accepts either jd_tt or civil date/time/tz; forwards ayanamsa, levels, and optional knobs.
     """
-    if _compute_vim_module is None:
-        raise RuntimeError("vimshottari module not available")
+    civ: Dict[str, Any] = {}
 
+    # Prefer client-provided jd_tt; else fallback to normalized jd_tt (if computed).
+    if isinstance(original.get("jd_tt"), (int, float)):
+        civ["jd_tt"] = float(original["jd_tt"])
+    elif isinstance(norm.get("jd_tt"), (int, float)):
+        civ["jd_tt"] = float(norm["jd_tt"])
+
+    # Civil triplet
+    for k in ("date", "time", "tz"):
+        v = norm.get(k)
+        if isinstance(v, str) and v.strip():
+            civ[k] = v.strip()
+
+    # Ayanamsa + levels
+    if norm.get("ayanamsa") is not None:
+        civ["ayanamsa"] = norm["ayanamsa"]
+    civ["levels"] = _levels_from(norm)
+
+    # Optional extras (directly from original if provided)
+    for k in ("start_mode", "year_days", "limit_jd_tt", "moon_nirayana_deg"):
+        if k in original and original[k] is not None:
+            civ[k] = original[k]
+
+    # Never pass validator internals
+    for k in ("timescales", "jd_ut1", "dut1_seconds"):
+        civ.pop(k, None)
+
+    return civ
+
+
+# ---- tiny module-call shims ---------------------------------------------------
+def _call_single_param_or_kwargs(fn, payload: Dict[str, Any]) -> Dict[str, Any]:
+    sig = None
     try:
-        sig = inspect.signature(_compute_vim_module)  # type: ignore[arg-type]
+        sig = inspect.signature(fn)  # type: ignore[arg-type]
         params = list(sig.parameters.values())
     except Exception:
-        # If we cannot inspect, use the canonical/expected API (single dict positional)
-        return _compute_vim_module(civ)  # type: ignore[misc]
+        return fn(payload)  # type: ignore[misc]
 
     if len(params) == 1 and params[0].kind in (
         inspect.Parameter.POSITIONAL_ONLY,
         inspect.Parameter.POSITIONAL_OR_KEYWORD,
     ):
-        return _compute_vim_module(civ)  # type: ignore[misc]
+        return fn(payload)  # type: ignore[misc]
     else:
-        return _compute_vim_module(**civ)  # type: ignore[misc]
+        return fn(**payload)  # type: ignore[misc]
+
+
+def _coerce_tree_like(res: Dict[str, Any], *, scheme: str) -> Dict[str, Any]:
+    """
+    Ensure a consistent tree-like shape. If the module returns 'nested' (forest),
+    wrap it into a single envelope node under 'tree'.
+    """
+    if isinstance(res, dict) and "tree" in res:
+        return res
+    if isinstance(res, dict) and isinstance(res.get("nested"), list):
+        nodes = res["nested"]
+        if nodes:
+            s0 = min(float(n.get("start_jd_tt", 0.0)) for n in nodes)
+            e1 = max(float(n.get("end_jd_tt", 0.0)) for n in nodes)
+        else:
+            s0, e1 = 0.0, 0.0
+        res = dict(res)
+        res["tree"] = {
+            "level": 0,
+            "lord": None,
+            "label": scheme,
+            "start_jd_tt": s0,
+            "end_jd_tt": e1,
+            "children": nodes,
+        }
+        return res
+    return res
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Core runner
+# Core runners
 # ──────────────────────────────────────────────────────────────────────────────
 def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
     # Validator required
@@ -185,7 +249,7 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
             depth_val = _levels_from(norm)
             out = _compute_dasha_registry("vimshottari", norm, depth=depth_val)
             if isinstance(out, dict):
-                return _wrap_ok(out, warns, tz_norm, branch="registry.compute_dasha")
+                return _wrap_ok(out, warns, tz_norm, branch="registry.compute_dasha", route_name="vimshottari")
         except Exception as e:
             msg = str(e)
             # Allow fallback if a known 3-arg build_timescales signature is the problem
@@ -202,7 +266,7 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
         try:
             out = _run_dasha("vimshottari", norm)
             if isinstance(out, dict):
-                return _wrap_ok(out, warns, tz_norm, branch="registry.run_dasha")
+                return _wrap_ok(out, warns, tz_norm, branch="registry.run_dasha", route_name="vimshottari")
         except Exception as e:
             return {
                 "ok": False,
@@ -214,10 +278,11 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
     # 3) Module fallback (clean civic payload; signature-aware call)
     if _compute_vim_module is not None:
         try:
-            civ = _build_civic_payload(payload, norm)
-            out = _call_vim_module(civ)
+            civ = _build_civic_payload_vim(payload, norm)
+            out = _call_single_param_or_kwargs(_compute_vim_module, civ)
             if isinstance(out, dict):
-                return _wrap_ok(out, warns, tz_norm, branch="module.compute_vimshottari")
+                out = _coerce_tree_like(out, scheme="vimshottari")
+                return _wrap_ok(out, warns, tz_norm, branch="module.compute_vimshottari", route_name="vimshottari")
             return {
                 "ok": False,
                 "error": "vimshottari_module_invalid_return",
@@ -237,6 +302,79 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
         "ok": False,
         "error": "vimshottari_engine_unavailable",
         "meta": {"route": "vimshottari", "tz_normalized": tz_norm, "branch": "none"},
+    }
+
+
+def _run_ashtottari(payload: Dict[str, Any]) -> Dict[str, Any]:
+    # Validator required (reuse same civil normalization)
+    if normalize_vim_payload is None:
+        return {
+            "ok": False,
+            "error": "validator_unavailable",
+            "detail": f"app.core.vedic_validator.normalize_vim_payload import failed: {_VALIDATOR_IMPORT_ERR}",
+        }
+
+    norm, warns, tz_norm = normalize_vim_payload(payload)  # type: ignore[misc]
+
+    if "dut1_seconds" not in norm or norm["dut1_seconds"] is None:
+        norm["dut1_seconds"] = _env_dut1_seconds()
+
+    # 1) Registry (preferred)
+    if _compute_dasha_registry is not None:
+        try:
+            depth_val = _levels_from(norm)
+            out = _compute_dasha_registry("ashtottari", norm, depth=depth_val)
+            if isinstance(out, dict):
+                return _wrap_ok(out, warns, tz_norm, branch="registry.compute_dasha", route_name="ashtottari")
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": "ashtottari_registry_failed",
+                "detail": str(e),
+                "meta": {"route": "ashtottari", "tz_normalized": tz_norm, "branch": "registry.compute_dasha"},
+            }
+
+    # 2) Legacy registry alias (rare)
+    if _run_dasha is not None:
+        try:
+            out = _run_dasha("ashtottari", norm)
+            if isinstance(out, dict):
+                return _wrap_ok(out, warns, tz_norm, branch="registry.run_dasha", route_name="ashtottari")
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": "ashtottari_registry_failed",
+                "detail": str(e),
+                "meta": {"route": "ashtottari", "tz_normalized": tz_norm, "branch": "registry.run_dasha"},
+            }
+
+    # 3) Module fallback (if available)
+    if _compute_ashto_module is not None:
+        try:
+            civ = _build_civic_payload_ashto(payload, norm)
+            out = _call_single_param_or_kwargs(_compute_ashto_module, civ)
+            if isinstance(out, dict):
+                out = _coerce_tree_like(out, scheme="ashtottari")
+                return _wrap_ok(out, warns, tz_norm, branch="module.compute_ashtottari", route_name="ashtottari")
+            return {
+                "ok": False,
+                "error": "ashtottari_module_invalid_return",
+                "detail": f"Expected dict, got {type(out).__name__}",
+                "meta": {"route": "ashtottari", "tz_normalized": tz_norm, "branch": "module.compute_ashtottari"},
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": "ashtottari_module_failed",
+                "detail": str(e),
+                "meta": {"route": "ashtottari", "tz_normalized": tz_norm, "branch": "module.compute_ashtottari"},
+            }
+
+    # 4) No engine available
+    return {
+        "ok": False,
+        "error": "ashtottari_engine_unavailable",
+        "meta": {"route": "ashtottari", "tz_normalized": tz_norm, "branch": "none"},
     }
 
 
@@ -265,6 +403,8 @@ def vedic_diag():
         "registry_run_sig": sigs(_run_dasha) if _run_dasha else None,
         "module_vimshottari_present": bool(_compute_vim_module),
         "module_vimshottari_sig": sigs(_compute_vim_module) if _compute_vim_module else None,
+        "module_ashtottari_present": bool(_compute_ashto_module),
+        "module_ashtottari_sig": sigs(_compute_ashto_module) if _compute_ashto_module else None,
         "rl_cap_per_min": RL_VEDIC_PREDICTIVE,
         "rl_bucket_key": "20",
         "dut1_seconds_env": _env_dut1_seconds(),
@@ -276,5 +416,16 @@ def vedic_diag():
 def vedic_vimshottari():
     body = request.get_json(silent=True) or {}
     res = _run_vimshottari(body)
+    status = 200 if res.get("ok") else (503 if str(res.get("error", "")).endswith("unavailable") else 400)
+    return jsonify(res), status
+
+
+# ASCII alias + Unicode canonical for Aṣṭottarī
+@vedic_api.post("/dasha/ashtottari")
+@vedic_api.post("/dasha/Aṣṭottarī")
+@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
+def vedic_ashtottari():
+    body = request.get_json(silent=True) or {}
+    res = _run_ashtottari(body)
     status = 200 if res.get("ok") else (503 if str(res.get("error", "")).endswith("unavailable") else 400)
     return jsonify(res), status
