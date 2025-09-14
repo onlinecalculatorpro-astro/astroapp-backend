@@ -190,10 +190,13 @@ def ashtottari_schedule(
     start_mode: str = "after",
     levels: int = 5,
     year_days: float = 365.24219,
-    limit_jd_tt: float | None = None
+    limit_jd_tt: float | None = None,
+    compact: bool = False,              # optional output compaction
+    include_spans: bool = True          # include flat spans (default True)
 ) -> Dict[str, Any]:
     """
-    Build flat spans + nested tree. Public signature unchanged.
+    Build flat spans + nested tree. Public signature unchanged; added optional
+    `compact` and `include_spans` for lighter payloads.
     """
     levels = max(1, min(5, int(levels)))
     start_mode = "after" if str(start_mode).lower().strip() != "same" else "same"
@@ -247,13 +250,13 @@ def ashtottari_schedule(
         )
 
     # Nested tree (linear)
-    tree = _to_nested_linear(spans, max_level=levels)
+    tree = _to_nested_linear(spans, max_level=levels, compact=compact)
 
-    return {
+    out: Dict[str, Any] = {
         "ok": True,
         "scheme": "ashtottari",
-        "order": list(ASHTOTTARI_ORDER),
-        "years": dict(ASHTOTTARI_YEARS),
+        "order": list(ASHTOTTARI_ORDER) if not compact else None,
+        "years": dict(ASHTOTTARI_YEARS) if not compact else None,
         "start": {
             "nakshatra_index": nak_idx,
             "nakshatra_name": NAKSHATRAS_27[nak_idx - 1],
@@ -262,7 +265,11 @@ def ashtottari_schedule(
         },
         "year_days": float(year_days),
         "levels": int(levels),
-        "spans": [
+        "nested": tree,
+        "meta": {"compact": bool(compact), "include_spans": bool(include_spans), "encoding": "v1"},
+    }
+    if include_spans:
+        out["spans"] = [
             {
                 "level": s.level,
                 "lord": s.lord,
@@ -270,9 +277,9 @@ def ashtottari_schedule(
                 "end_jd_tt": float(s.end_jd_tt),
             }
             for s in spans
-        ],
-        "nested": tree,
-    }
+        ]
+    # strip Nones for compact mode cleanliness
+    return {k: v for k, v in out.items() if v is not None}
 
 def _expand_sublevels_ticks(
     *,
@@ -286,10 +293,8 @@ def _expand_sublevels_ticks(
     Expand sublevels in-place using fixed-point ticks.
     Generates spans in (level, start) order so no final sorting is needed.
     """
-    # We'll append to this master list in increasing level order.
     all_spans: List[DashaSpan] = list(spans_level1)
 
-    # Convenience: convert a JD boundary back to ticks relative to base
     def jd_to_ticks(jd: float) -> int:
         return _to_ticks(jd - base_jd)
 
@@ -314,53 +319,60 @@ def _expand_sublevels_ticks(
                     t_start=t, dur_ticks=dur, limit_ticks=limit_ticks
                 )
                 t = t_next
-        # Append in order; current becomes next_level for deeper expansion
         all_spans.extend(next_level)
         current = next_level
 
-    # Replace incoming level-1 buffer with the full ordered set
     spans_level1.clear()
     spans_level1.extend(all_spans)
 
-def _to_nested_linear(spans: List[DashaSpan], *, max_level: int) -> List[Dict[str, Any]]:
+def _to_nested_linear(spans: List[DashaSpan], *, max_level: int, compact: bool = False) -> List[Dict[str, Any]]:
     """
     Linear-time nesting:
     - Group spans by level (they are already in level order).
     - For each level L>1, sweep once with a pointer over parents (L-1) to attach children.
+    In compact mode, nodes use short keys: l(level), p(planet index), s(start), e(end), c(children).
     """
     if not spans:
         return []
 
     by_level: Dict[int, List[DashaSpan]] = {}
     for s in spans:
-        if s.level > max_level:
-            continue
-        by_level.setdefault(s.level, []).append(s)
+        if s.level <= max_level:
+            by_level.setdefault(s.level, []).append(s)
 
-    # Build node objects mirroring DashaSpan
     def mk_node(s: DashaSpan) -> Dict[str, Any]:
-        return {
-            "level": s.level,
-            "lord": s.lord,
-            "start_jd_tt": float(s.start_jd_tt),
-            "end_jd_tt": float(s.end_jd_tt),
-            "children": [] if s.level < max_level else None,
-        }
+        if not compact:
+            node = {
+                "level": s.level,
+                "lord": s.lord,
+                "start_jd_tt": float(s.start_jd_tt),
+                "end_jd_tt": float(s.end_jd_tt),
+            }
+            if s.level < max_level:
+                node["children"] = []
+            return node
+        else:
+            node = {
+                "l": s.level,
+                "p": int(ASHTOTTARI_ORDER.index(s.lord)),
+                "s": float(s.start_jd_tt),
+                "e": float(s.end_jd_tt),
+            }
+            if s.level < max_level:
+                node["c"] = []
+            return node
 
-    # Level 1 nodes (roots)
     level1_spans = by_level.get(1, [])
     if not level1_spans:
         return []
     nodes_by_level: Dict[int, List[Dict[str, Any]]] = {1: [mk_node(s) for s in level1_spans]}
 
-    # Attach deeper levels
     for lvl in range(2, max_level + 1):
         parents = by_level.get(lvl - 1, [])
         kids    = by_level.get(lvl, [])
         if not parents or not kids:
             continue
         parent_nodes = nodes_by_level[lvl - 1]
-        # two-pointer sweep through time
         p = 0
         cur_parent = parents[p] if parents else None
         for child in kids:
@@ -371,19 +383,22 @@ def _to_nested_linear(spans: List[DashaSpan], *, max_level: int) -> List[Dict[st
                 break
             if (child.start_jd_tt + 1e-12) >= cur_parent.start_jd_tt and (child.end_jd_tt - 1e-12) <= cur_parent.end_jd_tt:
                 node = mk_node(child)
-                parent_nodes[p]["children"].append(node)
+                if compact:
+                    parent_nodes[p]["c"].append(node)
+                else:
+                    parent_nodes[p]["children"].append(node)
                 nodes_by_level.setdefault(lvl, []).append(node)
 
-    # Strip empty children lists at leaves for cleanliness
-    def strip_none_children(n: Dict[str, Any]) -> Dict[str, Any]:
-        if "children" in n:
-            if n["children"] is None or len(n["children"]) == 0 or n["level"] >= max_level:
-                n.pop("children", None)
+    def strip(n: Dict[str, Any]) -> Dict[str, Any]:
+        key = "c" if compact else "children"
+        if key in n:
+            if not n[key] or (compact and n.get("l", 0) >= max_level) or ((not compact) and n.get("level", 0) >= max_level):
+                n.pop(key, None)
             else:
-                n["children"] = [strip_none_children(k) for k in n["children"]]
+                n[key] = [strip(k) for k in n[key]]
         return n
 
-    return [strip_none_children(n) for n in nodes_by_level[1]]
+    return [strip(n) for n in nodes_by_level[1]]
 
 # ───────────────────────── moon longitude + timescales ─────────────────────────
 def _moon_nirayana_deg_at(jd_tt: float, *, ayanamsa_key: str) -> float:
@@ -459,14 +474,17 @@ def compute_dasha(
       - year_days: float
       - limit_jd_tt: float | None
       - moon_nirayana_deg: float | str  (override; bypass ephemeris)
+      - compact: bool (optional)
+      - include_spans: bool (optional)
     """
     opts = dict(options or {})
     start_mode = str(opts.get("start_mode", "after")).lower()
     levels = max(1, min(5, int(opts.get("levels", depth or 5))))
     year_days = float(opts.get("year_days", 365.24219))
     limit = _num(opts.get("limit_jd_tt"))
+    compact = bool(opts.get("compact", False))
+    include_spans = bool(opts.get("include_spans", True))
 
-    # Accept numeric *or string* override
     moon_nira = _num(opts.get("moon_nirayana_deg"))
     if moon_nira is None:
         moon_nira = _moon_nirayana_deg_at(float(jd_tt_birth), ayanamsa_key=ayanamsa_key)
@@ -480,8 +498,21 @@ def compute_dasha(
         levels=levels,
         year_days=year_days,
         limit_jd_tt=(float(limit) if limit is not None else None),
+        compact=compact,
+        include_spans=include_spans,
     )
-    tree = _wrap_root(sched["nested"])
+    tree = _wrap_root(
+        sched["nested"] if not compact else [
+            # If compact, caller likely expects regular keys when using compute_dasha.
+            # Keep nested as-is (compact) but still wrap with a root label.
+            # Downstream consumers of compute_dasha rarely need the root wrapper anyway.
+            # We therefore map compact keys to standard for the wrapper only.
+            {"level": n.get("l", n.get("level")), "lord": (ASHTOTTARI_ORDER[n["p"]] if "p" in n else n.get("lord")),
+             "start_jd_tt": n.get("s", n.get("start_jd_tt")), "end_jd_tt": n.get("e", n.get("end_jd_tt")),
+             "children": n.get("c") or n.get("children")}
+            for n in sched["nested"]
+        ]
+    )
     return {"tree": tree, "levels": _LEVEL_NAMES_5[:levels]}
 
 def compute_ashtottari(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -496,6 +527,8 @@ def compute_ashtottari(payload: Dict[str, Any]) -> Dict[str, Any]:
       - year_days: float (default 365.24219)
       - limit_jd_tt: float
       - moon_nirayana_deg: float | str (override; bypass ephemeris)
+      - compact: bool (optional; default False)
+      - include_spans: bool (optional; default True)
     """
     try:
         jd_tt = payload.get("jd_tt")
@@ -510,6 +543,8 @@ def compute_ashtottari(payload: Dict[str, Any]) -> Dict[str, Any]:
         levels = max(1, min(5, int(payload.get("levels", 5))))
         year_days = float(payload.get("year_days", 365.24219))
         limit = _num(payload.get("limit_jd_tt"))
+        compact = bool(payload.get("compact", False))
+        include_spans = bool(payload.get("include_spans", True))
 
         moon_nira = _num(payload.get("moon_nirayana_deg"))
         if moon_nira is None:
@@ -524,6 +559,8 @@ def compute_ashtottari(payload: Dict[str, Any]) -> Dict[str, Any]:
             levels=levels,
             year_days=year_days,
             limit_jd_tt=(float(limit) if limit is not None else None),
+            compact=compact,
+            include_spans=include_spans,
         )
         return sched
     except Exception as e:
