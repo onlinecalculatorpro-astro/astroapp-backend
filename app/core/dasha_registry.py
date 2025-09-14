@@ -5,41 +5,16 @@ from __future__ import annotations
 """
 Unified Dasha Registry — research-grade orchestration (gold-standard timescales)
 
-Purpose
--------
-Single entry point for all supported Vedic dasha systems (Vimshottari, Ashtottari,
-Yogini, Chara, Kalachakra). This module:
+Works with engines that expose either:
+  A) keyword/positional args: compute_dasha(jd_tt_birth, ayanamsa_key=..., ayanamsa_deg=..., depth=..., options=...)
+  B) single-argument payload: compute_xxx(payload: Dict[str, Any]) -> Dict
 
-- Normalizes civil inputs -> strict timescales (jd_tt, jd_ut, jd_ut1).
-- Resolves ayanāṁśa (key + degrees at birth).
-- Dispatches to the specific engine module with a uniform call wrapper.
-- Returns a standardized Dasha Tree (same schema for all systems).
-- Provides utilities:
-  * window slicing (start/end jd_tt)
-  * dasha_at() point query (active path across levels)
-  * flatten_dasha() (tree -> rows)
-  * next/prev boundary finders
-
-Gold-standard rules
--------------------
-- No UT≈TT shortcuts. Uses time_kernel/timescales; respects DUT1 if available.
-- Deterministic boundary handling with closed-open intervals [start, end).
-- 1-second JD bucketing for de-dupe in downstream consumers.
-- Ayanāṁśa from app.core.ayanamsa (or explicit degrees if provided).
-
-Public API
-----------
-    list_supported_dashas() -> list[dict]
-    compute_dasha(system: str, payload: dict, *, depth: int|None=None) -> dict
-    dasha_at(system: str, payload: dict, *, jd_tt: float) -> dict
-    dasha_window(system: str, payload: dict, *, start_jd_tt: float, end_jd_tt: float, depth: int|None=None) -> dict
-    flatten_dasha(tree: dict) -> list[dict]
-    next_boundary(system: str, payload: dict, *, jd_tt: float, level: int|None=None) -> dict
-    prev_boundary(system: str, payload: dict, *, jd_tt: float, level: int|None=None) -> dict
+This registry normalizes inputs (timescales, ayanāṁśa), dispatches to the
+engine, and returns a standardized tree.
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Callable
+from typing import Any, Dict, List, Optional, Tuple
 from functools import lru_cache
 import importlib
 import inspect
@@ -62,8 +37,8 @@ try:
 except Exception:
     _get_ayanamsa_deg = None  # guarded
 
-# JD quantization (align with astronomy.py defaults when present)
-_JD_QUANT = float(os.getenv("OCP_ASTRO_JD_QUANT", "1e-7"))  # ~0.009 s
+# JD quantization (~0.009 s by default)
+_JD_QUANT = float(os.getenv("OCP_ASTRO_JD_QUANT", "1e-7"))
 
 
 def _q_jd(x: float) -> float:
@@ -98,13 +73,13 @@ def _timescales_from_payload(payload: Dict[str, Any]) -> _TSOut:
     t = payload.get("time") or birth.get("time") or "12:00:00"
     tz = payload.get("tz") or payload.get("place_tz") or birth.get("tz") or "UTC"
 
-    # DUT1 from payload (seconds) with safe default
+    # DUT1 (seconds)
     try:
         dut1_sec = float(payload.get("dut1_seconds", payload.get("dut1", 0.0)) or 0.0)
     except Exception:
         dut1_sec = 0.0
 
-    # Preferred: time_kernel dynamic helpers (try signatures that include DUT1)
+    # Preferred: time_kernel helpers (support 4-arg and 3-arg forms)
     if _tk is not None:
         for fname in ("timescales_from_civil", "compute_timescales", "build_timescales", "to_timescales", "from_civil"):
             fn = getattr(_tk, fname, None)
@@ -113,9 +88,9 @@ def _timescales_from_payload(payload: Dict[str, Any]) -> _TSOut:
             attempts = (
                 lambda: fn(date=d, time=t, tz=tz, dut1_seconds=dut1_sec),
                 lambda: fn(date=d, time=t, tz=tz, dut1=dut1_sec),
-                lambda: fn(d, t, tz, dut1_sec),
-                lambda: fn(d, t, tz),                          # legacy 3-arg
-                lambda: fn(date=d, time=t, tz=tz),              # legacy kw
+                lambda: fn(d, t, tz, dut1_sec),   # legacy positional
+                lambda: fn(d, t, tz),             # legacy 3-arg
+                lambda: fn(date=d, time=t, tz=tz)
             )
             for call in attempts:
                 try:
@@ -125,7 +100,7 @@ def _timescales_from_payload(payload: Dict[str, Any]) -> _TSOut:
                 except Exception:
                     continue
                 if isinstance(out, dict):
-                    ju = float(out.get("jd_ut") or out.get("jd_utc") or out.get("jd_utc"))
+                    ju = float(out.get("jd_ut") or out.get("jd_utc"))
                     jt = float(out.get("jd_tt") or out.get("tt") or out.get("jdtt"))
                     j1 = float(out.get("jd_ut1") or (ju + dut1_sec / 86400.0))
                     return _TSOut(_q_jd(ju), _q_jd(jt), _q_jd(j1), warns)
@@ -136,7 +111,7 @@ def _timescales_from_payload(payload: Dict[str, Any]) -> _TSOut:
     if _ts is None:
         raise ValueError("timescales module unavailable and time_kernel fell through")
 
-    # Fallback chain via timescales
+    # Fallback via timescales
     try:
         jd_ut = float(_ts.julian_day_utc(d, t, tz))
     except Exception as e:
@@ -151,7 +126,6 @@ def _timescales_from_payload(payload: Dict[str, Any]) -> _TSOut:
         jd_tt = jd_ut + 69.0 / 86400.0  # constant ΔT fallback
         warns.append("deltaT_fallback_69s")
 
-    # Respect DUT1 if present
     jd_ut1 = jd_ut + dut1_sec / 86400.0
     return _TSOut(_q_jd(jd_ut), _q_jd(jd_tt), _q_jd(jd_ut1), warns)
 
@@ -163,9 +137,8 @@ def _resolve_ayanamsa(jd_tt: float, payload: Dict[str, Any]) -> Tuple[str, float
         return "explicit", float(payload["ayanamsa"]), warns
     key = str(payload.get("ayanamsa", "lahiri")).strip().lower()
     if _get_ayanamsa_deg is None:
-        # Conservative fallback if module is missing
-        # Lahiri-like linearized fallback (only if unavoidable)
-        AY_J2000_DEG = (23 + 51 / 60 + 26.26 / 3600)  # 23°51'26.26"
+        # Linearized Lahiri fallback
+        AY_J2000_DEG = (23 + 51 / 60 + 26.26 / 3600)
         RATE_AS_PER_YR = 50.290966
         Tcent = (float(jd_tt) - 2451545.0) / 36525.0
         years = Tcent * 100.0
@@ -177,7 +150,6 @@ def _resolve_ayanamsa(jd_tt: float, payload: Dict[str, Any]) -> Tuple[str, float
         return key, ay, warns
     except Exception as e:
         warns.append(f"ayanamsa_resolve_error:{e}")
-        # last-resort linearized
         AY_J2000_DEG = (23 + 51 / 60 + 26.26 / 3600)
         RATE_AS_PER_YR = 50.290966
         Tcent = (float(jd_tt) - 2451545.0) / 36525.0
@@ -196,14 +168,14 @@ class _DashaSpec:
     module: str
     fn_candidates: Tuple[str, ...]
     levels: Tuple[str, ...]
-    anchor: str  # informational: "moon_nakshatra", "nakshatra_pada", "charakaraka", etc.
+    anchor: str  # info only
 
 
 _ENGINE_SPECS: Tuple[_DashaSpec, ...] = (
     _DashaSpec(
         key="vimshottari",
         title="Vimśottarī (120y) — 5 levels",
-        module="app.core.dasha_vimshottari",
+        module="app.core.vimshottari_dasha",  # FIXED module path
         fn_candidates=("compute_dasha", "compute_vimshottari", "build_dasha_tree", "generate_dasha"),
         levels=("maha", "antara", "pratyantara", "sookshma", "prana"),
         anchor="moon_nakshatra",
@@ -211,9 +183,9 @@ _ENGINE_SPECS: Tuple[_DashaSpec, ...] = (
     _DashaSpec(
         key="ashtottari",
         title="Aṣṭottarī (108y) — 5 levels",
-        module="app.core.ashtottari_dasha",  # fixed module path
+        module="app.core.ashtottari_dasha",
         fn_candidates=("compute_dasha", "compute_ashtottari", "build_dasha_tree", "generate_dasha"),
-        levels=("maha", "antara", "pratyantara", "sookshma", "prana"),  # 5-level capability
+        levels=("maha", "antara", "pratyantara", "sookshma", "prana"),
         anchor="moon_nakshatra",
     ),
     _DashaSpec(
@@ -244,36 +216,25 @@ _ENGINE_SPECS: Tuple[_DashaSpec, ...] = (
 
 
 def list_supported_dashas() -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for s in _ENGINE_SPECS:
-        out.append({
-            "key": s.key,
-            "title": s.title,
-            "levels": list(s.levels),
-            "anchor": s.anchor,
-            "module": s.module,
-        })
-    return out
+    return [{
+        "key": s.key, "title": s.title, "levels": list(s.levels), "anchor": s.anchor, "module": s.module
+    } for s in _ENGINE_SPECS]
 
 
 # ───────────────────────────── Tree schema helpers ────────────────────────────
-# Standard node keys: level(int, 1..N), lord(str), label(str), start_jd_tt, end_jd_tt, children(list)
 
 def _norm_node(n: Dict[str, Any]) -> Dict[str, Any]:
     """Coerce engine-specific node shapes into the standard schema."""
-    # Common aliases
     lord = n.get("lord") or n.get("graha") or n.get("ruler") or n.get("planet") or n.get("deity") or n.get("name")
     label = n.get("label") or n.get("title") or str(lord or "Dasha")
     level = int(n.get("level") or n.get("depth") or 1)
     start = float(n.get("start_jd_tt") or n.get("start") or n.get("start_tt") or n.get("startJD") or 0.0)
     end = float(n.get("end_jd_tt") or n.get("end") or n.get("end_tt") or n.get("endJD") or 0.0)
     children = n.get("children") or n.get("subs") or n.get("items") or []
-    # Enforce closed-open: if end == start due to rounding, nudge end by 1e-9 d
     if not math.isfinite(start) or not math.isfinite(end):
-        start = float(n.get("start", 0.0))
-        end = float(n.get("end", 0.0))
+        start = float(n.get("start", 0.0)); end = float(n.get("end", 0.0))
     if abs(end - start) < 1e-12:
-        end = start + 1e-9
+        end = start + 1e-9  # enforce [start, end)
     node = {
         "level": int(level),
         "lord": (str(lord) if lord is not None else None),
@@ -290,32 +251,75 @@ def _norm_node(n: Dict[str, Any]) -> Dict[str, Any]:
 def _norm_tree(tree: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(tree, dict):
         raise ValueError("engine returned non-dict dasha tree")
-    root = _norm_node(tree)
-    return root
+    return _norm_node(tree)
 
 
 def _envelope_from_forest(nodes: List[Dict[str, Any]], *, label: str = "Dasha", level_hint: int | None = None) -> Dict[str, Any]:
-    """Wrap a list of sibling level-1 nodes into a single envelope tree node."""
     if not nodes:
         return {"level": 1, "lord": None, "label": label, "start_jd_tt": 0.0, "end_jd_tt": 0.0, "children": []}
     s0 = min(float(n.get("start_jd_tt") or n.get("start") or 0.0) for n in nodes)
     e1 = max(float(n.get("end_jd_tt") or n.get("end") or 0.0) for n in nodes)
-    # Keep envelope out of semantic levels by choosing 0 if children are 1+, else 1.
     child_levels = [int(n.get("level") or 1) for n in nodes]
     env_level = (min(child_levels) - 1) if min(child_levels) > 0 else 1
     if isinstance(level_hint, int):
         env_level = level_hint
-    return {
-        "level": int(env_level),
-        "lord": None,
-        "label": str(label),
-        "start_jd_tt": _q_jd(s0),
-        "end_jd_tt": _q_jd(e1),
-        "children": nodes,
-    }
+    return {"level": int(env_level), "lord": None, "label": str(label),
+            "start_jd_tt": _q_jd(s0), "end_jd_tt": _q_jd(e1), "children": nodes}
 
 
 # ───────────────────────────── Engine dispatch ────────────────────────────────
+
+def _payload_for_single_arg_engine(
+    spec: _DashaSpec,
+    original_payload: Dict[str, Any],
+    jd_tt_birth: float,
+    ay_key: str,
+    ay_deg: float,
+    depth: Optional[int],
+    options: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Build a payload compatible with engines that want a single dict arg.
+    Covers both Vimśottarī + Aṣṭottarī module styles.
+    """
+    p: Dict[str, Any] = {}
+
+    # Birth epoch (provide both common keys)
+    p["jd_tt"] = float(jd_tt_birth)
+    p["birth_jd_tt"] = float(jd_tt_birth)
+
+    # Ayanāṁśa: preserve caller's type if provided; else give both key + degrees
+    if "ayanamsa" in original_payload:
+        p["ayanamsa"] = original_payload["ayanamsa"]
+    else:
+        # engines vary: some want key, some degrees; include both
+        p["ayanamsa"] = ay_key
+        p["ayanamsa_deg"] = float(ay_deg)
+
+    # Depth/levels
+    if isinstance(depth, int) and depth > 0:
+        p["levels"] = int(depth)
+    elif isinstance(original_payload.get("levels"), int):
+        p["levels"] = int(original_payload["levels"])
+
+    # Common knobs (pass through if present)
+    for k in ("start_mode", "year_days", "limit_jd_tt", "moon_nirayana_deg"):
+        if k in original_payload:
+            p[k] = original_payload[k]
+        elif k in options:
+            p[k] = options[k]
+
+    # Also pass original civil triplet if present (engines may prefer civil)
+    for k in ("date", "time", "tz", "place_tz"):
+        if k in original_payload:
+            p[k] = original_payload[k]
+
+    # Options bag (if engine reads it)
+    if options:
+        p["options"] = dict(options)
+
+    return p
+
 
 def _coerce_engine_tree(res: Dict[str, Any], spec: _DashaSpec) -> Dict[str, Any]:
     """
@@ -324,29 +328,29 @@ def _coerce_engine_tree(res: Dict[str, Any], spec: _DashaSpec) -> Dict[str, Any]
       - {'nested': [...]} → wrap into an envelope and normalize
       - direct node {'start_jd_tt', 'end_jd_tt', ...} → normalize
     """
-    # Native 'tree'
     if isinstance(res, dict) and "tree" in res:
         return _norm_tree(res["tree"])
-    # Forest 'nested' (e.g., Ashtottari engine)
     if isinstance(res, dict) and "nested" in res and isinstance(res["nested"], list):
         env = _envelope_from_forest(res["nested"], label=(res.get("scheme") or spec.key or "Dasha"))
         return _norm_tree(env)
-    # Direct node
     if isinstance(res, dict) and all(k in res for k in ("start_jd_tt", "end_jd_tt")):
         return _norm_tree(res)
     raise ValueError(f"Engine returned unsupported shape for {spec.key}")
 
-def _call_engine(spec: _DashaSpec, jd_tt_birth: float, ay_key: str, ay_deg: float, *, depth: Optional[int], options: Dict[str, Any]) -> Dict[str, Any]:
+
+def _call_engine(
+    spec: _DashaSpec,
+    jd_tt_birth: float,
+    ay_key: str,
+    ay_deg: float,
+    *,
+    depth: Optional[int],
+    options: Dict[str, Any],
+    original_payload: Dict[str, Any],
+) -> Dict[str, Any]:
     """
-    Attempt a few natural signatures in order, to maximize compatibility:
-
-    Preferred engine signatures:
-        compute_dasha(jd_tt_birth, ayanamsa_key="lahiri", ayanamsa_deg=None, depth=None, options=None) -> dict
-        compute_dasha(jd_tt_birth, ayanamsa_key, depth=None, options=None) -> dict
-        compute_dasha(jd_tt_birth, depth=None, **options) -> dict
-
-    Engine should return dict with keys at least: {'levels': [...], 'tree': {...}}  OR
-    may return {'nested': [...]} which we will envelope into a single tree node.
+    Try single-arg payload engines first (compute_xxx(payload)), then
+    the keyword/positional variants.
     """
     mod = importlib.import_module(spec.module)
     fn = None
@@ -358,7 +362,25 @@ def _call_engine(spec: _DashaSpec, jd_tt_birth: float, ay_key: str, ay_deg: floa
     if fn is None:
         raise NotImplementedError(f"Engine function not found in {spec.module} (tried {spec.fn_candidates})")
 
-    # Try keyword-first call patterns
+    # Detect single-argument payload function
+    try:
+        sig = inspect.signature(fn)
+        params = list(sig.parameters.values())
+    except Exception:
+        params = []
+
+    # Case 1: single positional/pos-or-kw param → call with built payload
+    if len(params) == 1 and params[0].kind in (
+        inspect.Parameter.POSITIONAL_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    ):
+        engine_payload = _payload_for_single_arg_engine(spec, original_payload, jd_tt_birth, ay_key, ay_deg, depth, options)
+        res = fn(engine_payload)  # type: ignore[misc]
+        tree = _coerce_engine_tree(res, spec)
+        levels = list(res.get("levels")) if isinstance(res, dict) and isinstance(res.get("levels"), (list, tuple)) else list(spec.levels)
+        return {"levels": levels, "tree": tree}
+
+    # Case 2: keyword/positional variants
     kwargs_variants: List[Dict[str, Any]] = [
         {"jd_tt_birth": jd_tt_birth, "ayanamsa_key": ay_key, "ayanamsa_deg": ay_deg, "depth": depth, "options": options},
         {"jd_tt_birth": jd_tt_birth, "ayanamsa_key": ay_key, "depth": depth, "options": options},
@@ -373,10 +395,9 @@ def _call_engine(spec: _DashaSpec, jd_tt_birth: float, ay_key: str, ay_deg: floa
             res = fn(**k2)
             break
         except TypeError:
+            # Positional fallbacks based on arity
             try:
-                # Positional fallback: (jd_tt_birth, ayanamsa_key, ay_deg?, depth?)
-                sig = inspect.signature(fn)
-                pos_count = sum(1 for p in sig.parameters.values() if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD))
+                pos_count = sum(1 for p in params if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)) if params else 0
                 if pos_count >= 4:
                     res = fn(jd_tt_birth, ay_key, ay_deg, depth)
                 elif pos_count == 3:
@@ -396,16 +417,9 @@ def _call_engine(spec: _DashaSpec, jd_tt_birth: float, ay_key: str, ay_deg: floa
     if res is None:
         raise RuntimeError(f"Engine call failed for {spec.key}: {last_err}")
 
-    # Normalize engine output → single tree + levels
     tree = _coerce_engine_tree(res, spec)
-    out_levels = None
-    if isinstance(res, dict):
-        lv = res.get("levels")
-        if isinstance(lv, (list, tuple)) and lv:
-            out_levels = list(lv)
-    if not out_levels:
-        out_levels = list(spec.levels)
-    return {"levels": out_levels, "tree": tree}
+    levels = list(res.get("levels")) if isinstance(res, dict) and isinstance(res.get("levels"), (list, tuple)) else list(spec.levels)
+    return {"levels": levels, "tree": tree}
 
 
 def _find_spec(system: str) -> _DashaSpec:
@@ -419,7 +433,6 @@ def _find_spec(system: str) -> _DashaSpec:
 # ───────────────────────────── Windowing / slicing ────────────────────────────
 
 def _overlap(a0: float, a1: float, b0: float, b1: float) -> float:
-    """Length of overlap between [a0,a1) and [b0,b1)."""
     return max(0.0, min(a1, b1) - max(a0, b0))
 
 
@@ -450,7 +463,6 @@ def _slice_node(node: Dict[str, Any], w0: float, w1: float) -> Optional[Dict[str
 def _slice_tree(tree: Dict[str, Any], w0: float, w1: float) -> Dict[str, Any]:
     res = _slice_node(tree, float(w0), float(w1))
     if res is None:
-        # Return empty envelope matching root level
         return {
             "level": int(tree.get("level", 1)),
             "lord": tree.get("lord"),
@@ -481,7 +493,7 @@ def flatten_dasha(tree: Dict[str, Any]) -> List[Dict[str, Any]]:
             "index_path": ipath + [idx],
         }
         rows.append(row)
-        for i, ch in enumerate(n.get("children") or []):
+        for ch in n.get("children") or []:
             rec(ch, row["path"], row["index_path"], dict(idx_at_level))
 
     rec(tree, [], [], {})
@@ -490,7 +502,6 @@ def flatten_dasha(tree: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _contains(t: float, s: float, e: float) -> bool:
-    # Closed-open [s,e)
     return (s <= t) and (t < e - 1e-12)
 
 
@@ -510,10 +521,6 @@ def _active_path(tree: Dict[str, Any], t: float) -> List[Dict[str, Any]]:
 
 
 def _scan_boundaries(tree: Dict[str, Any], *, level: Optional[int] = None) -> List[Tuple[float, str, int, List[str]]]:
-    """
-    Collect (jd_tt, kind, level, path_names)
-    kind in {"start","end"}
-    """
     out: List[Tuple[float, str, int, List[str]]] = []
     def rec(n: Dict[str, Any], path: List[str]):
         lv = int(n["level"])
@@ -523,31 +530,30 @@ def _scan_boundaries(tree: Dict[str, Any], *, level: Optional[int] = None) -> Li
         for ch in n.get("children") or []:
             rec(ch, path + [str(n.get("lord") or n.get("label"))])
     rec(tree, [])
-    out.sort(key=lambda x: (x[0], x[1] == "start"))  # start before end at same instant
+    out.sort(key=lambda x: (x[0], x[1] == "start"))
     return out
 
 
 # ───────────────────────────── Orchestrators ─────────────────────────────────
 
 @lru_cache(maxsize=256)
-def _cached_engine_result(system_key: str, birth_jd_tt_q: float, ay_key: str, ay_deg_q: float, depth_key: int, options_key: Tuple[Tuple[str, Any], ...]) -> Dict[str, Any]:
+def _cached_engine_result(system_key: str, birth_jd_tt_q: float, ay_key: str, ay_deg_q: float, depth_key: int, options_key: Tuple[Tuple[str, Any], ...], payload_key: Tuple[Tuple[str, Any], ...]) -> Dict[str, Any]:
     """Cache full-tree engine result only; windowing/point queries operate on it."""
     spec = _find_spec(system_key)
     options = dict(options_key)
-    res = _call_engine(spec, birth_jd_tt_q, ay_key, ay_deg_q, depth=(depth_key or None), options=options)
-    # Normalize once
+    original_payload = dict(payload_key)
+    res = _call_engine(spec, birth_jd_tt_q, ay_key, ay_deg_q, depth=(depth_key or None), options=options, original_payload=original_payload)
     tree = _norm_tree(res["tree"])
     levels = list(res.get("levels") or spec.levels)
     return {"levels": levels, "tree": tree}
 
 
-def _options_key(options: Dict[str, Any]) -> Tuple[Tuple[str, Any], ...]:
-    if not options:
+def _options_key(d: Dict[str, Any]) -> Tuple[Tuple[str, Any], ...]:
+    if not d:
         return tuple()
-    # Sort keys for stable cache key; coerce floats/ints/strs
     items: List[Tuple[str, Any]] = []
-    for k in sorted(options.keys()):
-        v = options[k]
+    for k in sorted(d.keys()):
+        v = d[k]
         if isinstance(v, (float, int, str, bool)) or v is None:
             items.append((str(k), v))
         else:
@@ -564,10 +570,12 @@ def compute_dasha(system: str, payload: Dict[str, Any], *, depth: int | None = N
       - OR flat {date,time,tz} or {jd_tt[, jd_ut, jd_ut1]}
       - ayanamsa: "lahiri" (default) or explicit degrees
       - options: dict passed-through to engines (system-specific knobs)
+      - start_mode/year_days/limit_jd_tt/moon_nirayana_deg (forwarded to single-arg engines)
     """
     ts = _timescales_from_payload(payload)
     ay_key, ay_deg, ay_warns = _resolve_ayanamsa(ts.jd_tt, payload)
     opts = payload.get("options") or {}
+
     res = _cached_engine_result(
         str(system).strip().lower(),
         _q_jd(ts.jd_tt),
@@ -575,7 +583,9 @@ def compute_dasha(system: str, payload: Dict[str, Any], *, depth: int | None = N
         float(ay_deg),
         int(depth or 0),
         _options_key(opts),
+        _options_key(payload),   # include original payload (for single-arg engines)
     )
+
     out = {
         "ok": True,
         "system": str(system).strip().lower(),
@@ -612,7 +622,6 @@ def dasha_at(system: str, payload: Dict[str, Any], *, jd_tt: float) -> Dict[str,
     core = compute_dasha(system, payload)
     t = _q_jd(float(jd_tt))
     path = _active_path(core["tree"], t)
-    # time to end for the deepest active node
     tte = None
     if path:
         deepest = path[-1]
@@ -621,7 +630,7 @@ def dasha_at(system: str, payload: Dict[str, Any], *, jd_tt: float) -> Dict[str,
         "ok": True,
         "system": core["system"],
         "levels": core["levels"],
-        "active_path": path,  # list of nodes from level 1..k
+        "active_path": path,
         "query_jd_tt": t,
         "time_to_end_days": tte,
         "meta": core["meta"],
