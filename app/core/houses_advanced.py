@@ -529,17 +529,14 @@ def _sripati(_phi: float, _eps: float, asc: float, mc: float) -> List[float]:
 
 def _equal_from_mc(mc: float) -> List[float]:
     """
-    Equal-from-MC: start at MC (10th cusp) and step forward by 30°.
-    This yields:
+    Equal-from-MC (prograde numbering 1→12):
       cusp10 = MC
       cusp 1 = MC + 90°
-      cusp 4 = MC + 180°  (IC)
+      cusp 4 = MC + 180° (IC)
+    Compute all 12 cusps explicitly at 30° intervals starting from cusp 1.
     """
-    cusps = _blank()
-    for k in range(12):
-        idx = (9 + k) % 12  # 9 is the 10th cusp (0-based)
-        cusps[idx] = _norm_deg(mc + 30.0 * k)
-    return _fill_opposites(cusps)
+    base = _norm_deg(mc + 90.0)  # cusp 1
+    return [_norm_deg(base + 30.0 * i) for i in range(12)]
 
 def _natural_houses() -> List[float]:
     """Aries = 1st; whole-sign from zodiac origin (0° Aries)."""
