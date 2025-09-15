@@ -23,6 +23,19 @@ try:
 except Exception:
     _VIM_ENGINE_OK = False
 
+# Optional engines for Ashtottari & Yogini
+try:
+    from app.core.ashtottari_dasha import compute_ashtottari as _compute_ashtottari
+    _ASHTO_OK = True
+except Exception:
+    _ASHTO_OK = False
+
+try:
+    from app.core.yogini_dasha import compute_yogini as _compute_yogini
+    _YOGINI_OK = True
+except Exception:
+    _YOGINI_OK = False
+
 # Ephemeris access (module-level helper; avoids Config kwargs mismatches)
 try:
     from app.core.ephemeris_adapter import ecliptic_longitudes  # type: ignore
@@ -233,6 +246,89 @@ def _jd_to_iso(j: float) -> str:
     # Back-compat alias
     return _jd_tt_to_iso_utc(j)
 
+# ───────────────────────────── Helpers for multi-system dasha ──────────────────
+
+def _normalize_system(name: str) -> str:
+    n = (name or "").strip().lower()
+    aliases = {
+        "vimshottari": "vimshottari",
+        "vimsottari": "vimshottari",
+        "vimśottarī": "vimshottari",
+        "vimshottari_dasha": "vimshottari",
+        "ashtottari": "ashtottari",
+        "aṣṭottarī": "ashtottari",
+        "ashtottarī": "ashtottari",
+        "yogini": "yogini",
+        "yoginī": "yogini",
+    }
+    return aliases.get(n, n)
+
+def _natal_to_payload(natal_chart: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build a payload that the individual dasha engines accept.
+    Respects either jd_tt or {date,time,tz}. Passes through ayanamsa if present.
+    """
+    payload: Dict[str, Any] = {}
+    if "jd_tt" in natal_chart:
+        payload["jd_tt"] = float(natal_chart["jd_tt"])
+    else:
+        payload["date"] = str(natal_chart.get("date") or "")
+        payload["time"] = str(natal_chart.get("time") or "00:00:00")
+        payload["tz"] = str(natal_chart.get("place_tz") or natal_chart.get("timezone") or "UTC")
+    ay = natal_chart.get("ayanamsa")
+    if ay is not None:
+        payload["ayanamsa"] = ay
+    # optional: ayanamsa_deg is also supported by vim fallback; engines accept string keys
+    return payload
+
+def _flatten_nested(nested: List[Dict[str, Any]], max_level: int) -> List[Dict[str, Any]]:
+    """
+    Flatten a generic nested tree (with keys: level, lord, start_jd_tt, end_jd_tt, children?)
+    into rows that include 'path' for chain derivation.
+    """
+    out: List[Dict[str, Any]] = []
+    def walk(node: Dict[str, Any], path: List[str]):
+        lvl = int(node.get("level", 0))
+        if lvl < 1 or lvl > max_level:
+            return
+        lord = str(node.get("lord"))
+        a = float(node.get("start_jd_tt"))
+        b = float(node.get("end_jd_tt"))
+        new_path = path + [lord]
+        out.append({"level": lvl, "lord": lord, "start_jd_tt": a, "end_jd_tt": b, "path": tuple(new_path)})
+        kids = node.get("children") or node.get("c")  # allow compact
+        if isinstance(kids, list):
+            for k in kids:
+                walk(k, new_path)
+    for root in (nested or []):
+        walk(root, [])
+    # stable order
+    out.sort(key=lambda r: (r["start_jd_tt"], r["level"]))
+    return out
+
+def _clip_rows(rows: List[Dict[str, Any]], jd_a: float, jd_b: float) -> List[Dict[str, Any]]:
+    keep: List[Dict[str, Any]] = []
+    A, B = (jd_a, jd_b) if jd_b >= jd_a else (jd_b, jd_a)
+    for r in rows:
+        a = float(r["start_jd_tt"]); b = float(r["end_jd_tt"])
+        if b <= A or a >= B:
+            continue
+        if a < A: a = A
+        if b > B: b = B
+        keep.append({
+            "start_jd_tt": a,
+            "end_jd_tt": b,
+            "start_date": _jd_tt_to_iso_utc(a),
+            "end_date": _jd_tt_to_iso_utc(b),
+            "level": int(r["level"]),
+            "mahadasha_lord": (r.get("path") or (r.get("lord"),))[0],
+            "chain": list(r.get("path") or (r.get("lord"),)),
+            "lord": r["lord"],
+            "meta": {},
+        })
+    keep.sort(key=lambda d: (d["start_jd_tt"], d["level"]))
+    return keep
+
 # ───────────────────────────── Public predictive API ──────────────────────────
 
 def predict_dasha_periods(
@@ -245,11 +341,11 @@ def predict_dasha_periods(
     levels: Optional[int] = None,      # 1..5
 ) -> Dict[str, Any]:
     """
-    Build daśā periods covering [start_date, end_date] using the new engine.
+    Build daśā periods covering [start_date, end_date] using the selected engine.
+    Supports: vimshottari, ashtottari, yogini.
     Returns rows from all depths 1..L that intersect the window.
     """
-    if dasha_system.lower() not in ("vimshottari", "vimsottari", "vimśottarī", "vimshottari_dasha"):
-        return {"ok": False, "error": "unsupported_dasha"}
+    system = _normalize_system(dasha_system)
 
     # Resolve birth TT
     if "jd_tt" in natal_chart:
@@ -272,88 +368,128 @@ def predict_dasha_periods(
     if L < 1: L = 1
     elif L > 5: L = 5
 
-    # Prefer central Vimśottarī engine
-    if _VIM_ENGINE_OK:
-        ay = natal_chart.get("ayanamsa")
-        if ay is None:
-            ay = natal_chart.get("ayanamsa_deg", "lahiri")
+    # ---------------- Vimśottarī (preferred engine) ----------------
+    if system == "vimshottari":
+        if _VIM_ENGINE_OK:
+            ay = natal_chart.get("ayanamsa")
+            if ay is None:
+                ay = natal_chart.get("ayanamsa_deg", "lahiri")
 
-        tree = generate_vimshottari_tree(
-            birth_jd_tt=float(birth_jd_tt),
-            ayanamsa=ay,
+            tree = generate_vimshottari_tree(
+                birth_jd_tt=float(birth_jd_tt),
+                ayanamsa=ay,
+                levels=L,
+                end_jd_tt=float(jd1_tt),
+            )
+            periods = tree.get("periods", [])
+            rows: List[Dict[str, Any]] = []
+            rows_append = rows.append
+            clip_a = jd0_tt; clip_b = jd1_tt
+
+            for depth in range(1, L + 1):
+                flat = flatten_periods(periods, level=depth)
+                for r in flat:
+                    a = float(r["start_jd_tt"]); b = float(r["end_jd_tt"])
+                    if b <= clip_a or a >= clip_b:
+                        continue
+                    path = r.get("path")
+                    lord = r["lord"]
+                    chain = list(path) if path else [lord]
+                    rows_append({
+                        "start_jd_tt": a,
+                        "end_jd_tt": b,
+                        "start_date": _jd_tt_to_iso_utc(a),
+                        "end_date": _jd_tt_to_iso_utc(b),
+                        "level": depth,
+                        "mahadasha_lord": chain[0],
+                        "chain": chain,
+                        "lord": lord,
+                        "meta": {},
+                    })
+
+            rows.sort(key=lambda d: (d["start_jd_tt"], d["level"]))
+            return {"ok": True, "periods": rows, "system": "vimshottari", "levels": L}
+
+        # Fallback to legacy path (only if the central engine is unavailable)
+        if not _EPH_OK or ecliptic_longitudes is None:
+            return {"ok": False, "error": "ephemeris_unavailable"}
+
+        moon_rows = (ecliptic_longitudes(float(birth_jd_tt), names=["Moon"]) or {}).get("results", [])
+        if not moon_rows:
+            return {"ok": False, "error": "moon_longitude_unavailable"}
+        moon_lon_trop = float(moon_rows[0]["longitude"])
+
+        ay_deg = float(natal_chart.get("ayanamsa_deg", 0.0))
+
+        all_periods = vimsottari_dasha(
+            birth_jd_tt=birth_jd_tt,
+            moon_lon_tropical_deg=moon_lon_trop,
+            ayanamsa_deg=ay_deg,
             levels=L,
-            end_jd_tt=float(jd1_tt),
+            span_years=_TOTAL_YEARS,
         )
-        periods = tree.get("periods", [])
-        rows: List[Dict[str, Any]] = []
-        rows_append = rows.append
-        clip_a = jd0_tt; clip_b = jd1_tt
 
-        # Flatten per depth (keeps API contract), but avoid ISO work for non-intersections
-        for depth in range(1, L + 1):
-            flat = flatten_periods(periods, level=depth)
-            for r in flat:
-                a = float(r["start_jd_tt"]); b = float(r["end_jd_tt"])
-                if b <= clip_a or a >= clip_b:
-                    continue
-                path = r.get("path")
-                lord = r["lord"]
-                chain = list(path) if path else [lord]
-                rows_append({
-                    "start_jd_tt": a,
-                    "end_jd_tt": b,
-                    "start_date": _jd_tt_to_iso_utc(a),
-                    "end_date": _jd_tt_to_iso_utc(b),
-                    "level": depth,
-                    "mahadasha_lord": chain[0],
-                    "chain": chain,
-                    "lord": lord,
-                    "meta": {},
-                })
+        out: List[Dict[str, Any]] = []
+        out_append = out.append
+        a0 = jd0_tt; b0 = jd1_tt
+        for p in all_periods:
+            a = p.start_jd_tt; b = p.end_jd_tt
+            if b <= a0 or a >= b0:
+                continue
+            out_append({
+                "start_jd_tt": a,
+                "end_jd_tt": b,
+                "start_date": _jd_tt_to_iso_utc(a),
+                "end_date": _jd_tt_to_iso_utc(b),
+                "level": p.level,
+                "mahadasha_lord": p.parent_chain[0] if p.parent_chain else p.lord,
+                "chain": list(p.parent_chain),
+                "lord": p.lord,
+                "meta": p.meta,
+            })
 
-        rows.sort(key=lambda d: (d["start_jd_tt"], d["level"]))
-        return {"ok": True, "periods": rows, "system": "vimshottari", "levels": L}
+        return {"ok": True, "periods": out, "system": "vimshottari", "levels": L}
 
-    # Fallback to legacy path (only if the central engine is unavailable)
-    if not _EPH_OK or ecliptic_longitudes is None:
-        return {"ok": False, "error": "ephemeris_unavailable"}
-
-    # Get Moon tropical longitude at birth via ephemeris (no Config kwargs!)
-    moon_rows = (ecliptic_longitudes(float(birth_jd_tt), names=["Moon"]) or {}).get("results", [])
-    if not moon_rows:
-        return {"ok": False, "error": "moon_longitude_unavailable"}
-    moon_lon_trop = float(moon_rows[0]["longitude"])
-
-    ay_deg = float(natal_chart.get("ayanamsa_deg", 0.0))
-
-    all_periods = vimsottari_dasha(
-        birth_jd_tt=birth_jd_tt,
-        moon_lon_tropical_deg=moon_lon_trop,
-        ayanamsa_deg=ay_deg,
-        levels=L,
-        span_years=_TOTAL_YEARS,
-    )
-
-    out: List[Dict[str, Any]] = []
-    out_append = out.append
-    a0 = jd0_tt; b0 = jd1_tt
-    for p in all_periods:
-        a = p.start_jd_tt; b = p.end_jd_tt
-        if b <= a0 or a >= b0:
-            continue
-        out_append({
-            "start_jd_tt": a,
-            "end_jd_tt": b,
-            "start_date": _jd_tt_to_iso_utc(a),
-            "end_date": _jd_tt_to_iso_utc(b),
-            "level": p.level,
-            "mahadasha_lord": p.parent_chain[0] if p.parent_chain else p.lord,
-            "chain": list(p.parent_chain),
-            "lord": p.lord,
-            "meta": p.meta,
+    # ---------------- Aṣṭottarī ----------------
+    if system == "ashtottari":
+        if not _ASHTO_OK:
+            return {"ok": False, "error": "ashtottari_engine_unavailable"}
+        base = _natal_to_payload(natal_chart)
+        base.update({
+            "levels": L,
+            "year_days": 365.24219,
+            "limit_jd_tt": float(jd1_tt),
         })
+        sched = _compute_ashtottari(base)
+        if not sched.get("ok", False):
+            return {"ok": False, "error": sched.get("error", "ashtottari_failed")}
 
-    return {"ok": True, "periods": out, "system": "vimshottari", "levels": L}
+        nested = sched.get("nested") or []
+        flat = _flatten_nested(nested, max_level=L)
+        rows = _clip_rows(flat, jd0_tt, jd1_tt)
+        return {"ok": True, "periods": rows, "system": "ashtottari", "levels": L}
+
+    # ---------------- Yoginī ----------------
+    if system == "yogini":
+        if not _YOGINI_OK:
+            return {"ok": False, "error": "yogini_engine_unavailable"}
+        base = _natal_to_payload(natal_chart)
+        base.update({
+            "levels": L,
+            "year_days": 365.24219,
+            "limit_jd_tt": float(jd1_tt),
+        })
+        sched = _compute_yogini(base)
+        if not sched.get("ok", False):
+            return {"ok": False, "error": sched.get("error", "yogini_failed")}
+
+        nested = sched.get("nested") or []
+        flat = _flatten_nested(nested, max_level=L)
+        rows = _clip_rows(flat, jd0_tt, jd1_tt)
+        return {"ok": True, "periods": rows, "system": "yogini", "levels": L}
+
+    # Unknown system
+    return {"ok": False, "error": "unsupported_dasha"}
 
 # =============================================================================
 # VARGAS (DIVISIONAL CHARTS) — same API, micro-optimized internals
