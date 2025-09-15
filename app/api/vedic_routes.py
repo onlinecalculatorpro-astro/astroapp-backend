@@ -137,8 +137,19 @@ def _pick_times(norm: Dict[str, Any], original: Dict[str, Any]) -> Dict[str, Any
 
 
 def _build_civic_payload_vim(original: Dict[str, Any], norm: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    New: pass through flexible flags for Vimśottarī:
+      - method: "sidereal" | "tropical"  (default handled by validator/engine)
+      - coordinate_mode: "geocentric" | "topocentric"
+        (also accepts observer="..." or topocentric: true/false)
+      - ayanamsa: string key (default "lahiri")
+      - optional birth place fields (city/state/country or free-form 'place')
+      - lat/lon/elevation (used when topocentric)
+    Keeps legacy options like span_years, end_jd_tt, year_days, query params, flatten_level.
+    """
     civ: Dict[str, Any] = {}
-    # legacy engine expects birth_jd_tt OR civil
+
+    # Birth time: prefer explicit birth_jd_tt → else jd_tt → else (date,time,tz)
     if isinstance(original.get("birth_jd_tt"), (int, float)):
         civ["birth_jd_tt"] = float(original["birth_jd_tt"])
     elif isinstance(norm.get("jd_tt"), (int, float)):
@@ -147,12 +158,46 @@ def _build_civic_payload_vim(original: Dict[str, Any], norm: Dict[str, Any]) -> 
         v = norm.get(k)
         if isinstance(v, str) and v.strip():
             civ[k] = v.strip()
+
+    # Flexible flags (already normalized by validator when present)
+    if norm.get("method"):
+        civ["method"] = norm["method"]  # "sidereal" | "tropical"
+    if norm.get("coordinate_mode"):
+        civ["coordinate_mode"] = norm["coordinate_mode"]  # "geocentric" | "topocentric"
+        civ["topocentric"] = (str(norm["coordinate_mode"]).lower() == "topocentric")
+    elif "observer" in original:
+        obs = str(original.get("observer") or "").strip().lower()
+        civ["coordinate_mode"] = "topocentric" if obs == "topocentric" else "geocentric"
+        civ["topocentric"] = (civ["coordinate_mode"] == "topocentric")
+    elif "topocentric" in original:
+        civ["topocentric"] = bool(original.get("topocentric"))
+        civ["coordinate_mode"] = "topocentric" if civ["topocentric"] else "geocentric"
+
+    # Ayanāṃśa (default "lahiri" is handled upstream; pass through if present)
     if norm.get("ayanamsa") is not None:
         civ["ayanamsa"] = norm["ayanamsa"]
+
+    # Geography (used if topocentric; harmless otherwise)
+    for k in ("latitude", "longitude", "elevation"):
+        if norm.get(k) is not None:
+            civ[k] = norm[k]
+        elif original.get(k) is not None:
+            civ[k] = original[k]
+
+    # Optional "place" fields (pass-through for logging/UX; engine can ignore)
+    # Accept either a free-form "place" or structured pieces.
+    for k in ("place", "place_city", "place_state", "place_country"):
+        if original.get(k) is not None:
+            civ[k] = original[k]
+        elif norm.get(k) is not None:
+            civ[k] = norm[k]
+
+    # Depth & window controls
     _add_levels_and_limit(civ, norm)
     for k in ("span_years", "end_jd_tt", "year_days", "query_jd_tt", "q_date", "q_time", "q_tz", "flatten_level"):
         if k in original and original[k] is not None:
             civ[k] = original[k]
+
     return civ
 
 
@@ -210,7 +255,7 @@ def _build_civic_payload_kcd(original: Dict[str, Any], norm: Dict[str, Any]) -> 
     # levels
     civ["levels"] = _levels_from(norm)
 
-    # ✅ ensure limit_jd_tt is copied from original (fallback to norm)
+    # ensure limit_jd_tt if present
     lim = original.get("limit_jd_tt", norm.get("limit_jd_tt"))
     if isinstance(lim, (int, float)):
         civ["limit_jd_tt"] = float(lim)
