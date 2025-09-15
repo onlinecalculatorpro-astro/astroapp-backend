@@ -201,20 +201,23 @@ def _build_civic_payload_chara(original: Dict[str, Any], norm: Dict[str, Any]) -
     return civ
 
 
-def _build_civic_payload_kcd(original: Dict[str, Any], norm: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Prepare payload for compute_kalachakra_dasha(payload_dict).
-    Requires a kcd_table or kcd_preset supplied by the client.
-    """
+def _build_civic_payload_kcd(original, norm):
     civ = _pick_times(norm, original)
-
     if norm.get("ayanamsa") is not None:
         civ["ayanamsa"] = norm["ayanamsa"]
     _add_levels_and_limit(civ, norm)
 
-    # KCD-specific settings
-    for k in ("kcd_table", "kcd_preset", "use_demo_kcd_table", "override_start_sign_index",
-              "year_days", "balance_years", "balance_fraction", "planet_longitudes_sidereal"):
+    tbl = original.get("kcd_table")
+    if isinstance(tbl, dict):
+        yrs = tbl.get("sign_years")
+        if isinstance(yrs, dict):
+            tbl = dict(tbl)
+            tbl["sign_years"] = {int(k): float(v) for k, v in yrs.items()}
+        civ["kcd_table"] = tbl
+
+    for k in ("kcd_preset", "use_demo_kcd_table", "override_start_sign_index",
+              "year_days", "balance_years", "balance_fraction",
+              "planet_longitudes_sidereal"):
         if k in original and original[k] is not None:
             civ[k] = original[k]
     return civ
