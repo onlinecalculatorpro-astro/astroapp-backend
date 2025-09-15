@@ -5,29 +5,16 @@ from __future__ import annotations
 """
 Central dispatcher for Vedic daśā engines.
 
-Features
---------
-- Normalizes many scheme aliases to canonical keys.
-- Wires in engines that successfully import (others are reported unavailable).
-- Provides a cached Moon nirayana helper for engines/tests.
-- (Dev-only) Optional demo table injection for Kālachakra so you can test
-  without supplying a lineage table: set payload.use_demo_kcd_table=true.
+Changes in this version (Vimśottarī only):
+- When scheme is "vimshottari", the registry now normalizes payload to your
+  new engine contract:
+    • method            : "sidereal" | "tropical"  (defaults to "sidereal")
+    • coordinate_mode   : "geocentric" | "topocentric"
+      (also accepts observer="geocentric|topocentric" or topocentric: bool)
+    • ayanamsa          : normalized string; defaults to "lahiri"
+  Backwards-compat keys (zodiac_mode, mode, ayanamsa_key) are accepted.
 
-Public API
-----------
-compute_dasha(payload) -> dict
-    Payload may include any engine-specific args. Choose scheme from one of:
-    payload["scheme"] | payload["system"] | payload["dasha"].
-    Defaults to "vimshottari".
-
-compute_dasha_for(scheme, payload) -> dict
-    Explicit scheme variant of the above.
-
-available_schemes() -> dict[str, bool]
-    Which engines are wired and importable at runtime.
-
-_moon_nirayana_deg_at(jd_tt, ayanamsa_key="lahiri") -> float
-    Utility for tests/engines.
+Other engines (ashtottari, yogini, chara, kalachakra) are passed through unchanged.
 """
 
 from typing import Any, Dict, Callable, Optional
@@ -191,6 +178,52 @@ def _normalize_scheme(name: Any) -> str:
 
     return "vimshottari"
 
+# ────────────────────────── Vimśottarī payload normalizer ──────────────────────────
+def _norm_vim_payload(p: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Make payload robust to legacy keys and ensure the new engine flags exist.
+    - method: from method|mode|zodiac_mode → "sidereal"|"tropical" (default "sidereal")
+    - coordinate_mode/topocentric: from coordinate_mode|observer|topocentric
+    - ayanamsa: from ayanamsa|ayanamsa_key (default "lahiri")
+    Leaves lat/lon/elevation, jd_tt/jd_ut1, date/time/tz, levels etc. untouched if present.
+    """
+    if not isinstance(p, dict):
+        return {}
+
+    out = dict(p)  # shallow copy
+
+    # method
+    method = (out.get("method") or out.get("mode") or out.get("zodiac_mode") or "sidereal")
+    m = str(method).strip().lower()
+    if m in ("sidereal","nirayana","nirāyaṇa","sid","s"):
+        out["method"] = "sidereal"
+    elif m in ("tropical","sayana","sāyana","trop","t"):
+        out["method"] = "tropical"
+    else:
+        out["method"] = "sidereal"
+
+    # coordinate_mode / topocentric
+    if "coordinate_mode" in out and isinstance(out["coordinate_mode"], str):
+        cm = out["coordinate_mode"].strip().lower()
+    else:
+        obs = str(out.get("observer","")).strip().lower()
+        if obs in ("topocentric","apparent","obs"):
+            cm = "topocentric"
+        elif obs in ("geocentric","geo","center"):
+            cm = "geocentric"
+        else:
+            cm = "topocentric" if bool(out.get("topocentric")) else "geocentric"
+    out["coordinate_mode"] = "topocentric" if cm == "topocentric" else "geocentric"
+    out["topocentric"] = (out["coordinate_mode"] == "topocentric")
+
+    # ayanamsa
+    ay = out.get("ayanamsa", out.get("ayanamsa_key", "lahiri"))
+    ay = str(ay).strip().lower() if isinstance(ay, str) else (ay or "lahiri")
+    out["ayanamsa"] = ay or "lahiri"
+    out["ayanamsa_key"] = out["ayanamsa"]
+
+    return out
+
 # ────────────────────────── registry ──────────────────────────
 _DASHA_REGISTRY: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {}
 if _VIM_OK:
@@ -217,10 +250,6 @@ def available_schemes() -> Dict[str, bool]:
 
 # ───────────── dev helper: optional demo KCD table injection (off by default) ─────────────
 def _demo_kcd_table() -> Dict[str, Any]:
-    """
-    Tiny dev-only table so Kālachakra tests can run without an external lineage mapping.
-    Do NOT use in production.
-    """
     years = {1:7, 2:16, 3:9, 4:15, 5:19, 6:12, 7:7, 8:16, 9:9, 10:15, 11:19, 12:12}
     base = [1,2,3,4,5,6,7,8,9,10,11,12]
     seq = {}
@@ -230,10 +259,6 @@ def _demo_kcd_table() -> Dict[str, Any]:
     return {"name": "demo_dev_only", "sign_years": years, "pada_to_sequence": seq}
 
 def _maybe_inject_demo_kcd(scheme_key: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    If scheme is kalachakra and no table/preset provided, optionally inject a demo table.
-    Activate by setting payload.use_demo_kcd_table = True (default False).
-    """
     if scheme_key not in ("kalachakra", "kcd"):
         return payload
     if not isinstance(payload, dict):
@@ -251,8 +276,13 @@ def _dispatch(scheme_key: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     if not fn:
         return {"ok": False, "error": f"unsupported_dasha:{scheme_key}", "available": available_schemes()}
     try:
+        # Vimśottarī-only payload normalization (new engine flags & backwards-compat)
+        if scheme_key == "vimshottari":
+            payload = _norm_vim_payload(payload or {})
+
         # Dev helper (Kalachakra only)
         payload = _maybe_inject_demo_kcd(scheme_key, payload or {})
+
         out = fn(payload or {})
         if not isinstance(out, dict):
             return {"ok": False, "error": f"engine_returned_non_dict:{scheme_key}"}
