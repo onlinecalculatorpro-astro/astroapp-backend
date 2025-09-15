@@ -14,7 +14,7 @@ Engine highlights
 - Sidereal-first numerics (ayanāṁśa subtraction via app.core.ayanamsa.get_ayanamsa_deg).
 - Timescales: time_kernel preferred; fallback to app.core.timescales.
 - Moon sidereal longitude → nakṣatra/pada via guarded EphemerisAdapter.
-- Deterministic Decimal math for partitions; exact child-sum closure to parent (up to float emission).
+- Deterministic Decimal math for partitions; exact child-sum closure to parent (float output only at the edges).
 - Full 5-level nesting. Children start at parent’s rāśi and follow the scheme’s 12-sign sequence.
 - Child duration = parent_days × (years(child_rāśi) / total_years_per_cycle).
 - Optional balance for first mahā by absolute years or fraction.
@@ -37,12 +37,19 @@ compute_kalachakra_dasha(payload: dict) -> dict:
 
 NOTE
 - This module requires `kcd_table` at runtime (or implement `load_kcd_table_preset`).
+- For quick demos, set `use_demo_kcd_table: true` in the payload to auto-supply a simple, uniform mapping.
 """
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from decimal import Decimal, getcontext
 import math
+
+__all__ = [
+    "compute_kalachakra_dasha",
+    "kalachakra_schedule",
+    "load_kcd_table_preset",
+]
 
 # High-precision nested math
 getcontext().prec = 34
@@ -59,8 +66,8 @@ except Exception:
     _ts = None
 
 try:
-    from app.core.ephemeris_adapter import EphemerisAdapter, Config as EphemConfig
-    from app.core.ephem_singleton import TS, PLANETS
+    from app.core.ephemeris_adapter import EphemerisAdapter, Config as EphemConfig  # type: ignore
+    from app.core.ephem_singleton import TS, PLANETS  # type: ignore
     _EPH_OK = True
 except Exception:
     EphemerisAdapter = object  # type: ignore
@@ -107,6 +114,33 @@ def _timescales_from_civil(date: str, time: str, tz: str) -> Tuple[float, float,
     return jd_ut, jd_tt, jd_ut1
 
 # ───────────────────────── ephemeris helpers ─────────────────────────
+_EPHEM_CACHED: Optional[Any] = None
+
+def _make_ephem_adapter() -> Any:
+    """Robust adapter constructor across versions; cached for reuse."""
+    global _EPHEM_CACHED
+    if _EPHEM_CACHED is not None:
+        return _EPHEM_CACHED
+    if not _EPH_OK:
+        raise RuntimeError("EphemerisAdapter unavailable; enable app.core.ephemeris_adapter")
+    try:
+        cfg = EphemConfig(frame="ecliptic-of-date", planets=PLANETS)  # type: ignore[arg-type]
+    except TypeError:
+        cfg = EphemConfig(frame="ecliptic-of-date")  # type: ignore
+    try:
+        ep = EphemerisAdapter(cfg, timescale=TS)  # type: ignore[arg-type]
+    except TypeError:
+        try:
+            ep = EphemerisAdapter(cfg, TS)  # type: ignore[misc]
+        except TypeError:
+            try:
+                cfg2 = EphemConfig(frame="ecliptic-of-date", planets=PLANETS, timescale=TS)  # type: ignore
+                ep = EphemerisAdapter(cfg2)  # type: ignore
+            except TypeError:
+                ep = EphemerisAdapter(cfg)  # type: ignore
+    _EPHEM_CACHED = ep
+    return ep
+
 def _moon_sidereal_longitude(
     jd_tt: float, *, ay_key: str, preload_sidereal: Optional[Dict[str, float]] = None
 ) -> float:
@@ -116,9 +150,7 @@ def _moon_sidereal_longitude(
     """
     if preload_sidereal and isinstance(preload_sidereal.get("Moon"), (int, float)):
         return _norm360(float(preload_sidereal["Moon"]))
-    if not _EPH_OK:
-        raise RuntimeError("EphemerisAdapter unavailable; enable app.core.ephemeris_adapter")
-    ep = EphemerisAdapter(EphemConfig(frame="ecliptic-of-date", timescale=TS, planets=PLANETS))  # type: ignore
+    ep = _make_ephem_adapter()
     rows = (ep.ecliptic_longitudes(float(jd_tt), ["Moon"]) or {}).get("results", [])
     if not rows:
         raise RuntimeError("ephemeris returned no Moon longitude")
@@ -177,6 +209,20 @@ def _validate_kcd_table(tbl: Dict[str, Any]) -> None:
             raise ValueError("kcd_table['pada_to_sequence'] keys must be 1..108")
         if not (isinstance(v, (list, tuple)) and len(v) == 12 and all(1 <= int(x) <= 12 for x in v)):
             raise ValueError("each 'pada_to_sequence'[k] must be a 12-length list of 1..12")
+
+def _demo_kcd_table() -> Dict[str, Any]:
+    """
+    Demo mapping:
+      - Every pada maps to Aries..Pisces (1..12) order
+      - Per-sign years are uniform (10 each → total 120)
+    This is ONLY for dev console tests; do not use for research.
+    """
+    order = list(range(1, 13))
+    return {
+        "name": "demo_uniform",
+        "pada_to_sequence": {i: order[:] for i in range(1, 109)},
+        "sign_years": {i: 10 for i in range(1, 13)},
+    }
 
 # ───────────────────────── schedule builder ─────────────────────────
 def _years_total(yrs: Dict[int, float | int]) -> Decimal:
@@ -265,8 +311,7 @@ def kalachakra_schedule(
         if idx == 0 and isinstance(balance_years, (int, float)):
             reduce_days = Decimal(str(balance_years)) * year_days_D
             dur_days = max(Decimal(0), dur_days - reduce_days)
-        t, sp = _append_span(spans_L1, 1, int(s), t, dur_days, limit=t_limit)
-        # (t carries un-clipped cursor; sp.end may be clipped to limit)
+        t, _sp = _append_span(spans_L1, 1, int(s), t, dur_days, limit=t_limit)
 
     # Expand sub-levels
     all_spans: List[DashaSpan] = list(spans_L1)
@@ -348,6 +393,7 @@ def kalachakra_schedule(
 def compute_kalachakra_dasha(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Required: payload['kcd_table'] OR payload['kcd_preset'] (if you implement load_kcd_table_preset).
+    For quick dev tests, you may pass { use_demo_kcd_table: true } to auto-supply a uniform mapping.
 
     Steps:
       1) Resolve jd_tt (from args or civil).
@@ -388,6 +434,8 @@ def compute_kalachakra_dasha(payload: Dict[str, Any]) -> Dict[str, Any]:
 
         # KCD table
         table = payload.get("kcd_table")
+        if table is None and bool(payload.get("use_demo_kcd_table")):
+            table = _demo_kcd_table()
         if table is None and isinstance(payload.get("kcd_preset"), str):
             table = load_kcd_table_preset(str(payload["kcd_preset"]))
         if table is None:
@@ -464,12 +512,12 @@ def compute_kalachakra_dasha(payload: Dict[str, Any]) -> Dict[str, Any]:
             "year_days": float(year_days),
             "limit_jd_tt": limit_jd_tt,
         }
-        # Ensure root tree is present (harmonize with Chara module)
+        # Ensure root tree is present (harmonize with other engines)
         sched["tree"] = {
             "level": 0,
             "label": "kalachakra",
-            "start_jd_tt": sched.get("tree", {}).get("start_jd_tt", s0),
-            "end_jd_tt": sched.get("tree", {}).get("end_jd_tt", e1),
+            "start_jd_tt": s0,
+            "end_jd_tt": e1,
             "children": sched["nested"],
         }
         return sched
