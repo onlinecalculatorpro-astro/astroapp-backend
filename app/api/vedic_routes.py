@@ -1,7 +1,7 @@
 # app/api/vedic_routes.py
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import inspect
 import os
 
@@ -105,7 +105,6 @@ def _levels_from(norm: Dict[str, Any]) -> int:
 def _build_civic_payload_vim(original: Dict[str, Any], norm: Dict[str, Any]) -> Dict[str, Any]:
     """
     Prepare payload for compute_vimshottari(payload_dict).
-
     Accept either civil (date,time,tz) or a direct birth_jd_tt. Prefer the *original*
     birth_jd_tt if the client sent it; otherwise use norm.jd_tt if available.
     """
@@ -215,22 +214,44 @@ def _call_single_param_or_kwargs(fn, payload: Dict[str, Any]) -> Dict[str, Any]:
         return fn(**payload)  # type: ignore[misc]
 
 
-def _coerce_tree_like(res: Dict[str, Any], *, scheme: str) -> Dict[str, Any]:
+def _ensure_tree_envelope(res: Dict[str, Any], *, scheme: str) -> Dict[str, Any]:
     """
-    Ensure a consistent tree-like shape. If the module returns 'nested' (forest),
-    wrap it into a single envelope node under 'tree'.
+    Normalize various shapes to a consistent tree envelope + nested:
+      - If res.tree.periods is present (registry Vimśottarī), turn it into children + nested.
+      - If res.nested list exists, create/ensure a 'tree' wrapper using min/max bounds.
+      - Otherwise, return as-is.
     """
-    if isinstance(res, dict) and "tree" in res:
+    if not isinstance(res, dict):
         return res
-    if isinstance(res, dict) and isinstance(res.get("nested"), list):
+
+    # Handle registry Vimśottarī shape: tree.periods (no children)
+    t = res.get("tree")
+    if isinstance(t, dict) and isinstance(t.get("periods"), list):
+        periods = t["periods"]
+        s0 = min((float(p.get("start_jd_tt", 0.0)) for p in periods), default=0.0)
+        e1 = max((float(p.get("end_jd_tt", 0.0)) for p in periods), default=0.0)
+        out = dict(res)
+        out["nested"] = periods
+        out["tree"] = {
+            "level": 0,
+            "lord": None,
+            "label": scheme,
+            "start_jd_tt": s0,
+            "end_jd_tt": e1,
+            "children": periods,
+        }
+        return out
+
+    # If already has nested list, ensure a tree wrapper
+    if isinstance(res.get("nested"), list):
         nodes = res["nested"]
         if nodes:
             s0 = min(float(n.get("start_jd_tt", 0.0)) for n in nodes)
             e1 = max(float(n.get("end_jd_tt", 0.0)) for n in nodes)
         else:
             s0, e1 = 0.0, 0.0
-        res = dict(res)
-        res["tree"] = {
+        out = dict(res)
+        out["tree"] = {
             "level": 0,
             "lord": None,
             "label": scheme,
@@ -238,12 +259,13 @@ def _coerce_tree_like(res: Dict[str, Any], *, scheme: str) -> Dict[str, Any]:
             "end_jd_tt": e1,
             "children": nodes,
         }
-        return res
+        return out
+
     return res
 
 
 # --- helper for registry call that may/may not accept depth -------------------
-def _call_registry_compute(system: str, norm: Dict[str, Any]) -> tuple[Optional[Dict[str, Any]], str]:
+def _call_registry_compute(system: str, norm: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], str]:
     """
     Try (system, payload, depth=...), then positional 3-arg, then 2-arg.
     Returns (result or None, branch_name). Any non-TypeError exceptions fall through.
@@ -260,7 +282,6 @@ def _call_registry_compute(system: str, norm: Dict[str, Any]) -> tuple[Optional[
     except TypeError:
         pass
     except Exception:
-        # fall through to fallback paths
         return None, "registry.compute_dasha(error_depth_kw)"
 
     # 2) depth as positional
@@ -300,6 +321,7 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
     if _compute_dasha_registry is not None:
         out, branch = _call_registry_compute("vimshottari", norm)
         if isinstance(out, dict):
+            out = _ensure_tree_envelope(out, scheme="vimshottari")
             return _wrap_ok(out, warns, tz_norm, branch=branch, route_name="vimshottari")
 
     # 2) Legacy registry alias (if present)
@@ -307,6 +329,7 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
         try:
             out = _run_dasha("vimshottari", norm)
             if isinstance(out, dict):
+                out = _ensure_tree_envelope(out, scheme="vimshottari")
                 return _wrap_ok(out, warns, tz_norm, branch="registry.run_dasha", route_name="vimshottari")
         except Exception as e:
             return {
@@ -322,7 +345,7 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
             civ = _build_civic_payload_vim(payload, norm)
             out = _call_single_param_or_kwargs(_compute_vim_module, civ)
             if isinstance(out, dict):
-                out = _coerce_tree_like(out, scheme="vimshottari")
+                out = _ensure_tree_envelope(out, scheme="vimshottari")
                 return _wrap_ok(out, warns, tz_norm, branch="module.compute_vimshottari", route_name="vimshottari")
             return {
                 "ok": False,
@@ -363,6 +386,7 @@ def _run_ashtottari(payload: Dict[str, Any]) -> Dict[str, Any]:
     if _compute_dasha_registry is not None:
         out, branch = _call_registry_compute("ashtottari", norm)
         if isinstance(out, dict):
+            out = _ensure_tree_envelope(out, scheme="ashtottari")
             return _wrap_ok(out, warns, tz_norm, branch=branch, route_name="ashtottari")
 
     # 2) Legacy registry alias (rare)
@@ -370,6 +394,7 @@ def _run_ashtottari(payload: Dict[str, Any]) -> Dict[str, Any]:
         try:
             out = _run_dasha("ashtottari", norm)
             if isinstance(out, dict):
+                out = _ensure_tree_envelope(out, scheme="ashtottari")
                 return _wrap_ok(out, warns, tz_norm, branch="registry.run_dasha", route_name="ashtottari")
         except Exception as e:
             return {
@@ -385,7 +410,7 @@ def _run_ashtottari(payload: Dict[str, Any]) -> Dict[str, Any]:
             civ = _build_civic_payload_ashto(payload, norm)
             out = _call_single_param_or_kwargs(_compute_ashto_module, civ)
             if isinstance(out, dict):
-                out = _coerce_tree_like(out, scheme="ashtottari")
+                out = _ensure_tree_envelope(out, scheme="ashtottari")
                 return _wrap_ok(out, warns, tz_norm, branch="module.compute_ashtottari", route_name="ashtottari")
             return {
                 "ok": False,
@@ -426,6 +451,7 @@ def _run_yogini(payload: Dict[str, Any]) -> Dict[str, Any]:
     if _compute_dasha_registry is not None:
         out, branch = _call_registry_compute("yogini", norm)
         if isinstance(out, dict):
+            out = _ensure_tree_envelope(out, scheme="yogini")
             return _wrap_ok(out, warns, tz_norm, branch=branch, route_name="yogini")
 
     # 2) Legacy registry alias (rare)
@@ -433,6 +459,7 @@ def _run_yogini(payload: Dict[str, Any]) -> Dict[str, Any]:
         try:
             out = _run_dasha("yogini", norm)
             if isinstance(out, dict):
+                out = _ensure_tree_envelope(out, scheme="yogini")
                 return _wrap_ok(out, warns, tz_norm, branch="registry.run_dasha", route_name="yogini")
         except Exception as e:
             return {
@@ -448,7 +475,7 @@ def _run_yogini(payload: Dict[str, Any]) -> Dict[str, Any]:
             civ = _build_civic_payload_yogini(payload, norm)
             out = _call_single_param_or_kwargs(_compute_yogini_module, civ)
             if isinstance(out, dict):
-                out = _coerce_tree_like(out, scheme="yogini")
+                out = _ensure_tree_envelope(out, scheme="yogini")
                 return _wrap_ok(out, warns, tz_norm, branch="module.compute_yogini", route_name="yogini")
             return {
                 "ok": False,
