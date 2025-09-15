@@ -61,6 +61,11 @@ try:
 except Exception:
     _compute_yogini_module = None  # type: ignore
 
+try:
+    from app.core.chara_dasha import compute_chara_dasha as _compute_chara_module  # type: ignore
+except Exception:
+    _compute_chara_module = None  # type: ignore
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -197,7 +202,63 @@ def _build_civic_payload_yogini(original: Dict[str, Any], norm: Dict[str, Any]) 
     return civ
 
 
-# ---- tiny module-call shims ---------------------------------------------------
+def _build_civic_payload_chara(original: Dict[str, Any], norm: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Prepare payload for compute_chara_dasha(payload_dict).
+    Accepts jd_tt or civil date/time/tz; forwards ayanamsa, levels, site (lat/lon),
+    asc_* overrides, and chara-specific knobs.
+    """
+    civ: Dict[str, Any] = {}
+
+    # Timescales (prefer client-provided jd_tt; else normalized jd_tt/jd_ut1 if present)
+    if isinstance(original.get("jd_tt"), (int, float)):
+        civ["jd_tt"] = float(original["jd_tt"])
+    elif isinstance(norm.get("jd_tt"), (int, float)):
+        civ["jd_tt"] = float(norm["jd_tt"])
+    if isinstance(original.get("jd_ut1"), (int, float)):
+        civ["jd_ut1"] = float(original["jd_ut1"])
+    elif isinstance(norm.get("jd_ut1"), (int, float)):
+        civ["jd_ut1"] = float(norm["jd_ut1"])
+
+    # Civil triplet (strings only)
+    for k in ("date", "time", "tz"):
+        v = norm.get(k)
+        if isinstance(v, str) and v.strip():
+            civ[k] = v.strip()
+
+    # Site info – pass through from original (validator may not add these)
+    for k in ("latitude", "longitude"):
+        if isinstance(original.get(k), (int, float)):
+            civ[k] = float(original[k])
+
+    # Asc overrides
+    for k in ("asc_sidereal_deg", "asc_tropical_deg"):
+        if isinstance(original.get(k), (int, float)):
+            civ[k] = float(original[k])
+
+    # Ayanamsa + levels
+    if norm.get("ayanamsa") is not None:
+        civ["ayanamsa"] = norm["ayanamsa"]
+    civ["levels"] = _levels_from(norm)
+
+    # Chara-specific knobs
+    for k in (
+        "start_from", "include_rahu_in_karakas", "direction_mode",
+        "year_days", "limit_jd_tt",
+        "balance_years", "balance_fraction",
+        "override_start_sign_index", "planet_longitudes_sidereal"
+    ):
+        if k in original and original[k] is not None:
+            civ[k] = original[k]
+
+    # Never pass validator internals
+    for k in ("timescales", "dut1_seconds"):
+        civ.pop(k, None)
+
+    return civ
+
+
+# ---- tiny module-call shim ----------------------------------------------------
 def _call_single_param_or_kwargs(fn, payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         sig = inspect.signature(fn)  # type: ignore[arg-type]
@@ -499,6 +560,79 @@ def _run_yogini(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _run_chara(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Chara Daśā runner: registry → legacy registry alias → module.
+    Note: We forward site/location & asc_* via a dedicated civic builder.
+    """
+    if normalize_vim_payload is None:
+        return {
+            "ok": False,
+            "error": "validator_unavailable",
+            "detail": f"app.core.vedic_validator.normalize_vim_payload import failed: {_VALIDATOR_IMPORT_ERR}",
+        }
+
+    # Normalize (for jd_tt/jd_ut1 and tz). We still pull lat/lon/asc from the original body.
+    norm, warns, tz_norm = normalize_vim_payload(payload)  # type: ignore[misc]
+
+    if "dut1_seconds" not in norm or norm["dut1_seconds"] is None:
+        norm["dut1_seconds"] = _env_dut1_seconds()
+
+    # 1) Registry (preferred) — signature-aware
+    if _compute_dasha_registry is not None:
+        # Augment norm with site/asc for registry, so it doesn't miss them
+        for k in ("latitude", "longitude", "asc_sidereal_deg", "asc_tropical_deg",
+                  "start_from", "include_rahu_in_karakas", "direction_mode",
+                  "balance_years", "balance_fraction", "override_start_sign_index",
+                  "planet_longitudes_sidereal"):
+            if k in payload and payload[k] is not None:
+                norm.setdefault(k, payload[k])
+        out, branch = _call_registry_compute("chara", norm)
+        if isinstance(out, dict):
+            out = _ensure_tree_envelope(out, scheme="chara")
+            return _wrap_ok(out, warns, tz_norm, branch=branch, route_name="chara")
+
+    # 2) Legacy registry alias (rare)
+    if _run_dasha is not None:
+        try:
+            out = _run_dasha("chara", norm)
+            if isinstance(out, dict):
+                out = _ensure_tree_envelope(out, scheme="chara")
+                return _wrap_ok(out, warns, tz_norm, branch="registry.run_dasha", route_name="chara")
+        except Exception as e:
+            # Fall through to module
+            pass
+
+    # 3) Module fallback
+    if _compute_chara_module is not None:
+        try:
+            civ = _build_civic_payload_chara(payload, norm)
+            out = _call_single_param_or_kwargs(_compute_chara_module, civ)
+            if isinstance(out, dict):
+                out = _ensure_tree_envelope(out, scheme="chara")
+                return _wrap_ok(out, warns, tz_norm, branch="module.compute_chara_dasha", route_name="chara")
+            return {
+                "ok": False,
+                "error": "chara_module_invalid_return",
+                "detail": f"Expected dict, got {type(out).__name__}",
+                "meta": {"route": "chara", "tz_normalized": tz_norm, "branch": "module.compute_chara_dasha"},
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": "chara_module_failed",
+                "detail": str(e),
+                "meta": {"route": "chara", "tz_normalized": tz_norm, "branch": "module.compute_chara_dasha"},
+            }
+
+    # 4) No engine available
+    return {
+        "ok": False,
+        "error": "chara_engine_unavailable",
+        "meta": {"route": "chara", "tz_normalized": tz_norm, "branch": "none"},
+    }
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Routes (mounted at /api/vedic)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -528,6 +662,8 @@ def vedic_diag():
         "module_ashtottari_sig": sigs(_compute_ashto_module) if _compute_ashto_module else None,
         "module_yogini_present": bool(_compute_yogini_module),
         "module_yogini_sig": sigs(_compute_yogini_module) if _compute_yogini_module else None,
+        "module_chara_present": bool(_compute_chara_module),
+        "module_chara_sig": sigs(_compute_chara_module) if _compute_chara_module else None,
         "rl_cap_per_min": RL_VEDIC_PREDICTIVE,
         "rl_bucket_key": "20",
         "dut1_seconds_env": _env_dut1_seconds(),
@@ -561,5 +697,15 @@ def vedic_ashtottari():
 def vedic_yogini():
     body = request.get_json(silent=True) or {}
     res = _run_yogini(body)
+    status = 200 if res.get("ok") else (503 if str(res.get("error", "")).endswith("unavailable") else 400)
+    return jsonify(res), status
+
+
+# Chara (Jaimini) — ASCII route
+@vedic_api.post("/dasha/chara")
+@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
+def vedic_chara():
+    body = request.get_json(silent=True) or {}
+    res = _run_chara(body)
     status = 200 if res.get("ok") else (503 if str(res.get("error", "")).endswith("unavailable") else 400)
     return jsonify(res), status
