@@ -3,73 +3,63 @@
 from __future__ import annotations
 
 """
-Yoginī Daśā — 36-year cycle with five nested levels (Mahā → Antar → Pratyantar → Sūkṣma → Prāṇa)
+Yoginī Daśā — 36-year cycle with five nested levels
+(Mahā → Antar → Pratyantar → Sūkṣma → Prāṇa)
 
-Scope & numerics
-- Deterministic, research-grade schedule builder with precise time handling.
-- 8-yoginī sequence totaling 36 years:
-    Order (cyclic):
-        Mangala(1), Pingala(2), Dhanya(3), Bhramari(4),
-        Bhadrika(5), Ulka(6), Siddha(7), Sankata(8)
-- Start lord chosen from Moon’s birth nakṣatra index using a clean modulo mapping:
-      start = index % 8 with 1→Mangala, …, 7→Siddha, 0→Sankata.
-  (You can override via payload['start_lord'] if needed.)
-- Balance at birth = remaining fraction of the *current nakṣatra* × mahādaśā years of start lord.
-- Sub-periods: each lower level scales by (years(sub_lord) / 36) and follows the same 8-yoginī order.
-  Default Antar sequence begins with the yoginī *after* the parent; set start_mode="same" to begin with parent.
+Optimizations:
+- Fixed-point time arithmetic in ticks (1 tick = 1e-7 day) → no Decimal in hot path.
+- Largest-remainder partition for sub-spans → stable, drift-free, children sum to parent.
+- Linear-time tree construction (per-level two-pointer) → avoids O(N^2) filtering.
+- Spans are generated in order → no final sorting pass.
 
-Public API
-    compute_yogini(payload: dict) -> dict
-      Inputs (either jd_tt directly OR civil date/time/tz):
-        - jd_tt (float); optionally date="YYYY-MM-DD", time="HH:MM[:SS]", tz="Area/City"
-        - ayanamsa (str) default "lahiri"
-        - start_mode: "after" (default) or "same"
-        - levels: 1..5 (default 5)
-        - year_days: float (days per year, default 365.24219)
-        - limit_jd_tt: optional end JD_TT to stop schedule
-        - start_lord: optional explicit start yoginī name (overrides nakṣatra mapping)
-        - moon_nirayana_deg: optional precomputed Moon nirayana longitude (deg)
-
-    yogini_schedule(jd_start_tt, moon_nirayana_deg, *, start_mode="after",
-                    levels=5, year_days=365.24219, limit_jd_tt=None,
-                    start_lord: str | None = None) -> dict
+Public API (unchanged):
+  yogini_schedule(...)
+  compute_yogini(payload: dict) -> dict
 """
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
-from decimal import Decimal, getcontext
 import math
 
-# Optional ephemeris / timescales used for Moon longitude & time conversion
+__all__ = [
+    "YOGINI_ORDER", "YOGINI_YEARS", "YOGINI_TOTAL_YEARS",
+    "yogini_schedule", "compute_yogini",
+]
+
+# ───────────────────────── deps (module-level adapter; no Config kwargs) ─────────────────────────
 try:
-    from app.core.ephemeris_adapter import EphemerisAdapter, Config as EphemConfig
-    from app.core.ephem_singleton import TS, PLANETS
+    from app.core.ephemeris_adapter import ecliptic_longitudes  # type: ignore
     _EPH_OK = True
 except Exception:
-    EphemerisAdapter = object  # type: ignore
-    EphemConfig = object       # type: ignore
-    TS = None; PLANETS = None
+    ecliptic_longitudes = None  # type: ignore
     _EPH_OK = False
 
 try:
-    from app.core import time_kernel as _tk
+    from app.core import time_kernel as _tk  # type: ignore
 except Exception:
     _tk = None
 try:
-    from app.core import timescales as _ts
+    from app.core import timescales as _ts  # type: ignore
 except Exception:
     _ts = None
 
 from app.core.ayanamsa import get_ayanamsa_deg
 from app.core.constants_vedic import NAKSHATRAS_27
 
-# ───────────────────────── constants / helpers ─────────────────────────
-
-getcontext().prec = 34  # high precision for nested Decimal products
+# ───────────────────────── numerics / helpers ─────────────────────────
+_JD_QUANT = 1e-7  # ~0.00864 s
+def _q(x: float) -> float:
+    return round(float(x) / _JD_QUANT) * _JD_QUANT
 
 def _norm360(x: float) -> float:
     r = math.fmod(float(x), 360.0)
     return r + 360.0 if r < 0.0 else r
+
+def _num(x: Any) -> Optional[float]:
+    try:
+        return float(x)
+    except Exception:
+        return None
 
 _NAK_WIDTH = 360.0 / 27.0  # 13°20′
 
@@ -82,8 +72,7 @@ YOGINI_YEARS: Dict[str, int] = {
 }
 YOGINI_TOTAL_YEARS = 36
 
-# Nakṣatra→start yoginī mapping (index 1..27). Default: modulo pattern.
-# idx % 8: 1 Mangala, 2 Pingala, 3 Dhanya, 4 Bhramari, 5 Bhadrika, 6 Ulka, 7 Siddha, 0 Sankata
+# Nakṣatra→start yoginī mapping (index 1..27): idx % 8 (1..7), 0→Sankata
 def _start_lord_from_nak_index(idx: int) -> str:
     m = idx % 8
     return YOGINI_ORDER[(m - 1) % 8] if m != 0 else "Sankata"
@@ -96,54 +85,72 @@ def _nak_offset_in_deg(nirayana_lon: float) -> float:
     base = (_nak_index(nirayana_lon) - 1) * _NAK_WIDTH
     return _norm360(nirayana_lon) - base
 
-def _years_to_days(years: Decimal, year_days: Decimal) -> Decimal:
+# ───────────────────────── fixed-point time (ticks) ─────────────────────────
+_TICK_PER_DAY = int(round(1.0 / _JD_QUANT))  # 10_000_000
+_FRACTION = {k: YOGINI_YEARS[k] / YOGINI_TOTAL_YEARS for k in YOGINI_ORDER}
+
+def _years_to_days(years: float, year_days: float) -> float:
     return years * year_days
+
+def _to_ticks(days: float) -> int:
+    return int(round(days * _TICK_PER_DAY))
+
+def _from_ticks(ticks: int) -> float:
+    return ticks / _TICK_PER_DAY
+
+def _partition_ticks(parent_ticks: int, seq: List[str]) -> List[int]:
+    """
+    Largest-remainder partition proportional to YOGINI_YEARS.
+    Ensures sum(child) == parent with stable boundaries.
+    """
+    if parent_ticks <= 0:
+        return [0] * len(seq)
+    mults = [_FRACTION[l] for l in seq]
+    raw = [parent_ticks * m for m in mults]
+    base = [int(math.floor(x)) for x in raw]
+    rems = [x - b for x, b in zip(raw, base)]
+    need = parent_ticks - sum(base)
+    if need > 0:
+        order = sorted(range(len(rems)), key=lambda i: rems[i], reverse=True)
+        for i in range(need):
+            base[order[i]] += 1
+    return base
 
 def _after(lord: str) -> str:
     i = YOGINI_ORDER.index(lord)
     return YOGINI_ORDER[(i + 1) % 8]
 
 def _cycle_from(parent_lord: str, *, start_mode: str) -> List[str]:
-    base = list(YOGINI_ORDER)
-    start = parent_lord if start_mode == "same" else _after(parent_lord)
-    i = base.index(start)
-    return base[i:] + base[:i]
+    start = parent_lord if str(start_mode).lower().strip() == "same" else _after(parent_lord)
+    i = YOGINI_ORDER.index(start)
+    return list(YOGINI_ORDER[i:] + YOGINI_ORDER[:i])
 
 # ───────────────────────── data model ─────────────────────────
-
 @dataclass
 class DashaSpan:
-    level: int                # 1..5
+    __slots__ = ("level", "lord", "start_jd_tt", "end_jd_tt")
+    level: int
     lord: str
     start_jd_tt: float
     end_jd_tt: float
 
-# ───────────────────────── core math ─────────────────────────
-
-def _birth_balance_days(nak_offset_deg: float, lord: str, *, year_days: Decimal) -> Decimal:
-    """
-    Remaining portion of current nakṣatra × years(lord).
-    """
-    rem_frac = Decimal((_NAK_WIDTH - nak_offset_deg) / _NAK_WIDTH)
-    years = Decimal(YOGINI_YEARS[lord])
-    return _years_to_days(rem_frac * years, year_days)
-
-def _sub_duration(parent_days: Decimal, lord: str) -> Decimal:
-    """
-    Sub-period duration = parent_duration × (years(lord)/36).
-    """
-    return parent_days * (Decimal(YOGINI_YEARS[lord]) / Decimal(YOGINI_TOTAL_YEARS))
-
-def _append(spans: List[DashaSpan], level: int, lord: str, t0: Decimal, dur_days: Decimal, *, limit: Optional[Decimal]) -> Decimal:
-    t1 = t0 + dur_days
-    if limit is not None and t0 >= limit:
-        return t1
-    end = min(t1, limit) if limit is not None else t1
-    spans.append(DashaSpan(level, lord, float(t0), float(end)))
-    return t1
+def _append_span_ticks(
+    spans: List[DashaSpan],
+    *, level: int, lord: str, base_jd: float,
+    t_start: int, dur_ticks: int, limit_ticks: Optional[int],
+) -> int:
+    t_end = t_start + dur_ticks
+    if limit_ticks is not None and t_start >= limit_ticks:
+        return t_end
+    end_eff = min(t_end, limit_ticks) if limit_ticks is not None else t_end
+    s_jd = _q(base_jd + _from_ticks(t_start))
+    e_jd = _q(base_jd + _from_ticks(end_eff))
+    if abs(e_jd - s_jd) < 1e-12:
+        e_jd = _q(s_jd + 1e-9)
+    spans.append(DashaSpan(level, lord, s_jd, e_jd))
+    return t_end
 
 # ───────────────────────── schedule builder ─────────────────────────
-
 def yogini_schedule(
     *,
     jd_start_tt: float,
@@ -152,55 +159,69 @@ def yogini_schedule(
     levels: int = 5,
     year_days: float = 365.24219,
     limit_jd_tt: float | None = None,
-    start_lord: str | None = None
+    start_lord: str | None = None,
+    compact: bool = False,              # optional compact nested encoding
+    include_spans: bool = True,         # include flat spans array
 ) -> Dict[str, Any]:
     """
-    Build a full Yoginī daśā timeline from starting epoch & Moon’s nirayana longitude.
+    Build a full Yoginī daśā timeline from birth epoch & Moon’s nirayana longitude.
     """
     levels = max(1, min(5, int(levels)))
     start_mode = "after" if str(start_mode).lower().strip() != "same" else "same"
 
-    year_days_D = Decimal(str(year_days))
-    t0 = Decimal(str(jd_start_tt))
-    t_limit = Decimal(str(limit_jd_tt)) if isinstance(limit_jd_tt, (int,float)) else None
-
     # Determine start yoginī
     nak_idx = _nak_index(moon_nirayana_deg)
     nak_off = _nak_offset_in_deg(moon_nirayana_deg)
-    start_yogini = (start_lord or _start_lord_from_nak_index(nak_idx)).strip().title()
+    start_yogini = (start_lord.strip().title() if isinstance(start_lord, str) and start_lord.strip() else _start_lord_from_nak_index(nak_idx))
     if start_yogini not in YOGINI_YEARS:
         raise ValueError(f"Invalid start_lord '{start_yogini}' for Yoginī daśā")
 
-    # Build Mahā cycle starting at start_yogini
-    order = list(YOGINI_ORDER)
-    i0 = order.index(start_yogini)
-    maha_cycle = order[i0:] + order[:i0]
+    # Mahā order beginning at start_yogini
+    i0 = YOGINI_ORDER.index(start_yogini)
+    maha_cycle = list(YOGINI_ORDER[i0:] + YOGINI_ORDER[:i0])
+
+    # Fixed-point timeline
+    base_jd = float(jd_start_tt)
+    limit_ticks = None if limit_jd_tt is None else _to_ticks(float(limit_jd_tt) - base_jd)
 
     spans: List[DashaSpan] = []
 
-    # First Mahā (partial balance)
-    balance_days = _birth_balance_days(nak_off, start_yogini, year_days=year_days_D)
-    t1 = _append(spans, 1, start_yogini, t0, balance_days, limit=t_limit)
-    t_cur = t1
+    # First (partial) Mahā balance
+    rem_frac = (_NAK_WIDTH - nak_off) / _NAK_WIDTH
+    first_days = _years_to_days(YOGINI_YEARS[start_yogini] * rem_frac, year_days)
+    t_cur = _append_span_ticks(
+        spans, level=1, lord=start_yogini, base_jd=base_jd,
+        t_start=0, dur_ticks=_to_ticks(first_days), limit_ticks=limit_ticks
+    )
 
-    # Remaining Mahā in current cycle (full durations)
+    # Remaining Mahā in this 36-year cycle
     for lord in maha_cycle[1:]:
-        dur = _years_to_days(Decimal(YOGINI_YEARS[lord]), year_days_D)
-        t_next = _append(spans, 1, lord, t_cur, dur, limit=t_limit)
-        t_cur = t_next
-        if t_limit is not None and t_cur >= t_limit:
+        dur_days = _years_to_days(YOGINI_YEARS[lord], year_days)
+        t_cur = _append_span_ticks(
+            spans, level=1, lord=lord, base_jd=base_jd,
+            t_start=t_cur, dur_ticks=_to_ticks(dur_days), limit_ticks=limit_ticks
+        )
+        if limit_ticks is not None and t_cur >= limit_ticks:
             break
 
-    # Expand sublevels up to requested depth
-    if levels >= 2:
-        _expand_sublevels(spans, start_mode=start_mode, levels=levels, t_limit=t_limit)
+    # Sublevels (levels >= 2)
+    if levels >= 2 and spans:
+        _expand_sublevels_ticks(
+            spans_level1=spans,
+            base_jd=base_jd,
+            start_mode=start_mode,
+            levels=levels,
+            limit_ticks=limit_ticks,
+        )
 
-    tree = _to_nested(spans, max_level=levels)
-    return {
+    # Nested tree
+    tree = _to_nested_linear(spans, max_level=levels, compact=compact)
+
+    out: Dict[str, Any] = {
         "ok": True,
         "scheme": "yogini",
-        "order": list(YOGINI_ORDER),
-        "years": dict(YOGINI_YEARS),
+        "order": list(YOGINI_ORDER) if not compact else None,
+        "years": dict(YOGINI_YEARS) if not compact else None,
         "start": {
             "nakshatra_index": nak_idx,
             "nakshatra_name": NAKSHATRAS_27[nak_idx - 1],
@@ -209,69 +230,124 @@ def yogini_schedule(
         },
         "year_days": float(year_days),
         "levels": int(levels),
-        "spans": [s.__dict__ for s in spans],
         "nested": tree,
+        "meta": {"compact": bool(compact), "include_spans": bool(include_spans), "encoding": "v1"},
     }
+    if include_spans:
+        out["spans"] = [
+            {"level": s.level, "lord": s.lord, "start_jd_tt": float(s.start_jd_tt), "end_jd_tt": float(s.end_jd_tt)}
+            for s in spans
+        ]
+    return {k: v for k, v in out.items() if v is not None}
 
-def _expand_sublevels(
-    spans_level1: List[DashaSpan],
+def _expand_sublevels_ticks(
     *,
+    spans_level1: List[DashaSpan],
+    base_jd: float,
     start_mode: str,
     levels: int,
-    t_limit: Optional[Decimal],
+    limit_ticks: Optional[int],
 ) -> None:
     """
-    Populate Antar..Prāṇa (levels 2..levels) under each Mahā span in-place.
+    Expand Antar..Prāṇa (levels 2..levels) in-place with fixed-point ticks.
     """
-    all_spans = list(spans_level1)
+    all_spans: List[DashaSpan] = list(spans_level1)
 
-    def add_children(parent: DashaSpan, level: int) -> List[DashaSpan]:
-        parent_days = Decimal(str(parent.end_jd_tt)) - Decimal(str(parent.start_jd_tt))
-        seq = _cycle_from(parent.lord, start_mode=start_mode)
-        t = Decimal(str(parent.start_jd_tt))
-        kids: List[DashaSpan] = []
-        for lord in seq:
-            dur = _sub_duration(parent_days, lord)
-            t_next = t + dur
-            if t_limit is not None and t >= t_limit:
-                t = t_next
+    def jd_to_ticks(jd: float) -> int:
+        return _to_ticks(jd - base_jd)
+
+    current: List[DashaSpan] = [s for s in all_spans if s.level == 1]
+    for lvl in range(2, levels + 1):
+        next_level: List[DashaSpan] = []
+        for parent in current:
+            p_start = jd_to_ticks(parent.start_jd_tt)
+            p_end   = jd_to_ticks(parent.end_jd_tt)
+            p_ticks = max(0, p_end - p_start)
+            if p_ticks == 0:
                 continue
-            end = min(t_next, t_limit) if t_limit is not None else t_next
-            kids.append(DashaSpan(level, lord, float(t), float(end)))
-            t = t_next
-        return kids
+            seq = _cycle_from(parent.lord, start_mode=start_mode)
+            parts = _partition_ticks(p_ticks, seq)
 
-    current = [s for s in all_spans if s.level == 1]
-    for level in range(2, levels + 1):
-        nxt: List[DashaSpan] = []
-        for p in current:
-            nxt.extend(add_children(p, level))
-        all_spans.extend(nxt)
-        current = nxt
+            t = p_start
+            for lord, dur in zip(seq, parts):
+                if dur <= 0:
+                    continue
+                t = _append_span_ticks(
+                    next_level, level=lvl, lord=lord, base_jd=base_jd,
+                    t_start=t, dur_ticks=dur, limit_ticks=limit_ticks
+                )
+        all_spans.extend(next_level)
+        current = next_level
 
     spans_level1.clear()
-    spans_level1.extend(sorted(all_spans, key=lambda s: (s.level, s.start_jd_tt, YOGINI_ORDER.index(s.lord))))
+    spans_level1.extend(all_spans)
 
-def _to_nested(spans: List[DashaSpan], *, max_level: int) -> List[Dict[str, Any]]:
-    def children_of(parent: DashaSpan, level: int) -> List[DashaSpan]:
-        # containment with tiny numerical cushion
-        return [s for s in spans if s.level == level and parent.start_jd_tt <= s.start_jd_tt + 1e-12 and s.end_jd_tt <= parent.end_jd_tt + 1e-12]
+def _to_nested_linear(spans: List[DashaSpan], *, max_level: int, compact: bool = False) -> List[Dict[str, Any]]:
+    """
+    Group by level and attach children via a single sweep (two-pointer).
+    In compact mode, nodes use short keys: l(level), p(planet index), s(start), e(end), c(children).
+    """
+    if not spans:
+        return []
 
-    def node_for(span: DashaSpan, level: int) -> Dict[str, Any]:
-        node = {"level": level, "lord": span.lord, "start_jd_tt": span.start_jd_tt, "end_jd_tt": span.end_jd_tt}
-        if level < max_level:
-            node["children"] = [node_for(k, level + 1) for k in children_of(span, level + 1)]
+    by_level: Dict[int, List[DashaSpan]] = {}
+    for s in spans:
+        if s.level <= max_level:
+            by_level.setdefault(s.level, []).append(s)
+
+    def mk_node(s: DashaSpan) -> Dict[str, Any]:
+        if not compact:
+            node = {"level": s.level, "lord": s.lord, "start_jd_tt": float(s.start_jd_tt), "end_jd_tt": float(s.end_jd_tt)}
+            if s.level < max_level: node["children"] = []
+            return node
+        idx = int(YOGINI_ORDER.index(s.lord))
+        node = {"l": s.level, "p": idx, "s": float(s.start_jd_tt), "e": float(s.end_jd_tt)}
+        if s.level < max_level: node["c"] = []
         return node
 
-    return [node_for(s, 1) for s in spans if s.level == 1]
+    level1_spans = by_level.get(1, [])
+    if not level1_spans:
+        return []
+    nodes_by_level: Dict[int, List[Dict[str, Any]]] = {1: [mk_node(s) for s in level1_spans]}
 
-# ───────────────────────── Moon nirayana & timescales helpers ─────────────────────────
+    for lvl in range(2, max_level + 1):
+        parents = by_level.get(lvl - 1, [])
+        kids    = by_level.get(lvl, [])
+        if not parents or not kids:
+            continue
+        parent_nodes = nodes_by_level[lvl - 1]
+        p = 0
+        cur_parent = parents[p] if parents else None
+        for child in kids:
+            while cur_parent and child.start_jd_tt >= cur_parent.end_jd_tt - 1e-12 and p + 1 < len(parents):
+                p += 1
+                cur_parent = parents[p]
+            if not cur_parent:
+                break
+            if (child.start_jd_tt + 1e-12) >= cur_parent.start_jd_tt and (child.end_jd_tt - 1e-12) <= cur_parent.end_jd_tt:
+                node = mk_node(child)
+                if compact:
+                    parent_nodes[p]["c"].append(node)
+                else:
+                    parent_nodes[p]["children"].append(node)
+                nodes_by_level.setdefault(lvl, []).append(node)
 
+    def strip(n: Dict[str, Any]) -> Dict[str, Any]:
+        key = "c" if compact else "children"
+        if key in n:
+            if not n[key] or (compact and n.get("l", 0) >= max_level) or ((not compact) and n.get("level", 0) >= max_level):
+                n.pop(key, None)
+            else:
+                n[key] = [strip(k) for k in n[key]]
+        return n
+
+    return [strip(n) for n in nodes_by_level[1]]
+
+# ───────────────────────── Moon nirayana & timescales ─────────────────────────
 def _moon_nirayana_deg_at(jd_tt: float, *, ayanamsa_key: str) -> float:
-    if not _EPH_OK:
-        raise RuntimeError("EphemerisAdapter unavailable; enable app.core.ephemeris_adapter")
-    ep = EphemerisAdapter(EphemConfig(frame="ecliptic-of-date", timescale=TS, planets=PLANETS))  # type: ignore
-    rows = ep.ecliptic_longitudes(float(jd_tt), ["Moon"]).get("results", [])
+    if not _EPH_OK or ecliptic_longitudes is None:
+        raise RuntimeError("EphemerisAdapter unavailable; cannot compute Moon longitude")
+    rows = (ecliptic_longitudes(float(jd_tt), names=["Moon"]) or {}).get("results", [])
     if not rows:
         raise RuntimeError("ephemeris returned no Moon longitude")
     moon_trop = float(rows[0]["longitude"])
@@ -279,9 +355,7 @@ def _moon_nirayana_deg_at(jd_tt: float, *, ayanamsa_key: str) -> float:
     return _norm360(moon_trop - ay)
 
 def _timescales_from_civil(date: str, time: str, tz: str) -> Tuple[float, float, float]:
-    """
-    Returns (jd_ut, jd_tt, jd_ut1). Uses time_kernel if present, else timescales.
-    """
+    """Return (jd_ut, jd_tt, jd_ut1). Prefer time_kernel (with dut1=0.0), else fallback."""
     if _tk is not None:
         for fname in ("timescales_from_civil","compute_timescales","build_timescales","to_timescales","from_civil"):
             fn = getattr(_tk, fname, None)
@@ -291,19 +365,25 @@ def _timescales_from_civil(date: str, time: str, tz: str) -> Tuple[float, float,
                 except TypeError:
                     out = fn(date, time, tz, 0.0)
                 if isinstance(out, dict):
-                    return (float(out.get("jd_ut") or out.get("jd_utc")), float(out["jd_tt"]), float(out.get("jd_ut1") or out["jd_tt"]))
+                    return (
+                        float(out.get("jd_ut") or out.get("jd_utc")),
+                        float(out.get("jd_tt") or out["jd_tt"]),
+                        float(out.get("jd_ut1") or out.get("jd_ut") or out.get("jd_utc")),
+                    )
                 if isinstance(out, (list, tuple)) and len(out) >= 3:
-                    return (float(out[0]), float(out[1]), float(out[2]))
+                    ju, jt, j1 = out[:3]
+                    return float(ju), float(jt), float(j1)
     if _ts is None:
         raise ValueError("timescales module not available")
     jd_ut = float(_ts.julian_day_utc(date, time, tz))
-    y, m = map(int, date.split("-")[:2])
-    jd_tt = float(_ts.jd_tt_from_utc_jd(jd_ut, y, m)) if hasattr(_ts, "jd_tt_from_utc_jd") else jd_ut + 69.0/86400.0
-    jd_ut1 = jd_ut
-    return jd_ut, jd_tt, jd_ut1
+    try:
+        y, m = map(int, date.split("-")[:2])
+        jd_tt = float(_ts.jd_tt_from_utc_jd(jd_ut, y, m))
+    except Exception:
+        jd_tt = jd_ut + 69.0/86400.0  # fallback ΔT
+    return jd_ut, jd_tt, jd_ut
 
 # ───────────────────────── Orchestrator ─────────────────────────
-
 def compute_yogini(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Route-friendly wrapper.
@@ -315,11 +395,10 @@ def compute_yogini(payload: Dict[str, Any]) -> Dict[str, Any]:
       - levels: 1..5 (default 5)
       - year_days: float (default 365.24219)
       - limit_jd_tt: optional float
-      - start_lord: optional explicit string
-      - moon_nirayana_deg: optional float (deg)
-
-    Returns:
-      { ok, scheme, order, years, start:{...}, levels, year_days, spans:[...], nested:[...] }
+      - start_lord: optional explicit yoginī name
+      - moon_nirayana_deg: optional float or str (deg)
+      - compact: bool (optional; default False)
+      - include_spans: bool (optional; default True)
     """
     try:
         jd_tt = payload.get("jd_tt")
@@ -331,23 +410,29 @@ def compute_yogini(payload: Dict[str, Any]) -> Dict[str, Any]:
 
         ay_key = str(payload.get("ayanamsa", "lahiri")).strip().lower()
         start_mode = str(payload.get("start_mode", "after")).lower()
-        levels = int(payload.get("levels", 5))
+        levels = max(1, min(5, int(payload.get("levels", 5))))
         year_days = float(payload.get("year_days", 365.24219))
-        limit_jd_tt = payload.get("limit_jd_tt")
+        limit = _num(payload.get("limit_jd_tt"))
         start_lord = payload.get("start_lord")
-        limit = float(limit_jd_tt) if isinstance(limit_jd_tt, (int,float)) else None
+        compact = bool(payload.get("compact", False))
+        include_spans = bool(payload.get("include_spans", True))
 
-        moon_nira = float(payload.get("moon_nirayana_deg")) if isinstance(payload.get("moon_nirayana_deg"), (int,float)) \
-                    else _moon_nirayana_deg_at(float(jd_tt), ayanamsa_key=ay_key)
+        moon_nira = _num(payload.get("moon_nirayana_deg"))
+        if moon_nira is None:
+            moon_nira = _moon_nirayana_deg_at(float(jd_tt), ayanamsa_key=ay_key)
+        else:
+            moon_nira = _norm360(moon_nira)
 
         sched = yogini_schedule(
             jd_start_tt=float(jd_tt),
-            moon_nirayana_deg=moon_nira,
+            moon_nirayana_deg=float(moon_nira),
             start_mode=start_mode,
             levels=levels,
             year_days=year_days,
-            limit_jd_tt=limit,
+            limit_jd_tt=(float(limit) if limit is not None else None),
             start_lord=(str(start_lord).title() if isinstance(start_lord, str) and start_lord.strip() else None),
+            compact=compact,
+            include_spans=include_spans,
         )
         return sched
     except Exception as e:
