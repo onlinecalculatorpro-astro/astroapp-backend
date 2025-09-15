@@ -1,7 +1,7 @@
 # app/api/vedic_routes.py
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import inspect
 import os
 
@@ -47,19 +47,16 @@ except Exception:
 
 # Optional module fallbacks
 try:
-    # Vimśottarī module surface
     from app.core.vimshottari_dasha import compute_vimshottari as _compute_vim_module  # type: ignore
 except Exception:
     _compute_vim_module = None  # type: ignore
 
 try:
-    # Aṣṭottarī module surface
     from app.core.ashtottari_dasha import compute_ashtottari as _compute_ashto_module  # type: ignore
 except Exception:
     _compute_ashto_module = None  # type: ignore
 
 try:
-    # Yoginī module surface
     from app.core.yogini_dasha import compute_yogini as _compute_yogini_module  # type: ignore
 except Exception:
     _compute_yogini_module = None  # type: ignore
@@ -76,7 +73,7 @@ def _env_dut1_seconds() -> float:
         return 0.0
 
 
-def _wrap_ok(out: Dict[str, Any], warns: List[str], tz_norm: str, branch: str, *, route_name: str = "vimshottari") -> Dict[str, Any]:
+def _wrap_ok(out: Dict[str, Any], warns: List[str], tz_norm: str, branch: str, *, route_name: str) -> Dict[str, Any]:
     out.setdefault("ok", True)
     out.setdefault("meta", {})
     out["meta"].update({"route": route_name, "tz_normalized": tz_norm, "branch": branch})
@@ -114,35 +111,25 @@ def _build_civic_payload_vim(original: Dict[str, Any], norm: Dict[str, Any]) -> 
     """
     civ: Dict[str, Any] = {}
 
-    # Prefer client-provided birth_jd_tt; else fallback to normalized jd_tt (if computed).
     if isinstance(original.get("birth_jd_tt"), (int, float)):
         civ["birth_jd_tt"] = float(original["birth_jd_tt"])
     elif isinstance(norm.get("jd_tt"), (int, float)):
         civ["birth_jd_tt"] = float(norm["jd_tt"])
 
-    # Civil triplet (strings only)
     for k_src, k_dst in (("date", "date"), ("time", "time"), ("tz", "tz")):
         v = norm.get(k_src)
         if isinstance(v, str) and v.strip():
             civ[k_dst] = v.strip()
 
-    # Ayanamsa (float or str)
     if norm.get("ayanamsa") is not None:
         civ["ayanamsa"] = norm["ayanamsa"]
 
-    # Levels (clamped)
     civ["levels"] = _levels_from(norm)
 
-    # Optional extras (from the original body)
-    for k in (
-        "span_years", "end_jd_tt", "year_days",
-        "query_jd_tt", "q_date", "q_time", "q_tz",
-        "flatten_level",
-    ):
+    for k in ("span_years", "end_jd_tt", "year_days", "query_jd_tt", "q_date", "q_time", "q_tz", "flatten_level"):
         if k in original and original[k] is not None:
             civ[k] = original[k]
 
-    # Never pass validator internals
     for k in ("timescales", "jd_tt", "jd_ut1", "dut1_seconds"):
         civ.pop(k, None)
 
@@ -156,29 +143,24 @@ def _build_civic_payload_ashto(original: Dict[str, Any], norm: Dict[str, Any]) -
     """
     civ: Dict[str, Any] = {}
 
-    # Prefer client-provided jd_tt; else fallback to normalized jd_tt (if computed).
     if isinstance(original.get("jd_tt"), (int, float)):
         civ["jd_tt"] = float(original["jd_tt"])
     elif isinstance(norm.get("jd_tt"), (int, float)):
         civ["jd_tt"] = float(norm["jd_tt"])
 
-    # Civil triplet
     for k in ("date", "time", "tz"):
         v = norm.get(k)
         if isinstance(v, str) and v.strip():
             civ[k] = v.strip()
 
-    # Ayanamsa + levels
     if norm.get("ayanamsa") is not None:
         civ["ayanamsa"] = norm["ayanamsa"]
     civ["levels"] = _levels_from(norm)
 
-    # Optional extras (directly from original if provided)
     for k in ("start_mode", "year_days", "limit_jd_tt", "moon_nirayana_deg", "compact", "include_spans"):
         if k in original and original[k] is not None:
             civ[k] = original[k]
 
-    # Never pass validator internals
     for k in ("timescales", "jd_ut1", "dut1_seconds"):
         civ.pop(k, None)
 
@@ -218,7 +200,6 @@ def _build_civic_payload_yogini(original: Dict[str, Any], norm: Dict[str, Any]) 
 
 # ---- tiny module-call shims ---------------------------------------------------
 def _call_single_param_or_kwargs(fn, payload: Dict[str, Any]) -> Dict[str, Any]:
-    sig = None
     try:
         sig = inspect.signature(fn)  # type: ignore[arg-type]
         params = list(sig.parameters.values())
@@ -261,11 +242,48 @@ def _coerce_tree_like(res: Dict[str, Any], *, scheme: str) -> Dict[str, Any]:
     return res
 
 
+# --- helper for registry call that may/may not accept depth -------------------
+def _call_registry_compute(system: str, norm: Dict[str, Any]) -> tuple[Optional[Dict[str, Any]], str]:
+    """
+    Try (system, payload, depth=...), then positional 3-arg, then 2-arg.
+    Returns (result or None, branch_name). Any non-TypeError exceptions fall through.
+    """
+    if _compute_dasha_registry is None:
+        return None, "registry.absent"
+
+    L = _levels_from(norm)
+
+    # 1) depth as keyword
+    try:
+        out = _compute_dasha_registry(system, norm, depth=L)  # type: ignore[misc]
+        return out, "registry.compute_dasha(depth_kw)"
+    except TypeError:
+        pass
+    except Exception:
+        # fall through to fallback paths
+        return None, "registry.compute_dasha(error_depth_kw)"
+
+    # 2) depth as positional
+    try:
+        out = _compute_dasha_registry(system, norm, L)  # type: ignore[misc]
+        return out, "registry.compute_dasha(depth_pos)"
+    except TypeError:
+        pass
+    except Exception:
+        return None, "registry.compute_dasha(error_depth_pos)"
+
+    # 3) no depth supported
+    try:
+        out = _compute_dasha_registry(system, norm)  # type: ignore[misc]
+        return out, "registry.compute_dasha(no_depth)"
+    except Exception:
+        return None, "registry.compute_dasha(failed)"
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Core runners
 # ──────────────────────────────────────────────────────────────────────────────
 def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
-    # Validator required
     if normalize_vim_payload is None:
         return {
             "ok": False,
@@ -273,30 +291,16 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
             "detail": f"app.core.vedic_validator.normalize_vim_payload import failed: {_VALIDATOR_IMPORT_ERR}",
         }
 
-    # Normalize (may compute jd_tt/jd_ut1; NO jd_utc). Also adds common alias keys.
     norm, warns, tz_norm = normalize_vim_payload(payload)  # type: ignore[misc]
 
-    # Ensure dut1_seconds for any registry code that may call build_timescales(...)
     if "dut1_seconds" not in norm or norm["dut1_seconds"] is None:
         norm["dut1_seconds"] = _env_dut1_seconds()
 
-    # 1) Registry (preferred)
+    # 1) Registry (preferred) — signature-aware
     if _compute_dasha_registry is not None:
-        try:
-            depth_val = _levels_from(norm)
-            out = _compute_dasha_registry("vimshottari", norm, depth=depth_val)
-            if isinstance(out, dict):
-                return _wrap_ok(out, warns, tz_norm, branch="registry.compute_dasha", route_name="vimshottari")
-        except Exception as e:
-            msg = str(e)
-            # Allow fallback if a known 3-arg build_timescales signature is the problem
-            if "build_timescales() missing 1 required positional argument: 'dut1_seconds'" not in msg:
-                return {
-                    "ok": False,
-                    "error": "vimshottari_registry_failed",
-                    "detail": msg,
-                    "meta": {"route": "vimshottari", "tz_normalized": tz_norm, "branch": "registry.compute_dasha"},
-                }
+        out, branch = _call_registry_compute("vimshottari", norm)
+        if isinstance(out, dict):
+            return _wrap_ok(out, warns, tz_norm, branch=branch, route_name="vimshottari")
 
     # 2) Legacy registry alias (if present)
     if _run_dasha is not None:
@@ -312,7 +316,7 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "meta": {"route": "vimshottari", "tz_normalized": tz_norm, "branch": "registry.run_dasha"},
             }
 
-    # 3) Module fallback (clean civic payload; signature-aware call)
+    # 3) Module fallback
     if _compute_vim_module is not None:
         try:
             civ = _build_civic_payload_vim(payload, norm)
@@ -343,7 +347,6 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _run_ashtottari(payload: Dict[str, Any]) -> Dict[str, Any]:
-    # Validator required (reuse same civil normalization)
     if normalize_vim_payload is None:
         return {
             "ok": False,
@@ -356,20 +359,11 @@ def _run_ashtottari(payload: Dict[str, Any]) -> Dict[str, Any]:
     if "dut1_seconds" not in norm or norm["dut1_seconds"] is None:
         norm["dut1_seconds"] = _env_dut1_seconds()
 
-    # 1) Registry (preferred)
+    # 1) Registry (preferred) — signature-aware
     if _compute_dasha_registry is not None:
-        try:
-            depth_val = _levels_from(norm)
-            out = _compute_dasha_registry("ashtottari", norm, depth=depth_val)
-            if isinstance(out, dict):
-                return _wrap_ok(out, warns, tz_norm, branch="registry.compute_dasha", route_name="ashtottari")
-        except Exception as e:
-            return {
-                "ok": False,
-                "error": "ashtottari_registry_failed",
-                "detail": str(e),
-                "meta": {"route": "ashtottari", "tz_normalized": tz_norm, "branch": "registry.compute_dasha"},
-            }
+        out, branch = _call_registry_compute("ashtottari", norm)
+        if isinstance(out, dict):
+            return _wrap_ok(out, warns, tz_norm, branch=branch, route_name="ashtottari")
 
     # 2) Legacy registry alias (rare)
     if _run_dasha is not None:
@@ -416,7 +410,6 @@ def _run_ashtottari(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _run_yogini(payload: Dict[str, Any]) -> Dict[str, Any]:
-    # Validator required (reuse same civil normalization)
     if normalize_vim_payload is None:
         return {
             "ok": False,
@@ -429,20 +422,11 @@ def _run_yogini(payload: Dict[str, Any]) -> Dict[str, Any]:
     if "dut1_seconds" not in norm or norm["dut1_seconds"] is None:
         norm["dut1_seconds"] = _env_dut1_seconds()
 
-    # 1) Registry (preferred)
+    # 1) Registry (preferred) — signature-aware
     if _compute_dasha_registry is not None:
-        try:
-            depth_val = _levels_from(norm)
-            out = _compute_dasha_registry("yogini", norm, depth=depth_val)
-            if isinstance(out, dict):
-                return _wrap_ok(out, warns, tz_norm, branch="registry.compute_dasha", route_name="yogini")
-        except Exception as e:
-            return {
-                "ok": False,
-                "error": "yogini_registry_failed",
-                "detail": str(e),
-                "meta": {"route": "yogini", "tz_normalized": tz_norm, "branch": "registry.compute_dasha"},
-            }
+        out, branch = _call_registry_compute("yogini", norm)
+        if isinstance(out, dict):
+            return _wrap_ok(out, warns, tz_norm, branch=branch, route_name="yogini")
 
     # 2) Legacy registry alias (rare)
     if _run_dasha is not None:
