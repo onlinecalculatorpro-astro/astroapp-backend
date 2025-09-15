@@ -194,34 +194,56 @@ def load_kcd_table_preset(name: str) -> Dict[str, Any]:
     """
     raise NotImplementedError(f"KCD preset '{name}' not bundled. Supply kcd_table explicitly.")
 
-def _validate_kcd_table(tbl: Dict[str, Any]) -> None:
+def _normalize_kcd_table(tbl: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize JSON-ish tables:
+      - Coerce 'pada_to_sequence' keys to int and values to 12-int lists
+      - Accept 'sign_years' as dict with string/int keys or as a 12-length list
+    Returns a new dict (does not mutate input).
+    """
     if not isinstance(tbl, dict):
         raise ValueError("kcd_table must be a dict")
 
-    # --- pada_to_sequence (coerce keys to int) ---
+    # pada_to_sequence
     seq_raw = tbl.get("pada_to_sequence")
     if not isinstance(seq_raw, dict):
         raise ValueError("kcd_table must contain 'pada_to_sequence'")
-    seq: Dict[int, List[int]] = {}
+    p2s: Dict[int, List[int]] = {}
     for k, v in seq_raw.items():
         k_i = int(k)
         if not (1 <= k_i <= 108):
             raise ValueError("kcd_table['pada_to_sequence'] keys must be 1..108")
         if not (isinstance(v, (list, tuple)) and len(v) == 12 and all(1 <= int(x) <= 12 for x in v)):
             raise ValueError("each 'pada_to_sequence'[k] must be a 12-length list of 1..12")
-        seq[k_i] = [int(x) for x in v]
+        p2s[k_i] = [int(x) for x in v]
 
-    # --- sign_years: accept dict (string/int keys) or 12-item list ---
+    # sign_years
     yrs_raw = tbl.get("sign_years")
     if isinstance(yrs_raw, dict):
         yrs = {int(k): float(v) for k, v in yrs_raw.items()}
     elif isinstance(yrs_raw, (list, tuple)) and len(yrs_raw) == 12:
-        yrs = {i+1: float(yrs_raw[i]) for i in range(12)}
+        yrs = {i + 1: float(yrs_raw[i]) for i in range(12)}
     else:
         raise ValueError("kcd_table['sign_years'] must be a dict with keys 1..12 or a 12-length list")
-
     if len(yrs) != 12 or any(i not in yrs for i in range(1, 13)):
         raise ValueError("kcd_table['sign_years'] must define 12 entries keyed 1..12")
+
+    out = dict(tbl)
+    out["pada_to_sequence"] = p2s
+    out["sign_years"] = yrs
+    return out
+
+def _validate_kcd_table(tbl: Dict[str, Any]) -> None:
+    # Once normalized, checks are trivial
+    if not isinstance(tbl.get("pada_to_sequence"), dict) or not isinstance(tbl.get("sign_years"), dict):
+        raise ValueError("kcd_table must contain 'pada_to_sequence' and 'sign_years'")
+    if len(tbl["sign_years"]) != 12 or any(i not in tbl["sign_years"] for i in range(1, 13)):
+        raise ValueError("kcd_table['sign_years'] must define 12 entries keyed 1..12")
+    for k, v in tbl["pada_to_sequence"].items():
+        if not (1 <= int(k) <= 108):
+            raise ValueError("kcd_table['pada_to_sequence'] keys must be 1..108")
+        if not (isinstance(v, list) and len(v) == 12 and all(1 <= int(x) <= 12 for x in v)):
+            raise ValueError("each 'pada_to_sequence'[k] must be a 12-length list of 1..12")
 
 def _demo_kcd_table() -> Dict[str, Any]:
     """
@@ -453,6 +475,9 @@ def compute_kalachakra_dasha(payload: Dict[str, Any]) -> Dict[str, Any]:
             table = load_kcd_table_preset(str(payload["kcd_preset"]))
         if table is None:
             return {"ok": False, "error": "kcd_table_required"}
+
+        # Normalize → Validate
+        table = _normalize_kcd_table(table)
         _validate_kcd_table(table)
         table_name = str(table.get("name") or "")
 
@@ -500,9 +525,9 @@ def compute_kalachakra_dasha(payload: Dict[str, Any]) -> Dict[str, Any]:
         )
 
         # Attach start/rules/meta (plus root tree bounds)
-        if sched["nested"]:
-            s0 = min(n["start_jd_tt"] for n in sched["nested"])
-            e1 = max(n["end_jd_tt"] for n in sched["nested"])
+        if sched["nested"] and isinstance(sched["nested"], list):
+            s0 = min(n["start_jd_tt"] for n in sched["nested"]) if sched["nested"] else float(jd_tt)
+            e1 = max(n["end_jd_tt"] for n in sched["nested"]) if sched["nested"] else float(jd_tt)
         else:
             s0 = float(jd_tt); e1 = float(jd_tt)
 
