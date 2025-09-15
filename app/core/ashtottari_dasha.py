@@ -31,15 +31,10 @@ __all__ = [
     "ashtottari_schedule",
 ]
 
-# ───────────────────────── deps (no adapter Config kwargs!) ─────────────────────────
-try:
-    # Use module-level helpers to avoid wrong Config kwargs
-    from app.core.ephemeris_adapter import ecliptic_longitudes  # type: ignore
-    _EPH_OK = True
-except Exception:
-    ecliptic_longitudes = None  # type: ignore
-    _EPH_OK = False
+# Shared, robust ephemeris helper (single source of truth)
+from app.core.dasha_registry import _moon_nirayana_deg_at as _moon_nira_registry
 
+# Optional timescale helpers for civil → JD conversions
 try:
     from app.core import time_kernel as _tk  # type: ignore
 except Exception:
@@ -49,7 +44,6 @@ try:
 except Exception:
     _ts = None
 
-from app.core.ayanamsa import get_ayanamsa_deg
 from app.core.constants_vedic import NAKSHATRAS_27
 
 # ───────────────────────── numerics / helpers ─────────────────────────
@@ -77,6 +71,9 @@ ASHTOTTARI_YEARS: Dict[str, int] = {
     "Saturn": 10, "Jupiter": 19, "Rahu": 12, "Venus": 21
 }
 ASHTOTTARI_TOTAL_YEARS = 108
+
+# Fast lookups
+_ASHTO_LORD_TO_IDX = {p: i for i, p in enumerate(ASHTOTTARI_ORDER)}
 
 # Kṛttikādi nakṣatra→start-lord (nak index 1..27)
 _KRITTIKADI_RANGES = {
@@ -160,7 +157,7 @@ def _partition_ticks(parent_ticks: int, seq: List[str]) -> List[int]:
     return base
 
 def _lord_after(lord: str) -> str:
-    i = ASHTOTTARI_ORDER.index(lord)
+    i = _ASHTO_LORD_TO_IDX[lord]
     return ASHTOTTARI_ORDER[(i + 1) % len(ASHTOTTARI_ORDER)]
 
 def _cycle_from(after_lord: str, *, start_mode: str) -> List[str]:
@@ -170,7 +167,7 @@ def _cycle_from(after_lord: str, *, start_mode: str) -> List[str]:
     """
     base = list(ASHTOTTARI_ORDER)
     start = after_lord if str(start_mode).lower().strip() == "same" else _lord_after(after_lord)
-    i = base.index(start)
+    i = _ASHTO_LORD_TO_IDX[start]
     return base[i:] + base[:i]
 
 # ───────────────────────── data types ─────────────────────────
@@ -208,13 +205,18 @@ def ashtottari_schedule(
 
     # Mahā sequence beginning at start_lord
     order = list(ASHTOTTARI_ORDER)
-    i0 = order.index(start_lord)
+    i0 = _ASHTO_LORD_TO_IDX[start_lord]
     maha_cycle = order[i0:] + order[:i0]
 
     # Fixed-point timeline anchored at jd_start_tt
     base_jd = float(jd_start_tt)
     t0 = 0  # ticks from base_jd
-    limit_ticks = None if limit_jd_tt is None else _to_ticks(float(limit_jd_tt) - base_jd)
+    if isinstance(limit_jd_tt, (int, float)):
+        limit_ticks = _to_ticks(float(limit_jd_tt) - base_jd)
+        if limit_ticks < 0:
+            limit_ticks = 0
+    else:
+        limit_ticks = None
 
     spans: List[DashaSpan] = []
 
@@ -354,7 +356,7 @@ def _to_nested_linear(spans: List[DashaSpan], *, max_level: int, compact: bool =
         else:
             node = {
                 "l": s.level,
-                "p": int(ASHTOTTARI_ORDER.index(s.lord)),
+                "p": int(_ASHTO_LORD_TO_IDX[s.lord]),
                 "s": float(s.start_jd_tt),
                 "e": float(s.end_jd_tt),
             }
@@ -402,14 +404,8 @@ def _to_nested_linear(spans: List[DashaSpan], *, max_level: int, compact: bool =
 
 # ───────────────────────── moon longitude + timescales ─────────────────────────
 def _moon_nirayana_deg_at(jd_tt: float, *, ayanamsa_key: str) -> float:
-    if not _EPH_OK or ecliptic_longitudes is None:
-        raise RuntimeError("EphemerisAdapter unavailable; cannot compute Moon longitude")
-    rows = (ecliptic_longitudes(float(jd_tt), names=["Moon"]) or {}).get("results", [])
-    if not rows:
-        raise RuntimeError("ephemeris returned no Moon longitude")
-    moon_trop = float(rows[0]["longitude"])
-    ay = float(get_ayanamsa_deg(float(jd_tt), ayanamsa_key))
-    return _norm360(moon_trop - ay)
+    # Delegate to registry’s robust, cached adapter
+    return _moon_nira_registry(float(jd_tt), ayanamsa_key=ayanamsa_key)
 
 def _timescales_from_civil(date: str, time: str, tz: str) -> Tuple[float, float, float]:
     """Return (jd_ut, jd_tt, jd_ut1). Prefer time_kernel (with dut1=0.0), else fallback."""
@@ -447,8 +443,8 @@ def _wrap_root(nested_nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not nested_nodes:
         return {"level": 0, "lord": "Ashtottari", "label": "Ashtottari",
                 "start_jd_tt": 0.0, "end_jd_tt": 0.0, "children": []}
-    start = min(n["start_jd_tt"] for n in nested_nodes)
-    end   = max(n["end_jd_tt"] for n in nested_nodes)
+    start = min(n.get("start_jd_tt", n.get("s")) for n in nested_nodes)
+    end   = max(n.get("end_jd_tt", n.get("e")) for n in nested_nodes)
     return {
         "level": 0,
         "lord": "Ashtottari",
@@ -501,18 +497,8 @@ def compute_dasha(
         compact=compact,
         include_spans=include_spans,
     )
-    tree = _wrap_root(
-        sched["nested"] if not compact else [
-            # If compact, caller likely expects regular keys when using compute_dasha.
-            # Keep nested as-is (compact) but still wrap with a root label.
-            # Downstream consumers of compute_dasha rarely need the root wrapper anyway.
-            # We therefore map compact keys to standard for the wrapper only.
-            {"level": n.get("l", n.get("level")), "lord": (ASHTOTTARI_ORDER[n["p"]] if "p" in n else n.get("lord")),
-             "start_jd_tt": n.get("s", n.get("start_jd_tt")), "end_jd_tt": n.get("e", n.get("end_jd_tt")),
-             "children": n.get("c") or n.get("children")}
-            for n in sched["nested"]
-        ]
-    )
+    # For compute_dasha, we wrap with a root node. If compact, keep children compact.
+    tree = _wrap_root(sched["nested"])
     return {"tree": tree, "levels": _LEVEL_NAMES_5[:levels]}
 
 def compute_ashtottari(payload: Dict[str, Any]) -> Dict[str, Any]:
