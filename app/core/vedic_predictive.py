@@ -2,6 +2,25 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+"""
+Vedic predictive helpers
+
+What’s here
+-----------
+- Windowed daśā periods across multiple systems:
+    vimshottari (preferred engine), ashtottari, yogini, chara (Jaimini), kalachakra
+- Legacy Vimśottarī generator kept for back-compat.
+- Vargas (divisional charts) utilities.
+- A handful of common yoga detectors.
+- Simple feature builders for ML.
+
+Notes
+-----
+- For Kālachakra, you must supply a kcd_table (or a kcd_preset if you’ve wired
+  a preset loader inside the kalachakra module). For local/dev testing you can
+  also pass use_demo_kcd_table=True (if your environment supports it).
+"""
+
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Tuple, Literal, Optional, Set
 
@@ -43,6 +62,14 @@ try:
 except Exception:
     _CHARA_OK = False
     _compute_chara = None  # type: ignore
+
+# Optional engine for Kālachakra
+try:
+    from app.core.kala_chakra_dasha import compute_kalachakra_dasha as _compute_kcd
+    _KCD_OK = True
+except Exception:
+    _KCD_OK = False
+    _compute_kcd = None  # type: ignore
 
 # Ephemeris access (module-level helper; avoids Config kwargs mismatches)
 try:
@@ -273,6 +300,11 @@ def _normalize_system(name: str) -> str:
         "jaimini": "chara",
         "chara_dasha": "chara",
         "jaimini chara": "chara",
+        # Kālachakra
+        "kalachakra": "kalachakra",
+        "kcd": "kalachakra",
+        "kalacakra": "kalachakra",
+        "kalachakra_dasha": "kalachakra",
     }
     return aliases.get(n, n)
 
@@ -301,7 +333,7 @@ def _natal_to_payload(natal_chart: Dict[str, Any]) -> Dict[str, Any]:
 def _flatten_nested(nested: List[Dict[str, Any]], max_level: int) -> List[Dict[str, Any]]:
     """
     Flatten a generic nested tree into rows (level, label, start/end, path).
-    For planet-based systems we use node['lord']; for Chara we accept 'sign_name' or 'sign_index'.
+    For planet-based systems we use node['lord']; for Chara/KCD we accept 'sign_name' or 'sign_index'.
     """
     out: List[Dict[str, Any]] = []
 
@@ -327,7 +359,7 @@ def _flatten_nested(nested: List[Dict[str, Any]], max_level: int) -> List[Dict[s
         new_path = path + [label] if label else path + [""]
         out.append({
             "level": lvl,
-            "lord": label,  # we keep the key name 'lord' for downstream compatibility
+            "lord": label,  # keep key as 'lord' for downstream compatibility
             "start_jd_tt": a,
             "end_jd_tt": b,
             "path": tuple(new_path),
@@ -380,7 +412,7 @@ def predict_dasha_periods(
 ) -> Dict[str, Any]:
     """
     Build daśā periods covering [start_date, end_date] using the selected engine.
-    Supports: vimshottari, ashtottari, yogini, chara.
+    Supports: vimshottari, ashtottari, yogini, chara, kalachakra.
     Returns rows from all depths 1..L that intersect the window.
     """
     system = _normalize_system(dasha_system)
@@ -556,6 +588,43 @@ def predict_dasha_periods(
         flat = _flatten_nested(nested, max_level=L)
         rows = _clip_rows(flat, jd0_tt, jd1_tt)
         return {"ok": True, "periods": rows, "system": "chara", "levels": L}
+
+    # ---------------- Kālachakra ----------------
+    if system == "kalachakra":
+        if not _KCD_OK or _compute_kcd is None:
+            return {"ok": False, "error": "kalachakra_engine_unavailable"}
+
+        base = _natal_to_payload(natal_chart)
+        # Add KCD settings; table/preset/dev-flag can be provided by caller
+        # (e.g., via natal_chart["kcd_table"] / ["kcd_preset"] / ["use_demo_kcd_table"])
+        if "kcd_table" in natal_chart:
+            base["kcd_table"] = natal_chart["kcd_table"]
+        if "kcd_preset" in natal_chart:
+            base["kcd_preset"] = natal_chart["kcd_preset"]
+        if "use_demo_kcd_table" in natal_chart:
+            base["use_demo_kcd_table"] = bool(natal_chart["use_demo_kcd_table"])
+        if "override_start_sign_index" in natal_chart:
+            base["override_start_sign_index"] = int(natal_chart["override_start_sign_index"])
+
+        # Levels & window
+        base.update({
+            "levels": L,
+            "year_days": 365.24219,
+            "limit_jd_tt": float(jd1_tt),
+        })
+
+        # Optional preloaded Moon sidereal longitude (already sidereal)
+        if "planet_longitudes_sidereal" in natal_chart:
+            base["planet_longitudes_sidereal"] = natal_chart["planet_longitudes_sidereal"]
+
+        sched = _compute_kcd(base)
+        if not sched.get("ok", False):
+            return {"ok": False, "error": sched.get("error", "kalachakra_failed")}
+
+        nested = sched.get("nested") or []
+        flat = _flatten_nested(nested, max_level=L)
+        rows = _clip_rows(flat, jd0_tt, jd1_tt)
+        return {"ok": True, "periods": rows, "system": "kalachakra", "levels": L}
 
     # Unknown system
     return {"ok": False, "error": "unsupported_dasha"}
