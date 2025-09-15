@@ -11,8 +11,8 @@ Integration & numerics:
 - Ascendant from app.core.houses_advanced (GAST + true obliquity).
 - Planet longitudes via app.core.ephemeris_adapter.ecliptic_longitudes (ecliptic-of-date),
   then siderealized.
-- Deterministic nested scaling using Decimal (minimizes floating drift).
-- Single-pass tree/spans construction for speed.
+- Deterministic nested scaling using Decimal to minimize floating drift.
+- Single-pass tree/spans construction with caching for speed.
 
 Rules (configurable):
 - Start sign: Lagna (default) or Karakamśa (Ātmakāraka’s sign).
@@ -22,9 +22,9 @@ Rules (configurable):
 - Mahādaśā duration for sign S: inclusive count, following S’s own direction, from S to the
   sign occupied by S’s traditional lord (Sun, Moon, Mars, Mercury, Jupiter, Venus, Saturn).
   Same-sign ⇒ 12 years.
-- Subperiod scaling (levels 2..5): proportional partition:
-      child_days = parent_days × (years(child_sign) / 36)
-  (keeps children summing to the parent exactly).
+- Subperiod scaling (levels 2..5): proportional partition by local weights:
+      child_days = parent_days × years(child) / Σ years(child_seq)
+  (guarantees Σchildren = parent at every nesting; last child snaps to parent end.)
 - Optional balance for the very first mahādaśā: `balance_years` or `balance_fraction` (0..1).
 
 Public API
@@ -161,6 +161,10 @@ def _planet_lons_sidereal(
         for k in need:
             if k in got:
                 out[k] = _norm360(got[k] - ay)
+    # sanity check
+    for lord in set(SIGN_LORD):
+        if lord not in out:
+            raise RuntimeError(f"missing sidereal longitude for {lord}")
     return out
 
 # ────────────────────────── Ascendant (sidereal) ─────────────────────────
@@ -261,7 +265,6 @@ def _sign_sequence_from(start_sign: int, direction_mode: str) -> Tuple[int, ...]
         fwd = _dir_forward(s, mode=direction_mode)
         s = _next_sign(s, forward=fwd)
     if len(order) != 12:
-        # Ensure all 12 present without duplicates (rare)
         for i in range(1, 13):
             if i not in seen:
                 order.append(i)
@@ -286,7 +289,10 @@ def _count_to_target_in_its_direction(start_sign: int, target_sign: int, *, forw
 
 def _lord_pos_tuple(planets_sid: Dict[str, float]) -> Tuple[int, ...]:
     """Tuple of length 12: for each sign 1..12 → sign index of its lord."""
-    return tuple(_sign_index(float(planets_sid[SIGN_LORD[s-1]])) for s in range(1, 13))
+    try:
+        return tuple(_sign_index(float(planets_sid[SIGN_LORD[s-1]])) for s in range(1, 13))
+    except KeyError as ke:
+        raise RuntimeError(f"missing sidereal longitude for {ke.args[0]}") from ke
 
 @lru_cache(maxsize=256)
 def _years_by_sign_cached(lord_pos_tuple: Tuple[int, ...], direction_mode: str) -> Tuple[int, ...]:
@@ -315,10 +321,6 @@ class DashaSpan:
 def _years_to_days(years: Decimal, year_days: Decimal) -> Decimal:
     return years * year_days
 
-def _child_duration(parent_days: Decimal, years_for_sign: int) -> Decimal:
-    # Proportional partition (keeps children summing to parent)
-    return parent_days * (Decimal(years_for_sign) / Decimal(36))
-
 def _build_tree_and_spans(
     *,
     jd_start_tt: float,
@@ -343,7 +345,7 @@ def _build_tree_and_spans(
     nested_lvl1: List[Dict[str, Any]] = []
 
     def append_span(level: int, sign: int, t0: Decimal, t1: Decimal):
-        if include_spans:
+        if include_spans and t1 > t0:
             all_spans.append(DashaSpan(level, sign, float(t0), float(t1)))
 
     def mk_node(level: int, sign: int, t0: Decimal, t1: Decimal) -> Dict[str, Any]:
@@ -358,30 +360,51 @@ def _build_tree_and_spans(
             node["children"] = []
         return node
 
-    def _expand_children(node: Dict[str, Any], *, parent_sign: int, level_next: int, parent_start: Decimal, parent_end: Decimal):
-        """Recursive children expansion (proportional split; child sequence from parent sign)."""
-        if not include_nested and not include_spans:
+    def _expand_children(node: Dict[str, Any], *, parent_sign: int, level_next: int, parent_start_nom: Decimal, parent_end_nom: Decimal):
+        """Recursive children expansion (local-sum proportional split; last child snaps to effective end)."""
+        if (not include_nested and not include_spans) or level_next > levels:
             return
-        if level_next > levels:
+
+        # Effective window (respect global limit); children must sum to this effective duration
+        eff_start = parent_start_nom
+        eff_end = min(parent_end_nom, t_limit) if t_limit is not None else parent_end_nom
+        eff_days = eff_end - eff_start
+        if eff_days <= Decimal(0):
             return
-        parent_days = parent_end - parent_start
-        if parent_days <= 0:
-            return
+
         seq = _sign_sequence_from(parent_sign, direction_mode)
-        t0 = Decimal(parent_start)
-        for child_sign in seq:
-            dur = _child_duration(parent_days, years_by_sign[child_sign])
-            t1 = t0 + dur
-            if t_limit is not None and t0 >= t_limit:
-                t0 = t1
-                continue
-            end = clip_end(t1)
-            append_span(level_next, child_sign, t0, end)
+        weights = [int(years_by_sign[s]) for s in seq]
+        sum_w = Decimal(sum(weights))
+        equal_part = eff_days / Decimal(len(seq)) if sum_w == 0 else None
+
+        t0 = eff_start
+        for idx, child_sign in enumerate(seq):
+            # last child takes all remaining to absorb rounding
+            if idx == len(seq) - 1:
+                t1_nom = eff_end
+            else:
+                if sum_w == 0:
+                    part = equal_part
+                else:
+                    part = eff_days * (Decimal(weights[idx]) / sum_w)
+                t1_nom = t0 + part
+            t1_eff = clip_end(t1_nom)
+            append_span(level_next, child_sign, t0, t1_eff)
+
             if include_nested:
-                child_node = mk_node(level_next, child_sign, t0, end)
+                child_node = mk_node(level_next, child_sign, t0, t1_eff)
                 node.setdefault("children", []).append(child_node)
-                _expand_children(child_node, parent_sign=child_sign, level_next=level_next+1, parent_start=t0, parent_end=t1)
-            t0 = t1
+                # Recurse using nominal sub-window; deeper levels will again clip to limit
+                if level_next + 1 <= levels and t1_nom > t0:
+                    _expand_children(child_node,
+                                     parent_sign=child_sign,
+                                     level_next=level_next + 1,
+                                     parent_start_nom=t0,
+                                     parent_end_nom=t1_nom)
+
+            t0 = t1_nom
+            if t0 >= eff_end:
+                break
 
     # Level-1 order
     order = _maha_sequence_cached(int(start_sign_index), direction_mode)
@@ -394,26 +417,30 @@ def _build_tree_and_spans(
         if idx == 0 and isinstance(balance_years, (int, float)):
             dur_days = max(Decimal(0), dur_days - _years_to_days(Decimal(str(balance_years)), year_days_D))
 
-        t_next = t + dur_days
+        t_next_nom = t + dur_days
         if t_limit is not None and t >= t_limit:
-            t = t_next
+            t = t_next_nom
             break
 
-        end = clip_end(t_next)
-        node = mk_node(1, s, t, end)
-        append_span(1, s, t, end)
+        end_eff = clip_end(t_next_nom)
+        node = mk_node(1, s, t, end_eff)
+        append_span(1, s, t, end_eff)
         nested_lvl1.append(node)
 
         if levels >= 2:
-            _expand_children(node, parent_sign=s, level_next=2, parent_start=t, parent_end=t_next)
+            _expand_children(node,
+                             parent_sign=s,
+                             level_next=2,
+                             parent_start_nom=t,
+                             parent_end_nom=t_next_nom)
 
-        t = t_next
+        t = t_next_nom
 
     return nested_lvl1, all_spans
 
 # ─────────────────────────── schedule facade ───────────────────────────
 def chara_schedule(
-    *,
+    *_,
     jd_start_tt: float,
     start_sign_index: int,
     planets_sidereal: Dict[str, float],
@@ -425,8 +452,8 @@ def chara_schedule(
 ) -> Dict[str, Any]:
     """Build the full Chara Daśā schedule."""
     levels = max(1, min(5, int(levels)))
-
     yrs = _years_by_sign(planets_sidereal, direction_mode=direction_mode)
+
     nested, spans = _build_tree_and_spans(
         jd_start_tt=float(jd_start_tt),
         start_sign_index=int(start_sign_index),
@@ -460,7 +487,7 @@ def chara_schedule(
                 "sign_index": s.sign,
                 "sign_name": SIGN_NAMES[s.sign - 1],
                 "start_jd_tt": s.start_jd_tt,
-                "end_jd_tt": s.end_jd_tt
+                "end_jd_tt": s.end_jd_tt,
             } for s in spans
         ],
         "nested": nested,
@@ -570,7 +597,7 @@ def compute_chara_dasha(payload: Dict[str, Any]) -> Dict[str, Any]:
         sched["rules"] = {
             "direction_mode": direction_mode,
             "duration_rule": "count_to_lord_in_sign_direction (inclusive; same-sign=12)",
-            "sublevel_scaling": "proportional (years/36)",
+            "sublevel_scaling": "proportional (local years / local sum; last child snaps)",
         }
         sched["meta"] = {
             "ayanamsa": ay_key,
