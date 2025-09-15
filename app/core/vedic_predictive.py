@@ -36,6 +36,14 @@ try:
 except Exception:
     _YOGINI_OK = False
 
+# Optional engine for Chara (Jaimini)
+try:
+    from app.core.chara_dasha import compute_chara_dasha as _compute_chara
+    _CHARA_OK = True
+except Exception:
+    _CHARA_OK = False
+    _compute_chara = None  # type: ignore
+
 # Ephemeris access (module-level helper; avoids Config kwargs mismatches)
 try:
     from app.core.ephemeris_adapter import ecliptic_longitudes  # type: ignore
@@ -260,6 +268,11 @@ def _normalize_system(name: str) -> str:
         "ashtottarī": "ashtottari",
         "yogini": "yogini",
         "yoginī": "yogini",
+        # Chara / Jaimini
+        "chara": "chara",
+        "jaimini": "chara",
+        "chara_dasha": "chara",
+        "jaimini chara": "chara",
     }
     return aliases.get(n, n)
 
@@ -267,6 +280,7 @@ def _natal_to_payload(natal_chart: Dict[str, Any]) -> Dict[str, Any]:
     """
     Build a payload that the individual dasha engines accept.
     Respects either jd_tt or {date,time,tz}. Passes through ayanamsa if present.
+    Also forwards helpful extras (lat/lon/asc) when present.
     """
     payload: Dict[str, Any] = {}
     if "jd_tt" in natal_chart:
@@ -278,31 +292,53 @@ def _natal_to_payload(natal_chart: Dict[str, Any]) -> Dict[str, Any]:
     ay = natal_chart.get("ayanamsa")
     if ay is not None:
         payload["ayanamsa"] = ay
-    # optional: ayanamsa_deg is also supported by vim fallback; engines accept string keys
+    # Extras some engines can use (no-ops for others)
+    for k in ("latitude", "longitude", "asc_sidereal_deg", "asc_tropical_deg"):
+        if k in natal_chart:
+            payload[k] = natal_chart[k]
     return payload
 
 def _flatten_nested(nested: List[Dict[str, Any]], max_level: int) -> List[Dict[str, Any]]:
     """
-    Flatten a generic nested tree (with keys: level, lord, start_jd_tt, end_jd_tt, children?)
-    into rows that include 'path' for chain derivation.
+    Flatten a generic nested tree into rows (level, label, start/end, path).
+    For planet-based systems we use node['lord']; for Chara we accept 'sign_name' or 'sign_index'.
     """
     out: List[Dict[str, Any]] = []
+
+    def _label_of(node: Dict[str, Any]) -> str:
+        lbl = node.get("lord")
+        if lbl:
+            return str(lbl)
+        sn = node.get("sign_name")
+        if sn:
+            return str(sn)
+        si = node.get("sign_index")
+        if isinstance(si, int):
+            return f"Sign-{si}"
+        return ""
+
     def walk(node: Dict[str, Any], path: List[str]):
         lvl = int(node.get("level", 0))
         if lvl < 1 or lvl > max_level:
             return
-        lord = str(node.get("lord"))
+        label = _label_of(node)
         a = float(node.get("start_jd_tt"))
         b = float(node.get("end_jd_tt"))
-        new_path = path + [lord]
-        out.append({"level": lvl, "lord": lord, "start_jd_tt": a, "end_jd_tt": b, "path": tuple(new_path)})
-        kids = node.get("children") or node.get("c")  # allow compact
+        new_path = path + [label] if label else path + [""]
+        out.append({
+            "level": lvl,
+            "lord": label,  # we keep the key name 'lord' for downstream compatibility
+            "start_jd_tt": a,
+            "end_jd_tt": b,
+            "path": tuple(new_path),
+        })
+        kids = node.get("children") or node.get("c")
         if isinstance(kids, list):
             for k in kids:
                 walk(k, new_path)
+
     for root in (nested or []):
         walk(root, [])
-    # stable order
     out.sort(key=lambda r: (r["start_jd_tt"], r["level"]))
     return out
 
@@ -315,15 +351,17 @@ def _clip_rows(rows: List[Dict[str, Any]], jd_a: float, jd_b: float) -> List[Dic
             continue
         if a < A: a = A
         if b > B: b = B
+        path = list(r.get("path") or ())
+        chain = path if path else ([r.get("lord")] if r.get("lord") is not None else [])
         keep.append({
             "start_jd_tt": a,
             "end_jd_tt": b,
             "start_date": _jd_tt_to_iso_utc(a),
             "end_date": _jd_tt_to_iso_utc(b),
             "level": int(r["level"]),
-            "mahadasha_lord": (r.get("path") or (r.get("lord"),))[0],
-            "chain": list(r.get("path") or (r.get("lord"),)),
-            "lord": r["lord"],
+            "mahadasha_lord": chain[0] if chain else r.get("lord"),
+            "chain": chain,
+            "lord": r.get("lord"),
             "meta": {},
         })
     keep.sort(key=lambda d: (d["start_jd_tt"], d["level"]))
@@ -342,7 +380,7 @@ def predict_dasha_periods(
 ) -> Dict[str, Any]:
     """
     Build daśā periods covering [start_date, end_date] using the selected engine.
-    Supports: vimshottari, ashtottari, yogini.
+    Supports: vimshottari, ashtottari, yogini, chara.
     Returns rows from all depths 1..L that intersect the window.
     """
     system = _normalize_system(dasha_system)
@@ -487,6 +525,37 @@ def predict_dasha_periods(
         flat = _flatten_nested(nested, max_level=L)
         rows = _clip_rows(flat, jd0_tt, jd1_tt)
         return {"ok": True, "periods": rows, "system": "yogini", "levels": L}
+
+    # ---------------- Chara (Jaimini) ----------------
+    if system == "chara":
+        if not _CHARA_OK or _compute_chara is None:
+            return {"ok": False, "error": "chara_engine_unavailable"}
+
+        base = _natal_to_payload(natal_chart)
+        # Add Chara-specific knobs and geometry so Lagna/ĀK can resolve
+        base.update({
+            "levels": L,
+            "year_days": 365.24219,
+            "limit_jd_tt": float(jd1_tt),
+            # site/asc inputs (any subset is fine; module resolves appropriately)
+            "latitude": natal_chart.get("latitude"),
+            "longitude": natal_chart.get("longitude"),
+            "asc_sidereal_deg": natal_chart.get("asc_sidereal_deg"),
+            "asc_tropical_deg": natal_chart.get("asc_tropical_deg"),
+            # preferences (optional; defaults match module)
+            "start_from": natal_chart.get("chara_start_from", "lagna"),
+            "direction_mode": natal_chart.get("chara_direction_mode", "rashi_nature"),
+            "include_rahu_in_karakas": bool(natal_chart.get("include_rahu_in_karakas", False)),
+        })
+
+        sched = _compute_chara(base)
+        if not sched.get("ok", False):
+            return {"ok": False, "error": sched.get("error", "chara_failed")}
+
+        nested = sched.get("nested") or []
+        flat = _flatten_nested(nested, max_level=L)
+        rows = _clip_rows(flat, jd0_tt, jd1_tt)
+        return {"ok": True, "periods": rows, "system": "chara", "levels": L}
 
     # Unknown system
     return {"ok": False, "error": "unsupported_dasha"}
@@ -661,7 +730,7 @@ def detect_panch_mahapurusha(points_deg: Dict[str, float], cusps_deg: List[float
     for p, name in (("mars","Ruchaka"), ("mercury","Bhadra"), ("jupiter","Hamsa"),
                     ("venus","Malavya"), ("saturn","Shasha")):
         lon = points_deg.get(p)
-        if lon is None: 
+        if lon is None:
             continue
         s = sign_index(lon); h = house_index_for_longitude(cusps_deg, lon)
         if is_kendra(h) and in_own_or_exaltation(p, s):
