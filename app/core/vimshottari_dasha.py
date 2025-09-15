@@ -4,10 +4,11 @@ from __future__ import annotations
 """
 Vimśottarī Daśā — Mahā → Antar → Pratyantar → Sūkṣma → Prāṇa
 
-- Exact proportional timing with half-open intervals [start, end)
-- Sidereal-first (nakṣatra lord + remainder from Moon nirāyaṇa at birth)
-- Window-aware generation (build only what overlaps your window)
-- Utilities: current_dasha_at, flatten_periods
+Enhancements:
+- method: "sidereal" (default) or "tropical"
+- observer: "geocentric" (default) or "topocentric" (needs lat/lon)
+- ayanamsa: "lahiri" (default) or any supported key (fagan_bradley, krishnamurti, raman, yukteswar, devore, ...)
+- Boundary distance helper for near-nakṣatra-edge warnings
 """
 
 from dataclasses import dataclass
@@ -16,7 +17,7 @@ import os
 import math
 from functools import lru_cache
 
-# ── Optional time helpers (same pattern as panchanga.py) ──
+# ── Optional time helpers ─────────────────────────────────────────────────────
 try:
     from app.core import time_kernel as _tk
 except Exception:
@@ -26,7 +27,7 @@ try:
 except Exception:
     _ts = None
 
-# ── Ephemeris & ayanāṁśa ──
+# ── Ephemeris & ayanāṁśa ─────────────────────────────────────────────────────
 from app.core.ephem_singleton import TS, PLANETS  # singleton config
 try:
     from app.core.ephemeris_adapter import EphemerisAdapter, Config as EphemConfig
@@ -37,23 +38,32 @@ except Exception:
     _EPH_OK = False
 
 try:
+    # Your module should support multiple ayanamsa keys; default is lahiri.
     from app.core.ayanamsa import get_ayanamsa_deg as _ayan
 except Exception:
     _ayan = None
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Constants & helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# Optional override table for nakṣatra lords (27 entries)
+try:
+    from app.core.constants_vedic import NAKSHATRA_LORDS_27 as _NAK_LORDS  # type: ignore
+    _NAK_LORDS = [str(x).title() for x in _NAK_LORDS]
+    if len(_NAK_LORDS) != 27:
+        _NAK_LORDS = []
+except Exception:
+    _NAK_LORDS = []
+
+# ── Constants ─────────────────────────────────────────────────────────────────
 VIM_ORDER: Tuple[str, ...] = ("Ketu","Venus","Sun","Moon","Mars","Rahu","Jupiter","Saturn","Mercury")
 VIM_YEARS: Dict[str, int] = {"Ketu":7,"Venus":20,"Sun":6,"Moon":10,"Mars":7,"Rahu":18,"Jupiter":16,"Saturn":19,"Mercury":17}
 _RATIOS: Dict[str, float] = {k: VIM_YEARS[k] / 120.0 for k in VIM_ORDER}
-_NAK_WIDTH = 360.0 / 27.0  # 13°20'
+_NAK_WIDTH = 360.0 / 27.0  # 13°20′
 
 # Default year length (days) for Vimśottarī arithmetic; configurable via env
 VIM_YEAR_DAYS = float(os.getenv("VIM_YEAR_DAYS", "365.25"))
 
 _EPS = 1e-12
 
+# ── Small helpers ─────────────────────────────────────────────────────────────
 def _norm360(x: float) -> float:
     r = math.fmod(float(x), 360.0)
     return r + 360.0 if r < 0.0 else r
@@ -67,6 +77,34 @@ def _kahan_sum(vals: Iterable[float]) -> float:
         s = t
     return s
 
+def _norm_method(v: Any, default: str = "sidereal") -> str:
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("sidereal","nirayana","nirāyaṇa","sid","s"): return "sidereal"
+        if s in ("tropical","sayana","sāyana","trop","t"):    return "tropical"
+    return default
+
+def _norm_observer(v: Any, default: str = "geocentric") -> str:
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("geocentric","geo","center"):    return "geocentric"
+        if s in ("topocentric","apparent","obs"): return "topocentric"
+    return default
+
+def _norm_coord_mode(topocentric_flag: Any, mode_or_observer: Any) -> str:
+    # Accept either booleans (legacy topocentric) or a string observer/coordinate_mode
+    if isinstance(topocentric_flag, bool):
+        return "topocentric" if topocentric_flag else "geocentric"
+    if isinstance(mode_or_observer, str):
+        return _norm_observer(mode_or_observer, default="geocentric")
+    return "geocentric"
+
+def _norm_ayanamsa(v: Any) -> str:
+    # Default LAHIRI as requested
+    if v is None: return "lahiri"
+    s = str(v).strip().lower()
+    return s or "lahiri"
+
 @lru_cache(maxsize=16)
 def _cycle(start_lord: str) -> Tuple[str, ...]:
     s = start_lord.strip().title()
@@ -79,18 +117,12 @@ def _cycle(start_lord: str) -> Tuple[str, ...]:
 def _cycle_ratios(order: Tuple[str, ...]) -> Tuple[float, ...]:
     return tuple(_RATIOS[l] for l in order)
 
-# Optional constants_vedic override for nakṣatra lords (27-long list)
-try:
-    from app.core.constants_vedic import NAKSHATRA_LORDS_27 as _NAK_LORDS  # type: ignore
-    _NAK_LORDS = [str(x).title() for x in _NAK_LORDS]  # normalize
-    if len(_NAK_LORDS) != 27:
-        _NAK_LORDS = []
-except Exception:
-    _NAK_LORDS = []
+def _nak_lord_from_index(idx0: int) -> str:
+    if _NAK_LORDS:
+        return _NAK_LORDS[idx0]
+    return VIM_ORDER[idx0 % 9]  # Ashwini → Ketu
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Timescales
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Timescales ────────────────────────────────────────────────────────────────
 def _timescales_from_civil(date: str, time: str, tz: str) -> Tuple[float, float, float]:
     """
     Returns (jd_ut, jd_tt, jd_ut1). We accept any available backend.
@@ -118,9 +150,7 @@ def _timescales_from_civil(date: str, time: str, tz: str) -> Tuple[float, float,
         jd_tt = jd_ut + 69.0/86400.0
     return jd_ut, jd_tt, jd_ut
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Ephemeris compatibility + cache
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Ephemeris compatibility + cache ───────────────────────────────────────────
 _EPH_ADAPTER = None  # cached instance
 
 def _make_ephem(frame: str = "ecliptic-of-date"):
@@ -129,38 +159,27 @@ def _make_ephem(frame: str = "ecliptic-of-date"):
     are accepted by EphemConfig/EphemerisAdapter in this deployment.
     Tries several signatures gracefully.
     """
-    # Try Config(frame=..., timescale=TS, planets=PLANETS) → Adapter(cfg)
     try:
         cfg = EphemConfig(frame=frame, timescale=TS, planets=PLANETS)  # type: ignore[arg-type]
-        try:
-            return EphemerisAdapter(cfg)  # type: ignore[call-arg]
-        except TypeError:
-            pass
+        try:    return EphemerisAdapter(cfg)  # type: ignore[call-arg]
+        except TypeError: pass
     except TypeError:
         cfg = None  # type: ignore[assignment]
 
-    # Try Config(frame) only, then pass extras to Adapter(...)
     if cfg is None:
-        try:
-            cfg = EphemConfig(frame=frame)  # type: ignore[call-arg]
+        try:    cfg = EphemConfig(frame=frame)  # type: ignore[call-arg]
         except TypeError:
             cfg = None  # type: ignore[assignment]
 
     if cfg is not None:
-        try:
-            return EphemerisAdapter(cfg, timescale=TS, planets=PLANETS)  # type: ignore[call-arg]
+        try:    return EphemerisAdapter(cfg, timescale=TS, planets=PLANETS)  # type: ignore[call-arg]
         except TypeError:
-            try:
-                return EphemerisAdapter(cfg)  # type: ignore[call-arg]
-            except TypeError:
-                pass
+            try:    return EphemerisAdapter(cfg)  # type: ignore[call-arg]
+            except TypeError: pass
 
-    # Last resort: call Adapter with kwargs directly (with and without extras)
-    try:
-        return EphemerisAdapter(frame=frame, timescale=TS, planets=PLANETS)  # type: ignore[call-arg]
+    try:        return EphemerisAdapter(frame=frame, timescale=TS, planets=PLANETS)  # type: ignore[call-arg]
     except TypeError:
-        try:
-            return EphemerisAdapter(frame=frame)  # type: ignore[call-arg]
+        try:    return EphemerisAdapter(frame=frame)  # type: ignore[call-arg]
         except TypeError as e:
             raise RuntimeError(f"EphemerisAdapter incompatible signatures: {e}")
 
@@ -170,64 +189,131 @@ def _get_ephem():
         _EPH_ADAPTER = _make_ephem("ecliptic-of-date")
     return _EPH_ADAPTER
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Moon nirāyaṇa longitude & nakṣatra / balance
-# ─────────────────────────────────────────────────────────────────────────────
-def _moon_longitude_tropical(jd_tt: float) -> float:
+# ── Moon longitude (tropical), with geo/topo option ──────────────────────────
+def _moon_longitude_tropical(
+    jd_tt: float,
+    *,
+    topocentric: bool = False,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    elevation_m: Optional[float] = None,
+    warnings: Optional[List[str]] = None,
+) -> float:
+    """
+    Get Moon ecliptic longitude (tropical). Geocentric by default.
+    If topocentric=True and lat/lon provided, attempts an observer-based call.
+    Falls back to geocentric with a warning if the adapter lacks support.
+    """
     if not _EPH_OK:
         raise RuntimeError("EphemerisAdapter unavailable; enable app.core.ephemeris_adapter")
+
     ep = _get_ephem()
+
+    if topocentric and latitude is not None and longitude is not None:
+        rows = []
+        try:
+            rows = ep.ecliptic_longitudes(
+                float(jd_tt), ["Moon"],
+                observer={
+                    "lat": float(latitude), "lon": float(longitude),
+                    "elevation_m": float(elevation_m or 0.0), "topocentric": True
+                }
+            ).get("results", [])
+        except TypeError:
+            try:
+                rows = ep.ecliptic_longitudes(
+                    float(jd_tt), ["Moon"],
+                    lat=float(latitude), lon=float(longitude),
+                    elevation_m=float(elevation_m or 0.0), topocentric=True
+                ).get("results", [])
+            except TypeError:
+                try:
+                    # Some adapters expose an "apparent_*" API
+                    rows = ep.apparent_ecliptic_longitudes(  # type: ignore[attr-defined]
+                        float(jd_tt), ["Moon"],
+                        lat=float(latitude), lon=float(longitude),
+                        elevation_m=float(elevation_m or 0.0)
+                    ).get("results", [])
+                except Exception:
+                    rows = []
+        if rows:
+            return float(rows[0]["longitude"])
+        else:
+            if warnings is not None:
+                warnings.append("topocentric_unavailable:fallback_to_geocentric")
+
     rows = ep.ecliptic_longitudes(float(jd_tt), ["Moon"]).get("results", [])
     if not rows:
         raise RuntimeError("ephemeris returned no Moon longitude")
     return float(rows[0]["longitude"])
 
-def _ayanamsa_deg(jd_tt: float, ayanamsa: Optional[Any]) -> float:
-    if isinstance(ayanamsa, (int, float)):
-        return float(ayanamsa)
-    if isinstance(ayanamsa, str) and _ayan is not None:
+def _ayanamsa_deg(jd_tt: float, ayanamsa_key: Optional[Any]) -> float:
+    # Accept numeric ayanamsa or string key (lahiri default via _norm_ayanamsa)
+    if isinstance(ayanamsa_key, (int, float)):
+        return float(ayanamsa_key)
+    key = _norm_ayanamsa(ayanamsa_key)
+    if _ayan is not None:
         try:
-            return float(_ayan(jd_tt, ayanamsa.strip().lower()))
+            return float(_ayan(jd_tt, key))
         except Exception:
             return 0.0
     return 0.0
 
-def _nak_lord_from_index(idx0: int) -> str:
-    if _NAK_LORDS:
-        return _NAK_LORDS[idx0]
-    return VIM_ORDER[idx0 % 9]  # Ashwini → Ketu
-
+# ── Nakṣatra computation on chosen basis ─────────────────────────────────────
 @dataclass
 class NakshatraInfo:
     index: int              # 1..27
     lord: str               # "Ketu".. "Mercury"
-    start_deg: float        # start of nak in nirayana (deg)
-    offset_deg: float       # position within nak (deg, 0..13°20')
+    start_deg: float        # start of segment (sidereal or tropical)
+    offset_deg: float       # position within current 13°20′ segment
     fraction_left: float    # 0..1
-    moon_nirayana_deg: float
+    moon_basis_deg: float   # longitude used for segmentation (sidereal or tropical)
+    basis: str              # "sidereal" or "tropical"
 
-def nakshatra_info_from_jd(jd_tt: float, *, ayanamsa: Optional[Any] = "lahiri") -> NakshatraInfo:
-    moon_trop = _moon_longitude_tropical(jd_tt)
-    ay = _ayanamsa_deg(jd_tt, ayanamsa)
-    moon_nira = _norm360(moon_trop - ay)
-    idx0 = int(math.floor(moon_nira / _NAK_WIDTH))  # 0..26
+def nakshatra_info_from_jd(
+    jd_tt: float,
+    *,
+    method: str = "sidereal",         # "sidereal" (default) or "tropical"
+    ayanamsa: Optional[Any] = "lahiri",
+    topocentric: bool = False,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    elevation_m: Optional[float] = None,
+    warnings: Optional[List[str]] = None,
+) -> NakshatraInfo:
+    """
+    Compute nakṣatra from Moon longitude:
+      - method="sidereal": segment on nirāyaṇa Moon (tropical - ayanāṁśa)
+      - method="tropical": segment directly on tropical Moon
+    """
+    method = _norm_method(method, default="sidereal")
+
+    moon_trop = _moon_longitude_tropical(
+        jd_tt,
+        topocentric=topocentric,
+        latitude=latitude,
+        longitude=longitude,
+        elevation_m=elevation_m,
+        warnings=warnings,
+    )
+    if method == "sidereal":
+        ay = _ayanamsa_deg(jd_tt, ayanamsa)
+        base = _norm360(moon_trop - ay)
+    else:
+        base = _norm360(moon_trop)
+
+    idx0 = int(math.floor(base / _NAK_WIDTH))  # 0..26
     start = idx0 * _NAK_WIDTH
-    offset = moon_nira - start
+    offset = base - start
     frac_left = max(0.0, min(1.0, (_NAK_WIDTH - offset) / _NAK_WIDTH))
     lord = _nak_lord_from_index(idx0)
     return NakshatraInfo(
         index=idx0 + 1, lord=lord, start_deg=start, offset_deg=offset,
-        fraction_left=frac_left, moon_nirayana_deg=moon_nira
+        fraction_left=frac_left, moon_basis_deg=base, basis=method
     )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Core partitioning
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Partitioning and tree build ───────────────────────────────────────────────
 def _partition_by_weights(start: float, end: float, order: Tuple[str, ...]) -> List[Tuple[str, float, float]]:
-    """
-    Partition [start,end) into 9 children according to Vim years / 120.
-    The last child snaps to 'end' to ensure exact coverage.
-    """
     span = float(end - start)
     ratios = _cycle_ratios(order)
     durs = [span * r for r in ratios]
@@ -243,11 +329,6 @@ def _partition_by_weights(start: float, end: float, order: Tuple[str, ...]) -> L
     return out
 
 def _build_children_windowed(parent_lord: str, a: float, b: float, level: int, max_level: int, w0: float, w1: float) -> List[Dict[str, Any]]:
-    """
-    Recursively build 9-way subperiods down to max_level (<=5), but only keep
-    segments overlapping [w0, w1). Children are generated from the un-clipped
-    parent bounds to preserve exact proportional timing, then clipped once.
-    """
     if level >= max_level:
         return []
     order = _cycle(parent_lord)
@@ -263,14 +344,7 @@ def _build_children_windowed(parent_lord: str, a: float, b: float, level: int, m
         out.append(node)
     return out
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Top-level generation (Mahādaśā stream with clipping)
-# ─────────────────────────────────────────────────────────────────────────────
 def _maha_stream(start_maha_lord: str, maha0_start: float, jd_end: float, *, year_days: float) -> List[Tuple[str, float, float]]:
-    """
-    Generate consecutive Mahādaśās from maha0_start (which may begin before birth),
-    until jd_end (exclusive). Returns list of (lord, start, end) covering the span.
-    """
     seq = []
     t = float(maha0_start)
     lord_idx = VIM_ORDER.index(start_maha_lord)
@@ -291,9 +365,7 @@ def _clip_interval(a: float, b: float, w0: float, w1: float) -> Optional[Tuple[f
         return None
     return (aa, bb)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Public API
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Public API ────────────────────────────────────────────────────────────────
 def generate_vimshottari_tree(
     *,
     birth_jd_tt: float | None = None,
@@ -301,10 +373,17 @@ def generate_vimshottari_tree(
     time: str | None = None,
     tz: str | None = None,
     ayanamsa: Optional[Any] = "lahiri",
+    method: str = "sidereal",           # NEW
     levels: int = 5,
     span_years: float | None = 120.0,
     end_jd_tt: float | None = None,
     year_days: float | None = None,
+    # Place + toggle for topocentric
+    latitude: float | None = None,
+    longitude: float | None = None,
+    elevation_m: float | None = None,
+    topocentric: bool = False,
+    coordinate_mode: Optional[str] = None,  # alias for observer/coordinate mode
 ) -> Dict[str, Any]:
     """
     Build Vimśottarī daśā tree from birth onward, clipped to the requested window.
@@ -313,9 +392,20 @@ def generate_vimshottari_tree(
       - If end_jd_tt is provided, window = [birth_jd_tt, end_jd_tt)
       - Else if span_years is provided, window = [birth_jd_tt, birth_jd_tt + span_years*year_days)
       - Else default span_years=120.
+
+    New behavior:
+      - method: "sidereal" (default) or "tropical"
+      - coordinate_mode/topocentric: "geocentric" (default) or "topocentric" (needs lat/lon)
     """
     if levels < 1 or levels > 5:
         raise ValueError("levels must be between 1 and 5")
+
+    warns: List[str] = []
+
+    method = _norm_method(method, default="sidereal")
+    ay_key = _norm_ayanamsa(ayanamsa)
+    coord_mode = _norm_coord_mode(topocentric, coordinate_mode)
+    topo = (coord_mode == "topocentric")
 
     # Resolve birth time
     if birth_jd_tt is None:
@@ -326,8 +416,17 @@ def generate_vimshottari_tree(
     jd0 = float(birth_jd_tt)
     yd = float(year_days if isinstance(year_days, (int, float)) else VIM_YEAR_DAYS)
 
-    # Moon & nakṣatra at birth
-    info = nakshatra_info_from_jd(jd0, ayanamsa=ayanamsa)
+    # Moon & nakṣatra at birth (basis + geo/topo)
+    info = nakshatra_info_from_jd(
+        jd_tt=jd0,
+        method=method,
+        ayanamsa=ay_key,
+        topocentric=topo,
+        latitude=latitude,
+        longitude=longitude,
+        elevation_m=elevation_m,
+        warnings=warns,
+    )
     maha_lord0 = info.lord
     full_maha_days = VIM_YEARS[maha_lord0] * yd
     balance_days = info.fraction_left * full_maha_days
@@ -355,18 +454,37 @@ def generate_vimshottari_tree(
         root["children"] = _build_children_windowed(lord, a, b, level=1, max_level=levels, w0=ca, w1=cb)
         out_periods.append(root)
 
-    return {
+    # Distance to nearest nakṣatra boundary (deg)
+    boundary_dist = min(info.offset_deg, _NAK_WIDTH - info.offset_deg)
+
+    out: Dict[str, Any] = {
         "ok": True,
         "birth_jd_tt": jd0,
-        "moon_nirayana_deg": info.moon_nirayana_deg,
+        "moon_basis_deg": info.moon_basis_deg,  # longitude used for segmentation
         "nakshatra": {
-            "index": info.index, "lord": info.lord, "fraction_left": info.fraction_left,
-            "offset_deg": info.offset_deg, "width_deg": _NAK_WIDTH
+            "index": info.index,
+            "lord": info.lord,
+            "fraction_left": info.fraction_left,
+            "offset_deg": info.offset_deg,
+            "width_deg": _NAK_WIDTH,
+            "boundary_distance_deg": boundary_dist,
+            "basis": info.basis,  # "sidereal" | "tropical"
         },
         "year_days": yd,
         "levels": int(levels),
         "periods": out_periods,
+        "meta": {
+            "method": method,
+            "coordinate_mode": coord_mode,       # "geocentric" | "topocentric"
+            "ayanamsa_key": ay_key,              # e.g., "lahiri" (default)
+            "observer": {
+                "latitude": latitude, "longitude": longitude, "elevation_m": elevation_m
+            },
+        },
     }
+    if warns:
+        out["warnings"] = warns
+    return out
 
 def current_dasha_at(
     *,
@@ -395,8 +513,13 @@ def current_dasha_at(
         if birth_jd_tt is None:
             raise ValueError("Provide tree or birth_jd_tt")
         yd = float(year_days if isinstance(year_days, (int, float)) else VIM_YEAR_DAYS)
-        tree = generate_vimshottari_tree(birth_jd_tt=float(birth_jd_tt), ayanamsa=ayanamsa, levels=int(levels),
-                                         span_years=130.0, year_days=yd)
+        tree = generate_vimshottari_tree(
+            birth_jd_tt=float(birth_jd_tt),
+            ayanamsa=_norm_ayanamsa(ayanamsa),
+            levels=int(levels),
+            span_years=130.0,
+            year_days=yd
+        )
 
     out: Dict[str, Any] = {"ok": False, "levels": int(levels)}
     path: List[str] = []
@@ -456,26 +579,53 @@ def compute_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Route-friendly wrapper.
 
-    Payload keys (any subset):
-        birth_jd_tt | (date,time,tz)
-        ayanamsa: float|str     default "lahiri"
-        levels: 1..5            default 5
-        span_years: float       default 120
-        end_jd_tt: float        optional
-        year_days: float        default env VIM_YEAR_DAYS or 365.25
-        query_jd_tt | (q_date,q_time,q_tz)   optional → 'current'
-        flatten_level: 1..5     optional → also return flattened list;
-                                 if provided and < levels, we build only to flatten_level for speed.
+    Accepted payload keys (any subset):
+        # Primary civic time
+        date, time, tz
+        birth_jd_tt                       # alternative to (date,time,tz)
+
+        # Basis & observer
+        method: "sidereal"|"tropical"     # default "sidereal"
+        observer: "geocentric"|"topocentric"  # default "geocentric"
+        topocentric: bool                 # legacy alias
+        coordinate_mode: str              # legacy alias
+        ayanamsa: string|float            # default "lahiri"
+
+        # Site (needed if topocentric)
+        latitude|lat, longitude|lon, elevation_m|elevation
+
+        # Controls
+        levels: 1..5                      # default 5
+        span_years: float                 # default 120
+        end_jd_tt: float                  # optional
+        year_days: float                  # default env or 365.25
+        query_jd_tt | (q_date,q_time,q_tz)# optional → 'current'
+        flatten_level: 1..5               # optional → flat list at chosen level
     """
     birth_jd_tt = payload.get("birth_jd_tt")
     date = payload.get("date"); time = payload.get("time"); tz = payload.get("tz")
-    ay = payload.get("ayanamsa", "lahiri")
+
+    # Basis
+    method = _norm_method(payload.get("method", payload.get("mode", "sidereal")), default="sidereal")
+    ay = _norm_ayanamsa(payload.get("ayanamsa", payload.get("ayanamsa_key", "lahiri")))
+
+    # Observer
+    observer = _norm_observer(payload.get("observer", "geocentric"))
+    coord_mode = payload.get("coordinate_mode", observer)
+    topo = (_norm_coord_mode(payload.get("topocentric"), coord_mode) == "topocentric")
+
+    # Site
+    lat = payload.get("latitude", payload.get("lat"))
+    lon = payload.get("longitude", payload.get("lon"))
+    elev = payload.get("elevation_m", payload.get("elevation"))
+
+    # Controls
     levels = int(payload.get("levels", 5))
     span_years = payload.get("span_years", 120.0)
     end_jd_tt = payload.get("end_jd_tt")
     year_days = payload.get("year_days")
 
-    # If caller only needs flatten_level = L (and L < levels), cap build depth for performance.
+    # Depth optimization for flatten
     build_levels = levels
     flat_level = payload.get("flatten_level")
     if isinstance(flat_level, int) and 1 <= flat_level <= 5:
@@ -484,10 +634,20 @@ def compute_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
     tree = generate_vimshottari_tree(
         birth_jd_tt=birth_jd_tt,
         date=date, time=time, tz=tz,
-        ayanamsa=ay, levels=build_levels,
-        span_years=span_years, end_jd_tt=end_jd_tt, year_days=year_days
+        ayanamsa=ay, method=method, levels=build_levels,
+        span_years=span_years, end_jd_tt=end_jd_tt, year_days=year_days,
+        latitude=float(lat) if isinstance(lat, (int, float, str)) and str(lat).strip() else None,
+        longitude=float(lon) if isinstance(lon, (int, float, str)) and str(lon).strip() else None,
+        elevation_m=float(elev) if isinstance(elev, (int, float, str)) and str(elev).strip() else None,
+        topocentric=topo,
+        coordinate_mode=("topocentric" if topo else "geocentric"),
     )
+
     out: Dict[str, Any] = {"ok": True, "tree": tree}
+
+    # Bubble up warnings
+    if isinstance(tree, dict) and tree.get("warnings"):
+        out["warnings"] = list(tree["warnings"])
 
     # Current at query (optional)
     q_jd = payload.get("query_jd_tt")
@@ -504,15 +664,16 @@ def compute_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     return out
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Self-checks
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Self-checks ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Quick numeric sanity (no external I/O beyond ephemeris singleton)
     jd0 = 2451545.0  # J2000 TT
-    t = generate_vimshottari_tree(birth_jd_tt=jd0, ayanamsa="lahiri", levels=5, span_years=120.0)
-    assert t["ok"] and t["periods"], "Tree generation failed"
-    L1 = flatten_periods(t["periods"], level=1)
+    t_geo_sid = generate_vimshottari_tree(birth_jd_tt=jd0, method="sidereal", ayanamsa="lahiri", levels=5, span_years=120.0)
+    assert t_geo_sid["ok"] and t_geo_sid["periods"], "Tree generation failed (sidereal)"
+
+    t_geo_trop = generate_vimshottari_tree(birth_jd_tt=jd0, method="tropical", levels=5, span_years=120.0)
+    assert t_geo_trop["ok"] and t_geo_trop["periods"], "Tree generation failed (tropical)"
+
+    L1 = flatten_periods(t_geo_sid["periods"], level=1)
     for i in range(1, len(L1)):
         assert abs(L1[i-1]["end_jd_tt"] - L1[i]["start_jd_tt"]) < 1e-6
-    print("Vimśottarī core probes OK.")
+    print("Vimśottarī flexible core probes OK.")
