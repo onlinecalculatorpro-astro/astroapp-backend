@@ -58,6 +58,12 @@ try:
 except Exception:
     _compute_ashto_module = None  # type: ignore
 
+try:
+    # Yoginī module surface
+    from app.core.yogini_dasha import compute_yogini as _compute_yogini_module  # type: ignore
+except Exception:
+    _compute_yogini_module = None  # type: ignore
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -168,11 +174,42 @@ def _build_civic_payload_ashto(original: Dict[str, Any], norm: Dict[str, Any]) -
     civ["levels"] = _levels_from(norm)
 
     # Optional extras (directly from original if provided)
-    for k in ("start_mode", "year_days", "limit_jd_tt", "moon_nirayana_deg"):
+    for k in ("start_mode", "year_days", "limit_jd_tt", "moon_nirayana_deg", "compact", "include_spans"):
         if k in original and original[k] is not None:
             civ[k] = original[k]
 
     # Never pass validator internals
+    for k in ("timescales", "jd_ut1", "dut1_seconds"):
+        civ.pop(k, None)
+
+    return civ
+
+
+def _build_civic_payload_yogini(original: Dict[str, Any], norm: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Prepare payload for compute_yogini(payload_dict).
+    Accepts either jd_tt or civil date/time/tz; forwards ayanamsa, levels, and optional knobs.
+    """
+    civ: Dict[str, Any] = {}
+
+    if isinstance(original.get("jd_tt"), (int, float)):
+        civ["jd_tt"] = float(original["jd_tt"])
+    elif isinstance(norm.get("jd_tt"), (int, float)):
+        civ["jd_tt"] = float(norm["jd_tt"])
+
+    for k in ("date", "time", "tz"):
+        v = norm.get(k)
+        if isinstance(v, str) and v.strip():
+            civ[k] = v.strip()
+
+    if norm.get("ayanamsa") is not None:
+        civ["ayanamsa"] = norm["ayanamsa"]
+    civ["levels"] = _levels_from(norm)
+
+    for k in ("start_mode", "year_days", "limit_jd_tt", "start_lord", "moon_nirayana_deg"):
+        if k in original and original[k] is not None:
+            civ[k] = original[k]
+
     for k in ("timescales", "jd_ut1", "dut1_seconds"):
         civ.pop(k, None)
 
@@ -378,6 +415,79 @@ def _run_ashtottari(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _run_yogini(payload: Dict[str, Any]) -> Dict[str, Any]:
+    # Validator required (reuse same civil normalization)
+    if normalize_vim_payload is None:
+        return {
+            "ok": False,
+            "error": "validator_unavailable",
+            "detail": f"app.core.vedic_validator.normalize_vim_payload import failed: {_VALIDATOR_IMPORT_ERR}",
+        }
+
+    norm, warns, tz_norm = normalize_vim_payload(payload)  # type: ignore[misc]
+
+    if "dut1_seconds" not in norm or norm["dut1_seconds"] is None:
+        norm["dut1_seconds"] = _env_dut1_seconds()
+
+    # 1) Registry (preferred)
+    if _compute_dasha_registry is not None:
+        try:
+            depth_val = _levels_from(norm)
+            out = _compute_dasha_registry("yogini", norm, depth=depth_val)
+            if isinstance(out, dict):
+                return _wrap_ok(out, warns, tz_norm, branch="registry.compute_dasha", route_name="yogini")
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": "yogini_registry_failed",
+                "detail": str(e),
+                "meta": {"route": "yogini", "tz_normalized": tz_norm, "branch": "registry.compute_dasha"},
+            }
+
+    # 2) Legacy registry alias (rare)
+    if _run_dasha is not None:
+        try:
+            out = _run_dasha("yogini", norm)
+            if isinstance(out, dict):
+                return _wrap_ok(out, warns, tz_norm, branch="registry.run_dasha", route_name="yogini")
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": "yogini_registry_failed",
+                "detail": str(e),
+                "meta": {"route": "yogini", "tz_normalized": tz_norm, "branch": "registry.run_dasha"},
+            }
+
+    # 3) Module fallback (if available)
+    if _compute_yogini_module is not None:
+        try:
+            civ = _build_civic_payload_yogini(payload, norm)
+            out = _call_single_param_or_kwargs(_compute_yogini_module, civ)
+            if isinstance(out, dict):
+                out = _coerce_tree_like(out, scheme="yogini")
+                return _wrap_ok(out, warns, tz_norm, branch="module.compute_yogini", route_name="yogini")
+            return {
+                "ok": False,
+                "error": "yogini_module_invalid_return",
+                "detail": f"Expected dict, got {type(out).__name__}",
+                "meta": {"route": "yogini", "tz_normalized": tz_norm, "branch": "module.compute_yogini"},
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": "yogini_module_failed",
+                "detail": str(e),
+                "meta": {"route": "yogini", "tz_normalized": tz_norm, "branch": "module.compute_yogini"},
+            }
+
+    # 4) No engine available
+    return {
+        "ok": False,
+        "error": "yogini_engine_unavailable",
+        "meta": {"route": "yogini", "tz_normalized": tz_norm, "branch": "none"},
+    }
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Routes (mounted at /api/vedic)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -405,6 +515,8 @@ def vedic_diag():
         "module_vimshottari_sig": sigs(_compute_vim_module) if _compute_vim_module else None,
         "module_ashtottari_present": bool(_compute_ashto_module),
         "module_ashtottari_sig": sigs(_compute_ashto_module) if _compute_ashto_module else None,
+        "module_yogini_present": bool(_compute_yogini_module),
+        "module_yogini_sig": sigs(_compute_yogini_module) if _compute_yogini_module else None,
         "rl_cap_per_min": RL_VEDIC_PREDICTIVE,
         "rl_bucket_key": "20",
         "dut1_seconds_env": _env_dut1_seconds(),
@@ -427,5 +539,16 @@ def vedic_vimshottari():
 def vedic_ashtottari():
     body = request.get_json(silent=True) or {}
     res = _run_ashtottari(body)
+    status = 200 if res.get("ok") else (503 if str(res.get("error", "")).endswith("unavailable") else 400)
+    return jsonify(res), status
+
+
+# ASCII alias + Unicode canonical for Yoginī
+@vedic_api.post("/dasha/yogini")
+@vedic_api.post("/dasha/Yoginī")
+@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
+def vedic_yogini():
+    body = request.get_json(silent=True) or {}
+    res = _run_yogini(body)
     status = 200 if res.get("ok") else (503 if str(res.get("error", "")).endswith("unavailable") else 400)
     return jsonify(res), status
