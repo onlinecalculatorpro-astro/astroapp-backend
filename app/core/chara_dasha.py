@@ -3,80 +3,67 @@
 from __future__ import annotations
 
 """
-Chara Daśā (Jaimini) — sign-based daśā with five nested levels
+Chara Daśā (Jaimini) — sign-based daśā with up to five nested levels
 Mahā → Antar → Pratyantar → Sūkṣma → Prāṇa
 
-Numerical / integration policy (aligned with your gold standard):
-- Sidereal-first pipeline (ayanāṁśa subtraction via app.core.ayanamsa.get_ayanamsa_deg).
-- High-precision timescales: time_kernel if present, else app.core.timescales.
-- Ascendant from app.core.houses_advanced (PyERFA GAST + true obliquity).
-- Planet longitudes via safe wrapper app.core.ephemeris_adapter.ecliptic_longitudes (ecliptic-of-date),
-  then siderealized using chosen ayanāṁśa.
-- Deterministic schedule using Decimal internally for nested scaling (minimizes drift).
-- Full 5-level expansion; configurable direction and duration rules.
+Performance-oriented design:
+- O(N) tree construction (no O(N²) scans).
+- Early exit at limit_jd_tt on every level.
+- Minimal ephemeris queries (only required planets; Ketu never requested).
+- Optional trimming of large payload pieces (spans / nested) via flags.
+- Decimal used internally for stable proportional splits.
 
-Default rules implemented (configurable):
-- Start sign: Lagna sign (sidereal). Optionally start from Karakamśa (Ātmakāraka’s sign).
-- Direction per sign (“rashi_nature”):
-    movable (Ar, Cn, Li, Cp)   → forward (+1)
-    fixed   (Ta, Le, Sc, Aq)   → reverse (−1)
-    dual    (Ge, Vi, Sg, Pi)   → forward (+1)
-  (Alternate modes: "odd_forward_even_reverse", "uniform_forward".)
-- Mahādaśā duration for sign S: count, in S’s own direction, from S to the sign
-  occupied by S’s traditional lord (Sun, Moon, Mars, Mercury, Jupiter, Venus, Saturn).
-  Inclusive count with same-sign → 12 years.
-- Subperiod scaling (levels 2..5): proportional partition
-  child_duration = parent_duration × (years(child_sign) / 36).
-  (Keeps each level summing exactly to its parent; avoids calendar mismatch.)
-- Antar start within each parent: begins from the parent’s sign and proceeds by that child-sign’s direction at each nesting.
-- Optional balance at birth for the very first mahādaśā: supply `balance_years` or `balance_fraction` (0..1)
-  to reduce the first span accordingly (default: no balance).
+Public entrypoint:
+    compute_chara_dasha(payload: dict) -> dict
 
-Public API
-----------
-compute_chara_dasha(payload: dict) -> dict
-  Inputs (provide either jd_tt directly OR civil date/time/tz plus site):
-    Required for Lagna start unless asc provided:
-      - date="YYYY-MM-DD", time="HH:MM[:SS]", tz="Area/City", latitude, longitude
-    OR
-      - jd_tt, jd_ut1, latitude, longitude
-    OR
-      - asc_sidereal_deg (or asc_tropical_deg + ayanamsa)
-    For Karakamśa start:
-      - jd_tt (or date/time/tz), ephemeris available.
+Payload (route-style):
+  Required for start_from="lagna" (unless asc_* provided):
+    {date,time,tz,latitude,longitude} OR {jd_tt,jd_ut1,latitude,longitude}
+    OR asc_sidereal_deg (or asc_tropical_deg + ayanamsa)
 
   Options:
-    - ayanamsa: str, default "lahiri"
-    - start_from: "lagna" (default) | "ak"  (Karakamśa)
-    - include_rahu_in_karakas: bool = False  (7-karaka by default)
-    - direction_mode: "rashi_nature" (default) | "odd_forward_even_reverse" | "uniform_forward"
-    - levels: int 1..5 (default 5)
-    - year_days: float = 365.24219
-    - limit_jd_tt: float | None   (truncate schedule)
-    - balance_years: float | None  (only applied to first mahādaśā)
-    - balance_fraction: float | None in [0,1)
-    - override_start_sign_index: int 1..12 (overrides start_from logic)
-    - planet_longitudes_sidereal: optional precomputed dict {name: deg} to avoid fresh ephemeris
+    ayanamsa: str = "lahiri"
+    start_from: "lagna" | "ak"
+    include_rahu_in_karakas: bool = False
+    direction_mode: "rashi_nature" | "odd_forward_even_reverse" | "uniform_forward"
+    levels: int in [1..5] (default 5)
+    year_days: float = 365.24219
+    limit_jd_tt: float | None
+    balance_years: float | None
+    balance_fraction: float | None (0..1)
+    override_start_sign_index: int in [1..12]
+    planet_longitudes_sidereal: Optional[dict[str,float]] (precomputed)
+
+    # Performance/payload knobs (all default to True for back-compat):
+    include_spans: bool = True          # include flat "spans" array
+    include_nested: bool = True         # include hierarchical "nested"
+    include_tree: bool = True           # include "tree" envelope
 
 Return (route-friendly):
   {
-    ok, scheme, start: {...}, rules: {...}, years_by_sign: {...},
-    spans: [ {level, sign_index, sign_name, start_jd_tt, end_jd_tt} ... ],
-    nested: [ {level, sign_index, sign_name, start_jd_tt, end_jd_tt, children:[...]} ... ],
-    tree: {level:0,label:"chara",start_jd_tt,end_jd_tt,children:[...]},
+    ok, scheme: "chara",
+    years_by_sign: {1:int,...,12:int},
+    mahadasa_order: [12 ints],
+    levels, year_days,
+    spans?: [...],              # if include_spans
+    nested?: [...],             # if include_nested
+    tree?: {...},               # if include_tree
+    start: {...},
+    rules: {...},
     meta: {...}
   }
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from functools import lru_cache
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from decimal import Decimal, getcontext
 import math
 
 # High-precision internal math for nested scaling
 getcontext().prec = 34
 
-# ─────────────────────────────────── imports (optional/guarded) ───────────────────────────────────
+# ─────────────────────────────────── guarded imports ───────────────────────────────────
 try:
     from app.core import time_kernel as _tk
 except Exception:
@@ -92,7 +79,7 @@ try:
 except Exception:
     PreciseHouseCalculator = None  # type: ignore
 
-# SAFE ephemeris wrapper (no direct adapter construction)
+# SAFE ephemeris wrapper (avoids direct adapter construction)
 try:
     from app.core.ephemeris_adapter import ecliptic_longitudes  # type: ignore
     _EPH_OK = True
@@ -108,7 +95,7 @@ SIGN_NAMES = (
     "Libra","Scorpio","Sagittarius","Capricorn","Aquarius","Pisces"
 )
 
-# Traditional lords (Jaimini = Parāśara rashi lords; nodes not lords)
+# Traditional rashi lords (Parāśara), used by Jaimini for sign lordship
 SIGN_LORD: Tuple[str, ...] = (
     "Mars","Venus","Mercury","Moon","Sun","Mercury",
     "Venus","Mars","Jupiter","Saturn","Saturn","Jupiter"
@@ -118,15 +105,15 @@ MOVABLE = {1,4,7,10}
 FIXED   = {2,5,8,11}
 DUAL    = {3,6,9,12}
 
-_PLANETS_FOR_KARAKAS_7 = ("Sun","Moon","Mars","Mercury","Jupiter","Venus","Saturn")
-_PLANETS_FOR_KARAKAS_8 = ("Sun","Moon","Mars","Mercury","Jupiter","Venus","Saturn","Rahu")
+_KARAKAS_7 = ("Sun","Moon","Mars","Mercury","Jupiter","Venus","Saturn")
+_KARAKAS_8 = ("Sun","Moon","Mars","Mercury","Jupiter","Venus","Saturn","Rahu")
 
 def _norm360(x: float) -> float:
     r = math.fmod(float(x), 360.0)
     return r + 360.0 if r < 0.0 else r
 
 def _sign_index(lon_deg: float) -> int:
-    """1..12 (Aries=1)."""
+    """1..12 (Aries=1)"""
     return int(math.floor(_norm360(lon_deg) / 30.0)) + 1
 
 def _deg_within_sign(lon_deg: float) -> float:
@@ -135,7 +122,7 @@ def _deg_within_sign(lon_deg: float) -> float:
 # ─────────────────────────────────── time helpers ───────────────────────────────────
 def _timescales_from_civil(date: str, time: str, tz: str) -> Tuple[float, float, float]:
     """
-    Returns (jd_ut, jd_tt, jd_ut1). Uses time_kernel if present, else timescales.
+    Returns (jd_ut, jd_tt, jd_ut1). Uses time_kernel if present, else app.core.timescales.
     """
     if _tk is not None:
         for fname in ("timescales_from_civil","compute_timescales","build_timescales","to_timescales","from_civil"):
@@ -160,36 +147,46 @@ def _timescales_from_civil(date: str, time: str, tz: str) -> Tuple[float, float,
     return jd_ut, jd_tt, jd_ut1
 
 # ─────────────────────────────────── ephemeris wrappers ───────────────────────────────────
+def _canon_planet(n: str) -> str:
+    n = str(n).strip().lower()
+    return n.capitalize()  # 'sun' -> 'Sun', 'rahu' -> 'Rahu'
+
 def _planet_lons_sidereal(
     jd_tt: float,
     *,
     ay_key: str,
-    preload: Optional[Dict[str, float]] = None
+    preload: Optional[Dict[str, float]] = None,
+    need: Optional[Iterable[str]] = None,
 ) -> Dict[str, float]:
     """
-    Returns sidereal longitudes (deg) for required planets.
-    Accepts an optional preload {name: deg} (already sidereal).
+    Return sidereal longitudes (deg) for requested planets.
+    - 'need' limits ephemeris calls (defaults to Sun..Saturn + Moon).
+    - 'preload' can include any case; values are assumed sidereal.
     """
-    want = {"Sun","Moon","Mars","Mercury","Jupiter","Venus","Saturn","Rahu","Ketu"}
+    default_need = ("Sun","Moon","Mars","Mercury","Jupiter","Venus","Saturn")
+    want = { _canon_planet(x) for x in (need or default_need) }
     out: Dict[str, float] = {}
+
+    # Case-insensitive preload
     if preload:
         for k, v in preload.items():
-            if k in want:
+            ck = _canon_planet(k)
+            if ck in want:
                 try:
                     x = float(v)
+                    if math.isfinite(x):
+                        out[ck] = x
                 except Exception:
-                    continue
-                if math.isfinite(x):
-                    out[k] = x
-    need = [p for p in want if p not in out]
+                    pass
 
-    if need:
+    missing = [p for p in want if p not in out]
+    if missing:
         if not _EPH_OK or ecliptic_longitudes is None:
             raise RuntimeError("ephemeris_unavailable")
-        rows = (ecliptic_longitudes(float(jd_tt), names=list(need)) or {}).get("results", [])
+        rows = (ecliptic_longitudes(float(jd_tt), names=missing) or {}).get("results", [])
         got = {str(r.get("name")): float(r.get("longitude")) for r in rows if "name" in r and "longitude" in r}
         ay = float(get_ayanamsa_deg(float(jd_tt), ay_key))
-        for k in need:
+        for k in missing:
             if k in got:
                 out[k] = _norm360(got[k] - ay)
 
@@ -198,7 +195,7 @@ def _planet_lons_sidereal(
 # ─────────────────────────────────── Ascendant helpers ───────────────────────────────────
 def _asc_sidereal_deg(payload: Dict[str, Any], *, ay_key: str) -> float:
     """
-    Resolve sidereal Ascendant longitude in degrees from payload ingredients.
+    Resolve sidereal Ascendant longitude in degrees.
     Priority:
       1) asc_sidereal_deg
       2) asc_tropical_deg - ayanamsa
@@ -219,12 +216,12 @@ def _asc_sidereal_deg(payload: Dict[str, Any], *, ay_key: str) -> float:
     lat = payload.get("latitude")
     lon = payload.get("longitude")
 
+    # From civil if needed
     if not (isinstance(lat, (int, float)) and isinstance(lon, (int, float))):
-        # derive timescales from civil if present
         if not (isinstance(payload.get("date"), str)
                 and isinstance(payload.get("time"), str)
                 and (payload.get("tz") or payload.get("place_tz"))):
-            raise ValueError("To compute Ascendant, provide either asc_* directly OR (date,time,tz,latitude,longitude)")
+            raise ValueError("To compute Ascendant, provide asc_* OR (date,time,tz,latitude,longitude)")
         tz = str(payload.get("tz") or payload.get("place_tz"))
         jd_ut, jd_tt, jd_ut1 = _timescales_from_civil(str(payload["date"]), str(payload["time"]), tz)
         lat = float(payload["latitude"]); lon = float(payload["longitude"])
@@ -232,9 +229,9 @@ def _asc_sidereal_deg(payload: Dict[str, Any], *, ay_key: str) -> float:
         if not (isinstance(jd_tt, (int, float)) and isinstance(jd_ut1, (int, float))):
             if isinstance(payload.get("date"), str):
                 tz = str(payload.get("tz") or payload.get("place_tz") or "UTC")
-                _ju, jd_tt, jd_ut1 = _timescales_from_civil(str(payload["date"]), str(payload.get("time", "12:00:00")), tz)
+                _ju, jd_tt, jd_ut1 = _timescales_from_civil(str(payload["date"]), str(payload.get("time","12:00:00")), tz)
             else:
-                raise ValueError("Provide jd_tt and jd_ut1 when supplying latitude/longitude directly")
+                raise ValueError("Provide jd_tt and jd_ut1 with latitude/longitude")
 
     calc = PreciseHouseCalculator(require_strict_timescales=True, enable_diagnostics=False, enable_validation=False)
     hd = calc.calculate_houses(latitude=float(lat),
@@ -248,31 +245,28 @@ def _asc_sidereal_deg(payload: Dict[str, Any], *, ay_key: str) -> float:
 # ─────────────────────────────────── Karakas (Ātmakāraka) ───────────────────────────────────
 def _atmakaraka_sign_index(planet_lons_sid: Dict[str, float], *, include_rahu: bool = False) -> int:
     """
-    Ātmakāraka = planet with max longitude within its sign (0..30), ties broken by full precision.
-    Default: 7-karaka (exclude Rahu/Ketu). Optionally include Rahu (8-karaka).
+    Ātmakāraka = planet with max longitude within its sign (0..30). 7-karaka by default.
     """
-    cand_names = _PLANETS_FOR_KARAKAS_8 if include_rahu else _PLANETS_FOR_KARAKAS_7
-    best_name = None
+    cand = _KARAKAS_8 if include_rahu else _KARAKAS_7
+    best_nm = None
     best_within = -1.0
-    for nm in cand_names:
+    for nm in cand:
         lon = planet_lons_sid.get(nm)
         if lon is None:
             continue
         w = _deg_within_sign(float(lon))
         if w > best_within:
             best_within = w
-            best_name = nm
-    if best_name is None:
+            best_nm = nm
+    if best_nm is None:
         raise RuntimeError("Unable to determine Ātmakāraka (no planet longitudes)")
-    return _sign_index(float(planet_lons_sid[best_name]))
+    return _sign_index(float(planet_lons_sid[best_nm]))
 
 # ─────────────────────────────────── direction & duration rules ───────────────────────────────────
 def _dir_forward(sign_idx: int, *, mode: str) -> bool:
     mode = (mode or "rashi_nature").lower().strip()
     if mode == "rashi_nature":
-        if sign_idx in FIXED:
-            return False
-        return True  # movable & dual forward
+        return False if sign_idx in FIXED else True  # movable & dual forward
     if mode == "odd_forward_even_reverse":
         return (sign_idx % 2) == 1
     if mode == "uniform_forward":
@@ -280,10 +274,7 @@ def _dir_forward(sign_idx: int, *, mode: str) -> bool:
     raise ValueError(f"Unknown direction_mode: {mode}")
 
 def _next_sign(sign_idx: int, *, forward: bool) -> int:
-    if forward:
-        return 1 if sign_idx == 12 else (sign_idx + 1)
-    else:
-        return 12 if sign_idx == 1 else (sign_idx - 1)
+    return (1 if sign_idx == 12 else (sign_idx + 1)) if forward else (12 if sign_idx == 1 else (sign_idx - 1))
 
 def _lord_sign_index_map(planets_sid: Dict[str, float]) -> Dict[int, int]:
     m: Dict[int, int] = {}
@@ -296,25 +287,20 @@ def _lord_sign_index_map(planets_sid: Dict[str, float]) -> Dict[int, int]:
     return m
 
 def _count_to_target_in_its_direction(start_sign: int, target_sign: int, *, forward_from_start: bool) -> int:
-    """
-    Inclusive count (1..12). Same sign => 12.
-    """
+    """Inclusive count (1..12). Same sign → 12."""
     if start_sign == target_sign:
         return 12
     count = 1
     s = start_sign
-    while True:
+    for _ in range(12):
         s = _next_sign(s, forward=forward_from_start)
         count += 1
-        if s == target_sign or count > 12:
+        if s == target_sign:
             break
     return min(count, 12)
 
 def _years_by_sign(planets_sid: Dict[str, float], *, direction_mode: str) -> Dict[int, int]:
-    """
-    For each sign S, duration_years[S] = inclusive sign count from S to sign(lord(S)),
-    counting in the direction determined by S per direction_mode.
-    """
+    """For each sign S, years[S] = inclusive count from S to sign(lord(S)) along S's direction."""
     lord_pos = _lord_sign_index_map(planets_sid)
     years: Dict[int, int] = {}
     for s in range(1, 13):
@@ -323,15 +309,12 @@ def _years_by_sign(planets_sid: Dict[str, float], *, direction_mode: str) -> Dic
         years[s] = _count_to_target_in_its_direction(s, tgt, forward_from_start=fwd)
     return years
 
-def _maha_sequence(start_sign: int, *, direction_mode: str) -> List[int]:
-    """
-    Build the 12-sign mahādaśā sequence by stepping 1 sign each time,
-    using the direction dictated by the CURRENT sign.
-    """
+@lru_cache(maxsize=64)
+def _maha_sequence_cached(start_sign: int, direction_mode: str) -> Tuple[int, ...]:
     order: List[int] = []
     seen = set()
-    s = start_sign
-    for _ in range(24):  # safety
+    s = int(start_sign)
+    for _ in range(24):
         if s in seen:
             break
         order.append(s); seen.add(s)
@@ -341,54 +324,30 @@ def _maha_sequence(start_sign: int, *, direction_mode: str) -> List[int]:
         remaining = [i for i in range(1, 13) if i not in seen]
         order.extend(remaining)
         order = order[:12]
-    return order
+    return tuple(order)
 
 # ─────────────────────────────────── data model ───────────────────────────────────
-@dataclass
+@dataclass(slots=True, frozen=True)
 class DashaSpan:
     level: int                 # 1..5
     sign: int                  # 1..12
     start_jd_tt: float
     end_jd_tt: float
 
-# ─────────────────────────────────── schedule core ───────────────────────────────────
-def _append_span(
-    spans: List[DashaSpan],
-    level: int,
-    sign: int,
-    t0: Decimal,
-    dur_days: Decimal,
-    *,
-    limit: Optional[Decimal]
-) -> Decimal:
-    t1 = t0 + dur_days
-    if limit is not None and t0 >= limit:
-        return t1
-    end = min(t1, limit) if limit is not None else t1
-    spans.append(DashaSpan(level, sign, float(t0), float(end)))
-    return t1
-
+# ─────────────────────────────────── schedule core (O(N)) ───────────────────────────────────
 def _years_to_days(years: Decimal, year_days: Decimal) -> Decimal:
     return years * year_days
 
-def _sub_duration(parent_days: Decimal, years_for_sign: int) -> Decimal:
-    # Proportional partition (keeps children summing to parent)
+def _child_duration(parent_days: Decimal, years_for_sign: int) -> Decimal:
+    # Proportional partition; children sum to parent exactly
     return parent_days * (Decimal(years_for_sign) / Decimal(36))
 
-def _expand_children_for_parent(
-    parent: DashaSpan,
-    *,
-    level_next: int,
-    direction_mode: str,
-    years_by_sign: Dict[int, int],
-    t_limit: Optional[Decimal]
-) -> List[DashaSpan]:
-    parent_days = Decimal(str(parent.end_jd_tt)) - Decimal(str(parent.start_jd_tt))
-    # Child sequence starts at the parent's sign; each child advances by ITS OWN direction
+def _sign_sequence_from(sign_idx: int, *, direction_mode: str) -> Tuple[int, ...]:
+    """12-sign sequence starting at sign_idx; each step uses current sign's direction."""
     seq: List[int] = []
-    s = parent.sign
     seen = set()
-    for _ in range(12):
+    s = sign_idx
+    for _ in range(24):
         if s in seen:
             break
         seq.append(s); seen.add(s)
@@ -398,43 +357,104 @@ def _expand_children_for_parent(
         for i in range(1, 13):
             if i not in seen:
                 seq.append(i)
-    t = Decimal(str(parent.start_jd_tt))
-    kids: List[DashaSpan] = []
-    for child_sign in seq[:12]:
-        dur = _sub_duration(parent_days, years_by_sign[child_sign])
-        t_next = t + dur
-        if t_limit is not None and t >= t_limit:
-            t = t_next
-            continue
-        end = min(t_next, t_limit) if t_limit is not None else t_next
-        kids.append(DashaSpan(level_next, child_sign, float(t), float(end)))
-        t = t_next
-    return kids
+    return tuple(seq[:12])
 
-def _to_nested(spans: List[DashaSpan], *, max_level: int) -> List[Dict[str, Any]]:
-    def children_of(p: DashaSpan, lvl: int) -> List[DashaSpan]:
-        eps = 1e-12
-        return [
-            s for s in spans
-            if s.level == lvl
-            and p.start_jd_tt - eps <= s.start_jd_tt <= p.end_jd_tt + eps
-            and s.end_jd_tt <= p.end_jd_tt + eps
-        ]
+def _build_tree_and_spans(
+    *,
+    jd_start_tt: float,
+    start_sign_index: int,
+    years_by_sign: Dict[int, int],
+    direction_mode: str,
+    levels: int,
+    year_days: float,
+    limit_jd_tt: float | None,
+    balance_years: float | None,
+    include_spans: bool,
+    include_nested: bool,
+) -> Tuple[List[Dict[str, Any]], List[DashaSpan]]:
+    """
+    Build nested nodes (level 1..L) and optional flat spans in a single pass.
+    Returns (nested_nodes, spans).
+    """
+    year_days_D = Decimal(str(year_days))
+    t_limit = Decimal(str(limit_jd_tt)) if isinstance(limit_jd_tt, (int, float)) else None
 
-    def node_for(s: DashaSpan, lvl: int) -> Dict[str, Any]:
+    def clip_end(t_next: Decimal) -> Decimal:
+        return min(t_next, t_limit) if t_limit is not None else t_next
+
+    all_spans: List[DashaSpan] = []
+    nested_lvl1: List[Dict[str, Any]] = []
+
+    def append_span(level: int, sign: int, t0: Decimal, t1: Decimal):
+        if include_spans:
+            all_spans.append(DashaSpan(level, sign, float(t0), float(t1)))
+
+    def mk_node(level: int, sign: int, t0: Decimal, t1: Decimal) -> Dict[str, Any]:
         node = {
-            "level": lvl,
-            "sign_index": s.sign,
-            "sign_name": SIGN_NAMES[s.sign - 1],
-            "start_jd_tt": s.start_jd_tt,
-            "end_jd_tt": s.end_jd_tt,
+            "level": level,
+            "sign_index": sign,
+            "sign_name": SIGN_NAMES[sign - 1],
+            "start_jd_tt": float(t0),
+            "end_jd_tt": float(t1),
         }
-        if lvl < max_level:
-            node["children"] = [node_for(k, lvl + 1) for k in children_of(s, lvl + 1)]
+        if include_nested and level < levels:
+            node["children"] = []
         return node
 
-    return [node_for(s, 1) for s in spans if s.level == 1]
+    # Level-1 order
+    order = _maha_sequence_cached(int(start_sign_index), direction_mode)
+    t = Decimal(str(jd_start_tt))
 
+    # Build L1 and recurse
+    for idx, s in enumerate(order):
+        years = Decimal(years_by_sign[s])
+        dur_days = _years_to_days(years, year_days_D)
+        if idx == 0 and isinstance(balance_years, (int, float)):
+            dur_days = max(Decimal(0), dur_days - _years_to_days(Decimal(str(balance_years)), year_days_D))
+
+        t_next = t + dur_days
+        if t_limit is not None and t >= t_limit:
+            t = t_next
+            break
+
+        end = clip_end(t_next)
+        node = mk_node(1, s, t, end)
+        append_span(1, s, t, end)
+        nested_lvl1.append(node)
+
+        if levels >= 2:
+            _expand_children(node, parent_sign=s, level_next=2, parent_start=t, parent_end=t_next)
+
+        t = t_next
+
+    # Recursive children expansion (proportional split; child sequence from parent sign)
+    def _expand_children(node: Dict[str, Any], *, parent_sign: int, level_next: int, parent_start: Decimal, parent_end: Decimal):
+        if not include_nested and not include_spans:
+            return
+        if level_next > levels:
+            return
+        parent_days = parent_end - parent_start
+        if parent_days <= 0:
+            return
+        seq = _sign_sequence_from(parent_sign, direction_mode=direction_mode)
+        t0 = Decimal(parent_start)
+        for child_sign in seq:
+            dur = _child_duration(parent_days, years_by_sign[child_sign])
+            t1 = t0 + dur
+            if t_limit is not None and t0 >= t_limit:
+                t0 = t1
+                continue
+            end = clip_end(t1)
+            append_span(level_next, child_sign, t0, end)
+            if include_nested:
+                child_node = mk_node(level_next, child_sign, t0, end)
+                node.setdefault("children", []).append(child_node)
+                _expand_children(child_node, parent_sign=child_sign, level_next=level_next+1, parent_start=t0, parent_end=t1)
+            t0 = t1
+
+    return nested_lvl1, all_spans
+
+# ─────────────────────────────────── top-level schedule ───────────────────────────────────
 def chara_schedule(
     *,
     jd_start_tt: float,
@@ -445,153 +465,142 @@ def chara_schedule(
     year_days: float = 365.24219,
     limit_jd_tt: float | None = None,
     balance_years: float | None = None,
+    return_spans: bool = True,
+    return_nested: bool = True,
+    return_tree: bool = True,
 ) -> Dict[str, Any]:
     """
     Build the full Chara Daśā schedule.
+    Flags:
+      - return_spans / return_nested / return_tree allow trimming payload for speed.
     """
     levels = max(1, min(5, int(levels)))
-    year_days_D = Decimal(str(year_days))
-    t0 = Decimal(str(jd_start_tt))
-    t_limit = Decimal(str(limit_jd_tt)) if isinstance(limit_jd_tt, (int, float)) else None
+    years = _years_by_sign(planets_sidereal, direction_mode=direction_mode)
 
-    # Years per sign and mahā sequence
-    yrs = _years_by_sign(planets_sidereal, direction_mode=direction_mode)
-    order = _maha_sequence(start_sign_index, direction_mode=direction_mode)
+    nested, spans = _build_tree_and_spans(
+        jd_start_tt=float(jd_start_tt),
+        start_sign_index=int(start_sign_index),
+        years_by_sign=years,
+        direction_mode=direction_mode,
+        levels=levels,
+        year_days=float(year_days),
+        limit_jd_tt=limit_jd_tt,
+        balance_years=balance_years,
+        include_spans=bool(return_spans),
+        include_nested=bool(return_nested),
+    )
 
-    # Compose mahā spans
-    spans: List[DashaSpan] = []
-    t = t0
-    for idx, s in enumerate(order):
-        years = Decimal(yrs[s])
-        dur_days = _years_to_days(years, year_days_D)
-        if idx == 0 and isinstance(balance_years, (int, float)):
-            reduce_days = _years_to_days(Decimal(str(balance_years)), year_days_D)
-            dur_days = max(Decimal(0), dur_days - reduce_days)
-        t = _append_span(spans, 1, s, t, dur_days, limit=t_limit)
-
-    # Expand sublevels
-    current = [sp for sp in spans if sp.level == 1]
-    all_spans = list(spans)
-    for level in range(2, levels + 1):
-        nxt: List[DashaSpan] = []
-        for p in current:
-            nxt.extend(_expand_children_for_parent(
-                p, level_next=level, direction_mode=direction_mode,
-                years_by_sign=yrs, t_limit=t_limit
-            ))
-        all_spans.extend(nxt)
-        current = nxt
-
-    all_spans.sort(key=lambda s: (s.level, s.start_jd_tt, s.sign))
-    nested = _to_nested(all_spans, max_level=levels)
-
-    # Tree envelope for route-friendliness
+    # Envelope bounds
     if nested:
         s0 = min(float(n.get("start_jd_tt", 0.0)) for n in nested)
         e1 = max(float(n.get("end_jd_tt", 0.0)) for n in nested)
+    elif spans:
+        s0 = min(s.start_jd_tt for s in spans); e1 = max(s.end_jd_tt for s in spans)
     else:
-        s0 = float(jd_start_tt)
-        e1 = float(jd_start_tt)
+        s0 = float(jd_start_tt); e1 = float(jd_start_tt)
 
-    return {
+    out: Dict[str, Any] = {
         "ok": True,
         "scheme": "chara",
-        "years_by_sign": {i: int(yrs[i]) for i in range(1, 13)},
-        "mahadasa_order": order,
+        "years_by_sign": {i: int(years[i]) for i in range(1, 13)},
+        "mahadasa_order": list(_maha_sequence_cached(int(start_sign_index), direction_mode)),
         "levels": int(levels),
         "year_days": float(year_days),
-        "spans": [
+    }
+
+    if return_spans:
+        out["spans"] = [
             {
                 "level": s.level,
                 "sign_index": s.sign,
                 "sign_name": SIGN_NAMES[s.sign - 1],
                 "start_jd_tt": s.start_jd_tt,
-                "end_jd_tt": s.end_jd_tt
-            } for s in all_spans
-        ],
-        "nested": nested,
-        "tree": {
+                "end_jd_tt": s.end_jd_tt,
+            } for s in spans
+        ]
+    if return_nested:
+        out["nested"] = nested
+    if return_tree:
+        out["tree"] = {
             "level": 0,
             "lord": None,
             "label": "chara",
             "start_jd_tt": s0,
             "end_jd_tt": e1,
-            "children": nested,
-        },
-    }
+            "children": nested if return_nested else [],
+        }
+    return out
 
 # ─────────────────────────────────── Orchestrator (route-friendly) ───────────────────────────────────
 def compute_chara_dasha(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Build Chara Daśā from a route-style payload.
-
-    Accepted inputs (any one path):
-      A) Provide asc_sidereal_deg (or asc_tropical_deg + ayanamsa) and jd_tt
-      B) Provide jd_tt & jd_ut1 & latitude & longitude
-      C) Provide date/time/tz & latitude & longitude
-
-    Options:
-      - ayanamsa: str = "lahiri"
-      - start_from: "lagna" | "ak"
-      - include_rahu_in_karakas: bool = False
-      - direction_mode: "rashi_nature" | "odd_forward_even_reverse" | "uniform_forward"
-      - levels: 1..5 (default 5)
-      - year_days: 365.24219
-      - limit_jd_tt: float | None
-      - balance_years: float | None
-      - balance_fraction: float | None (applied to first mahā)
-      - override_start_sign_index: int 1..12
-      - planet_longitudes_sidereal: optional dict {name: deg} (precomputed)
+    Build Chara Daśā from a route-style payload (see module docstring).
     """
     try:
         ay_key = str(payload.get("ayanamsa", "lahiri")).strip().lower()
         direction_mode = str(payload.get("direction_mode", "rashi_nature")).strip().lower()
         levels = int(payload.get("levels", 5))
         year_days = float(payload.get("year_days", 365.24219))
-        limit = payload.get("limit_jd_tt")
-        limit_jd_tt = float(limit) if isinstance(limit, (int, float)) else None
 
-        # Resolve jd_tt (and possibly jd_ut1 for asc calc path C)
+        # Payload knobs (default True for back-compat; set to False client-side for speed)
+        include_spans = bool(payload.get("include_spans", True))
+        include_nested = bool(payload.get("include_nested", True))
+        include_tree = bool(payload.get("include_tree", True))
+
+        # Limit
+        lim = payload.get("limit_jd_tt")
+        limit_jd_tt = float(lim) if isinstance(lim, (int, float)) else None
+
+        # Resolve jd_tt; only compute timescales if needed
         jd_tt = payload.get("jd_tt")
         jd_ut1 = payload.get("jd_ut1")
         if not isinstance(jd_tt, (int, float)):
             if isinstance(payload.get("date"), str):
                 tz = str(payload.get("tz") or payload.get("place_tz") or "UTC")
-                _ju, jd_tt, jd_ut1 = _timescales_from_civil(str(payload["date"]), str(payload.get("time", "12:00:00")), tz)
+                _ju, jd_tt, jd_ut1 = _timescales_from_civil(str(payload["date"]), str(payload.get("time","12:00:00")), tz)
             else:
                 raise ValueError("jd_tt or (date,time,tz) required")
 
-        # Planet sidereal longitudes (for lords and optionally ĀK)
+        # Determine which planets we actually need from ephemeris
+        need_planets: List[str] = ["Sun","Moon","Mars","Mercury","Jupiter","Venus","Saturn"]
+        start_from = str(payload.get("start_from", "lagna")).strip().lower()
+        include_rahu = bool(payload.get("include_rahu_in_karakas", False))
+        if start_from == "ak":
+            if include_rahu:
+                need_planets.append("Rahu")  # only AK logic needs Rahu
+
+        # Planet longitudes (sidereal); use preload if available
         preload = payload.get("planet_longitudes_sidereal")
         planets_sid = _planet_lons_sidereal(
             float(jd_tt),
             ay_key=ay_key,
-            preload=preload if isinstance(preload, dict) else None
+            preload=preload if isinstance(preload, dict) else None,
+            need=need_planets,
         )
 
-        # Starting sign:
+        # Starting sign
         start_override = payload.get("override_start_sign_index")
         if isinstance(start_override, int) and 1 <= int(start_override) <= 12:
             start_sign = int(start_override)
             start_basis = "override"
         else:
-            start_from = str(payload.get("start_from", "lagna")).strip().lower()
             if start_from == "ak":
-                include_rahu = bool(payload.get("include_rahu_in_karakas", False))
                 ak_sign = _atmakaraka_sign_index(planets_sid, include_rahu=include_rahu)
                 start_sign = ak_sign
                 start_basis = "karakamsha"
             else:
+                # Only compute Ascendant if needed
                 asc_sid = _asc_sidereal_deg(payload, ay_key=ay_key)
                 start_sign = _sign_index(asc_sid)
                 start_basis = "lagna"
 
-        # Balance for first mahādaśā (optional)
+        # First-mahā balance (optional)
         balance_years: Optional[float] = None
         if isinstance(payload.get("balance_years"), (int, float)):
             balance_years = float(payload["balance_years"])
         elif isinstance(payload.get("balance_fraction"), (int, float)):
             frac = max(0.0, min(0.999999, float(payload["balance_fraction"])))
+            # need years_by_sign for the first sign
             yrs_tmp = _years_by_sign(planets_sid, direction_mode=direction_mode)
             first_years = float(yrs_tmp[start_sign])
             balance_years = first_years * frac
@@ -606,9 +615,12 @@ def compute_chara_dasha(payload: Dict[str, Any]) -> Dict[str, Any]:
             year_days=float(year_days),
             limit_jd_tt=limit_jd_tt,
             balance_years=balance_years,
+            return_spans=include_spans,
+            return_nested=include_nested,
+            return_tree=include_tree,
         )
 
-        # Add metadata
+        # Metadata
         sched["start"] = {
             "basis": start_basis,
             "sign_index": int(start_sign),
