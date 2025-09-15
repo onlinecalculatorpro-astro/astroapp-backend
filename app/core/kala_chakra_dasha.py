@@ -197,18 +197,31 @@ def load_kcd_table_preset(name: str) -> Dict[str, Any]:
 def _validate_kcd_table(tbl: Dict[str, Any]) -> None:
     if not isinstance(tbl, dict):
         raise ValueError("kcd_table must be a dict")
-    seq = tbl.get("pada_to_sequence")
-    yrs = tbl.get("sign_years")
-    if not isinstance(seq, dict) or not isinstance(yrs, dict):
-        raise ValueError("kcd_table must contain 'pada_to_sequence' and 'sign_years'")
-    if len(yrs) != 12 or any(s not in yrs for s in range(1, 13)):
-        raise ValueError("kcd_table['sign_years'] must define 12 entries keyed 1..12")
-    for k, v in seq.items():
+
+    # --- pada_to_sequence (coerce keys to int) ---
+    seq_raw = tbl.get("pada_to_sequence")
+    if not isinstance(seq_raw, dict):
+        raise ValueError("kcd_table must contain 'pada_to_sequence'")
+    seq: Dict[int, List[int]] = {}
+    for k, v in seq_raw.items():
         k_i = int(k)
         if not (1 <= k_i <= 108):
             raise ValueError("kcd_table['pada_to_sequence'] keys must be 1..108")
         if not (isinstance(v, (list, tuple)) and len(v) == 12 and all(1 <= int(x) <= 12 for x in v)):
             raise ValueError("each 'pada_to_sequence'[k] must be a 12-length list of 1..12")
+        seq[k_i] = [int(x) for x in v]
+
+    # --- sign_years: accept dict (string/int keys) or 12-item list ---
+    yrs_raw = tbl.get("sign_years")
+    if isinstance(yrs_raw, dict):
+        yrs = {int(k): float(v) for k, v in yrs_raw.items()}
+    elif isinstance(yrs_raw, (list, tuple)) and len(yrs_raw) == 12:
+        yrs = {i+1: float(yrs_raw[i]) for i in range(12)}
+    else:
+        raise ValueError("kcd_table['sign_years'] must be a dict with keys 1..12 or a 12-length list")
+
+    if len(yrs) != 12 or any(i not in yrs for i in range(1, 13)):
+        raise ValueError("kcd_table['sign_years'] must define 12 entries keyed 1..12")
 
 def _demo_kcd_table() -> Dict[str, Any]:
     """
