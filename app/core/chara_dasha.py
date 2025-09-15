@@ -401,6 +401,31 @@ def _build_tree_and_spans(
             node["children"] = []
         return node
 
+    def _expand_children(node: Dict[str, Any], *, parent_sign: int, level_next: int, parent_start: Decimal, parent_end: Decimal):
+        """Recursive children expansion (proportional split; child sequence from parent sign)."""
+        if not include_nested and not include_spans:
+            return
+        if level_next > levels:
+            return
+        parent_days = parent_end - parent_start
+        if parent_days <= 0:
+            return
+        seq = _sign_sequence_from(parent_sign, direction_mode=direction_mode)
+        t0 = Decimal(parent_start)
+        for child_sign in seq:
+            dur = _child_duration(parent_days, years_by_sign[child_sign])
+            t1 = t0 + dur
+            if t_limit is not None and t0 >= t_limit:
+                t0 = t1
+                continue
+            end = clip_end(t1)
+            append_span(level_next, child_sign, t0, end)
+            if include_nested:
+                child_node = mk_node(level_next, child_sign, t0, end)
+                node.setdefault("children", []).append(child_node)
+                _expand_children(child_node, parent_sign=child_sign, level_next=level_next+1, parent_start=t0, parent_end=t1)
+            t0 = t1
+
     # Level-1 order
     order = _maha_sequence_cached(int(start_sign_index), direction_mode)
     t = Decimal(str(jd_start_tt))
@@ -426,31 +451,6 @@ def _build_tree_and_spans(
             _expand_children(node, parent_sign=s, level_next=2, parent_start=t, parent_end=t_next)
 
         t = t_next
-
-    # Recursive children expansion (proportional split; child sequence from parent sign)
-    def _expand_children(node: Dict[str, Any], *, parent_sign: int, level_next: int, parent_start: Decimal, parent_end: Decimal):
-        if not include_nested and not include_spans:
-            return
-        if level_next > levels:
-            return
-        parent_days = parent_end - parent_start
-        if parent_days <= 0:
-            return
-        seq = _sign_sequence_from(parent_sign, direction_mode=direction_mode)
-        t0 = Decimal(parent_start)
-        for child_sign in seq:
-            dur = _child_duration(parent_days, years_by_sign[child_sign])
-            t1 = t0 + dur
-            if t_limit is not None and t0 >= t_limit:
-                t0 = t1
-                continue
-            end = clip_end(t1)
-            append_span(level_next, child_sign, t0, end)
-            if include_nested:
-                child_node = mk_node(level_next, child_sign, t0, end)
-                node.setdefault("children", []).append(child_node)
-                _expand_children(child_node, parent_sign=child_sign, level_next=level_next+1, parent_start=t0, parent_end=t1)
-            t0 = t1
 
     return nested_lvl1, all_spans
 
