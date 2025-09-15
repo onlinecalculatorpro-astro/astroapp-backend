@@ -1,7 +1,7 @@
 # app/api/vedic_routes.py
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 import inspect
 import os
 
@@ -35,13 +35,13 @@ else:
 # Engines: central registry (preferred) + direct module fallbacks
 # ──────────────────────────────────────────────────────────────────────────────
 _compute_dasha_registry = None
-available_schemes = None
+_available_schemes_fn = None
 try:
     from app.core.dasha_registry import compute_dasha as _compute_dasha_registry  # type: ignore
-    from app.core.dasha_registry import available_schemes as available_schemes  # type: ignore
+    from app.core.dasha_registry import available_schemes as _available_schemes_fn  # type: ignore
 except Exception:
     _compute_dasha_registry = None  # type: ignore
-    available_schemes = None  # type: ignore
+    _available_schemes_fn = None  # type: ignore
 
 # Optional module fallbacks
 try:
@@ -304,16 +304,17 @@ def _run_with_registry_first(
 
     norm, warns, tz_norm = normalize_vim_payload(body)  # type: ignore[misc]
 
-    # Attempt central registry (preferred)
+    # Attempt central registry (preferred) — return ONLY on success
     if _compute_dasha_registry is not None:
         try:
             civ = civic_builder(body, norm)
             civ["scheme"] = scheme_key
             out = _compute_dasha_registry(civ)  # type: ignore[misc]
-            if isinstance(out, dict):
+            if isinstance(out, dict) and out.get("ok"):
                 out = _ensure_tree_envelope(out, scheme=scheme_key)
                 return _wrap_ok(out, warns, tz_norm, branch="registry.compute_dasha", route_name=route_name)
-        except Exception as e:
+            # else: fall through to module fallback
+        except Exception:
             # fall through to module fallback
             pass
 
@@ -418,7 +419,7 @@ def vedic_diag():
         "validator_error": _VALIDATOR_IMPORT_ERR,
         "registry_compute_present": bool(_compute_dasha_registry),
         "registry_compute_sig": sigs(_compute_dasha_registry) if _compute_dasha_registry else None,
-        "registry_available": available_schemes() if callable(available_schemes) else None,
+        "registry_available": _available_schemes_fn() if callable(_available_schemes_fn) else None,
         "module_vimshottari_present": bool(_compute_vim_module),
         "module_vimshottari_sig": sigs(_compute_vim_module) if _compute_vim_module else None,
         "module_ashtottari_present": bool(_compute_ashto_module),
