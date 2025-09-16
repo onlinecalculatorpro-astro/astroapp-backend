@@ -1,7 +1,7 @@
 # app/api/vedic_routes.py
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple, Iterable
+from typing import Any, Dict, List, Optional
 import inspect
 import os
 
@@ -106,28 +106,23 @@ except Exception:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Yoga engine wiring (primary via app.core.yoga)
+# Yoga engines
 # ──────────────────────────────────────────────────────────────────────────────
-_YOGA_CORE_OK = False
+# Preferred unified shim (can route to yoga.py if present)
 try:
-    # Prefer yoga.py
-    from app.core.yoga import (
-        compute_yogas as _compute_yogas_core,
-        list_registered_yogas as _yoga_list,
-    )
-    _YOGA_CORE_OK = True
+    from app.core.vedic_predictive import yoga_detect  # type: ignore
+    _YOGA_SHIM_OK = True
 except Exception:
-    try:
-        # Alternate file name yogas.py
-        from app.core.yogas import (  # type: ignore
-            compute_yogas as _compute_yogas_core,
-            list_registered_yogas as _yoga_list,
-        )
-        _YOGA_CORE_OK = True
-    except Exception:
-        _compute_yogas_core = None  # type: ignore
-        _yoga_list = None  # type: ignore
-        _YOGA_CORE_OK = False
+    yoga_detect = None  # type: ignore
+    _YOGA_SHIM_OK = False
+
+# Always keep legacy detectors available for direct fallback
+try:
+    from app.core.vedic_predictive import detect_yogas as _legacy_detect_yogas  # type: ignore
+    _YOGA_LEGACY_OK = True
+except Exception:
+    _legacy_detect_yogas = None  # type: ignore
+    _YOGA_LEGACY_OK = False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -198,7 +193,7 @@ def _pick_times(norm: Dict[str, Any], original: Dict[str, Any]) -> Dict[str, Any
 
 def _build_civic_payload_vim(original: Dict[str, Any], norm: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Flexible flags for Vimśottarī (method/observer/ayanamsa/place/etc.)."
+    Flexible flags for Vimśottarī (method/observer/ayanamsa/place/etc.).
     """
     civ: Dict[str, Any] = {}
 
@@ -588,7 +583,6 @@ def _ayanamsa_deg_from_key(jd_tt: Optional[float], key: str) -> Optional[float]:
     if not _AY_OK or get_ayanamsa_deg is None:
         return None
     try:
-        # Prefer (jd_tt, key); fall back to (None, key) if the impl allows it.
         if jd_tt is not None:
             try:
                 return float(get_ayanamsa_deg(jd_tt, key))  # type: ignore[misc]
@@ -597,81 +591,6 @@ def _ayanamsa_deg_from_key(jd_tt: Optional[float], key: str) -> Optional[float]:
         return float(get_ayanamsa_deg(None, key))  # type: ignore[misc]
     except Exception:
         return None
-
-def _resolve_ayanamsa_for_engine(body: Dict[str, Any], method: str, jd_tt: Optional[float]) -> tuple[Any, Dict[str, Any]]:
-    """
-    Decide what to pass into varga_charts:
-      - Tropical → ayanamsa not applied (pass-through; note why)
-      - If numeric provided (ayanamsa or ayanamsa_deg) → use numeric (explicit)
-      - If string key and we can compute deg via get_ayanamsa_deg(jd_tt,key) → use numeric
-      - Else pass string through (engine may fallback to 0°); include warning in meta
-    Returns (ayanamsa_for_engine, meta_dict)
-    """
-    meta: Dict[str, Any] = {
-        "ts_available": _TS_OK,
-        "ayanamsa_adapter_available": _AY_OK,
-        "jd_tt_used": jd_tt,
-    }
-    method_lc = (method or "sidereal").lower()
-    ay_in = body.get("ayanamsa")
-    ay_deg_in = _coerce_float(body.get("ayanamsa_deg"))
-
-    # Tropical: ignore ayanamsa, but still echo what was received for transparency
-    if method_lc.startswith("trop"):
-        meta.update({
-            "ayanamsa_input": ay_in if ay_in is not None else ("ayanamsa_deg=" + str(ay_deg_in) if ay_deg_in is not None else None),
-            "ayanamsa_effective": None,
-            "ayanamsa_resolve": "not_applied_tropical",
-        })
-        return ay_in, meta  # value is ignored downstream anyway
-
-    # Sidereal
-    # 1) explicit numeric wins
-    if isinstance(ay_deg_in, float):
-        meta.update({
-            "ayanamsa_input": ay_deg_in,
-            "ayanamsa_effective": ay_deg_in,
-            "ayanamsa_resolve": "explicit_numeric",
-        })
-        return ay_deg_in, meta
-    if isinstance(ay_in, (int, float)):
-        val = float(ay_in)
-        meta.update({
-            "ayanamsa_input": val,
-            "ayanamsa_effective": val,
-            "ayanamsa_resolve": "explicit_numeric",
-        })
-        return val, meta
-
-    # 2) string key → try to compute degrees with jd_tt
-    key = _norm_ayanamsa(ay_in)
-    if isinstance(key, str) and key:
-        deg = _ayanamsa_deg_from_key(jd_tt, key)
-        if isinstance(deg, float):
-            meta.update({
-                "ayanamsa_input": key,
-                "ayanamsa_effective": deg,
-                "ayanamsa_resolve": "computed_from_key",
-                "ayanamsa_key": key,
-            })
-            return deg, meta
-        # Could not compute — pass the key through (engine may fallback to 0°)
-        meta.update({
-            "ayanamsa_input": key,
-            "ayanamsa_effective": key,
-            "ayanamsa_resolve": "pass_through_string_fallback",
-            "ayanamsa_key": key,
-            "warning": "could_not_compute_ayanamsa_degrees_from_key",
-        })
-        return key, meta
-
-    # 3) last resort default
-    meta.update({
-        "ayanamsa_input": key,
-        "ayanamsa_effective": key,
-        "ayanamsa_resolve": "default_key_passthrough",
-    })
-    return key, meta
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -689,15 +608,6 @@ def vedic_diag():
             return str(inspect.signature(fn))
         except Exception:
             return None
-
-    # Try discovering legacy detectors availability without importing at module load.
-    try:
-        from app.core.vedic_predictive import detect_yogas as _legacy_detect  # type: ignore
-        _legacy_ok = callable(_legacy_detect)
-        _legacy_sig = sigs(_legacy_detect)
-    except Exception:
-        _legacy_ok = False
-        _legacy_sig = None
 
     return jsonify({
         "validator_loaded": normalize_vim_payload is not None,
@@ -719,19 +629,17 @@ def vedic_diag():
         "timescales_present": _TS_OK,
         "ayanamsa_adapter_present": _AY_OK,
         # Yoga diagnostics
-        "yoga_core_present": _YOGA_CORE_OK,
-        "yoga_core_sig": sigs(_compute_yogas_core) if _YOGA_CORE_OK else None,
-        "yoga_legacy_present": _legacy_ok,
-        "yoga_legacy_sig": _legacy_sig,
+        "yoga_shim_present": _YOGA_SHIM_OK,
+        "yoga_legacy_present": _YOGA_LEGACY_OK,
         "rl_cap_per_min": RL_VEDIC_PREDICTIVE,
         "rl_bucket_key": "20",
         "dut1_seconds_env": _env_dut1_seconds(),
     }), 200
 
 
-# ──────────────── Dasha routes (unchanged) ────────────────
+# ──────────────── Dasha routes ────────────────
 @vedic_api.post("/dasha/vimshottari")
-@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)  # shared bucket "20"
+@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
 def vedic_vimshottari():
     body = request.get_json(silent=True) or {}
     res = _run_vimshottari(body)
@@ -778,8 +686,7 @@ def vedic_kalachakra():
     return jsonify(res), status
 
 
-# ──────────────── Yoga routes (core first; legacy fallback; NO shim required) ────────────────
-
+# ──────────────── Yoga routes ────────────────
 def _parse_listish(v: Any) -> List[str]:
     if v is None:
         return []
@@ -790,17 +697,16 @@ def _parse_listish(v: Any) -> List[str]:
     return []
 
 def _pick_points_deg(body: Dict[str, Any]) -> Dict[str, float]:
-    # Legacy fallback when yoga core is unavailable or fails
-    for key in ("points_deg", "longitudes", "longitudes_by_name"):
-        raw = body.get(key)
-        if isinstance(raw, dict):
-            out: Dict[str, float] = {}
-            for k, v in raw.items():
-                f = _coerce_float(v)
-                if f is not None:
-                    out[str(k).lower()] = f
-            if out:
-                return out
+    raw = body.get("points_deg")
+    if isinstance(raw, dict):
+        out: Dict[str, float] = {}
+        for k, v in raw.items():
+            try:
+                f = float(v)
+            except Exception:
+                continue
+            out[str(k).lower()] = f
+        return out
     return {}
 
 def _pick_cusps_deg(body: Dict[str, Any]) -> List[float]:
@@ -809,10 +715,10 @@ def _pick_cusps_deg(body: Dict[str, Any]) -> List[float]:
         if isinstance(raw, list) and len(raw) >= 12:
             vals: List[float] = []
             for i in range(12):
-                f = _coerce_float(raw[i])
-                if f is None:
+                try:
+                    vals.append(float(raw[i]))
+                except Exception:
                     break
-                vals.append(float(f))
             if len(vals) == 12:
                 return vals
     return []
@@ -821,143 +727,118 @@ def _pick_cusps_deg(body: Dict[str, Any]) -> List[float]:
 @vedic_api.get("/yoga/catalog")
 @rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
 def vedic_yoga_catalog():
-    # Prefer direct catalog from yoga core if present
-    if _YOGA_CORE_OK and callable(_yoga_list):
+    # If yoga.py registers a catalog, expose it; otherwise OK with empty
+    try:
+        from app.core.yoga import list_registered_yogas as _yoga_list  # type: ignore
         try:
-            catalog = _yoga_list()  # type: ignore[misc]
+            catalog = _yoga_list() or []
             return jsonify({"ok": True, "catalog": catalog, "meta": {"route": "yoga/catalog", "branch": "yoga_core"}}), 200
         except Exception as e:
             return jsonify({"ok": False, "error": "yoga_catalog_failed", "detail": str(e)}), 400
-
-    # If yoga core is missing, expose a small hint
-    return jsonify({"ok": False, "error": "yoga_core_unavailable"}), 503
+    except Exception:
+        # Gracefully return empty when yoga core absent
+        return jsonify({"ok": True, "catalog": [], "meta": {"route": "yoga/catalog", "branch": "none"}}), 200
 
 
 @vedic_api.post("/yoga/detect")
 @rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
 def vedic_yoga_detect():
     """
-    Detect yogas using the primary engine (app.core.yoga) when available.
-    Fallback: legacy-basic detectors require `points_deg` and `cusps_deg` (12).
-    Body (accepts either civil+place or precomputed geometry):
-    {
-      "date": "YYYY-MM-DD", "time": "HH:MM[:SS]", "tz": "Area/City",
-      "latitude": 12.34, "longitude": 56.78,
-      "ayanamsa": "lahiri" | 23.85,
-      "house_system": "placidus|whole_sign|...",
+    Yoga detection with robust fallbacks.
 
-      // Optional filters:
-      "include": ["Gajakesari","Parivartana"],             // or comma string
-      "enable_catalog_tags": ["classic","mahapurusha"],    // or comma string
-      "disable_catalog_tags": ["experimental"],
+    Fast-path: if body provides BOTH `points_deg` and `cusps_deg` (12 values),
+    we run the legacy detectors directly (no dependency on yoga.py).
 
-      // Legacy fallback only:
-      "points_deg": { "sun": 123.4, "moon": 210.6, ... },  # sidereal longitudes expected
-      "cusps_deg": [Asc, 2nd, ..., 12th]                   # 12 floats, degrees
-    }
+    Otherwise we pass normalized civil/time/geo into the unified shim
+    `vedic_predictive.yoga_detect` (which delegates to yoga.py if present),
+    and surface helpful guidance when coordinates are missing.
     """
     body = request.get_json(silent=True) or {}
 
-    # Normalize civil fields (date/time/tz/lat/lon/ayanamsa/jd_tt).
-    if normalize_vim_payload is None:
-        norm = {}
-        warns: List[str] = ["validator_unavailable"]
-        tz_norm = str(body.get("tz") or body.get("place_tz") or "UTC")
-    else:
-        norm, warns, tz_norm = normalize_vim_payload(body)  # type: ignore[misc]
-
-    # Pass through yoga-specific hints
-    norm["house_system"] = body.get("house_system") or norm.get("house_system") or "placidus"
-    norm["include"] = _parse_listish(body.get("include"))
-    norm["enable_catalog_tags"] = _parse_listish(body.get("enable_catalog_tags"))
-    norm["disable_catalog_tags"] = _parse_listish(body.get("disable_catalog_tags"))
-
-    # Legacy fallback inputs in request (used only if core not present / fails)
-    pts = _pick_points_deg(body)
+    # Precomputed geometry → DIRECT legacy detectors (Mode A)
+    points = _pick_points_deg(body)
     cusps = _pick_cusps_deg(body)
-    if pts:
-        norm["points_deg"] = pts
-    if cusps:
-        norm["cusps_deg"] = cusps
+    includes = _parse_listish(body.get("include"))
 
-    # ---------------- Primary path: yoga core ----------------
-    if _YOGA_CORE_OK and callable(_compute_yogas_core):
-        req: Dict[str, Any] = {
-            "date": norm.get("date"),
-            "time": norm.get("time"),
-            "tz": norm.get("tz") or norm.get("tz_name") or norm.get("place_tz"),
-            "latitude": norm.get("latitude"),
-            "longitude": norm.get("longitude"),
-            "ayanamsa": norm.get("ayanamsa"),
-            "house_system": norm.get("house_system"),
-            "include": norm.get("include") or [],
-            "enable_catalog_tags": norm.get("enable_catalog_tags") or [],
-            "disable_catalog_tags": norm.get("disable_catalog_tags") or [],
-            # precomputed geometry (some cores can use it)
-            "points_deg": norm.get("points_deg"),
-            "cusps_deg": norm.get("cusps_deg"),
-        }
+    if points and cusps and _YOGA_LEGACY_OK and callable(_legacy_detect_yogas):
         try:
-            res = _compute_yogas_core(req)  # type: ignore[misc]
-            if isinstance(res, dict) and res.get("ok"):
-                out = {
-                    "ok": True,
-                    "yogas": res.get("yogas", []),
-                    "present": res.get("present", []),
-                    "context": res.get("context"),
-                    "warnings": (res.get("warnings", []) or []) + warns,
-                    "meta": {"route": "yoga/detect", "branch": "yoga_core", "tz_normalized": tz_norm},
-                }
-                return jsonify(out), 200
-            # If core returns not-ok, try legacy fallback if geometry provided
-        except Exception as _core_err:
-            # fall through to legacy if available
-            pass
-
-    # ---------------- Legacy fallback (basic detectors) ----------------
-    if pts and cusps:
-        try:
-            # Import lazily to avoid module-load dependency
-            from app.core.vedic_predictive import detect_yogas as _legacy_detect  # type: ignore
-            yogas = _legacy_detect(points_deg=pts, cusps_deg=cusps)  # type: ignore[misc]
-            out = {
+            yogas = _legacy_detect_yogas(points_deg=points, cusps_deg=cusps, include=includes)  # type: ignore[misc]
+            yogas = yogas or []
+            yogas.sort(key=lambda x: (x.get("yoga",""), x.get("planet","")))
+            return jsonify({
                 "ok": True,
                 "yogas": yogas,
                 "present": [y.get("yoga") for y in yogas],
-                "warnings": ["yoga_core_unavailable_fallback"] + warns,
-                "meta": {"route": "yoga/detect", "branch": "legacy_basic", "tz_normalized": tz_norm},
-            }
-            return jsonify(out), 200
+                "meta": {"route": "yoga/detect", "branch": "yoga_legacy_direct"},
+            }), 200
         except Exception as e:
             return jsonify({"ok": False, "error": "legacy_detector_failed", "detail": str(e)}), 400
 
-    # No engine available and no fallback geometry
-    return jsonify({
-        "ok": False,
-        "error": "yoga_unavailable_or_insufficient_inputs",
-        "meta": {"route": "yoga/detect", "branch": "none", "tz_normalized": tz_norm},
-        "warnings": warns,
-    }), (503 if not _YOGA_CORE_OK else 400)
+    # Otherwise, use validator → shim/core (Mode B)
+    if normalize_vim_payload is None:
+        return jsonify({"ok": False, "error": "validator_unavailable"}), 503
+
+    norm, warns, tz_norm = normalize_vim_payload(body)  # type: ignore[misc]
+    norm["include"] = includes
+    # preserve house system if caller hints; yoga engine defaults internally
+    if "house_system" in body:
+        norm["house_system"] = body["house_system"]
+
+    # If shim not present, explain what caller can do
+    if yoga_detect is None or not _YOGA_SHIM_OK:
+        return jsonify({
+            "ok": False,
+            "error": "yoga_shim_unavailable",
+            "meta": {"route": "yoga/detect", "branch": "none", "tz_normalized": tz_norm},
+            "hints": [
+                "Send precomputed 'points_deg' and 'cusps_deg' (12) to use legacy detectors directly.",
+                "Or include 'latitude' and 'longitude' so the engine can compute houses from civil time."
+            ]
+        }), 503
+
+    # If coordinates are missing, return a clear actionable message (this matched your console screenshot)
+    lat = norm.get("latitude"); lon = norm.get("longitude")
+    if lat is None or lon is None:
+        msg = "missing_coordinates"
+        if "place_name" in norm or any(body.get(k) for k in ("place","place_city","place_country","place_state")):
+            msg = "place_resolver_unavailable_or_missing_coordinates"
+        return jsonify({
+            "ok": False,
+            "error": "yoga_unavailable_or_insufficient_inputs",
+            "warnings": (warns or []) + [msg],
+            "meta": {"route": "yoga/detect", "branch": "needs_coordinates", "tz_normalized": tz_norm},
+            "hints": [
+                "Provide 'latitude' and 'longitude' (in degrees).",
+                "Or send 'points_deg' + 'cusps_deg' (12 floats) to run legacy detectors.",
+                "Or enable a place resolver (astronomy.resolve_place) so city/state/country can be geocoded."
+            ],
+        }), 400
+
+    # Good to run shim/core
+    try:
+        res = yoga_detect(norm)  # type: ignore[misc]
+    except Exception as e:
+        return jsonify({"ok": False, "error": "yoga_detect_failed", "detail": str(e)}), 400
+
+    ok = bool(res.get("ok"))
+    out = {
+        "ok": ok,
+        "yogas": res.get("yogas", []),
+        "present": res.get("present", []),
+        "context": res.get("context"),
+        "warnings": (warns or []) + res.get("warnings", []),
+        "meta": {"route": "yoga/detect", "branch": "yoga_core", "tz_normalized": tz_norm},
+    }
+    if not ok:
+        out["error"] = res.get("error", "yoga_detect_failed")
+        return jsonify(out), (503 if str(out["error"]).endswith("unavailable") else 400)
+    return jsonify(out), 200
 
 
 # ──────────────── Varga routes (varga_charts) ────────────────
 @vedic_api.post("/varga/position")
 @rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
 def vedic_varga_position():
-    """
-    Compute a SINGLE point’s varga placement.
-
-    Body:
-      {
-        "varga": "D9",
-        "lon_deg": 123.456,         # tropical by default unless method='sidereal'
-        "method": "sidereal|tropical",
-        "ayanamsa": "lahiri" | 22.5,
-        // optionally include one of:
-        "jd_tt": 2447762.123,
-        "date": "1989-07-26", "time": "20:44", "tz": "Asia/Kolkata"
-      }
-    """
     if not _VARGA_OK or _varga_position is None:
         return jsonify({"ok": False, "error": "varga_engine_unavailable"}), 503
 
@@ -987,20 +868,6 @@ def vedic_varga_position():
 @vedic_api.post("/varga/chart")
 @rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
 def vedic_varga_chart():
-    """
-    Compute placements for MANY points in a SINGLE varga.
-
-    Body:
-      {
-        "varga": "D9",
-        "longitudes": { "Sun": 123.4, "Moon": 210.6, ... },  # tropical unless method='sidereal'
-        "method": "sidereal|tropical",
-        "ayanamsa": "lahiri" | 22.5,
-        // optionally include either jd_tt or {date,time,tz}
-        "jd_tt": 2447762.123,
-        "date": "1989-07-26", "time": "20:44", "tz": "Asia/Kolkata"
-      }
-    """
     if not _VARGA_OK or _compute_varga_chart is None:
         return jsonify({"ok": False, "error": "varga_engine_unavailable"}), 503
 
@@ -1031,20 +898,6 @@ def vedic_varga_chart():
 @vedic_api.post("/varga/many")
 @rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
 def vedic_varga_many():
-    """
-    Compute placements for MANY points across MULTIPLE vargas.
-
-    Body:
-      {
-        "vargas": ["D1","D9","D10"],
-        "longitudes": { "Sun": 123.4, "Moon": 210.6, ... },  # tropical unless method='sidereal'
-        "method": "sidereal|tropical",
-        "ayanamsa": "lahiri" | 22.5,
-        // optionally include either jd_tt or {date,time,tz}
-        "jd_tt": 2447762.123,
-        "date": "1989-07-26", "time": "20:44", "tz": "Asia/Kolkata"
-      }
-    """
     if not _VARGA_OK or _compute_many_vargas is None:
         return jsonify({"ok": False, "error": "varga_engine_unavailable"}), 503
 
@@ -1063,10 +916,75 @@ def vedic_varga_many():
         out = {
             "ok": True,
             "vargas": [v.upper() for v in vargas],
-            "placements": placements,  # { 'D9': { 'Sun': {...}, ... }, ... }
+            "placements": placements,
             "options": {"zodiac_mode": method, "ayanamsa": ay_for_engine},
             "meta": _wrap_varga_meta("varga/many", method, ay_meta),
         }
         return jsonify(out), 200
     except Exception as e:
         return jsonify({"ok": False, "error": "varga_many_failed", "detail": str(e)}), 400
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Local ayanamsa resolver for varga helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def _resolve_ayanamsa_for_engine(body: Dict[str, Any], method: str, jd_tt: Optional[float]) -> tuple[Any, Dict[str, Any]]:
+    meta: Dict[str, Any] = {
+        "ts_available": _TS_OK,
+        "ayanamsa_adapter_available": _AY_OK,
+        "jd_tt_used": jd_tt,
+    }
+    method_lc = (method or "sidereal").lower()
+    ay_in = body.get("ayanamsa")
+    ay_deg_in = _coerce_float(body.get("ayanamsa_deg"))
+
+    if method_lc.startswith("trop"):
+        meta.update({
+            "ayanamsa_input": ay_in if ay_in is not None else ("ayanamsa_deg=" + str(ay_deg_in) if ay_deg_in is not None else None),
+            "ayanamsa_effective": None,
+            "ayanamsa_resolve": "not_applied_tropical",
+        })
+        return ay_in, meta
+
+    if isinstance(ay_deg_in, float):
+        meta.update({
+            "ayanamsa_input": ay_deg_in,
+            "ayanamsa_effective": ay_deg_in,
+            "ayanamsa_resolve": "explicit_numeric",
+        })
+        return ay_deg_in, meta
+    if isinstance(ay_in, (int, float)):
+        val = float(ay_in)
+        meta.update({
+            "ayanamsa_input": val,
+            "ayanamsa_effective": val,
+            "ayanamsa_resolve": "explicit_numeric",
+        })
+        return val, meta
+
+    key = _norm_ayanamsa(ay_in)
+    if isinstance(key, str) and key:
+        deg = _ayanamsa_deg_from_key(jd_tt, key)
+        if isinstance(deg, float):
+            meta.update({
+                "ayanamsa_input": key,
+                "ayanamsa_effective": deg,
+                "ayanamsa_resolve": "computed_from_key",
+                "ayanamsa_key": key,
+            })
+            return deg, meta
+        meta.update({
+            "ayanamsa_input": key,
+            "ayanamsa_effective": key,
+            "ayanamsa_resolve": "pass_through_string_fallback",
+            "ayanamsa_key": key,
+            "warning": "could_not_compute_ayanamsa_degrees_from_key",
+        })
+        return key, meta
+
+    meta.update({
+        "ayanamsa_input": key,
+        "ayanamsa_effective": key,
+        "ayanamsa_resolve": "default_key_passthrough",
+    })
+    return key, meta
