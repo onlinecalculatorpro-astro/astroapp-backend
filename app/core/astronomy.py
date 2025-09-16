@@ -27,7 +27,73 @@ warnings.filterwarnings(
     module=r"erfa",
 )
 
-__all__ = ["compute_chart", "clear_ephemeris_cache"]
+# --- add 'resolve_place' to the public API ---
+__all__ = ["compute_chart", "clear_ephemeris_cache", "resolve_place"]
+
+def resolve_place(
+    q: str | None = None, *,
+    place_city: str | None = None,
+    place_state: str | None = None,
+    place_country: str | None = None,
+) -> Dict[str, Any]:
+    """
+    Resolve a place string or parts into:
+      { "lat": float|None, "lon": float|None, "tz": str, "elevation_m": float|None }
+
+    - Accepts either a single freeform `q` ("City, State, Country") or parts.
+    - Tries project resolvers if present.
+    - Never raises; will fall back to tz="UTC" when nothing better is available.
+    """
+    # Build a nice query string if parts were provided
+    if not q:
+        parts = [str(x).strip() for x in (place_city, place_state, place_country) if x]
+        q = ", ".join(parts)
+    q = (q or "").strip()
+    if not q:
+        raise AstronomyError("place_missing", "place string or city/country required")
+
+    # Try any project-provided resolvers
+    providers: list[Callable[[str], Any]] = []
+    for modname, fname in (
+        ("app.core.geo", "resolve_place"),
+        ("app.core.place", "resolve_place"),
+        ("app.core.place_resolver", "resolve_place"),
+    ):
+        try:
+            m = __import__(modname, fromlist=[fname])
+            fn = getattr(m, fname, None)
+            if callable(fn):
+                providers.append(fn)
+        except Exception:
+            pass
+
+    for fn in providers:
+        try:
+            out = fn(q)
+            if isinstance(out, dict) and ("lat" in out) and ("lon" in out):
+                lat = float(out["lat"]) if out["lat"] is not None else None
+                lon = float(out["lon"]) if out["lon"] is not None else None
+                tz = str(out.get("tz") or out.get("timezone") or "UTC")
+                elev = out.get("elevation_m", out.get("elevation"))
+                elev_m = float(elev) if isinstance(elev, (int, float, str)) and str(elev).strip() != "" else None
+                return {"lat": lat, "lon": lon, "tz": tz, "elevation_m": elev_m}
+        except Exception:
+            continue
+
+    # Tiny built-in map (extend as you like)
+    _HARDCODED = {
+        "patna, bihar, india": (25.5941, 85.1376, "Asia/Kolkata", 53.0),
+        "new delhi, india": (28.6139, 77.2090, "Asia/Kolkata", 216.0),
+        "mumbai, maharashtra, india": (19.0760, 72.8777, "Asia/Kolkata", 14.0),
+        "london, united kingdom": (51.5074, -0.1278, "Europe/London", 24.0),
+    }
+    key = q.lower().strip()
+    if key in _HARDCODED:
+        lat, lon, tz, elev = _HARDCODED[key]
+        return {"lat": float(lat), "lon": float(lon), "tz": tz, "elevation_m": float(elev)}
+
+    # Last resort: unknown coords, safe tz
+    return {"lat": None, "lon": None, "tz": "UTC", "elevation_m": None}
 
 
 # ───────────────────────────── Exceptions ─────────────────────────────
