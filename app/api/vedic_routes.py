@@ -291,9 +291,9 @@ def _call_single_param_or_kwargs(fn, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _ensure_tree_envelope(res: Dict[str, Any], *, scheme: str) -> Dict[str, Any]:
     """
-    Normalize shapes to a consistent tree envelope + nested:
-      - If res.tree.periods is present (some engines), mirror to children + nested.
-      - If res.nested list exists, create/ensure a 'tree' wrapper using min/max bounds.
+    Normalize shapes to a consistent tree envelope + nested, while preserving
+    engine metadata like nakshatra/moon_nirayana_deg/year_days, which the
+    frontend/dev tools may rely on for boundary badges, etc.
     """
     if not isinstance(res, dict):
         return res
@@ -303,16 +303,34 @@ def _ensure_tree_envelope(res: Dict[str, Any], *, scheme: str) -> Dict[str, Any]
         periods = t["periods"]
         s0 = min((float(p.get("start_jd_tt", 0.0)) for p in periods), default=0.0)
         e1 = max((float(p.get("end_jd_tt", 0.0)) for p in periods), default=0.0)
+
+        # extras we want to surface on the root for easy access
+        extras_keys = (
+            "nakshatra",
+            "moon_nirayana_deg",
+            "birth_jd_tt",
+            "year_days",
+            "levels",
+            # include any other passthroughs your engine might add later:
+            "ayanamsa",
+            "method",
+            "coordinate_mode",
+            "topocentric",
+        )
+        extras = {k: t[k] for k in extras_keys if k in t}
+
         out = dict(res)
         out["nested"] = periods
-        out["tree"] = {
+        root = {
             "level": 0,
             "lord": None,
             "label": scheme,
             "start_jd_tt": s0,
             "end_jd_tt": e1,
             "children": periods,
+            **extras,  # ← keep nakshatra & co.
         }
+        out["tree"] = root
         return out
 
     if isinstance(res.get("nested"), list):
