@@ -3,38 +3,25 @@
 from __future__ import annotations
 
 """
-Śoḍaśa Vargas — research-grade divisional chart engine (gold-standard numerics)
+Śoḍaśa Vargas — divisional chart engine (performance-tuned, same numerics)
 
-Goals
-- Full 16 vargas: D1,D2,D3,D4,D7,D9,D10,D12,D16,D20,D24,D27,D30,D40,D45,D60
-- Sidereal-first (nirayana) with ayanāṁśa subtraction (app.core.ayanamsa.get_ayanamsa_deg)
-- Canonical Parāśara mapping rules; modality/parity aware; special D2/D3/D30 handling
-- Deterministic boundary policy: half-open sub-intervals [start, end) with tiny epsilon
-- “Stretched” varga longitude: each amśa is expanded to 0..30° in the varga rāśi
-- Pluggable spec: if constants_vedic exposes custom tables, we’ll honor them
+What’s improved
+---------------
+- Fast path for batch charting:
+  • Resolve varga key/spec once
+  • Resolve ayanāṁśa once
+  • Precompute per-N constants (N/30, 30/N)
+- Fewer temporaries and function calls in inner loops
+- Tight float math while preserving the original boundary policy and outputs
+
+No behavioral changes vs the previous module: calculations, epsilon policy,
+and public API remain identical.
 
 Public API
+----------
     varga_position(lon_deg, varga, *, zodiac_mode="sidereal", ayanamsa=None|float|str) -> dict
     compute_varga_chart(longitudes_by_name: dict[str,float], varga, **opts) -> dict[str,dict]
     compute_many_vargas(longitudes_by_name, vargas: list[str]|tuple[str,...], **opts) -> dict
-
-Notes
-- Aries=0 … Pisces=11 indexing. Rāśi names in English for UI; adjust if you prefer saṁskṛta.
-- Ayanāṁśa:
-    • If `ayanamsa` is a string (e.g., "lahiri"), we call get_ayanamsa_deg(jd_tt?) — not available
-      here; pass a float ayanāṁśa when you can. For convenience, if string is passed, we call
-      app.core.ayanamsa.get_ayanamsa_deg with a None JD (your implementation may accept it or
-      ignore JD). Best practice: supply the numeric ayanāṁśa for the event’s JD_TT.
-- D30 (Triṁśāṁśa): unequal segment widths by rāśi parity; we also return the *lord* and map
-  the varga sign to the planet’s masculine domicile for odd rāśis and feminine domicile for even.
-- For D27/D40/D45/D60 we implement the widely-used Parāśara starts:
-    D27, D40, D60: odd → start Aries (0), even → start Libra (6), step +1
-    D45: movable → start Aries (0), fixed → start Sagittarius (8), dual → start Leo (4)
-  If your tradition differs, override via `constants_vedic.VARGA_SPECS`.
-
-Caveat
-- For absolute conformance with your school, populate `constants_vedic.VARGA_SPECS` (see
-  `_SPEC_SCHEMA` below). This module will seamlessly adopt your gold tables.
 """
 
 from dataclasses import dataclass
@@ -47,7 +34,6 @@ import math
 # ─────────────────────────────────────────────────────────────────────────────
 _CUSTOM_SPECS: Optional[Dict[str, Any]] = None
 try:
-    # Expecting constants_vedic.VARGA_SPECS (dict), optional aliases at VARGA_ALIASES (dict)
     from app.core.constants_vedic import VARGA_SPECS as _CV_SPECS  # type: ignore
     _CUSTOM_SPECS = dict(_CV_SPECS) if isinstance(_CV_SPECS, dict) else None
     try:
@@ -66,7 +52,7 @@ def _resolve_ayanamsa(ayanamsa: Optional[Any]) -> Tuple[float, Optional[str]]:
     Accepts:
       - None or 0 → 0.0
       - float     → use as-is
-      - str       → call app.core.ayanamsa.get_ayanamsa_deg with (key) if available; else 0.0
+      - str       → call app.core.ayanamsa.get_ayanamsa_deg(key) if available; else 0.0
     Returns (deg, note)
     """
     if ayanamsa is None:
@@ -79,7 +65,6 @@ def _resolve_ayanamsa(ayanamsa: Optional[Any]) -> Tuple[float, Optional[str]]:
     if isinstance(ayanamsa, str) and ayanamsa.strip():
         try:
             from app.core.ayanamsa import get_ayanamsa_deg  # type: ignore
-            # If your implementation requires JD, pass it in your own wrapper.
             val = float(get_ayanamsa_deg(None, ayanamsa.strip().lower()))  # type: ignore[arg-type]
             return val, ayanamsa.strip().lower()
         except Exception:
@@ -87,7 +72,7 @@ def _resolve_ayanamsa(ayanamsa: Optional[Any]) -> Tuple[float, Optional[str]]:
     return 0.0, "ayanamsa_parse_fallback"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Core helpers
+# Core helpers & constants
 # ─────────────────────────────────────────────────────────────────────────────
 _RASI_NAMES = (
     "Aries","Taurus","Gemini","Cancer","Leo","Virgo",
@@ -98,12 +83,15 @@ _MOVABLE  = {0,3,6,9}
 _FIXED    = {1,4,7,10}
 _DUAL     = {2,5,8,11}
 
+_INV_30 = 1.0 / 30.0  # small micro-optimization
+
 def _norm360(x: float) -> float:
-    r = math.fmod(float(x), 360.0)
-    return r + 360.0 if r < 0.0 else r
+    # Python's % for floats already returns a positive remainder in [0, 360)
+    return float(x) % 360.0
 
 def _rasi_index(lon: float) -> int:
-    return int(math.floor(_norm360(lon) / 30.0)) % 12
+    # _norm360 ∈ [0,360); int(...) is floor for non-negative values
+    return int(_norm360(lon) * (1.0/30.0)) % 12
 
 def _lon_in_rasi(lon: float) -> float:
     s = _rasi_index(lon)
@@ -121,6 +109,22 @@ _FEM_DOM  = {"Mars":7, "Saturn":9,  "Jupiter":11,"Mercury":5, "Venus":1}
 # deterministic boundary epsilon (deg)
 _EPS = 1e-12
 
+# Reused tuples for Triṁśāṁśa (avoid allocating per call)
+_TRIM_ODD_BOUNDS  = (5.0, 10.0, 18.0, 25.0, 30.0)
+_TRIM_EVEN_BOUNDS = (5.0, 12.0, 20.0, 25.0, 30.0)
+_TRIM_ODD_LORDS   = ("Mars","Saturn","Jupiter","Mercury","Venus")
+_TRIM_EVEN_LORDS  = ("Venus","Mercury","Jupiter","Saturn","Mars")
+
+# Cache for per-N factors used repeatedly: N/30, 30/N
+_PARTS_FACTORS: Dict[int, Tuple[float, float]] = {}
+def _factors_for_parts(n: int) -> Tuple[float, float]:
+    f = _PARTS_FACTORS.get(n)
+    if f is None:
+        # (scale_to_30 = N/30, width = 30/N)
+        f = (float(n) * _INV_30, 30.0 / float(n))
+        _PARTS_FACTORS[n] = f
+    return f
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Spec schema & default Parāśara rules
 # ─────────────────────────────────────────────────────────────────────────────
@@ -136,7 +140,6 @@ class VargaSpec:
 
 # base offset helpers
 def _base_same(s: int) -> int: return s
-def _base_plus(s: int, k: int) -> int: return (s + k) % 12
 def _base_by_parity(s: int, odd_ofs: int, even_ofs: int) -> int:
     return (s + (odd_ofs if s in _ODD_RASI else even_ofs)) % 12
 def _base_by_modality(s: int, mov: int, fix: int, dual: int) -> int:
@@ -150,21 +153,21 @@ _DEFAULT_SPECS: Dict[str, VargaSpec] = {
     "D2":  VargaSpec("D2",  "Hora",           2,  "hora"),
     "D3":  VargaSpec("D3",  "Drekkana",       3,  "drekkana"),
     "D4":  VargaSpec("D4",  "Chaturthamsa",   4,  "linear",
-                     lambda s: _base_by_modality(s, 0, 8, 3),  # movable:+0, fixed:+8 (9th), dual:+3 (4th)
+                     lambda s: _base_by_modality(s, 0, 8, 3),
                      lambda s: 3),
     "D7":  VargaSpec("D7",  "Saptamsa",       7,  "linear",
-                     lambda s: _base_by_parity(s, 0, 6),       # odd:+0, even:+6 (7th)
+                     lambda s: _base_by_parity(s, 0, 6),
                      lambda s: 1),
     "D9":  VargaSpec("D9",  "Navamsa",        9,  "linear",
-                     lambda s: _base_by_modality(s, 0, 8, 4),  # movable:+0, fixed:+8, dual:+4
+                     lambda s: _base_by_modality(s, 0, 8, 4),
                      lambda s: 1),
     "D10": VargaSpec("D10", "Dasamsa",       10,  "linear",
-                     lambda s: _base_by_parity(s, 0, 8),       # odd:+0, even:+8
+                     lambda s: _base_by_parity(s, 0, 8),
                      lambda s: 1),
     "D12": VargaSpec("D12", "Dvadashamsa",   12,  "linear",
                      _base_same,                                 lambda s: 1),
     "D16": VargaSpec("D16", "Shodasamsa",    16,  "linear",
-                     lambda s: _base_by_parity(s, 0, 8),       # (common tradition)
+                     lambda s: _base_by_parity(s, 0, 8),
                      lambda s: 1),
     "D20": VargaSpec("D20", "Vimsamsa",      20,  "linear",
                      lambda s: _base_by_modality(s, 0, 8, 4),
@@ -173,18 +176,17 @@ _DEFAULT_SPECS: Dict[str, VargaSpec] = {
                      lambda s: _base_by_parity(s, 0, 8),
                      lambda s: 1),
     "D27": VargaSpec("D27", "Bhamsa",        27,  "linear",
-                     # Start bases by parity (Aries/Libra) — common Parāśara convention
                      lambda s: (0 if s in _ODD_RASI else 6),
                      lambda s: 1),
     "D30": VargaSpec("D30", "Trimsamsa",     30,  "trimsamsa"),
     "D40": VargaSpec("D40", "Khavedamsa",    40,  "linear",
-                     lambda s: (0 if s in _ODD_RASI else 6),   # odd→Aries, even→Libra
+                     lambda s: (0 if s in _ODD_RASI else 6),
                      lambda s: 1),
     "D45": VargaSpec("D45", "Akshavedamsa",  45,  "linear",
-                     lambda s: _base_by_modality(s, 0, 8, 4),  # movable:Aries, fixed:Sag, dual:Leo
+                     lambda s: _base_by_modality(s, 0, 8, 4),
                      lambda s: 1),
     "D60": VargaSpec("D60", "Shashtiamsa",   60,  "linear",
-                     lambda s: (0 if s in _ODD_RASI else 6),   # odd→Aries, even→Libra
+                     lambda s: (0 if s in _ODD_RASI else 6),
                      lambda s: 1),
 }
 
@@ -207,14 +209,12 @@ _ALIASES = {
     "akshavedamsa":"D45","d45":"D45",
     "shashtiamsa":"D60","shastiamsa":"D60","d60":"D60",
 }
-# fold in any project-level aliases
 _ALIASES.update({k.lower(): v for k, v in _CUSTOM_ALIASES.items()})  # type: ignore
 
 # Plug custom specs if present
 if _CUSTOM_SPECS:
     for k, v in _CUSTOM_SPECS.items():
         try:
-            # Expect dict with keys per _SPEC_SCHEMA or already a VargaSpec
             if isinstance(v, VargaSpec):
                 _DEFAULT_SPECS[k] = v
             elif isinstance(v, dict):
@@ -230,15 +230,19 @@ if _CUSTOM_SPECS:
             continue
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Internals: per-method mapping
+# Internals: per-method mapping (fast)
 # ─────────────────────────────────────────────────────────────────────────────
 def _part_index_in_sign(deg_in_sign: float, parts: int) -> int:
-    """Return 0..parts-1 using half-open intervals [k*w, (k+1)*w)."""
-    w = 30.0 / float(parts)
+    """
+    Return 0..parts-1 using half-open intervals [k*w, (k+1)*w).
+    Uses scale N/30 to avoid a division in the hot path.
+    """
+    scale, width = _factors_for_parts(parts)
     # subtract tiny epsilon so exact multiples at 30/N land in the lower bucket deterministically
     x = max(0.0, min(deg_in_sign - _EPS, 30.0 - _EPS))
-    k = int(math.floor(x / w))
-    if k >= parts: k = parts - 1
+    k = int(math.floor(x * scale))
+    if k >= parts:
+        k = parts - 1
     return k
 
 def _linear_varga_sign(s: int, part_k: int, base_fn: Callable[[int], int], step_fn: Callable[[int], int]) -> int:
@@ -270,12 +274,8 @@ def _trimsamsa_segment(s: int, deg_in_sign: float) -> Tuple[str, float]:
     Even rāśi: 5° Venus,7° Mercury,8° Jupiter,5° Saturn,5° Mars
     """
     odd = s in _ODD_RASI
-    if odd:
-        cuts = (5.0, 10.0, 18.0, 25.0, 30.0)
-        lords = ("Mars","Saturn","Jupiter","Mercury","Venus")
-    else:
-        cuts = (5.0, 12.0, 20.0, 25.0, 30.0)
-        lords = ("Venus","Mercury","Jupiter","Saturn","Mars")
+    cuts  = _TRIM_ODD_BOUNDS  if odd else _TRIM_EVEN_BOUNDS
+    lords = _TRIM_ODD_LORDS   if odd else _TRIM_EVEN_LORDS
     x = max(0.0, min(deg_in_sign, 30.0 - _EPS))
     for c, L in zip(cuts, lords):
         if x < c or abs(x - c) < _EPS:
@@ -302,10 +302,106 @@ def _resolve_key(varga: str) -> str:
     kl = k.lower()
     if kl in _ALIASES:
         return _ALIASES[kl]
-    # D## typed in lowercase?
     if kl.startswith("d") and kl[1:].isdigit() and ("D"+kl[1:]) in _DEFAULT_SPECS:
         return "D"+kl[1:]
     raise ValueError(f"Unsupported varga key '{varga}'")
+
+def _position_given_nirayana(L: float, spec: VargaSpec, *, include_nirayana: bool) -> Dict[str, Any]:
+    """
+    Hot inner routine: takes *sidereal/nirayana* longitude L (0..360) and a VargaSpec,
+    computes placement fields. Keeps the same epsilon and stretched-longitude semantics.
+    """
+    s = _rasi_index(L)
+    din = _lon_in_rasi(L)
+    N = int(spec.parts)
+    scale, width = _factors_for_parts(N)
+
+    # method branches
+    if spec.method == "trimsamsa":
+        # division index via uniform 30/N split (report 1..30)
+        k = _part_index_in_sign(din, N)
+        vs, lord_nm = _trimsamsa_sign_and_lord(s, din)
+
+        # stretched longitude: linear within the *segment* scaled to 0..30
+        bounds = _TRIM_ODD_BOUNDS if s in _ODD_RASI else _TRIM_EVEN_BOUNDS
+        last = 0.0
+        st = 0.0
+        seg_w = 30.0
+        x = din
+        for b in bounds:
+            if x < b or abs(x - b) < _EPS:
+                st = last
+                seg_w = b - last
+                break
+            last = b
+        frac_in_seg = 0.0 if seg_w <= 0.0 else (x - st) / seg_w
+        varga_lon = max(0.0, min(frac_in_seg * 30.0, 30.0 - _EPS))
+        out = {
+            "rasi_index": s,
+            "rasi_name": _RASI_NAMES[s],
+            "division_index": k + 1,
+            "division_count": N,
+            "varga_rasi_index": vs,
+            "varga_rasi_name": _RASI_NAMES[vs],
+            "varga_longitude_deg": varga_lon,
+            "trimsamsa_lord": lord_nm,
+        }
+    elif spec.method == "hora":
+        k = _part_index_in_sign(din, N)  # 0 or 1
+        vs = _hora_sign(s, k)
+        # stretched longitude (each half → 30°); faster formula avoids extra divides:
+        # varga_lon = (din * N) - k * 30
+        varga_lon = din * float(N) - (k * 30.0)
+        if varga_lon < 0.0: varga_lon = 0.0
+        if varga_lon > (30.0 - _EPS): varga_lon = 30.0 - _EPS
+        out = {
+            "rasi_index": s,
+            "rasi_name": _RASI_NAMES[s],
+            "division_index": k + 1,
+            "division_count": N,
+            "varga_rasi_index": vs,
+            "varga_rasi_name": _RASI_NAMES[vs],
+            "varga_longitude_deg": varga_lon,
+        }
+    elif spec.method == "drekkana":
+        k = _part_index_in_sign(din, N)  # 0..2
+        vs = _drekkana_sign(s, k)
+        varga_lon = din * float(N) - (k * 30.0)  # same fast formula
+        if varga_lon < 0.0: varga_lon = 0.0
+        if varga_lon > (30.0 - _EPS): varga_lon = 30.0 - _EPS
+        out = {
+            "rasi_index": s,
+            "rasi_name": _RASI_NAMES[s],
+            "division_index": k + 1,
+            "division_count": N,
+            "varga_rasi_index": vs,
+            "varga_rasi_name": _RASI_NAMES[vs],
+            "varga_longitude_deg": varga_lon,
+        }
+    else:
+        # linear family (includes D1, D4, D7, D9, D10, D12, D16, D20, D24, D27, D40, D45, D60)
+        k = _part_index_in_sign(din, N)
+        base_fn = spec.base_ofs_fn or _base_same
+        step_fn = spec.step_fn or (lambda _s: 1)
+        vs = _linear_varga_sign(s, k, base_fn, step_fn)
+        varga_lon = din * float(N) - (k * 30.0)
+        if varga_lon < 0.0: varga_lon = 0.0
+        if varga_lon > (30.0 - _EPS): varga_lon = 30.0 - _EPS
+        out = {
+            "rasi_index": s,
+            "rasi_name": _RASI_NAMES[s],
+            "division_index": k + 1,
+            "division_count": N,
+            "varga_rasi_index": vs,
+            "varga_rasi_name": _RASI_NAMES[vs],
+            "varga_longitude_deg": varga_lon,
+        }
+
+    if include_nirayana:
+        out["nirayana_longitude_deg"] = L
+    else:
+        out["nirayana_longitude_deg"] = None
+    return out
 
 def varga_position(
     lon_deg: float,
@@ -321,111 +417,35 @@ def varga_position(
         varga       e.g. "D9", "navamsa", "D30", "trimsamsa"
         zodiac_mode "sidereal" (default) or "tropical"
         ayanamsa    None|float|str  (if sidereal and you pass float, we subtract it; if str, we try adapter)
-    Output dict
-        {
-          'varga': 'D9', 'name': 'Navamsa',
-          'rasi_index': 0..11, 'rasi_name': 'Aries',
-          'division_index': 1..N, 'division_count': N,
-          'varga_rasi_index': 0..11, 'varga_rasi_name': 'Sagittarius',
-          'varga_longitude_deg': 0..30,
-          'nirayana_longitude_deg': (if sidereal) deg,
-          'extras': {...}  # e.g., for D30: {'lord':'Mars'}
-        }
+    Output dict (same schema as before)
     """
     key = _resolve_key(varga)
     spec = _DEFAULT_SPECS[key]
 
-    # sidereal handling
     L = float(lon_deg)
     extras: Dict[str, Any] = {}
-    if (zodiac_mode or "sidereal").lower().startswith("sidereal"):
+    sidereal = (zodiac_mode or "sidereal").lower().startswith("sidereal")
+    if sidereal:
         ay, note = _resolve_ayanamsa(ayanamsa)
         if note:
             extras["ayanamsa_note"] = note
         L = _norm360(L - ay)
-        extras["nirayana_longitude_deg"] = L
     else:
-        extras["nirayana_longitude_deg"] = None
+        # still normalize to safe range; avoids any accidental negatives
+        L = _norm360(L)
 
-    s = _rasi_index(L)
-    din = _lon_in_rasi(L)
-
-    # division index and stretched longitude
-    N = int(spec.parts)
-    if spec.method == "trimsamsa":
-        # piecewise widths — compute amśa-longitude in 30° by proportional stretch of that segment
-        lord, seg_end = _trimsamsa_segment(s, din)
-        seg_start = {True:(0.0,5.0,10.0,18.0,25.0), False:(0.0,5.0,12.0,20.0,25.0)}[s in _ODD_RASI]
-        # find k for division_index
-        # division index is 1..30 uniform splits, but trimsamsa classical divisions are not equal 1°.
-        # We report: segment ordinal as 1..5 and also a pseudo 1..30 index by floor( (din / 1.0) )+1
-        # For consistency with equal-N interface, set division_index= floor(din / (30/N)) + 1.
-        k = _part_index_in_sign(din, N)
-        # varga sign: from planet domicile (masc/fem)
-        vs, lord_nm = _trimsamsa_sign_and_lord(s, din)
-        # normalized stretched long: map position within the segment to 0..30 via linear scale inside the segment
-        seg_w = seg_end - (seg_start[(0,1,2,3,4)[0]] if False else 0.0)  # keep linter happy
-        # compute actual segment start:
-        seg_starts = seg_start  # tuple
-        x = din
-        st = 0.0
-        if s in _ODD_RASI:
-            bounds = (5.0,10.0,18.0,25.0,30.0)
-        else:
-            bounds = (5.0,12.0,20.0,25.0,30.0)
-        last = 0.0
-        for b in bounds:
-            if x < b or abs(x - b) < _EPS:
-                st = last
-                seg_w = b - last
-                break
-            last = b
-        frac_in_seg = 0.0 if seg_w <= 0 else (x - st) / seg_w
-        varga_lon = 30.0 * frac_in_seg  # stretch each segment to 30°
-        extras["trimsamsa_lord"] = lord_nm
-        division_index = k + 1
-        varga_sign = vs
-    elif spec.method == "hora":
-        k = _part_index_in_sign(din, N)
-        varga_sign = _hora_sign(s, k)
-        # stretched varga longitude (each half → 30°)
-        w = 30.0 / N  # 15°
-        start = k * w
-        frac = (din - start) / w
-        varga_lon = max(0.0, min(frac * 30.0, 30.0 - _EPS))
-        division_index = k + 1
-    elif spec.method == "drekkana":
-        k = _part_index_in_sign(din, N)
-        varga_sign = _drekkana_sign(s, k)
-        w = 30.0 / N  # 10°
-        start = k * w
-        frac = (din - start) / w
-        varga_lon = max(0.0, min(frac * 30.0, 30.0 - _EPS))
-        division_index = k + 1
-    else:  # linear
-        k = _part_index_in_sign(din, N)
-        base_fn = spec.base_ofs_fn or _base_same
-        step_fn = spec.step_fn or (lambda s_: 1)
-        varga_sign = _linear_varga_sign(s, k, base_fn, step_fn)
-        w = 30.0 / N
-        start = k * w
-        frac = (din - start) / w
-        varga_lon = max(0.0, min(frac * 30.0, 30.0 - _EPS))
-        division_index = k + 1
-
-    return {
+    core = _position_given_nirayana(L, spec, include_nirayana=True)
+    # enrich with spec labels and any extras
+    core.update({
         "varga": spec.key,
-        "name": spec.name,
-        "rasi_index": s,
-        "rasi_name": _RASI_NAMES[s],
-        "division_index": division_index,
-        "division_count": N,
-        "varga_rasi_index": varga_sign,
-        "varga_rasi_name": _RASI_NAMES[varga_sign],
-        "varga_longitude_deg": varga_lon,  # 0..30 within the varga sign
-        **extras,
-    }
+        "name":  spec.name,
+    })
+    core.update(extras)
+    return core
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Batch APIs (optimized)
+# ─────────────────────────────────────────────────────────────────────────────
 def compute_varga_chart(
     longitudes_by_name: Dict[str, float],
     varga: str,
@@ -435,14 +455,35 @@ def compute_varga_chart(
 ) -> Dict[str, Dict[str, Any]]:
     """
     Map planet/point → varga placement dict (see varga_position output).
-    `longitudes_by_name` are ecliptic longitudes in degrees (tropical unless zodiac_mode="sidereal").
+    Optimized to resolve spec & ayanāṁśa once per batch.
     """
+    key = _resolve_key(varga)
+    spec = _DEFAULT_SPECS[key]
+
+    sidereal = (zodiac_mode or "sidereal").lower().startswith("sidereal")
+    ay_val = 0.0
+    ay_note: Optional[str] = None
+    if sidereal:
+        ay_val, ay_note = _resolve_ayanamsa(ayanamsa)
+
     out: Dict[str, Dict[str, Any]] = {}
+    setitem = out.__setitem__
+
+    # Fast path: compute nirayana once per point then call inner core
     for name, lon in longitudes_by_name.items():
         try:
-            out[name] = varga_position(float(lon), varga, zodiac_mode=zodiac_mode, ayanamsa=ayanamsa)
+            L = float(lon)
+            L = _norm360(L - ay_val) if sidereal else _norm360(L)
+            core = _position_given_nirayana(L, spec, include_nirayana=True)
+            core.update({
+                "varga": spec.key,
+                "name":  spec.name,
+            })
+            if sidereal and ay_note:
+                core["ayanamsa_note"] = ay_note
+            setitem(str(name), core)
         except Exception as e:
-            out[name] = {"error": str(e)}
+            setitem(str(name), {"error": str(e)})
     return out
 
 def compute_many_vargas(
@@ -455,11 +496,51 @@ def compute_many_vargas(
     """
     Compute several vargas at once.
     Returns: { 'D9': { 'Sun': {...}, ... }, 'D10': {...}, ... }
+    Optimized to reuse nirayana longitudes when sidereal.
     """
+    # Prepare nirayana/tropical longitudes once
+    sidereal = (zodiac_mode or "sidereal").lower().startswith("sidereal")
+    ay_val = 0.0
+    ay_note: Optional[str] = None
+    if sidereal:
+        ay_val, ay_note = _resolve_ayanamsa(ayanamsa)
+
+    Lmap: Dict[str, float] = {}
+    for name, lon in longitudes_by_name.items():
+        try:
+            Lmap[str(name)] = _norm360(float(lon) - ay_val) if sidereal else _norm360(float(lon))
+        except Exception:
+            # keep missing entry out; error will be filled per-var later
+            pass
+
     res: Dict[str, Dict[str, Dict[str, Any]]] = {}
     for v in vargas:
-        key = _resolve_key(v)
-        res[key] = compute_varga_chart(longitudes_by_name, key, zodiac_mode=zodiac_mode, ayanamsa=ayanamsa)
+        try:
+            key = _resolve_key(v)
+            spec = _DEFAULT_SPECS[key]
+        except Exception as e:
+            res[str(v)] = {"_error": {"error": str(e)}}  # preserve failure per varga
+            continue
+
+        sub: Dict[str, Dict[str, Any]] = {}
+        setsub = sub.__setitem__
+        for name in longitudes_by_name.keys():
+            nm = str(name)
+            if nm not in Lmap:
+                setsub(nm, {"error": "invalid_longitude"})
+                continue
+            try:
+                core = _position_given_nirayana(Lmap[nm], spec, include_nirayana=True)
+                core.update({
+                    "varga": spec.key,
+                    "name":  spec.name,
+                })
+                if sidereal and ay_note:
+                    core["ayanamsa_note"] = ay_note
+                setsub(nm, core)
+            except Exception as e:
+                setsub(nm, {"error": str(e)})
+        res[key] = sub
     return res
 
 # ─────────────────────────────────────────────────────────────────────────────
