@@ -5,34 +5,22 @@ from __future__ import annotations
 """
 Classical Yogas — sidereal-first, deterministic rules, fast path enabled.
 
-Highlights in this rewrite
---------------------------
-• Registry now auto-builds for both compute_yogas() and list_registered_yogas() (fixes empty catalog).
-• Correct timescales plumbing for houses: pass jd_ut=jd_ut1 (previous code accidentally used jd_tt).
-• Performance:
-    - Module-level ephemeris adapter (no per-call construction).
-    - LRU caches for ayanāṁśa and ecliptic longitudes.
-    - Optional fast path: accept precomputed sidereal planet longitudes (points_deg) and 12 house cusps (cusps_deg).
-• Safer handling of optional dependencies; fewer hard failures → returned 'warnings'.
-• No dependency on external varga API during scoring (keeps D9/D10 lightweight & self-contained).
+What this file does (integration-friendly)
+------------------------------------------
+• Houses: uses the *same façade* your common routes use:
+  `from app.core.house import compute_houses_with_policy` (no custom engine here).
+• Vargas: uses your dedicated module:
+  `from app.core.varga_charts import compute_many_vargas` (no local D9/D10 math).
+• Timescales: prefers `app.core.time_kernel` and falls back to `app.core.timescales`.
+
+Fast path remains:
+  - If payload contains `points_deg` (SIDEREAL longs) + `cusps_deg` (12), we skip ephemeris/house compute.
 
 Public API (unchanged)
 ----------------------
     compute_yogas(payload, **options) -> dict
     list_registered_yogas() -> list[dict]
     enable_yogas(names_or_tag_keys), disable_yogas(names_or_tag_keys)
-
-Input (flexible)
-----------------
-payload accepts either:
-  (A) Civil + site:
-      { date, time, tz, latitude, longitude, [jd_tt], [jd_ut1], [ayanamsa] }
-  (B) Precomputed geometry (fast path):
-      { points_deg: {Sun:.., Moon:.., ...}  // SIDEREAL ecliptic longitudes, degrees
-        cusps_deg: [Asc, 2nd, ..., 12th]   // 12 house cusps, degrees, sidereal or tropical? → sidereal here
-        [latitude], [longitude], [ayanamsa] // lat/lon optional (used only for context)
-      }
-If points/cusps are given, ephemeris & house computations are skipped.
 
 Returned shape
 --------------
@@ -55,6 +43,7 @@ try:
 except Exception:
     _get_ayanamsa_deg = None
 
+# Ephemeris (singleton adapter)
 _EPH_OK = True
 try:
     from app.core.ephem_singleton import TS, PLANETS
@@ -66,27 +55,46 @@ except Exception:
     TS = None                 # type: ignore
     PLANETS = None            # type: ignore
 
+# Houses: import via the same façade as routes.py
 _HOUSES_OK = True
 try:
-    from app.core.houses_advanced import compute_house_system as _compute_houses
-    from app.core.houses_advanced import assign_houses as _assign_houses
+    from app.core.house import compute_houses_with_policy as _compute_houses_with_policy
 except Exception:
     _HOUSES_OK = False
+    _compute_houses_with_policy = None  # type: ignore
 
+# We still use the robust cusp→house mapper from houses_advanced
+_ASSIGN_OK = True
+try:
+    from app.core.houses_advanced import assign_houses as _assign_houses
+except Exception:
+    _ASSIGN_OK = False
+    def _assign_houses(_lstA, _lstB):  # type: ignore
+        raise RuntimeError("assign_houses unavailable")
+
+# Panchanga (optional waxing/waning Moon)
 try:
     from app.core.panchanga import panchanga_elements_at as _panchanga_elements_at
 except Exception:
     _panchanga_elements_at = None
 
+# Vargas: use your core engine (wired also in vedic_routes)
+_VARGA_OK = True
+try:
+    from app.core.varga_charts import compute_many_vargas as _compute_many_vargas
+except Exception:
+    _VARGA_OK = False
+    _compute_many_vargas = None  # type: ignore
+
 # multiple timescale backends supported
 _ts = None
 _tk = None
 try:
-    from app.core import timescales as _ts  # preferred simple backend
+    from app.core import timescales as _ts  # fallback backend
 except Exception:
     _ts = None
 try:
-    from app.core import time_kernel as _tk  # richer backend if present
+    from app.core import time_kernel as _tk  # preferred/rich backend
 except Exception:
     _tk = None
 
@@ -171,7 +179,6 @@ def _waxing_moon_cached(jd_tt_bucket: int, ay_key: str) -> Optional[bool]:
     if _panchanga_elements_at is None:
         return None
     try:
-        # bucket by day to keep cache hit-rate high
         el = _panchanga_elements_at(float(jd_tt_bucket), ayanamsa_key=ay_key)
         idx = int(el["tithi"]["index"])
         return idx <= 15
@@ -199,7 +206,7 @@ def _timescales(payload: Dict[str, Any]) -> Tuple[float, float, List[str]]:
     t = payload.get("time") or payload.get("birth", {}).get("time") or "12:00:00"
     tz = payload.get("tz") or payload.get("place_tz") or payload.get("birth", {}).get("tz") or "UTC"
 
-    # rich kernels first
+    # rich kernel first
     if _tk is not None:
         for fname in ("timescales_from_civil","compute_timescales","build_timescales","to_timescales","from_civil"):
             fn = getattr(_tk, fname, None)
@@ -209,8 +216,8 @@ def _timescales(payload: Dict[str, Any]) -> Tuple[float, float, List[str]]:
                 except TypeError:
                     out = fn(d, t, tz)
                 if isinstance(out, dict):
-                    jt = float(out.get("jd_tt") or out.get("jdTT") or out.get("tt") or 0.0)
-                    ju = float(out.get("jd_ut1") or out.get("jd_ut") or out.get("ut1") or jt)
+                    jt = float(out.get("jd_tt") or out.get("tt") or 0.0)
+                    ju = float(out.get("jd_ut1") or out.get("ut1") or jt)
                     return jt, ju, warns
                 if isinstance(out, (list, tuple)) and len(out) >= 3:
                     ju, jt = float(out[1]), float(out[0])
@@ -234,9 +241,7 @@ def _timescales(payload: Dict[str, Any]) -> Tuple[float, float, List[str]]:
 @lru_cache(maxsize=4096)
 def _ayanamsa_cached(jd_tt_bucket: int, key_or_deg: str) -> Tuple[str, float, Tuple[str, ...]]:
     warns: List[str] = []
-    # numeric value encoded as string? allow "23.5"
     try:
-        # treat numeric-like strings as explicit degrees
         val = float(key_or_deg)
         return "explicit", val, tuple(warns)
     except Exception:
@@ -279,60 +284,70 @@ def _ecliptic_lons_cached(jd_tt_bucket: int, names_key: Tuple[str, ...]) -> Dict
     return {str(r["name"]): float(r["longitude"]) for r in (rows or [])}
 
 def _sidereal_longitudes(jd_tt: float, names: List[str], ay_deg: float) -> Dict[str, float]:
-    # bucket to nearest ~1e-6 day: practical caching for nearby calls
     jd_bucket = float(jd_tt)
     lons_trop = _ecliptic_lons_cached(int(round(jd_bucket * 1e6)), tuple(names))
     return {nm: _norm360(lon - float(ay_deg)) for nm, lon in lons_trop.items()}
 
 # ─────────────────────────────────────────────────────────────────────
-# Houses & mapping
+# Houses & mapping (via façade + assign helper)
 # ─────────────────────────────────────────────────────────────────────
 def _compute_houses_payload(lat: float, lon: float, jd_tt: float, jd_ut1: float, house_system: str) -> Dict[str, Any]:
-    if not _HOUSES_OK:
+    if not (_HOUSES_OK and callable(_compute_houses_with_policy)):
         raise RuntimeError("houses_module_unavailable")
-    # IMPORTANT: use jd_ut=jd_ut1 (previous code mistakenly fed jd_tt)
-    return _compute_houses(
-        latitude=float(lat),
-        longitude=float(lon),
-        house_system=str(house_system or "placidus"),
-        jd_ut=float(jd_ut1),
+    # IMPORTANT: pass jd_ut = jd_ut1 (strict engine uses UT1)
+    payload = _compute_houses_with_policy(  # type: ignore[misc]
+        lat=float(lat),
+        lon=float(lon),
+        system=str(house_system or "placidus"),
         jd_tt=float(jd_tt),
         jd_ut1=float(jd_ut1),
+        jd_ut=float(jd_ut1),
+        diagnostics=False,
+        validation=False,
     )
+    return payload
 
 def _house_map_for_planets(planet_lons: Dict[str, float], cusps: List[float]) -> Dict[str, int]:
     idxs = _assign_houses([planet_lons[p] for p in planet_lons], cusps)
     return {k: int(idxs[i]) for i, k in enumerate(planet_lons.keys())}
 
 # ─────────────────────────────────────────────────────────────────────
-# Varga helpers — built-in D9/D10 sign indexes (lightweight)
+# Vargas (D9/D10 + vargottama) — via core varga_charts
 # ─────────────────────────────────────────────────────────────────────
-def _d9_sign_index_from_lon(lon: float) -> int:
-    si = _sign_index(lon)
-    within = _norm360(lon) % 30.0
-    pada = int(within // (30.0 / 9.0))  # 0..8
-    if si in (0,3,6,9):      # movable: start same sign
-        start = si
-    elif si in (1,4,7,10):   # fixed: start 9th from sign
-        start = (si + 8) % 12
-    else:                    # dual: start 5th from sign
-        start = (si + 4) % 12
-    return (start + pada) % 12
+def _varga_context(pl_lons_sidereal: Dict[str, float], ay_key: str,
+                   enable: bool, varga_keys: Tuple[str, ...]) -> Tuple[Dict[str, bool], Dict[str, int], Dict[str, int], List[str]]:
+    """
+    Returns (vargottama_map, d9_signs, d10_signs, warnings)
+    NOTE: inputs are *sidereal* longitudes. We call varga engine with
+    zodiac_mode='tropical' so it treats inputs as final nirayana (no ay subtracted).
+    """
+    warns: List[str] = []
+    if not (enable and _VARGA_OK and callable(_compute_many_vargas)):
+        return {}, {}, {}, warns
+    try:
+        res = _compute_many_vargas(pl_lons_sidereal, list(varga_keys), zodiac_mode="tropical", ayanamsa=None)  # type: ignore[misc]
+    except Exception as e:
+        warns.append(f"varga_compute_error:{e}")
+        return {}, {}, {}, warns
 
-def _d10_sign_index_from_lon(lon: float) -> int:
-    si = _sign_index(lon)
-    within = _norm360(lon) % 30.0
-    part = int(within // 3.0)  # 0..9
-    if si in (0,3,6,9):      # movable
-        start = si
-    elif si in (1,4,7,10):   # fixed
-        start = (si + 8) % 12
-    else:                    # dual
-        start = (si + 3) % 12
-    return (start + part) % 12
+    d9: Dict[str, int] = {}
+    d10: Dict[str, int] = {}
+    for name, sub in (res.get("D9") or {}).items():
+        if isinstance(sub, dict) and "varga_rasi_index" in sub:
+            d9[str(name)] = int(sub["varga_rasi_index"])
+    for name, sub in (res.get("D10") or {}).items():
+        if isinstance(sub, dict) and "varga_rasi_index" in sub:
+            d10[str(name)] = int(sub["varga_rasi_index"])
 
-def _vargottama_flags(pl_lons: Dict[str, float]) -> Dict[str, bool]:
-    return {p: (_sign_index(lon) == _d9_sign_index_from_lon(lon)) for p, lon in pl_lons.items()}
+    vargottama: Dict[str, bool] = {}
+    for p, lon in pl_lons_sidereal.items():
+        try:
+            d1 = _sign_index(lon)
+            vargottama[p] = (d1 == d9.get(p, -99))
+        except Exception:
+            vargottama[p] = False
+
+    return vargottama, d9, d10, warns
 
 # ─────────────────────────────────────────────────────────────────────
 # Data structures & Registry
@@ -696,14 +711,14 @@ def _kala_sarpa_rule(ctx: Dict[str, Any]) -> List[YogaHit]:
     ]
 
 # ─────────────────────────────────────────────────────────────────────
-# Varga-aware scoring & optional AL notes (kept minimal for speed)
+# Varga-aware scoring (via varga_charts) — quick bumps only
 # ─────────────────────────────────────────────────────────────────────
 def _score_with_vargas(hit: YogaHit, ctx: Dict[str, Any], strengthen_on: Tuple[str,...]) -> YogaHit:
     if not hit.present:
         return hit
     bump = 0.0
+    vg = ctx.get("vargottama", {})
     if "D9" in strengthen_on:
-        vg = ctx.get("vargottama", {})
         if isinstance(hit.levels.get("lords"), dict):
             if any(vg.get(p, False) for p in hit.levels["lords"].values()):
                 bump += 0.04
@@ -729,10 +744,10 @@ def compute_yogas(
     chandra_mangala_by_sign: bool = True,
     conj_orb_deg: float = 6.0,
     gajakesari_include_same_house: bool = True,
-    include_mooltrikona_in_mahapurusha: bool = True,  # kept wiring (rule uses True)
+    include_mooltrikona_in_mahapurusha: bool = True,  # kept wiring
     use_vargas_for_scoring: bool = True,
     varga_keys_for_boost: Tuple[str,...] = ("D9","D10"),
-    include_arudha_notes: bool = False,  # disabled by default for speed in core
+    include_arudha_notes: bool = False,  # intentionally skipped for speed
     enable_catalog_tags: Tuple[str,...] = (),
     disable_catalog_tags: Tuple[str,...] = (),
 ) -> Dict[str, Any]:
@@ -740,39 +755,40 @@ def compute_yogas(
 
     warnings: List[str] = []
 
-    # Fast path: use precomputed sidereal points + cusps if present
+    # Fast path: precomputed *sidereal* points + cusps
     pre_pts = payload.get("points_deg")
     pre_cusps = payload.get("cusps_deg")
     lat = payload.get("latitude")
     lon = payload.get("longitude")
 
     if isinstance(pre_pts, dict) and isinstance(pre_cusps, (list, tuple)) and len(pre_cusps) >= 12:
-        # Normalize planet name keys to Title-case used here
         def _norm_name(k: str) -> str:
             s = str(k).strip()
             return s[:1].upper() + s[1:].lower()
         pl_lons = {_norm_name(k): float(v) for k,v in pre_pts.items() if k and v is not None}
         cusps = [float(pre_cusps[i]) for i in range(12)]
-        # fallback lat/lon not required for yoga rules; only for context
         lat_f = float(lat) if lat is not None else None
         lon_f = float(lon) if lon is not None else None
-        ay_key = str(ayanamsa) if not isinstance(ayanamsa, (int, float)) else "explicit"
-        ay_deg = float(ayanamsa) if isinstance(ayanamsa, (int, float)) else None
-        if ay_deg is None:
-            # ay_degrees unknown (points are already sidereal; we only keep ay key for context)
-            ay_deg = float("nan")
+
+        # ayanāṁśa context only (points are already sidereal)
+        ay_key = "explicit" if isinstance(ayanamsa, (int,float)) else str(ayanamsa)
+        ay_deg = float(ayanamsa) if isinstance(ayanamsa, (int,float)) else float("nan")
+
+        if not _ASSIGN_OK:
+            return {"ok": False, "error": "assign_houses_unavailable", "yogas": [], "warnings": warnings}
+
         pl_houses = _house_map_for_planets({k:v for k,v in pl_lons.items() if k in _PLANETS_ALL}, cusps)
-        asc_sid = float(cusps[0])  # assume cusp[0] is Asc sidereal
+        asc_sid = float(cusps[0])
         lagna_sign = _sign_index(asc_sid)
         sign_lords = _sign_lords(sign_lord_variant)
         house_lords = {i: sign_lords[(lagna_sign + (i-1)) % 12] for i in range(1,13)}
-        benefics = _benefic_set(float("nan"), ay_key)  # unknown moon phase → include Moon by default
-        d9_signs = {p: _d9_sign_index_from_lon(lon) for p,lon in pl_lons.items()}
-        d10_signs = {p: _d10_sign_index_from_lon(lon) for p,lon in pl_lons.items()}
-        vargottama = _vargottama_flags(pl_lons)
+        benefics = _benefic_set(float("nan"), str(ay_key))  # unknown moon phase → include Moon
+        # Vargas via your module (inputs are sidereal → zodiac_mode="tropical")
+        vargottama, d9_signs, d10_signs, warns_v = _varga_context(pl_lons, str(ay_key), use_vargas_for_scoring, varga_keys_for_boost)
+        warnings.extend(warns_v)
 
         ctx = {
-            "jd_tt": None, "ay_key": ay_key, "ay_deg": ay_deg,
+            "jd_tt": None, "ay_key": str(ay_key), "ay_deg": ay_deg,
             "lat": lat_f, "lon": lon_f,
             "asc_sid": asc_sid, "lagna_sign": lagna_sign,
             "cusps": cusps,
@@ -781,9 +797,10 @@ def compute_yogas(
             "benefics": benefics,
             "vargottama": vargottama, "d9_signs": d9_signs, "d10_signs": d10_signs,
         }
+
     else:
         # Full compute path (civil/site or jd_tt + jd_ut1)
-        if not (_EPH_OK and _HOUSES_OK):
+        if not (_EPH_OK and _HOUSES_OK and callable(_compute_houses_with_policy)):
             return {"ok": False, "error": "core_modules_unavailable", "yogas": [], "warnings": []}
 
         if not all(k in payload for k in ("latitude","longitude")):
@@ -800,7 +817,7 @@ def compute_yogas(
         ay_key, ay_deg, warns_ay = _ayanamsa_cached(int(round(jd_tt * 1e6)), str(ayanamsa))
         warnings.extend(list(warns_ay))
 
-        # Houses
+        # Houses (via façade)
         try:
             hp = _compute_houses_payload(lat_f, lon_f, jd_tt, jd_ut1, house_system)
         except Exception as e:
@@ -809,20 +826,21 @@ def compute_yogas(
         asc_sid = _norm360(asc_trop - ay_deg)
         lagna_sign = _sign_index(asc_sid)
 
-        # Longitudes & houses
+        # Longitudes (sidereal) & houses
         try:
             pl_lons = _sidereal_longitudes(jd_tt, list(_PLANETS_ALL), ay_deg)
         except Exception as e:
             return {"ok": False, "error": f"ephemeris_unavailable:{e}", "yogas": [], "warnings": warnings}
         pl_houses = _house_map_for_planets({k:v for k,v in pl_lons.items() if k in _PLANETS_ALL}, cusps)
 
-        # Lords, benefics, varga flags
+        # Lords, benefics
         sign_lords = _sign_lords(sign_lord_variant)
         house_lords = {i: sign_lords[(lagna_sign + (i-1)) % 12] for i in range(1,13)}
         benefics = _benefic_set(jd_tt, ay_key)
-        d9_signs = {p: _d9_sign_index_from_lon(lon) for p,lon in pl_lons.items()}
-        d10_signs = {p: _d10_sign_index_from_lon(lon) for p,lon in pl_lons.items()}
-        vargottama = _vargottama_flags(pl_lons)
+
+        # Vargas via your module (we already have *sidereal* longs → zodiac_mode="tropical")
+        vargottama, d9_signs, d10_signs, warns_v = _varga_context(pl_lons, ay_key, use_vargas_for_scoring, varga_keys_for_boost)
+        warnings.extend(warns_v)
 
         ctx = {
             "jd_tt": jd_tt, "ay_key": ay_key, "ay_deg": ay_deg,
@@ -837,10 +855,10 @@ def compute_yogas(
 
     # Tag gating
     if enable_catalog_tags:
-        for nm, rec in _RULES.items():
+        for _nm, rec in _RULES.items():
             rec["enabled"] = any(t in rec["tags"] for t in enable_catalog_tags)
     for tag in disable_catalog_tags:
-        for nm, rec in _RULES.items():
+        for _nm, rec in _RULES.items():
             if tag in rec["tags"]:
                 rec["enabled"] = False
 
@@ -857,10 +875,9 @@ def compute_yogas(
             elif isinstance(out, YogaHit):
                 hits.append(out)
         except Exception:
-            # robust: skip faulty rule
-            continue
+            continue  # robust: skip faulty rule
 
-    # Varga-aware scoring (quick bumps) — AL notes intentionally skipped by default for speed
+    # Optional varga-aware scoring bumps
     final_hits: List[YogaHit] = []
     if use_vargas_for_scoring:
         for h in hits:
@@ -880,7 +897,8 @@ def compute_yogas(
         "house_lords": ctx["house_lords"],
         "planet_houses": {k:int(v) for k,v in ctx["pl_houses"].items()},
         "planet_signs": {k:int(_sign_index(ctx["pl_lons"][k])) for k in ctx["pl_lons"]},
-        "vargottama": ctx["vargottama"],
+        "vargottama": ctx.get("vargottama", {}),
+        "varga_signs": {"D9": ctx.get("d9_signs", {}), "D10": ctx.get("d10_signs", {})},
         "house_system": house_system,
         "lat": ctx.get("lat"), "lon": ctx.get("lon"),
     }
