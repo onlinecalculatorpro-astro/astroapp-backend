@@ -5,18 +5,22 @@ Vedic API — Payload normalization & validation (Vimśottarī only)
 Public API:
     normalize_vim_payload(payload: Dict[str, Any]) -> tuple[Dict[str, Any], list[str], str]
 
-What it does for Vimśottarī:
-- Accepts your frontend shape:
+What it does for Vimśottarī
+---------------------------
+- Accepts your frontend shape (preferred):
     {
       "method": "sidereal|tropical",
       "observer": "geocentric|topocentric",
       "ayanamsa": "lahiri|fagan_bradley|krishnamurti|raman|yukteswar|devore|...",
       "date": "YYYY-MM-DD",
       "time": "HH:MM[:SS]",
-      "Place of Birth": "City, State, Country"
+      "place_city": "City",
+      "place_state": "State/Region",
+      "place_country": "Country"
     }
-  (Also accepts split fields: place_city / place_state / place_country.)
-- Resolves Place of Birth → latitude, longitude, elevation_m, tz (if resolver available).
+  (Also accepts a single freeform field: "Place of Birth": "City, State, Country".)
+
+- Resolves place → latitude, longitude, elevation_m, tz via astronomy.resolve_place(...) if available.
 - Normalizes to a canonical dict for the core:
     method, ayanamsa, coordinate_mode, topocentric, tz, lat/lon/elevation_m, levels, jd_tt, jd_ut1, etc.
 - NEVER returns jd_utc (ERFA-safe).
@@ -212,8 +216,15 @@ def normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List
     else:
         if callable(_resolve_place):
             try:
-                # Expected to return dict-like with keys: lat, lon, tz, elevation_m (if available)
-                pr = _resolve_place(pob_str)
+                # Prefer newer signature (q + parts); fall back to q-only if not supported.
+                city = _coerce_str(payload.get("place_city")).strip() or None
+                state = _coerce_str(payload.get("place_state")).strip() or None
+                country = _coerce_str(payload.get("place_country")).strip() or None
+                try:
+                    pr = _resolve_place(pob_str, place_city=city, place_state=state, place_country=country)  # type: ignore[misc]
+                except TypeError:
+                    pr = _resolve_place(pob_str)  # type: ignore[misc]
+
                 # Dict or object access
                 _lat = pr.get("lat") if isinstance(pr, dict) else getattr(pr, "lat", None)
                 _lon = pr.get("lon") if isinstance(pr, dict) else getattr(pr, "lon", None)
@@ -277,8 +288,8 @@ def normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List
         "time": time_str,
         "tz": tz_norm,
 
-        "method": method,                   # "sidereal" | "tropical"
-        "ayanamsa": ayanamsa,               # default "lahiri"
+        "method": method,                    # "sidereal" | "tropical"
+        "ayanamsa": ayanamsa,                # default "lahiri"
 
         "levels": depth,
         "max_levels": depth,
@@ -287,7 +298,7 @@ def normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List
         "longitude": lon,
         "elevation_m": elevation_m,
 
-        "coordinate_mode": coordinate_mode, # "geocentric" | "topocentric"
+        "coordinate_mode": coordinate_mode,  # "geocentric" | "topocentric"
         "topocentric": bool(topocentric),
 
         "place_name": pob_str or None,
