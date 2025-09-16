@@ -71,7 +71,7 @@ except Exception:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Varga engine (new)
+# Varga engine (varga_charts)
 # ──────────────────────────────────────────────────────────────────────────────
 try:
     from app.core.varga_charts import (
@@ -85,6 +85,24 @@ except Exception:
     _compute_varga_chart = None  # type: ignore
     _compute_many_vargas = None  # type: ignore
     _VARGA_OK = False
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Timescales + Ayanāṁśa (to avoid fallback on varga routes)
+# ──────────────────────────────────────────────────────────────────────────────
+try:
+    from app.core.timescales import build_timescales  # type: ignore
+    _TS_OK = True
+except Exception:
+    build_timescales = None  # type: ignore
+    _TS_OK = False
+
+try:
+    from app.core.ayanamsa import get_ayanamsa_deg  # type: ignore
+    _AY_OK = True
+except Exception:
+    get_ayanamsa_deg = None  # type: ignore
+    _AY_OK = False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -460,7 +478,7 @@ def _run_kalachakra(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Varga helpers (simple, request-scoped; no tz/jd needed)
+# Varga helpers (request-scoped; will compute ayanāṁśa deg from jd_tt if possible)
 # ──────────────────────────────────────────────────────────────────────────────
 def _norm_method(v: Any, default: str = "sidereal") -> str:
     if isinstance(v, str):
@@ -505,8 +523,131 @@ def _pick_vargas(body: Dict[str, Any]) -> List[str]:
     # sensible default if caller forgot (match common UI)
     return ["D1", "D9", "D10", "D12"]
 
-def _wrap_varga_meta(route: str, method: str, ay: Any) -> Dict[str, Any]:
-    return {"route": route, "branch": "varga_charts", "zodiac_mode": method, "ayanamsa": ay}
+def _wrap_varga_meta(route: str, method: str, ay_meta: Dict[str, Any]) -> Dict[str, Any]:
+    base = {"route": route, "branch": "varga_charts", "zodiac_mode": method}
+    base.update(ay_meta or {})
+    return base
+
+def _pad_hms(t: Any) -> str:
+    s = str(t or "").strip()
+    if not s: return "12:00:00"
+    parts = s.split(":")
+    if len(parts) == 1: return f"{parts[0]}:00:00"
+    if len(parts) == 2: return f"{parts[0]}:{parts[1]}:00"
+    return s
+
+def _jd_tt_from_body(body: Dict[str, Any]) -> Optional[float]:
+    # direct overrides
+    jd = _coerce_float(body.get("jd_tt") or body.get("birth_jd_tt"))
+    if isinstance(jd, float):
+        return jd
+    # civil → JD_TT
+    if not _TS_OK:
+        return None
+    date = str(body.get("date") or body.get("birth_date") or "").strip()
+    if not date:
+        return None
+    time = _pad_hms(body.get("time") or body.get("birth_time") or "12:00")
+    tz   = str(body.get("tz") or body.get("place_tz") or "UTC").strip() or "UTC"
+    try:
+        ts = build_timescales(date, time, tz, _env_dut1_seconds())  # type: ignore[misc]
+        if isinstance(ts, dict):
+            j = ts.get("jd_tt")
+        else:
+            j = getattr(ts, "jd_tt", None)
+        return float(j) if j is not None else None
+    except Exception:
+        return None
+
+def _ayanamsa_deg_from_key(jd_tt: Optional[float], key: str) -> Optional[float]:
+    if not _AY_OK or get_ayanamsa_deg is None:
+        return None
+    try:
+        # Prefer (jd_tt, key); fall back to (None, key) if the impl allows it.
+        if jd_tt is not None:
+            try:
+                return float(get_ayanamsa_deg(jd_tt, key))  # type: ignore[misc]
+            except Exception:
+                pass
+        return float(get_ayanamsa_deg(None, key))  # type: ignore[misc]
+    except Exception:
+        return None
+
+def _resolve_ayanamsa_for_engine(body: Dict[str, Any], method: str, jd_tt: Optional[float]) -> tuple[Any, Dict[str, Any]]:
+    """
+    Decide what to pass into varga_charts:
+      - Tropical → ayanamsa not applied (pass-through; note why)
+      - If numeric provided (ayanamsa or ayanamsa_deg) → use numeric (explicit)
+      - If string key and we can compute deg via get_ayanamsa_deg(jd_tt,key) → use numeric
+      - Else pass string through (engine may fallback to 0°); include warning in meta
+    Returns (ayanamsa_for_engine, meta_dict)
+    """
+    meta: Dict[str, Any] = {
+        "ts_available": _TS_OK,
+        "ayanamsa_adapter_available": _AY_OK,
+        "jd_tt_used": jd_tt,
+    }
+    method_lc = (method or "sidereal").lower()
+    ay_in = body.get("ayanamsa")
+    ay_deg_in = _coerce_float(body.get("ayanamsa_deg"))
+
+    # Tropical: ignore ayanamsa, but still echo what was received for transparency
+    if method_lc.startswith("trop"):
+        meta.update({
+            "ayanamsa_input": ay_in if ay_in is not None else ("ayanamsa_deg=" + str(ay_deg_in) if ay_deg_in is not None else None),
+            "ayanamsa_effective": None,
+            "ayanamsa_resolve": "not_applied_tropical",
+        })
+        return ay_in, meta  # value is ignored downstream anyway
+
+    # Sidereal
+    # 1) explicit numeric wins
+    if isinstance(ay_deg_in, float):
+        meta.update({
+            "ayanamsa_input": ay_deg_in,
+            "ayanamsa_effective": ay_deg_in,
+            "ayanamsa_resolve": "explicit_numeric",
+        })
+        return ay_deg_in, meta
+    if isinstance(ay_in, (int, float)):
+        val = float(ay_in)
+        meta.update({
+            "ayanamsa_input": val,
+            "ayanamsa_effective": val,
+            "ayanamsa_resolve": "explicit_numeric",
+        })
+        return val, meta
+
+    # 2) string key → try to compute degrees with jd_tt
+    key = _norm_ayanamsa(ay_in)
+    if isinstance(key, str) and key:
+        deg = _ayanamsa_deg_from_key(jd_tt, key)
+        if isinstance(deg, float):
+            meta.update({
+                "ayanamsa_input": key,
+                "ayanamsa_effective": deg,
+                "ayanamsa_resolve": "computed_from_key",
+                "ayanamsa_key": key,
+            })
+            return deg, meta
+        # Could not compute — pass the key through (engine may fallback to 0°)
+        meta.update({
+            "ayanamsa_input": key,
+            "ayanamsa_effective": key,
+            "ayanamsa_resolve": "pass_through_string_fallback",
+            "ayanamsa_key": key,
+            "warning": "could_not_compute_ayanamsa_degrees_from_key",
+        })
+        return key, meta
+
+    # 3) last resort default
+    meta.update({
+        "ayanamsa_input": key,
+        "ayanamsa_effective": key,
+        "ayanamsa_resolve": "default_key_passthrough",
+    })
+    return key, meta
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Routes (mounted at /api/vedic)
@@ -541,6 +682,8 @@ def vedic_diag():
         "module_kalachakra_present": bool(_compute_kcd_module),
         "module_kalachakra_sig": sigs(_compute_kcd_module) if _compute_kcd_module else None,
         "varga_engine_present": _VARGA_OK,
+        "timescales_present": _TS_OK,
+        "ayanamsa_adapter_present": _AY_OK,
         "rl_cap_per_min": RL_VEDIC_PREDICTIVE,
         "rl_bucket_key": "20",
         "dut1_seconds_env": _env_dut1_seconds(),
@@ -608,7 +751,10 @@ def vedic_varga_position():
         "varga": "D9",
         "lon_deg": 123.456,         # tropical by default unless method='sidereal'
         "method": "sidereal|tropical",
-        "ayanamsa": "lahiri" | 22.5
+        "ayanamsa": "lahiri" | 22.5,
+        // optionally include one of:
+        "jd_tt": 2447762.123,
+        "date": "1989-07-26", "time": "20:44", "tz": "Asia/Kolkata"
       }
     """
     if not _VARGA_OK or _varga_position is None:
@@ -621,11 +767,17 @@ def vedic_varga_position():
         return jsonify({"ok": False, "error": "missing_or_invalid_lon_deg"}), 400
 
     method = _norm_method(body.get("method") or body.get("zodiac_mode") or "sidereal")
-    ay = _norm_ayanamsa(body.get("ayanamsa"))
+    jd_tt = _jd_tt_from_body(body)
+    ay_for_engine, ay_meta = _resolve_ayanamsa_for_engine(body, method, jd_tt)
 
     try:
-        result = _varga_position(float(lon), varga, zodiac_mode=method, ayanamsa=ay)
-        out = {"ok": True, "varga": result.get("varga", varga), "result": result, "meta": _wrap_varga_meta("varga/position", method, ay)}
+        result = _varga_position(float(lon), varga, zodiac_mode=method, ayanamsa=ay_for_engine)
+        out = {
+            "ok": True,
+            "varga": result.get("varga", varga),
+            "result": result,
+            "meta": _wrap_varga_meta("varga/position", method, ay_meta),
+        }
         return jsonify(out), 200
     except Exception as e:
         return jsonify({"ok": False, "error": "varga_position_failed", "detail": str(e)}), 400
@@ -642,7 +794,10 @@ def vedic_varga_chart():
         "varga": "D9",
         "longitudes": { "Sun": 123.4, "Moon": 210.6, ... },  # tropical unless method='sidereal'
         "method": "sidereal|tropical",
-        "ayanamsa": "lahiri" | 22.5
+        "ayanamsa": "lahiri" | 22.5,
+        // optionally include either jd_tt or {date,time,tz}
+        "jd_tt": 2447762.123,
+        "date": "1989-07-26", "time": "20:44", "tz": "Asia/Kolkata"
       }
     """
     if not _VARGA_OK or _compute_varga_chart is None:
@@ -655,16 +810,17 @@ def vedic_varga_chart():
         return jsonify({"ok": False, "error": "missing_or_invalid_longitudes"}), 400
 
     method = _norm_method(body.get("method") or body.get("zodiac_mode") or "sidereal")
-    ay = _norm_ayanamsa(body.get("ayanamsa"))
+    jd_tt = _jd_tt_from_body(body)
+    ay_for_engine, ay_meta = _resolve_ayanamsa_for_engine(body, method, jd_tt)
 
     try:
-        placements = _compute_varga_chart(longitudes, varga, zodiac_mode=method, ayanamsa=ay)
+        placements = _compute_varga_chart(longitudes, varga, zodiac_mode=method, ayanamsa=ay_for_engine)
         out = {
             "ok": True,
             "varga": varga.upper(),
             "placements": placements,
-            "options": {"zodiac_mode": method, "ayanamsa": ay},
-            "meta": _wrap_varga_meta("varga/chart", method, ay),
+            "options": {"zodiac_mode": method, "ayanamsa": ay_for_engine},
+            "meta": _wrap_varga_meta("varga/chart", method, ay_meta),
         }
         return jsonify(out), 200
     except Exception as e:
@@ -682,7 +838,10 @@ def vedic_varga_many():
         "vargas": ["D1","D9","D10"],
         "longitudes": { "Sun": 123.4, "Moon": 210.6, ... },  # tropical unless method='sidereal'
         "method": "sidereal|tropical",
-        "ayanamsa": "lahiri" | 22.5
+        "ayanamsa": "lahiri" | 22.5,
+        // optionally include either jd_tt or {date,time,tz}
+        "jd_tt": 2447762.123,
+        "date": "1989-07-26", "time": "20:44", "tz": "Asia/Kolkata"
       }
     """
     if not _VARGA_OK or _compute_many_vargas is None:
@@ -695,16 +854,17 @@ def vedic_varga_many():
 
     vargas = _pick_vargas(body)
     method = _norm_method(body.get("method") or body.get("zodiac_mode") or "sidereal")
-    ay = _norm_ayanamsa(body.get("ayanamsa"))
+    jd_tt = _jd_tt_from_body(body)
+    ay_for_engine, ay_meta = _resolve_ayanamsa_for_engine(body, method, jd_tt)
 
     try:
-        placements = _compute_many_vargas(longitudes, vargas, zodiac_mode=method, ayanamsa=ay)
+        placements = _compute_many_vargas(longitudes, vargas, zodiac_mode=method, ayanamsa=ay_for_engine)
         out = {
             "ok": True,
             "vargas": [v.upper() for v in vargas],
             "placements": placements,  # { 'D9': { 'Sun': {...}, ... }, ... }
-            "options": {"zodiac_mode": method, "ayanamsa": ay},
-            "meta": _wrap_varga_meta("varga/many", method, ay),
+            "options": {"zodiac_mode": method, "ayanamsa": ay_for_engine},
+            "meta": _wrap_varga_meta("varga/many", method, ay_meta),
         }
         return jsonify(out), 200
     except Exception as e:
