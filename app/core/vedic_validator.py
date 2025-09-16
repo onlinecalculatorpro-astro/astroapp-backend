@@ -1,12 +1,12 @@
 # app/core/vedic_validator.py
 """
-Vedic API — Payload normalization & validation (Vimśottarī only)
+Vedic API — Payload normalization & validation (Vimśottarī + optional Varga request)
 
 Public API:
     normalize_vim_payload(payload: Dict[str, Any]) -> tuple[Dict[str, Any], list[str], str]
 
-What it does for Vimśottarī
----------------------------
+What it does
+------------
 - Accepts your frontend shape (preferred):
     {
       "method": "sidereal|tropical",
@@ -16,14 +16,23 @@ What it does for Vimśottarī
       "time": "HH:MM[:SS]",
       "place_city": "City",
       "place_state": "State/Region",
-      "place_country": "Country"
+      "place_country": "Country",
+
+      // NEW — optional Varga request (no computation here):
+      // Any of these keys may be used by the frontend; we normalize them.
+      "vargas": ["D9","D10"],
+      "varga": "D9, D10",
+      "divisional": ["navamsa","dashamsa"],
+      "divisional_charts": "d2, d9, trimsamsa",
+      "include_vargas": true,
+      "varga_zodiac_mode": "sidereal|tropical",   // default → "sidereal"
+      "varga_ayanamsa": "lahiri" | 23.856         // default → ayanamsa from payload
     }
-  (Also accepts a single freeform field: "Place of Birth": "City, State, Country".)
 
 - Resolves place → latitude, longitude, elevation_m, tz via astronomy.resolve_place(...) if available.
-- Normalizes to a canonical dict for the core:
-    method, ayanamsa, coordinate_mode, topocentric, tz, lat/lon/elevation_m, levels, jd_tt, jd_ut1, etc.
-- NEVER returns jd_utc (ERFA-safe).
+- Computes time scales (jd_tt/jd_ut1). NEVER returns jd_utc (ERFA-safe).
+- Returns a canonical dict for the core, plus an optional **varga_request** block that downstream engines
+  (e.g., varga_charts) can use to compute divisional charts.
 """
 
 from __future__ import annotations
@@ -40,11 +49,9 @@ except Exception:
     _TIMESCALES_OK = False
 
 # ── Optional place resolver (geocoding + tz + elevation) via astronomy.py ──
-# We try multiple likely function names to keep it robust across deployments.
 _resolve_place = None
 try:
     import app.core.astronomy as _astro  # type: ignore
-
     for _fname in (
         "resolve_place",          # preferred
         "geocode_place",
@@ -60,17 +67,16 @@ except Exception:
     _astro = None  # type: ignore
     _resolve_place = None
 
-# ── Timezone normalization table (lightweight) ──
-_TZ_ALIAS = {
-    "asia/patna": "Asia/Kolkata",
-    "asia/calcutta": "Asia/Kolkata",
-    "ist": "Asia/Kolkata",
-    "indian standard time": "Asia/Kolkata",
-}
-_TZ_FALLBACK = "UTC"
+# ── Optional varga module (for key normalization only; no computation here) ──
+try:
+    from app.core import varga_charts as _varga  # type: ignore
+    _VARGA_OK = True
+except Exception:
+    _varga = None  # type: ignore
+    _VARGA_OK = False
 
 # ── Simple helpers ──
-_NUM_RE = re.compile(r"^[+-]?\d+(\.\d+)?$")
+_NUM_RE = re.compile(r"^[+-]?\d+(?:\.\d+)?$")
 
 
 def _coerce_str(x: Any, default: str = "") -> str:
@@ -93,15 +99,6 @@ def _as_float(x: Any) -> Optional[float]:
         except Exception:
             return None
     return None
-
-
-def _normalize_tz(tz: Any) -> str:
-    if not isinstance(tz, str):
-        return _TZ_FALLBACK
-    key = tz.strip()
-    if not key:
-        return _TZ_FALLBACK
-    return _TZ_ALIAS.get(key.lower(), key)
 
 
 def _pad_hms(t: str) -> str:
@@ -166,13 +163,87 @@ def _join_place(city: str, state: str, country: str) -> str:
     return ", ".join(parts)
 
 
-# ────────────────────────────────────────────────────────────────────────────────
+# ── Varga key collection & normalization (no computation here) ──
+_VARGA_ALIAS_MIN = {
+    # minimal alias map to decouple validator from varga internals
+    "rasi": "D1", "d1": "D1",
+    "hora": "D2", "d2": "D2",
+    "drekkana": "D3", "d3": "D3",
+    "chaturthamsa": "D4", "d4": "D4",
+    "saptamsa": "D7", "d7": "D7",
+    "navamsa": "D9", "navamsha": "D9", "d9": "D9",
+    "dasamsa": "D10", "dashamsa": "D10", "d10": "D10",
+    "dvadasamsa": "D12", "dvadashamsa": "D12", "d12": "D12",
+    "shodasamsa": "D16", "sodasamsa": "D16", "d16": "D16",
+    "vimsamsa": "D20", "d20": "D20",
+    "chaturvimshamsa": "D24", "siddhamsa": "D24", "d24": "D24",
+    "bhamsa": "D27", "nakshatramsa": "D27", "d27": "D27",
+    "trimsamsa": "D30", "trimsamsha": "D30", "d30": "D30",
+    "khavedamsa": "D40", "d40": "D40",
+    "akshavedamsa": "D45", "d45": "D45",
+    "shashtiamsa": "D60", "shastiamsa": "D60", "d60": "D60",
+}
+
+
+def _canon_varga_key(x: str) -> Optional[str]:
+    if not x:
+        return None
+    k = x.strip()
+    if not k:
+        return None
+    # Prefer project’s varga module resolver if available
+    if _VARGA_OK:
+        try:
+            res = getattr(_varga, "_resolve_key", None)
+            if callable(res):
+                return str(res(k))
+        except Exception:
+            pass
+    kl = k.lower()
+    if kl in _VARGA_ALIAS_MIN:
+        return _VARGA_ALIAS_MIN[kl]
+    if kl.startswith("d") and kl[1:].isdigit():
+        return "D" + kl[1:]
+    return None
+
+
+def _collect_vargas(payload: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+    """Return (canon_vargas, warnings). Accept list or comma strings across multiple keys."""
+    warns: List[str] = []
+    raw_keys: List[str] = []
+    for key in ("vargas", "varga", "divisional", "divisional_charts"):
+        v = payload.get(key)
+        if not v:
+            continue
+        if isinstance(v, (list, tuple)):
+            raw_keys.extend([_coerce_str(x) for x in v])
+        else:
+            txt = _coerce_str(v)
+            raw_keys.extend([p for p in re.split(r"[,\s]+", txt) if p])
+    canon: List[str] = []
+    bad: List[str] = []
+    for x in raw_keys:
+        ck = _canon_varga_key(x)
+        if ck:
+            if ck not in canon:
+                canon.append(ck)
+        else:
+            bad.append(x)
+    if bad:
+        warns.append("unknown_varga_keys:" + ",".join(bad))
+    return canon, warns
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main entry — Vimśottarī + optional Varga payload
+# ─────────────────────────────────────────────────────────────────────────────
+
 def normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str], str]:
     """
-    Normalize inputs for Vimśottarī with basis (method) & observer switches.
+    Normalize inputs for Vimśottarī with basis (method) & observer switches,
+    and optionally include a varga_request block (no varga computation here).
 
-    Returns:
-        (norm, warns, tz_norm)
+    Returns: (norm, warns, tz_norm)
     """
     warns: List[str] = []
 
@@ -205,7 +276,7 @@ def normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List
     lat = _as_float(payload.get("latitude") or payload.get("lat"))
     lon = _as_float(payload.get("longitude") or payload.get("lon"))
     elevation_m = _as_float(payload.get("elevation_m") or payload.get("elevation"))
-    tz_norm = _normalize_tz(payload.get("tz") or payload.get("place_tz") or _TZ_FALLBACK)
+    tz_norm = _coerce_str(payload.get("tz") or payload.get("place_tz") or "UTC").strip() or "UTC"
 
     # Levels / depth
     depth = _clamp_levels(payload.get("levels", payload.get("depth", payload.get("max_levels", 5))), default=5)
@@ -216,7 +287,6 @@ def normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List
     else:
         if callable(_resolve_place):
             try:
-                # Prefer newer signature (q + parts); fall back to q-only if not supported.
                 city = _coerce_str(payload.get("place_city")).strip() or None
                 state = _coerce_str(payload.get("place_state")).strip() or None
                 country = _coerce_str(payload.get("place_country")).strip() or None
@@ -237,7 +307,7 @@ def normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List
                 if _elev is not None:
                     elevation_m = _as_float(_elev)
                 if _tz:
-                    tz_norm = _normalize_tz(_tz)
+                    tz_norm = _coerce_str(_tz).strip() or tz_norm
                 else:
                     warns.append("place_resolved_without_tz:fallback_tz_applied")
             except Exception as e:
@@ -281,6 +351,22 @@ def normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List
         except Exception as e:
             warns.append(f"timescales_failed:{e!s}")
 
+    # ── Varga request normalization (no computation) ──
+    vargas, varga_warns = _collect_vargas(payload)
+    warns.extend(varga_warns)
+    include_vargas = bool(payload.get("include_vargas") or vargas)
+    varga_mode = _norm_method(payload.get("varga_zodiac_mode"), default="sidereal")
+    varga_ayan = payload.get("varga_ayanamsa", ayanamsa)
+
+    varga_request = None
+    if include_vargas and vargas:
+        varga_request = {
+            "enabled": True,
+            "vargas": vargas,                 # canonical keys like D9, D10, D30
+            "zodiac_mode": varga_mode,        # "sidereal" (default) or "tropical"
+            "ayanamsa": varga_ayan,           # string key or numeric degrees; no JD used here
+        }
+
     # ── Canonical normalized dict for the core ──
     norm: Dict[str, Any] = {
         "system": "vimshottari",
@@ -319,12 +405,13 @@ def normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List
         "depth": depth,
     })
 
+    if varga_request:
+        norm["varga_request"] = varga_request
+
     # ── Final light sanity notes ──
     if not date:
         warns.append("missing_date")
     if not time_str:
         warns.append("missing_time")
-    if tz_norm == _TZ_FALLBACK and payload.get("tz"):
-        warns.append("tz_normalization_fallback")
 
     return norm, warns, tz_norm
