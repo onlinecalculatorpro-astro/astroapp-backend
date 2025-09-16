@@ -1,7 +1,7 @@
 # app/api/vedic_routes.py
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Iterable, Optional
 import inspect
 import os
 
@@ -15,12 +15,12 @@ vedic_api = Blueprint("vedic_api", __name__)
 RL_VEDIC_PREDICTIVE = int(os.getenv("ASTRO_RL_VEDIC_PREDICTIVE_PER_MIN", "20"))
 
 def fixed_key(*_a, **_k) -> str:
-    """Shared bucket key ('20') used by all dasha calls."""
+    """Shared bucket key ('20') used by all predictive/varga calls."""
     return "20"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Validator (NO jd_utc)
+# Validator (NO jd_utc) — used by dasha routes
 # ──────────────────────────────────────────────────────────────────────────────
 try:
     from app.core.vedic_validator import normalize_vim_payload  # type: ignore
@@ -32,7 +32,7 @@ else:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Engines: central registry (preferred) + direct module fallbacks
+# Engines: central registry (preferred) + direct module fallbacks (dasha)
 # ──────────────────────────────────────────────────────────────────────────────
 _compute_dasha_registry = None
 _available_schemes_fn = None
@@ -68,6 +68,23 @@ try:
     from app.core.kala_chakra_dasha import compute_kalachakra_dasha as _compute_kcd_module  # type: ignore
 except Exception:
     _compute_kcd_module = None  # type: ignore
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Varga engine (new)
+# ──────────────────────────────────────────────────────────────────────────────
+try:
+    from app.core.varga_charts import (
+        varga_position as _varga_position,
+        compute_varga_chart as _compute_varga_chart,
+        compute_many_vargas as _compute_many_vargas,
+    )
+    _VARGA_OK = True
+except Exception:
+    _varga_position = None  # type: ignore
+    _compute_varga_chart = None  # type: ignore
+    _compute_many_vargas = None  # type: ignore
+    _VARGA_OK = False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -115,7 +132,7 @@ def _add_levels_and_limit(payload: Dict[str, Any], norm: Dict[str, Any]) -> None
         payload["limit_jd_tt"] = norm["limit_jd_tt"]
 
 
-# ---- civic payload builders ---------------------------------------------------
+# ---- civic payload builders (dasha) ------------------------------------------
 def _pick_times(norm: Dict[str, Any], original: Dict[str, Any]) -> Dict[str, Any]:
     civ: Dict[str, Any] = {}
     # Prefer direct jd_tt if given
@@ -138,14 +155,7 @@ def _pick_times(norm: Dict[str, Any], original: Dict[str, Any]) -> Dict[str, Any
 
 def _build_civic_payload_vim(original: Dict[str, Any], norm: Dict[str, Any]) -> Dict[str, Any]:
     """
-    New: pass through flexible flags for Vimśottarī:
-      - method: "sidereal" | "tropical"  (default handled by validator/engine)
-      - coordinate_mode: "geocentric" | "topocentric"
-        (also accepts observer="..." or topocentric: true/false)
-      - ayanamsa: string key (default "lahiri")
-      - optional birth place fields (city/state/country or free-form 'place')
-      - lat/lon/elevation (used when topocentric)
-    Keeps legacy options like span_years, end_jd_tt, year_days, query params, flatten_level.
+    Flexible flags for Vimśottarī (method/observer/ayanamsa/place/etc.).
     """
     civ: Dict[str, Any] = {}
 
@@ -159,11 +169,11 @@ def _build_civic_payload_vim(original: Dict[str, Any], norm: Dict[str, Any]) -> 
         if isinstance(v, str) and v.strip():
             civ[k] = v.strip()
 
-    # Flexible flags (already normalized by validator when present)
+    # Method/observer/ayanamsa
     if norm.get("method"):
-        civ["method"] = norm["method"]  # "sidereal" | "tropical"
+        civ["method"] = norm["method"]
     if norm.get("coordinate_mode"):
-        civ["coordinate_mode"] = norm["coordinate_mode"]  # "geocentric" | "topocentric"
+        civ["coordinate_mode"] = norm["coordinate_mode"]
         civ["topocentric"] = (str(norm["coordinate_mode"]).lower() == "topocentric")
     elif "observer" in original:
         obs = str(original.get("observer") or "").strip().lower()
@@ -173,26 +183,23 @@ def _build_civic_payload_vim(original: Dict[str, Any], norm: Dict[str, Any]) -> 
         civ["topocentric"] = bool(original.get("topocentric"))
         civ["coordinate_mode"] = "topocentric" if civ["topocentric"] else "geocentric"
 
-    # Ayanāṃśa (default "lahiri" is handled upstream; pass through if present)
     if norm.get("ayanamsa") is not None:
         civ["ayanamsa"] = norm["ayanamsa"]
 
-    # Geography (used if topocentric; harmless otherwise)
+    # Geography
     for k in ("latitude", "longitude", "elevation"):
         if norm.get(k) is not None:
             civ[k] = norm[k]
         elif original.get(k) is not None:
             civ[k] = original[k]
 
-    # Optional "place" fields (pass-through for logging/UX; engine can ignore)
-    # Accept either a free-form "place" or structured pieces.
+    # Optional place fields (pass-through)
     for k in ("place", "place_city", "place_state", "place_country"):
         if original.get(k) is not None:
             civ[k] = original[k]
         elif norm.get(k) is not None:
             civ[k] = norm[k]
 
-    # Depth & window controls
     _add_levels_and_limit(civ, norm)
     for k in ("span_years", "end_jd_tt", "year_days", "query_jd_tt", "q_date", "q_time", "q_tz", "flatten_level"):
         if k in original and original[k] is not None:
@@ -252,15 +259,12 @@ def _build_civic_payload_kcd(original: Dict[str, Any], norm: Dict[str, Any]) -> 
     if norm.get("ayanamsa") is not None:
         civ["ayanamsa"] = norm["ayanamsa"]
 
-    # levels
     civ["levels"] = _levels_from(norm)
 
-    # ensure limit_jd_tt if present
     lim = original.get("limit_jd_tt", norm.get("limit_jd_tt"))
     if isinstance(lim, (int, float)):
         civ["limit_jd_tt"] = float(lim)
 
-    # KCD-specific settings
     for k in (
         "kcd_table", "kcd_preset", "use_demo_kcd_table",
         "override_start_sign_index", "year_days",
@@ -272,7 +276,7 @@ def _build_civic_payload_kcd(original: Dict[str, Any], norm: Dict[str, Any]) -> 
     return civ
 
 
-# ---- tiny module-call shim ----------------------------------------------------
+# ---- tiny module-call shim (dasha) -------------------------------------------
 def _call_single_param_or_kwargs(fn, payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         sig = inspect.signature(fn)  # type: ignore[arg-type]
@@ -291,9 +295,7 @@ def _call_single_param_or_kwargs(fn, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _ensure_tree_envelope(res: Dict[str, Any], *, scheme: str) -> Dict[str, Any]:
     """
-    Normalize shapes to a consistent tree envelope + nested, while preserving
-    engine metadata like nakshatra/moon_nirayana_deg/year_days, which the
-    frontend/dev tools may rely on for boundary badges, etc.
+    Normalize shapes to a consistent tree envelope + nested.
     """
     if not isinstance(res, dict):
         return res
@@ -304,18 +306,9 @@ def _ensure_tree_envelope(res: Dict[str, Any], *, scheme: str) -> Dict[str, Any]
         s0 = min((float(p.get("start_jd_tt", 0.0)) for p in periods), default=0.0)
         e1 = max((float(p.get("end_jd_tt", 0.0)) for p in periods), default=0.0)
 
-        # extras we want to surface on the root for easy access
         extras_keys = (
-            "nakshatra",
-            "moon_nirayana_deg",
-            "birth_jd_tt",
-            "year_days",
-            "levels",
-            # include any other passthroughs your engine might add later:
-            "ayanamsa",
-            "method",
-            "coordinate_mode",
-            "topocentric",
+            "nakshatra", "moon_nirayana_deg", "birth_jd_tt", "year_days",
+            "levels", "ayanamsa", "method", "coordinate_mode", "topocentric",
         )
         extras = {k: t[k] for k in extras_keys if k in t}
 
@@ -328,7 +321,7 @@ def _ensure_tree_envelope(res: Dict[str, Any], *, scheme: str) -> Dict[str, Any]
             "start_jd_tt": s0,
             "end_jd_tt": e1,
             "children": periods,
-            **extras,  # ← keep nakshatra & co.
+            **extras,
         }
         out["tree"] = root
         return out
@@ -374,7 +367,7 @@ def _run_with_registry_first(
 
     norm, warns, tz_norm = normalize_vim_payload(body)  # type: ignore[misc]
 
-    # Attempt central registry (preferred) — return ONLY on success
+    # Attempt central registry (preferred)
     if _compute_dasha_registry is not None:
         try:
             civ = civic_builder(body, norm)
@@ -383,10 +376,8 @@ def _run_with_registry_first(
             if isinstance(out, dict) and out.get("ok"):
                 out = _ensure_tree_envelope(out, scheme=scheme_key)
                 return _wrap_ok(out, warns, tz_norm, branch="registry.compute_dasha", route_name=route_name)
-            # else: fall through to module fallback
         except Exception:
-            # fall through to module fallback
-            pass
+            pass  # fall through
 
     # Module fallback, if available
     if module_fallback_fn is not None:
@@ -469,6 +460,55 @@ def _run_kalachakra(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Varga helpers (simple, request-scoped; no tz/jd needed)
+# ──────────────────────────────────────────────────────────────────────────────
+def _norm_method(v: Any, default: str = "sidereal") -> str:
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("sidereal", "nirayana", "nirāyaṇa", "sid", "s"): return "sidereal"
+        if s in ("tropical", "sayana", "sāyana", "trop", "t"):   return "tropical"
+    return default
+
+def _norm_ayanamsa(v: Any) -> Any:
+    # pass through floats/ints; normalize strings; default lahiri
+    if v is None: return "lahiri"
+    if isinstance(v, (int, float)): return float(v)
+    return str(v).strip().lower() or "lahiri"
+
+def _coerce_float(x: Any) -> Optional[float]:
+    try:
+        if isinstance(x, (int, float)): return float(x)
+        if isinstance(x, str) and x.strip() not in ("", "null", "None"):
+            return float(x.strip())
+    except Exception:
+        return None
+    return None
+
+def _pick_longitudes(body: Dict[str, Any]) -> Dict[str, float]:
+    for key in ("longitudes", "points_deg", "longitudes_by_name"):
+        raw = body.get(key)
+        if isinstance(raw, dict):
+            out: Dict[str, float] = {}
+            for name, val in raw.items():
+                f = _coerce_float(val)
+                if f is not None:
+                    out[str(name)] = f
+            return out
+    return {}
+
+def _pick_vargas(body: Dict[str, Any]) -> List[str]:
+    v = body.get("vargas") or body.get("include")
+    if isinstance(v, (list, tuple)):
+        return [str(x).upper() for x in v if str(x).strip()]
+    if isinstance(v, str) and v.strip():
+        return [s.strip().upper() for s in v.split(",") if s.strip()]
+    # sensible default if caller forgot (match common UI)
+    return ["D1", "D9", "D10", "D12"]
+
+def _wrap_varga_meta(route: str, method: str, ay: Any) -> Dict[str, Any]:
+    return {"route": route, "branch": "varga_charts", "zodiac_mode": method, "ayanamsa": ay}
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Routes (mounted at /api/vedic)
 # ──────────────────────────────────────────────────────────────────────────────
 @vedic_api.get("/health")
@@ -500,12 +540,14 @@ def vedic_diag():
         "module_chara_sig": sigs(_compute_chara_module) if _compute_chara_module else None,
         "module_kalachakra_present": bool(_compute_kcd_module),
         "module_kalachakra_sig": sigs(_compute_kcd_module) if _compute_kcd_module else None,
+        "varga_engine_present": _VARGA_OK,
         "rl_cap_per_min": RL_VEDIC_PREDICTIVE,
         "rl_bucket_key": "20",
         "dut1_seconds_env": _env_dut1_seconds(),
     }), 200
 
 
+# ──────────────── Dasha routes (unchanged) ────────────────
 @vedic_api.post("/dasha/vimshottari")
 @rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)  # shared bucket "20"
 def vedic_vimshottari():
@@ -515,7 +557,6 @@ def vedic_vimshottari():
     return jsonify(res), status
 
 
-# ASCII alias + Unicode canonical for Aṣṭottarī
 @vedic_api.post("/dasha/ashtottari")
 @vedic_api.post("/dasha/Aṣṭottarī")
 @rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
@@ -526,7 +567,6 @@ def vedic_ashtottari():
     return jsonify(res), status
 
 
-# ASCII alias + Unicode canonical for Yoginī
 @vedic_api.post("/dasha/yogini")
 @vedic_api.post("/dasha/Yoginī")
 @rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
@@ -537,7 +577,6 @@ def vedic_yogini():
     return jsonify(res), status
 
 
-# Chara (Jaimini)
 @vedic_api.post("/dasha/chara")
 @rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
 def vedic_chara():
@@ -547,18 +586,126 @@ def vedic_chara():
     return jsonify(res), status
 
 
-# Kālachakra
 @vedic_api.post("/dasha/kalachakra")
 @vedic_api.post("/dasha/kalacakra")
 @rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
 def vedic_kalachakra():
-    """
-    Body must include either:
-      - kcd_table: { "pada_to_sequence": {1:[...],...,108:[...]}, "sign_years": {1:.., ... 12:..} }
-        (and optionally "name"), or
-      - kcd_preset: "your-preset-name" if your kalachakra module wires a preset loader.
-    """
     body = request.get_json(silent=True) or {}
     res = _run_kalachakra(body)
     status = 200 if res.get("ok") else (503 if str(res.get("error", "")).endswith("unavailable") else 400)
     return jsonify(res), status
+
+
+# ──────────────── NEW: Varga routes (varga_charts) ────────────────
+@vedic_api.post("/varga/position")
+@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
+def vedic_varga_position():
+    """
+    Compute a SINGLE point’s varga placement.
+
+    Body:
+      {
+        "varga": "D9",
+        "lon_deg": 123.456,         # tropical by default unless method='sidereal'
+        "method": "sidereal|tropical",
+        "ayanamsa": "lahiri" | 22.5
+      }
+    """
+    if not _VARGA_OK or _varga_position is None:
+        return jsonify({"ok": False, "error": "varga_engine_unavailable"}), 503
+
+    body = request.get_json(silent=True) or {}
+    varga = str(body.get("varga") or "").strip() or "D9"
+    lon = _coerce_float(body.get("lon_deg"))
+    if lon is None:
+        return jsonify({"ok": False, "error": "missing_or_invalid_lon_deg"}), 400
+
+    method = _norm_method(body.get("method") or body.get("zodiac_mode") or "sidereal")
+    ay = _norm_ayanamsa(body.get("ayanamsa"))
+
+    try:
+        result = _varga_position(float(lon), varga, zodiac_mode=method, ayanamsa=ay)
+        out = {"ok": True, "varga": result.get("varga", varga), "result": result, "meta": _wrap_varga_meta("varga/position", method, ay)}
+        return jsonify(out), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": "varga_position_failed", "detail": str(e)}), 400
+
+
+@vedic_api.post("/varga/chart")
+@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
+def vedic_varga_chart():
+    """
+    Compute placements for MANY points in a SINGLE varga.
+
+    Body:
+      {
+        "varga": "D9",
+        "longitudes": { "Sun": 123.4, "Moon": 210.6, ... },  # tropical unless method='sidereal'
+        "method": "sidereal|tropical",
+        "ayanamsa": "lahiri" | 22.5
+      }
+    """
+    if not _VARGA_OK or _compute_varga_chart is None:
+        return jsonify({"ok": False, "error": "varga_engine_unavailable"}), 503
+
+    body = request.get_json(silent=True) or {}
+    varga = str(body.get("varga") or "").strip() or "D9"
+    longitudes = _pick_longitudes(body)
+    if not longitudes:
+        return jsonify({"ok": False, "error": "missing_or_invalid_longitudes"}), 400
+
+    method = _norm_method(body.get("method") or body.get("zodiac_mode") or "sidereal")
+    ay = _norm_ayanamsa(body.get("ayanamsa"))
+
+    try:
+        placements = _compute_varga_chart(longitudes, varga, zodiac_mode=method, ayanamsa=ay)
+        out = {
+            "ok": True,
+            "varga": varga.upper(),
+            "placements": placements,
+            "options": {"zodiac_mode": method, "ayanamsa": ay},
+            "meta": _wrap_varga_meta("varga/chart", method, ay),
+        }
+        return jsonify(out), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": "varga_chart_failed", "detail": str(e)}), 400
+
+
+@vedic_api.post("/varga/many")
+@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
+def vedic_varga_many():
+    """
+    Compute placements for MANY points across MULTIPLE vargas.
+
+    Body:
+      {
+        "vargas": ["D1","D9","D10"],
+        "longitudes": { "Sun": 123.4, "Moon": 210.6, ... },  # tropical unless method='sidereal'
+        "method": "sidereal|tropical",
+        "ayanamsa": "lahiri" | 22.5
+      }
+    """
+    if not _VARGA_OK or _compute_many_vargas is None:
+        return jsonify({"ok": False, "error": "varga_engine_unavailable"}), 503
+
+    body = request.get_json(silent=True) or {}
+    longitudes = _pick_longitudes(body)
+    if not longitudes:
+        return jsonify({"ok": False, "error": "missing_or_invalid_longitudes"}), 400
+
+    vargas = _pick_vargas(body)
+    method = _norm_method(body.get("method") or body.get("zodiac_mode") or "sidereal")
+    ay = _norm_ayanamsa(body.get("ayanamsa"))
+
+    try:
+        placements = _compute_many_vargas(longitudes, vargas, zodiac_mode=method, ayanamsa=ay)
+        out = {
+            "ok": True,
+            "vargas": [v.upper() for v in vargas],
+            "placements": placements,  # { 'D9': { 'Sun': {...}, ... }, ... }
+            "options": {"zodiac_mode": method, "ayanamsa": ay},
+            "meta": _wrap_varga_meta("varga/many", method, ay),
+        }
+        return jsonify(out), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": "varga_many_failed", "detail": str(e)}), 400
