@@ -15,6 +15,7 @@ What it does for Vimśottarī:
       "time": "HH:MM[:SS]",
       "Place of Birth": "City, State, Country"
     }
+  (Also accepts split fields: place_city / place_state / place_country.)
 - Resolves Place of Birth → latitude, longitude, elevation_m, tz (if resolver available).
 - Normalizes to a canonical dict for the core:
     method, ayanamsa, coordinate_mode, topocentric, tz, lat/lon/elevation_m, levels, jd_tt, jd_ut1, etc.
@@ -34,21 +35,26 @@ except Exception:
     build_timescales = None  # type: ignore
     _TIMESCALES_OK = False
 
-# ── Optional place resolver (geocoding + tz + elevation) ──
-# Your project can expose any of these; we try a few names gracefully.
+# ── Optional place resolver (geocoding + tz + elevation) via astronomy.py ──
+# We try multiple likely function names to keep it robust across deployments.
 _resolve_place = None
-for _modname, _fname in (
-    ("app.core.place", "resolve_place"),
-    ("app.core.place_resolver", "resolve_place"),
-    ("app.core.geo", "resolve_place"),
-):
-    try:
-        _m = __import__(_modname, fromlist=[_fname])  # type: ignore
-        _resolve_place = getattr(_m, _fname, None)
+try:
+    import app.core.astronomy as _astro  # type: ignore
+
+    for _fname in (
+        "resolve_place",          # preferred
+        "geocode_place",
+        "place_to_site",
+        "lookup_place",
+        "city_to_coords",
+        "resolve_site",
+    ):
+        _resolve_place = getattr(_astro, _fname, None)
         if callable(_resolve_place):
             break
-    except Exception:
-        _resolve_place = None
+except Exception:
+    _astro = None  # type: ignore
+    _resolve_place = None
 
 # ── Timezone normalization table (lightweight) ──
 _TZ_ALIAS = {
@@ -62,6 +68,7 @@ _TZ_FALLBACK = "UTC"
 # ── Simple helpers ──
 _NUM_RE = re.compile(r"^[+-]?\d+(\.\d+)?$")
 
+
 def _coerce_str(x: Any, default: str = "") -> str:
     if x is None:
         return default
@@ -71,6 +78,7 @@ def _coerce_str(x: Any, default: str = "") -> str:
         except Exception:
             return default
     return str(x)
+
 
 def _as_float(x: Any) -> Optional[float]:
     if isinstance(x, (int, float)):
@@ -82,6 +90,7 @@ def _as_float(x: Any) -> Optional[float]:
             return None
     return None
 
+
 def _normalize_tz(tz: Any) -> str:
     if not isinstance(tz, str):
         return _TZ_FALLBACK
@@ -89,6 +98,7 @@ def _normalize_tz(tz: Any) -> str:
     if not key:
         return _TZ_FALLBACK
     return _TZ_ALIAS.get(key.lower(), key)
+
 
 def _pad_hms(t: str) -> str:
     """Ensure HH:MM:SS (append :00 if only HH:MM)."""
@@ -103,6 +113,7 @@ def _pad_hms(t: str) -> str:
         return f"{hh}:00:00"
     return t
 
+
 def _clamp_levels(v: Any, default: int = 5) -> int:
     try:
         depth = int(v)
@@ -111,35 +122,50 @@ def _clamp_levels(v: Any, default: int = 5) -> int:
             depth = len(v)
         else:
             depth = default
-    if depth < 1: depth = 1
-    if depth > 5: depth = 5
+    if depth < 1:
+        depth = 1
+    if depth > 5:
+        depth = 5
     return depth
+
 
 def _norm_method(v: Any, default: str = "sidereal") -> str:
     if isinstance(v, str):
         s = v.strip().lower()
-        if s in ("sidereal","nirayana","nirāyaṇa","sid","s"): return "sidereal"
-        if s in ("tropical","sayana","sāyana","trop","t"):    return "tropical"
+        if s in ("sidereal", "nirayana", "nirāyaṇa", "sid", "s"):
+            return "sidereal"
+        if s in ("tropical", "sayana", "sāyana", "trop", "t"):
+            return "tropical"
     return default
+
 
 def _norm_observer(v: Any, default: str = "geocentric") -> str:
     if isinstance(v, str):
         s = v.strip().lower()
-        if s in ("geocentric","geo","center"):    return "geocentric"
-        if s in ("topocentric","apparent","obs"): return "topocentric"
+        if s in ("geocentric", "geo", "center"):
+            return "geocentric"
+        if s in ("topocentric", "apparent", "obs"):
+            return "topocentric"
     return default
+
 
 def _norm_ayanamsa(v: Any) -> str:
     # Default to LAHIRI
-    if v is None: return "lahiri"
+    if v is None:
+        return "lahiri"
     s = str(v).strip().lower()
     return s or "lahiri"
 
-# ────────────────────────────────────────────────────────────────────────────────
 
+def _join_place(city: str, state: str, country: str) -> str:
+    parts = [p.strip() for p in (city, state, country) if _coerce_str(p).strip()]
+    return ", ".join(parts)
+
+
+# ────────────────────────────────────────────────────────────────────────────────
 def normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str], str]:
     """
-    Normalize inputs for Vimśottarī with your new basis & observer switches.
+    Normalize inputs for Vimśottarī with basis (method) & observer switches.
 
     Returns:
         (norm, warns, tz_norm)
@@ -151,15 +177,20 @@ def normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List
     time_in = _coerce_str(payload.get("time") or payload.get("birth_time") or "12:00")
     time_str = _pad_hms(time_in)
 
-    # Place of Birth: mandatory in your product spec (but we avoid raising here to keep route flow).
-    pob = (
+    # Place of Birth: accept combined or split fields
+    pob_str = _coerce_str(
         payload.get("Place of Birth")
         or payload.get("place")
         or payload.get("birth_place")
         or payload.get("birthPlace")
         or ""
-    )
-    pob_str = _coerce_str(pob).strip()
+    ).strip()
+    if not pob_str:
+        pob_str = _join_place(
+            _coerce_str(payload.get("place_city")),
+            _coerce_str(payload.get("place_state")),
+            _coerce_str(payload.get("place_country")),
+        )
 
     # Observer & method & ayanamsa (defaults as requested)
     method = _norm_method(payload.get("method", payload.get("mode", "sidereal")), default="sidereal")
@@ -181,12 +212,14 @@ def normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List
     else:
         if callable(_resolve_place):
             try:
-                pr = _resolve_place(pob_str)  # expected to return dict-like
-                # Try common keys
+                # Expected to return dict-like with keys: lat, lon, tz, elevation_m (if available)
+                pr = _resolve_place(pob_str)
+                # Dict or object access
                 _lat = pr.get("lat") if isinstance(pr, dict) else getattr(pr, "lat", None)
                 _lon = pr.get("lon") if isinstance(pr, dict) else getattr(pr, "lon", None)
-                _tz  = pr.get("tz")  if isinstance(pr, dict) else getattr(pr, "tz", None)
-                _elev= pr.get("elevation_m") if isinstance(pr, dict) else getattr(pr, "elevation_m", None)
+                _tz = pr.get("tz") if isinstance(pr, dict) else getattr(pr, "tz", None)
+                _elev = pr.get("elevation_m") if isinstance(pr, dict) else getattr(pr, "elevation_m", None)
+
                 if _lat is not None and _lon is not None:
                     lat = _as_float(_lat)
                     lon = _as_float(_lon)
@@ -243,18 +276,25 @@ def normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List
         "date": date,
         "time": time_str,
         "tz": tz_norm,
-        "method": method,                  # "sidereal" | "tropical"
-        "ayanamsa": ayanamsa,              # default "lahiri"
+
+        "method": method,                   # "sidereal" | "tropical"
+        "ayanamsa": ayanamsa,               # default "lahiri"
+
         "levels": depth,
         "max_levels": depth,
+
         "latitude": lat,
         "longitude": lon,
         "elevation_m": elevation_m,
-        "coordinate_mode": coordinate_mode,  # "geocentric" | "topocentric"
+
+        "coordinate_mode": coordinate_mode, # "geocentric" | "topocentric"
         "topocentric": bool(topocentric),
+
         "place_name": pob_str or None,
+
         "jd_tt": jd_tt,
         "jd_ut1": jd_ut1,
+
         "raw": payload,
     }
 
