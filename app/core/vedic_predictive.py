@@ -662,7 +662,7 @@ def compute_vargas(
     zodiac_mode: Literal["tropical","sidereal"] = "sidereal",
     ayanamsa: Any = "lahiri",
     include: Iterable[str] = ("D1","D2","D3","D9","D10","D12"),
-) -> Dict[str, Dict[str, int]]]:
+) -> Dict[str, Dict[str, int]]:
     """Return { planet: {"D9": sign_index, ...}, ... } using varga_charts."""
     if not _VARGA_OK or _compute_many_vargas is None:
         return {}
