@@ -946,7 +946,7 @@ def compute_yogas(
             return {"ok": False, "error": f"timescales_unavailable:{e}", "yogas": [], "warnings": warnings}
 
         # ayanāṁśa (cached)
-        ay_key, ay_deg, warns_ay = _ayanamsa_cached(int(round(jd_tt * 1e6)), str(ayanamsa))
+        ay_key, ay_deg, warns_ay = _ayanamsa_cached(int(math.floor(jd_tt)), str(ayanamsa))
         warnings.extend(list(warns_ay))
 
         # Houses (via façade)
