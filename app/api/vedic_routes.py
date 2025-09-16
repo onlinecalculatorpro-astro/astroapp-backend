@@ -1,7 +1,7 @@
 # app/api/vedic_routes.py
 from __future__ import annotations
 
-from typing import Any, Dict, List, Iterable, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Iterable
 import inspect
 import os
 
@@ -106,7 +106,7 @@ except Exception:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Yoga engine wiring (primary via app.core.yoga; shim via vedic_predictive)
+# Yoga engine wiring (primary via app.core.yoga)
 # ──────────────────────────────────────────────────────────────────────────────
 _YOGA_CORE_OK = False
 try:
@@ -119,24 +119,15 @@ try:
 except Exception:
     try:
         # Alternate file name yogas.py
-        from app.core.yogas import (
-            compute_yogas as _compute_yogas_core,  # type: ignore
-            list_registered_yogas as _yoga_list,   # type: ignore
+        from app.core.yogas import (  # type: ignore
+            compute_yogas as _compute_yogas_core,
+            list_registered_yogas as _yoga_list,
         )
         _YOGA_CORE_OK = True
     except Exception:
         _compute_yogas_core = None  # type: ignore
         _yoga_list = None  # type: ignore
         _YOGA_CORE_OK = False
-
-# Unified detect shim from vedic_predictive (calls yoga core if available,
-# otherwise falls back to legacy-basic detectors when points/cusps provided)
-try:
-    from app.core.vedic_predictive import yoga_detect  # type: ignore
-    _YOGA_SHIM_OK = True
-except Exception:
-    _YOGA_SHIM_OK = False
-    yoga_detect = None  # type: ignore
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -207,7 +198,7 @@ def _pick_times(norm: Dict[str, Any], original: Dict[str, Any]) -> Dict[str, Any
 
 def _build_civic_payload_vim(original: Dict[str, Any], norm: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Flexible flags for Vimśottarī (method/observer/ayanamsa/place/etc.).
+    Flexible flags for Vimśottarī (method/observer/ayanamsa/place/etc.)."
     """
     civ: Dict[str, Any] = {}
 
@@ -699,6 +690,15 @@ def vedic_diag():
         except Exception:
             return None
 
+    # Try discovering legacy detectors availability without importing at module load.
+    try:
+        from app.core.vedic_predictive import detect_yogas as _legacy_detect  # type: ignore
+        _legacy_ok = callable(_legacy_detect)
+        _legacy_sig = sigs(_legacy_detect)
+    except Exception:
+        _legacy_ok = False
+        _legacy_sig = None
+
     return jsonify({
         "validator_loaded": normalize_vim_payload is not None,
         "validator_error": _VALIDATOR_IMPORT_ERR,
@@ -720,8 +720,9 @@ def vedic_diag():
         "ayanamsa_adapter_present": _AY_OK,
         # Yoga diagnostics
         "yoga_core_present": _YOGA_CORE_OK,
-        "yoga_shim_present": _YOGA_SHIM_OK,
-        "yoga_compute_sig": sigs(_compute_yogas_core) if _YOGA_CORE_OK else None,
+        "yoga_core_sig": sigs(_compute_yogas_core) if _YOGA_CORE_OK else None,
+        "yoga_legacy_present": _legacy_ok,
+        "yoga_legacy_sig": _legacy_sig,
         "rl_cap_per_min": RL_VEDIC_PREDICTIVE,
         "rl_bucket_key": "20",
         "dut1_seconds_env": _env_dut1_seconds(),
@@ -777,7 +778,7 @@ def vedic_kalachakra():
     return jsonify(res), status
 
 
-# ──────────────── NEW: Yoga routes (wired to yoga.py via vedic_predictive.yoga_detect) ────────────────
+# ──────────────── Yoga routes (core first; legacy fallback; NO shim required) ────────────────
 
 def _parse_listish(v: Any) -> List[str]:
     if v is None:
@@ -789,15 +790,17 @@ def _parse_listish(v: Any) -> List[str]:
     return []
 
 def _pick_points_deg(body: Dict[str, Any]) -> Dict[str, float]:
-    # Only used for legacy fallback when yoga core is unavailable
-    raw = body.get("points_deg")
-    if isinstance(raw, dict):
-        out: Dict[str, float] = {}
-        for k, v in raw.items():
-            f = _coerce_float(v)
-            if f is not None:
-                out[str(k).lower()] = f
-        return out
+    # Legacy fallback when yoga core is unavailable or fails
+    for key in ("points_deg", "longitudes", "longitudes_by_name"):
+        raw = body.get(key)
+        if isinstance(raw, dict):
+            out: Dict[str, float] = {}
+            for k, v in raw.items():
+                f = _coerce_float(v)
+                if f is not None:
+                    out[str(k).lower()] = f
+            if out:
+                return out
     return {}
 
 def _pick_cusps_deg(body: Dict[str, Any]) -> List[float]:
@@ -849,16 +852,13 @@ def vedic_yoga_detect():
       "disable_catalog_tags": ["experimental"],
 
       // Legacy fallback only:
-      "points_deg": { "sun": 123.4, "moon": 210.6, ... },  // sidereal longitudes expected
-      "cusps_deg": [Asc, 2nd, ..., 12th]                   // 12 floats, degrees
+      "points_deg": { "sun": 123.4, "moon": 210.6, ... },  # sidereal longitudes expected
+      "cusps_deg": [Asc, 2nd, ..., 12th]                   # 12 floats, degrees
     }
     """
-    if yoga_detect is None or not _YOGA_SHIM_OK:
-        return jsonify({"ok": False, "error": "yoga_shim_unavailable"}), 503
-
     body = request.get_json(silent=True) or {}
 
-    # Use the existing validator to normalize civil fields (date/time/tz/lat/lon/ayanamsa/jd_tt).
+    # Normalize civil fields (date/time/tz/lat/lon/ayanamsa/jd_tt).
     if normalize_vim_payload is None:
         norm = {}
         warns: List[str] = ["validator_unavailable"]
@@ -872,7 +872,7 @@ def vedic_yoga_detect():
     norm["enable_catalog_tags"] = _parse_listish(body.get("enable_catalog_tags"))
     norm["disable_catalog_tags"] = _parse_listish(body.get("disable_catalog_tags"))
 
-    # Legacy fallback inputs (only used if yoga core missing OR shim falls back)
+    # Legacy fallback inputs in request (used only if core not present / fails)
     pts = _pick_points_deg(body)
     cusps = _pick_cusps_deg(body)
     if pts:
@@ -880,35 +880,64 @@ def vedic_yoga_detect():
     if cusps:
         norm["cusps_deg"] = cusps
 
-    try:
-        res = yoga_detect(norm)  # type: ignore[misc]
-    except Exception as e:
-        return jsonify({"ok": False, "error": "yoga_detect_failed", "detail": str(e)}), 400
+    # ---------------- Primary path: yoga core ----------------
+    if _YOGA_CORE_OK and callable(_compute_yogas_core):
+        req: Dict[str, Any] = {
+            "date": norm.get("date"),
+            "time": norm.get("time"),
+            "tz": norm.get("tz") or norm.get("tz_name") or norm.get("place_tz"),
+            "latitude": norm.get("latitude"),
+            "longitude": norm.get("longitude"),
+            "ayanamsa": norm.get("ayanamsa"),
+            "house_system": norm.get("house_system"),
+            "include": norm.get("include") or [],
+            "enable_catalog_tags": norm.get("enable_catalog_tags") or [],
+            "disable_catalog_tags": norm.get("disable_catalog_tags") or [],
+            # precomputed geometry (some cores can use it)
+            "points_deg": norm.get("points_deg"),
+            "cusps_deg": norm.get("cusps_deg"),
+        }
+        try:
+            res = _compute_yogas_core(req)  # type: ignore[misc]
+            if isinstance(res, dict) and res.get("ok"):
+                out = {
+                    "ok": True,
+                    "yogas": res.get("yogas", []),
+                    "present": res.get("present", []),
+                    "context": res.get("context"),
+                    "warnings": (res.get("warnings", []) or []) + warns,
+                    "meta": {"route": "yoga/detect", "branch": "yoga_core", "tz_normalized": tz_norm},
+                }
+                return jsonify(out), 200
+            # If core returns not-ok, try legacy fallback if geometry provided
+        except Exception as _core_err:
+            # fall through to legacy if available
+            pass
 
-    # Shape + status mapping
-    ok = bool(res.get("ok"))
-    branch = "yoga_core" if _YOGA_CORE_OK else ("legacy_basic" if (pts and cusps) else "none")
-    out = {
-        "ok": ok,
-        "yogas": res.get("yogas", []),
-        "present": res.get("present", []),
-        "context": res.get("context"),
-        "warnings": res.get("warnings", []),
-        "meta": {"route": "yoga/detect", "branch": branch, "tz_normalized": tz_norm},
-    }
+    # ---------------- Legacy fallback (basic detectors) ----------------
+    if pts and cusps:
+        try:
+            # Import lazily to avoid module-load dependency
+            from app.core.vedic_predictive import detect_yogas as _legacy_detect  # type: ignore
+            yogas = _legacy_detect(points_deg=pts, cusps_deg=cusps)  # type: ignore[misc]
+            out = {
+                "ok": True,
+                "yogas": yogas,
+                "present": [y.get("yoga") for y in yogas],
+                "warnings": ["yoga_core_unavailable_fallback"] + warns,
+                "meta": {"route": "yoga/detect", "branch": "legacy_basic", "tz_normalized": tz_norm},
+            }
+            return jsonify(out), 200
+        except Exception as e:
+            return jsonify({"ok": False, "error": "legacy_detector_failed", "detail": str(e)}), 400
 
-    if not ok and str(res.get("error","")).endswith("unavailable_or_insufficient_inputs"):
-        # Distinguish between engine missing (503) vs bad inputs for fallback (400)
-        status = 503 if not _YOGA_CORE_OK else 400
-        out["error"] = res.get("error")
-        return jsonify(out), status
-
-    if not ok:
-        out["error"] = res.get("error", "yoga_detect_failed")
-        return jsonify(out), (503 if str(out["error"]).endswith("unavailable") else 400)
-
-    # Success
-    return jsonify(out), 200
+    # No engine available and no fallback geometry
+    return jsonify({
+        "ok": False,
+        "error": "yoga_unavailable_or_insufficient_inputs",
+        "meta": {"route": "yoga/detect", "branch": "none", "tz_normalized": tz_norm},
+        "warnings": warns,
+    }), (503 if not _YOGA_CORE_OK else 400)
 
 
 # ──────────────── Varga routes (varga_charts) ────────────────
