@@ -606,7 +606,7 @@ def _kartari_rule(ctx: Dict[str, Any], around: str) -> List[YogaHit]:
     ]
 
 
-def _raja_rule(ctx: Dict[str, Any], conj_only: bool) -> YogaHit:
+def _raja_rule(ctx: Dict[str, Any], conj_only: bool = False) -> YogaHit:
     pairs = []
     for k in (1, 4, 7, 10):
         for t in (1, 5, 9):
