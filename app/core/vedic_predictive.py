@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 """
-Vedic predictive helpers — rewired so divisional charts use `app.core.varga_charts`.
+Vedic predictive helpers — dasha, varga wrappers, and Yoga detection (wired to app.core.yoga).
 
 What’s here
 -----------
@@ -12,21 +12,19 @@ What’s here
 - Legacy Vimśottarī generator kept for back-compat (used only if preferred engine missing).
 - Vargas (divisional charts): thin wrappers that DELEGATE to `varga_charts` and preserve
   previous return shapes (sign indices) for callers. Full-detail helpers are also provided.
-- A handful of common yoga detectors.
-- Simple feature builders for ML.
+- Yoga detection:
+    • Primary path delegates to `app.core.yoga.compute_yogas` (sidereal-first, strict numerics)
+    • Legacy “basic” detectors are kept as a fallback when core modules aren’t available,
+      and for older call sites that pass only precomputed points/cusps.
 
-Notes
------
-- Kālachakra requires a table/preset from your environment.
-- Varga wrappers accept `zodiac_mode` (default: "sidereal"). When "sidereal", we
-  pass through to `varga_charts` which subtracts ayanāṁśa from the given longitude
-  (i.e., treat the input as tropical and convert inside). This matches the legacy
-  semantics of earlier internal helpers.
+Conventions
+-----------
+- Never introduce jd_utc in API surfaces; use jd_tt / jd_ut1 or civil+tz.
+- Pass through zodiac_mode/method, ayanamsa, observer exactly as requested by callers.
 """
 
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Tuple, Literal, Optional, Set
-
 from datetime import datetime, timezone
 
 from app.core.common_predictive import (
@@ -93,6 +91,35 @@ except Exception:
     _compute_varga_chart = None  # type: ignore
     _compute_many_vargas = None  # type: ignore
 
+# ───────────────────────── Yoga core (primary) ───────────────────────────────
+_YOGA_CORE_OK = False
+try:
+    # prefer singular module name
+    from app.core.yoga import (
+        compute_yogas as _compute_yogas_core,
+        list_registered_yogas as _yoga_list,
+        enable_yogas as _yoga_enable,
+        disable_yogas as _yoga_disable,
+    )
+    _YOGA_CORE_OK = True
+except Exception:
+    try:
+        # support alternate filename (# app/core/yogas.py)
+        from app.core.yogas import (
+            compute_yogas as _compute_yogas_core,
+            list_registered_yogas as _yoga_list,
+            enable_yogas as _yoga_enable,
+            disable_yogas as _yoga_disable,
+        )
+        _YOGA_CORE_OK = True
+    except Exception:
+        _YOGA_CORE_OK = False
+        _compute_yogas_core = None  # type: ignore
+        _yoga_list = None  # type: ignore
+        _yoga_enable = None  # type: ignore
+        _yoga_disable = None  # type: ignore
+
+
 __all__ = [
     # Dasha
     "DashaPeriod", "vimsottari_dasha", "predict_dasha_periods",
@@ -100,7 +127,8 @@ __all__ = [
     # Vargas (wrappers and full-detail helpers)
     "compute_vargas_for_point", "compute_vargas",
     "compute_varga_for_point_full", "compute_varga_full",
-    # Yogas
+    # Yogas (new wired API + legacy basic detectors retained)
+    "yoga_detect", "list_yoga_catalog",
     "house_index_for_longitude",
     "detect_panch_mahapurusha", "detect_gajakesari", "detect_chandra_mangal",
     "detect_parivartana", "detect_adhi", "detect_vesi_vasi_ubhayachari",
@@ -259,7 +287,6 @@ def _datetime_to_jd_tt(dt: datetime) -> float:
             t = TS.utc(dt.astimezone(timezone.utc))
         return float(t.tt)
     except Exception:
-        # Fallback (approx): POSIX epoch → JD UTC → +Δ to TT handled by caller if needed
         epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
@@ -289,12 +316,10 @@ def _normalize_system(name: str) -> str:
         "ashtottarī": "ashtottari",
         "yogini": "yogini",
         "yoginī": "yogini",
-        # Chara / Jaimini
         "chara": "chara",
         "jaimini": "chara",
         "chara_dasha": "chara",
         "jaimini chara": "chara",
-        # Kālachakra
         "kalachakra": "kalachakra",
         "kcd": "kalachakra",
         "kalacakra": "kalachakra",
@@ -318,19 +343,13 @@ def _natal_to_payload(natal_chart: Dict[str, Any]) -> Dict[str, Any]:
     ay = natal_chart.get("ayanamsa")
     if ay is not None:
         payload["ayanamsa"] = ay
-    # Extras some engines can use (no-ops for others)
     for k in ("latitude", "longitude", "asc_sidereal_deg", "asc_tropical_deg"):
         if k in natal_chart:
             payload[k] = natal_chart[k]
     return payload
 
 def _flatten_nested(nested: List[Dict[str, Any]], max_level: int) -> List[Dict[str, Any]]:
-    """
-    Flatten a generic nested tree into rows (level, label, start/end, path).
-    For planet-based systems we use node['lord']; for Chara/KCD we accept 'sign_name' or 'sign_index'.
-    """
     out: List[Dict[str, Any]] = []
-
     def _label_of(node: Dict[str, Any]) -> str:
         lbl = node.get("lord")
         if lbl:
@@ -342,7 +361,6 @@ def _flatten_nested(nested: List[Dict[str, Any]], max_level: int) -> List[Dict[s
         if isinstance(si, int):
             return f"Sign-{si}"
         return ""
-
     def walk(node: Dict[str, Any], path: List[str]):
         lvl = int(node.get("level", 0))
         if lvl < 1 or lvl > max_level:
@@ -353,7 +371,7 @@ def _flatten_nested(nested: List[Dict[str, Any]], max_level: int) -> List[Dict[s
         new_path = path + [label] if label else path + [""]
         out.append({
             "level": lvl,
-            "lord": label,  # keep key as 'lord' for downstream compatibility
+            "lord": label,
             "start_jd_tt": a,
             "end_jd_tt": b,
             "path": tuple(new_path),
@@ -362,7 +380,6 @@ def _flatten_nested(nested: List[Dict[str, Any]], max_level: int) -> List[Dict[s
         if isinstance(kids, list):
             for k in kids:
                 walk(k, new_path)
-
     for root in (nested or []):
         walk(root, [])
     out.sort(key=lambda r: (r["start_jd_tt"], r["level"]))
@@ -401,8 +418,8 @@ def predict_dasha_periods(
     start_date: datetime,
     end_date: datetime,
     dasha_system: str = "vimshottari",
-    include_antardasha: bool = True,   # kept for back-compat; ignored if 'levels' provided
-    levels: Optional[int] = None,      # 1..5
+    include_antardasha: bool = True,
+    levels: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Build daśā periods covering [start_date, end_date] using the selected engine.
@@ -556,17 +573,14 @@ def predict_dasha_periods(
             return {"ok": False, "error": "chara_engine_unavailable"}
 
         base = _natal_to_payload(natal_chart)
-        # Add Chara-specific knobs and geometry so Lagna/ĀK can resolve
         base.update({
             "levels": L,
             "year_days": 365.24219,
             "limit_jd_tt": float(jd1_tt),
-            # site/asc inputs (any subset is fine; module resolves appropriately)
             "latitude": natal_chart.get("latitude"),
             "longitude": natal_chart.get("longitude"),
             "asc_sidereal_deg": natal_chart.get("asc_sidereal_deg"),
             "asc_tropical_deg": natal_chart.get("asc_tropical_deg"),
-            # preferences (optional; defaults match module)
             "start_from": natal_chart.get("chara_start_from", "lagna"),
             "direction_mode": natal_chart.get("chara_direction_mode", "rashi_nature"),
             "include_rahu_in_karakas": bool(natal_chart.get("include_rahu_in_karakas", False)),
@@ -587,7 +601,6 @@ def predict_dasha_periods(
             return {"ok": False, "error": "kalachakra_engine_unavailable"}
 
         base = _natal_to_payload(natal_chart)
-        # Optional extras from caller
         if "kcd_table" in natal_chart:
             base["kcd_table"] = natal_chart["kcd_table"]
         if "kcd_preset" in natal_chart:
@@ -603,7 +616,6 @@ def predict_dasha_periods(
             "limit_jd_tt": float(jd1_tt),
         })
 
-        # Optional preloaded Moon sidereal longitude (already sidereal)
         if "planet_longitudes_sidereal" in natal_chart:
             base["planet_longitudes_sidereal"] = natal_chart["planet_longitudes_sidereal"]
 
@@ -623,9 +635,6 @@ def predict_dasha_periods(
 # VARGAS (DIVISIONAL CHARTS) — thin wrappers over app.core.varga_charts
 # =============================================================================
 
-# Back-compat wrappers returning ONLY the varga sign index per varga code.
-# These match the older API used by callers that want a minimal map.
-
 def compute_vargas_for_point(
     *,
     lon_deg: float,
@@ -633,15 +642,8 @@ def compute_vargas_for_point(
     ayanamsa: Any = "lahiri",
     include: Iterable[str] = ("D1","D2","D3","D9","D10","D12"),
 ) -> Dict[str, int]:
-    """Return {"D9": sign_index, ...} for a single point.
-
-    NOTE on semantics: when `zodiac_mode=="sidereal"`, we forward as-is to
-    `varga_charts` which subtracts the ayanāṁśa internally, i.e., treating the
-    given `lon_deg` as tropical and converting inside. If your `lon_deg` is
-    already sidereal, call with `zodiac_mode="tropical"` and `ayanamsa=0`.
-    """
+    """Return {"D9": sign_index, ...} for a single point."""
     if not _VARGA_OK or _varga_position is None:
-        # Minimal graceful fallback: no vargas available
         return {}
     out: Dict[str, int] = {}
     for code in include:
@@ -650,7 +652,6 @@ def compute_vargas_for_point(
             idx = int(res.get("varga_rasi_index"))
             out[str(res.get("varga", code))] = idx
         except Exception:
-            # skip unsupported keys gracefully
             continue
     return out
 
@@ -661,22 +662,15 @@ def compute_vargas(
     zodiac_mode: Literal["tropical","sidereal"] = "sidereal",
     ayanamsa: Any = "lahiri",
     include: Iterable[str] = ("D1","D2","D3","D9","D10","D12"),
-) -> Dict[str, Dict[str, int]]:
-    """Return { planet: {"D9": sign_index, ...}, ... } for many points.
-
-    Internally calls `varga_charts.compute_many_vargas` and then compresses each
-    placement to its varga sign index for back-compat with earlier callers.
-    """
+) -> Dict[str, Dict[str, int]]]:
+    """Return { planet: {"D9": sign_index, ...}, ... } using varga_charts."""
     if not _VARGA_OK or _compute_many_vargas is None:
         return {}
-    # varga_charts expects the vargas list; returns { 'D9': { 'Sun': {...}, ... }, ... }
     varga_list = [str(v) for v in include]
     try:
         full = _compute_many_vargas(points_deg, varga_list, zodiac_mode=zodiac_mode, ayanamsa=ayanamsa)
     except Exception:
         return {}
-
-    # Transform to { planet: { D#: index } }
     out: Dict[str, Dict[str, int]] = {name: {} for name in points_deg.keys()}
     for varga_key, per_point in (full or {}).items():
         if not isinstance(per_point, dict):
@@ -689,7 +683,6 @@ def compute_vargas(
                 continue
     return out
 
-# Convenience helpers exposing FULL placement dicts (not just indices)
 
 def compute_varga_for_point_full(
     *,
@@ -717,28 +710,114 @@ def compute_varga_full(
     return _compute_many_vargas(points_deg, [str(v) for v in vargas], zodiac_mode=zodiac_mode, ayanamsa=ayanamsa)
 
 # =============================================================================
-# YOGAS — unchanged API
+# YOGAS — primary path via app.core.yoga, with legacy-basic fallback
 # =============================================================================
+
+def list_yoga_catalog() -> Dict[str, Any]:
+    """Expose the registry catalog (name/tags/meta) when core is available."""
+    if not _YOGA_CORE_OK or _yoga_list is None:
+        return {"ok": False, "error": "yoga_core_unavailable"}
+    try:
+        return {"ok": True, "catalog": _yoga_list()}
+    except Exception as e:
+        return {"ok": False, "error": f"yoga_catalog_error:{e}"}
+
+def yoga_detect(norm: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Run Yoga detection given a *normalized* yoga payload from vedic_validator.normalize_yoga_payload.
+
+    Expected keys in `norm` (best-effort; missing values tolerated):
+      - zodiac_mode/method, ayanamsa, observer, house_system
+      - date, time, tz, latitude, longitude, jd_tt, jd_ut1
+      - include (names), enable_catalog_tags, disable_catalog_tags
+      - points_deg/cusps_deg may be present but are not required by the core engine.
+
+    Returns:
+      { ok, yogas, context, warnings, present }  // `present` is a convenience list of matched names
+    """
+    include_names = [str(n).strip().lower() for n in (norm.get("include") or [])]
+
+    if _YOGA_CORE_OK and _compute_yogas_core is not None:
+        payload = {
+            # timescales/site (core will compute as needed)
+            "jd_tt": norm.get("jd_tt"),
+            "jd_ut1": norm.get("jd_ut1"),
+            "date": norm.get("date"),
+            "time": norm.get("time"),
+            "tz": norm.get("tz") or norm.get("place_tz") or norm.get("tz_name") or "UTC",
+            "latitude": norm.get("latitude"),
+            "longitude": norm.get("longitude"),
+        }
+        try:
+            res = _compute_yogas_core(
+                payload,
+                ayanamsa=norm.get("ayanamsa", "lahiri"),
+                house_system=str(norm.get("house_system") or "placidus"),
+                # honor tag gates (names are filtered post-hoc below)
+                enable_catalog_tags=tuple(norm.get("enable_catalog_tags") or ()),
+                disable_catalog_tags=tuple(norm.get("disable_catalog_tags") or ()),
+                # leave other options at defaults (sidereal-first, AL notes on, varga boosts on)
+            )
+        except Exception as e:
+            return {"ok": False, "error": f"yoga_engine_error:{e}"}
+
+        yogas = list(res.get("yogas") or [])
+        if include_names:
+            yogas = [y for y in yogas if str(y.get("name","")).strip().lower() in include_names]
+
+        present_list = [{"yoga": y["name"], "score": y.get("score"), "tags": y.get("tags", [])}
+                        for y in yogas if bool(y.get("present"))]
+
+        return {
+            "ok": bool(res.get("ok", False)),
+            "yogas": yogas,
+            "context": res.get("context"),
+            "warnings": res.get("warnings", []),
+            "present": present_list,
+        }
+
+    # ── Fallback: legacy-basic detectors; requires precomputed points + cusps ──
+    pts = norm.get("points_deg") or {}
+    cusps = norm.get("cusps_deg") or []
+    if pts and isinstance(cusps, list) and len(cusps) == 12:
+        legacy_hits = detect_yogas(
+            points_deg={k.lower(): v for k, v in pts.items()},
+            cusps_deg=cusps,
+            include=tuple(include_names) if include_names else (
+                "panch_mahapurusha","gajakesari","chandra_mangal","parivartana",
+                "adhi","vesi_vasi_ubhayachari","viparita_rajayoga_basic",
+                "neecha_bhanga_basic","kemadruma_basic"
+            ),
+        )
+        return {
+            "ok": True,
+            "yogas": legacy_hits,
+            "context": {"mode": "legacy_basic"},
+            "warnings": ["yoga_core_unavailable_fallback_basic"],
+            "present": [{"yoga": y.get("yoga")} for y in legacy_hits],
+        }
+
+    return {"ok": False, "error": "yoga_engine_unavailable_or_insufficient_inputs"}
+
+# ───────────────────────── Legacy-basic detectors (unchanged) ─────────────────
 
 EXALT_SIGN = {"sun":0,"moon":1,"mars":9,"mercury":5,"jupiter":3,"venus":11,"saturn":6}
 OWN_SIGNS = {
-    "sun":[4],"moon":[3],"mars":[0,7],"mercury":[2,5],"jupiter":[8,11],"venus":[1,6],"saturn":[9,10]
+    "sun":[4],"moon":[3],"mars":[0,7],"mercury":[2,5],
+    "jupiter":[8,11],"venus":[1,6],"saturn":[9,10]
 }
 DEBIL_SIGN = {"sun":6,"moon":7,"mars":3,"mercury":11,"jupiter":9,"venus":5,"saturn":0}
 
-# Precompute a reverse owner map once (used in multiple yogas)
 _OWNER_BY_SIGN: Dict[int, str] = {}
 for _pl, _signs in OWN_SIGNS.items():
     for _s in _signs:
         _OWNER_BY_SIGN[_s] = _pl
-
 
 def house_index_for_longitude(cusps_deg: List[float], lon_deg: float) -> int:
     if len(cusps_deg) != 12:
         raise ValueError("cusps_deg must be 12 values")
     c0 = [norm360(x) for x in cusps_deg]
     lam = norm360(lon_deg)
-    # single pass; closed-open [start, end)
     for i in range(12):
         start = c0[i]
         end = norm360(c0[(i + 1) % 12])
@@ -748,17 +827,14 @@ def house_index_for_longitude(cusps_deg: List[float], lon_deg: float) -> int:
             return i + 1
     return 12
 
-
 def is_kendra(h: int) -> bool:
     return h in (1,4,7,10)
-
 
 def in_own_or_exaltation(planet: str, sign_idx: int) -> bool:
     p = planet.lower()
     if EXALT_SIGN.get(p, -1) == sign_idx:
         return True
     return sign_idx in OWN_SIGNS.get(p, [])
-
 
 def detect_panch_mahapurusha(points_deg: Dict[str, float], cusps_deg: List[float]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
@@ -773,7 +849,6 @@ def detect_panch_mahapurusha(points_deg: Dict[str, float], cusps_deg: List[float
             add({"yoga": name, "planet": p, "house": h, "sign_index": s})
     return out
 
-
 def detect_gajakesari(points_deg: Dict[str, float], cusps_deg: List[float]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     moon = points_deg.get("moon"); jup = points_deg.get("jupiter")
@@ -786,7 +861,6 @@ def detect_gajakesari(points_deg: Dict[str, float], cusps_deg: List[float]) -> L
         out.append({"yoga": "Gajakesari", "from": "moon", "to": "jupiter", "offset_houses": diff})
     return out
 
-
 def detect_chandra_mangal(points_deg: Dict[str, float], max_orb_deg: float = 8.0) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     moon = points_deg.get("moon"); mars = points_deg.get("mars")
@@ -797,9 +871,7 @@ def detect_chandra_mangal(points_deg: Dict[str, float], max_orb_deg: float = 8.0
         out.append({"yoga": "Chandra-Mangal", "orb_deg": float(sep)})
     return out
 
-
 def detect_parivartana(points_deg: Dict[str, float]) -> List[Dict[str, Any]]:
-    # map each sign → owner (precomputed) and each planet → sign owner of its location
     loc_owner: Dict[str, str] = {}
     setitem = loc_owner.__setitem__
     for pl, lon in points_deg.items():
@@ -816,7 +888,6 @@ def detect_parivartana(points_deg: Dict[str, float]) -> List[Dict[str, Any]]:
             add({"yoga": "Parivartana", "pair": (a, lord_b)})
             seen.add((a, lord_b))
     return out
-
 
 def detect_adhi(points_deg: Dict[str, float], cusps_deg: List[float]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
@@ -836,7 +907,6 @@ def detect_adhi(points_deg: Dict[str, float], cusps_deg: List[float]) -> List[Di
     if present:
         out.append({"yoga": "Adhi", "planets": sorted(present), "from_moon_house": moon_h})
     return out
-
 
 def detect_vesi_vasi_ubhayachari(points_deg: Dict[str, float], sun_orb_block_deg: float = 12.0) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
@@ -866,7 +936,6 @@ def detect_vesi_vasi_ubhayachari(points_deg: Dict[str, float], sun_orb_block_deg
         out.append({"yoga": "Vasi", "planets": sorted(vasi)})
     return out
 
-
 def detect_viparita_rajayoga_basic(points_deg: Dict[str, float], cusps_deg: List[float]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     houses = {pl: house_index_for_longitude(cusps_deg, lon) for pl, lon in points_deg.items()}
@@ -880,7 +949,6 @@ def detect_viparita_rajayoga_basic(points_deg: Dict[str, float], cusps_deg: List
             add({"yoga": "Viparita-Rajayoga (basic)", "planet": pl, "house": h, "owner": lord})
     return out
 
-
 def detect_neecha_bhanga_basic(points_deg: Dict[str, float]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     add = out.append
@@ -888,7 +956,6 @@ def detect_neecha_bhanga_basic(points_deg: Dict[str, float]) -> List[Dict[str, A
         if DEBIL_SIGN.get(pl, -1) == sign_index(lon):
             add({"yoga": "Neecha (debilitation)", "planet": pl, "sign_index": sign_index(lon)})
     return out
-
 
 def detect_kemadruma_basic(points_deg: Dict[str, float]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
@@ -905,7 +972,6 @@ def detect_kemadruma_basic(points_deg: Dict[str, float]) -> List[Dict[str, Any]]
         out.append({"yoga": "Kemadruma (basic)"})
     return out
 
-
 def detect_yogas(
     *,
     points_deg: Dict[str, float],
@@ -916,6 +982,7 @@ def detect_yogas(
     ),
     orbs: Optional[Dict[str, float]] = None
 ) -> List[Dict[str, Any]]:
+    """Legacy-basic aggregator, used as a fallback and for backwards-compat."""
     out: List[Dict[str, Any]] = []
     inc = set(include)
     if "panch_mahapurusha" in inc: out.extend(detect_panch_mahapurusha(points_deg, cusps_deg))
@@ -935,7 +1002,6 @@ def detect_yogas(
 # =============================================================================
 # FEATURE BUILDERS
 # =============================================================================
-
 
 def feature_dasha_lords_onehot(periods: List[Dict[str, Any]], *, levels: int = 2) -> List[List[int]]:
     """
@@ -957,16 +1023,21 @@ def feature_dasha_lords_onehot(periods: List[Dict[str, Any]], *, levels: int = 2
         out.append(row)
     return out
 
-
 def feature_yoga_flags(yogas: List[Dict[str, Any]], *, include: Optional[Iterable[str]] = None) -> Dict[str, int]:
     """Produce simple binary flags per yoga name."""
     inc = set(include) if include else None
     flags: Dict[str, int] = {}
     for y in yogas:
-        name = str(y.get("yoga","")).strip()
+        # works with both legacy-basic (key 'yoga') and core output (key 'name')
+        name = str(y.get("yoga") or y.get("name") or "").strip()
         if not name:
             continue
         if inc and name not in inc:
             continue
-        flags[name] = 1
+        present = y.get("present")
+        if present is None:
+            # legacy-basic only lists positives
+            flags[name] = 1
+        else:
+            flags[name] = 1 if bool(present) else 0
     return flags
