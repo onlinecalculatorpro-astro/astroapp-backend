@@ -3,19 +3,17 @@
 from __future__ import annotations
 
 """
-Vedic predictive helpers — dasha, varga wrappers, and Yoga detection (wired to app.core.yoga).
+Vedic predictive helpers — daśā, varga wrappers, and Yoga detection (wired to app.core.yoga).
 
 What’s here
 -----------
 - Windowed daśā periods across multiple systems:
     vimshottari (preferred engine), ashtottari, yogini, chara (Jaimini), kalachakra
 - Legacy Vimśottarī generator kept for back-compat (used only if preferred engine missing).
-- Vargas (divisional charts): thin wrappers that DELEGATE to `varga_charts` and preserve
-  previous return shapes (sign indices) for callers. Full-detail helpers are also provided.
+- Vargas (divisional charts): thin wrappers that DELEGATE to `varga_charts`.
 - Yoga detection:
-    • Primary path delegates to `app.core.yoga.compute_yogas` (sidereal-first, strict numerics)
-    • Legacy “basic” detectors are kept as a fallback when core modules aren’t available,
-      and for older call sites that pass only precomputed points/cusps.
+    • Primary path delegates to `app.core.yoga.compute_yogas` (sidereal-first)
+    • Legacy “basic” detectors are kept as a fallback for precomputed points/cusps.
 
 Conventions
 -----------
@@ -26,6 +24,7 @@ Conventions
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Tuple, Literal, Optional, Set
 from datetime import datetime, timezone
+import re
 
 from app.core.common_predictive import (
     norm360, sign_index, angdiff, compute_houses, timescales_from_civil
@@ -722,21 +721,40 @@ def list_yoga_catalog() -> Dict[str, Any]:
     except Exception as e:
         return {"ok": False, "error": f"yoga_catalog_error:{e}"}
 
+# --- include-name normalization helpers --------------------------------------
+
+_WS_RE = re.compile(r"\s+")
+
+def _canon_name(s: str) -> str:
+    """
+    Normalize a yoga name for robust matching:
+    lowercased, spaces/hyphens -> underscores, drop surrounding punctuation.
+    Examples:
+      'Chandra-Mangal' -> 'chandra_mangal'
+      'Viparita-Rajayoga (basic)' -> 'viparita_rajayoga_basic'
+    """
+    t = (s or "").strip().lower()
+    t = _WS_RE.sub(" ", t)
+    t = t.replace("-", " ").replace("/", " ")
+    t = "".join(ch for ch in t if ch.isalnum() or ch in (" ", "_"))
+    t = t.replace(" ", "_")
+    while "__" in t:
+        t = t.replace("__", "_")
+    return t.strip("_")
+
+def _canon_set(seq: Iterable[str]) -> Set[str]:
+    return { _canon_name(x) for x in seq if str(x).strip() }
+
 def yoga_detect(norm: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Run Yoga detection given a *normalized* yoga payload from vedic_validator.normalize_yoga_payload.
-
-    Expected keys in `norm` (best-effort; missing values tolerated):
-      - zodiac_mode/method, ayanamsa, observer, house_system
-      - date, time, tz, latitude, longitude, jd_tt, jd_ut1
-      - include (names), enable_catalog_tags, disable_catalog_tags
-      - points_deg/cusps_deg may be present but are not required by the core engine.
-
+    Run Yoga detection given a *normalized* yoga payload.
     Returns:
       { ok, yogas, context, warnings, present }  // `present` is a convenience list of matched names
     """
-    include_names = [str(n).strip().lower() for n in (norm.get("include") or [])]
+    include_raw = list(norm.get("include") or ())
+    include_names = _canon_set(include_raw)
 
+    # ── Primary path: registry/core ──
     if _YOGA_CORE_OK and _compute_yogas_core is not None:
         payload = {
             # timescales/site (core will compute as needed)
@@ -756,38 +774,58 @@ def yoga_detect(norm: Dict[str, Any]) -> Dict[str, Any]:
                 # honor tag gates (names are filtered post-hoc below)
                 enable_catalog_tags=tuple(norm.get("enable_catalog_tags") or ()),
                 disable_catalog_tags=tuple(norm.get("disable_catalog_tags") or ()),
-                # leave other options at defaults (sidereal-first, AL notes on, varga boosts on)
             )
         except Exception as e:
             return {"ok": False, "error": f"yoga_engine_error:{e}"}
 
-        yogas = list(res.get("yogas") or [])
+        # Filter and normalize names for the include gate (if provided)
+        yogas_full = list(res.get("yogas") or [])
         if include_names:
-            yogas = [y for y in yogas if str(y.get("name","")).strip().lower() in include_names]
+            filtered: List[Dict[str, Any]] = []
+            for y in yogas_full:
+                nm = str(y.get("name") or "")
+                if _canon_name(nm) in include_names:
+                    filtered.append(y)
+            yogas = filtered
+        else:
+            yogas = yogas_full
 
-        present_list = [{"yoga": y["name"], "score": y.get("score"), "tags": y.get("tags", [])}
-                        for y in yogas if bool(y.get("present"))]
+        present_list = [
+            {"yoga": y.get("name"), "score": y.get("score"), "tags": y.get("tags", [])}
+            for y in yogas if bool(y.get("present"))
+        ]
 
-        return {
-            "ok": bool(res.get("ok", False)),
+        ok = bool(res.get("ok", False))
+        out = {
+            "ok": ok,
             "yogas": yogas,
             "context": res.get("context"),
-            "warnings": res.get("warnings", []),
+            "warnings": list(res.get("warnings", [])),
             "present": present_list,
         }
+        # Bubble up specific error text if core provided one (prevents generic 'failed')
+        if not ok:
+            if res.get("error"):
+                out["error"] = res["error"]
+            else:
+                out["error"] = "yoga_detect_failed"
+        return out
 
     # ── Fallback: legacy-basic detectors; requires precomputed points + cusps ──
     pts = norm.get("points_deg") or {}
     cusps = norm.get("cusps_deg") or []
     if pts and isinstance(cusps, list) and len(cusps) == 12:
+        # default include when caller didn't specify
+        default_inc = (
+            "panch_mahapurusha","gajakesari","chandra_mangal","parivartana",
+            "adhi","vesi_vasi_ubhayachari","viparita_rajayoga_basic",
+            "neecha_bhanga_basic","kemadruma_basic"
+        )
+        inc = tuple(include_raw) if include_names else default_inc
         legacy_hits = detect_yogas(
             points_deg={k.lower(): v for k, v in pts.items()},
             cusps_deg=cusps,
-            include=tuple(include_names) if include_names else (
-                "panch_mahapurusha","gajakesari","chandra_mangal","parivartana",
-                "adhi","vesi_vasi_ubhayachari","viparita_rajayoga_basic",
-                "neecha_bhanga_basic","kemadruma_basic"
-            ),
+            include=inc,
         )
         return {
             "ok": True,
