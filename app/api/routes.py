@@ -10,12 +10,16 @@ Single dispatcher for shared/core ops:
   • op: "chart" (astronomy.compute_chart)
   • op: "houses" (house policy façade)
 
+Plus: free geocoding & timezone resolution
+- GET  /geo/search?q=<place>      → {label, latitude, longitude, tz}
+- (optional injection) supply 'place' in /ops/calculate to auto-fill lat/lon/tz
+
 Diagnostics & health:
 - GET  /ops/health
-- GET  /api/health                  (back-compat; main.py may add Deprecation header)
+- GET  /api/health
 - GET  /ops/version
 - GET  /ops/config
-- GET  /ops/diag/cores              (includes leap-seconds + ephemeris diagnostics)
+- GET  /ops/diag/cores
 - GET  /ops/diag/validators
 """
 
@@ -97,6 +101,10 @@ _, _normalize_houses_payload, _NH_ERR          = _try_import("app.core.validator
 _wval_mod, _, _WVAL_ERR                    = _try_import("app.core.western_validator")
 _ved_val_mod, _, _VEDVAL_ERR               = _try_import("app.core.vedic_validator")
 
+# Geocoding (free OSM + GeoNames)
+_geo_mod, _resolve_place, _GEO_RESOLVE_ERR = _try_import("app.core.geocoding", "resolve_place")
+_, _tz_from_coords, _GEO_TZ_ERR            = _try_import("app.core.geocoding", "tz_from_coords")
+
 
 # ───────────────────────── helpers ─────────────────────────
 def _env_dut1_seconds() -> float:
@@ -115,12 +123,12 @@ def _err(status: int, code: str, detail: str, **meta):
     return jsonify({"ok": False, "error": code, "detail": detail, "meta": meta}), status
 
 
-# One shared bucket for /ops/calculate (env overridable)
+# Rate limits
 RL_OPS_CALCULATE = int(os.getenv("ASTRO_RL_OPS_CALCULATE_PER_MIN", "60"))
+RL_GEO_SEARCH    = int(os.getenv("ASTRO_RL_GEO_SEARCH_PER_MIN", "60"))
 
-
-def _ops_bucket(*_a, **_k) -> str:
-    return "ops-calc"
+def _ops_bucket(*_a, **_k) -> str: return "ops-calc"
+def _geo_bucket(*_a, **_k) -> str: return "geo-search"
 
 
 # ───────────────────────── Ephemeris helpers ─────────────────────────
@@ -257,6 +265,31 @@ def ops_config():
     return jsonify(ok=True, config=cfg), 200
 
 
+# ───────────────────────── Geocoding API ─────────────────────────
+@ops_api.get("/geo/search")
+@rate_limit(RL_GEO_SEARCH, key_fn=_geo_bucket)
+def geo_search():
+    """
+    Resolve a place string to latitude/longitude (+ best-effort timezone).
+    GET /geo/search?q=Varanasi, India
+    """
+    if _resolve_place is None:
+        return _err(503, "geocoding_unavailable", _GEO_RESOLVE_ERR or "geocoding module not loaded")
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return _err(400, "bad_request", "Missing query parameter 'q'")
+    try:
+        place = _resolve_place(q)  # type: ignore[misc]
+        if not place:
+            return _err(404, "not_found", "Place not found")
+        # Always include attribution if present
+        if "attribution" not in place:
+            place["attribution"] = "© OpenStreetMap contributors"
+        return _ok({"place": place})
+    except Exception as e:
+        return _err(500, "geocoding_failed", str(e))
+
+
 # ───────────────────────── diagnostics ─────────────────────────
 @ops_api.get("/ops/diag/cores")
 def ops_diag_cores():
@@ -305,6 +338,12 @@ def ops_diag_cores():
         "leapseconds": {
             "loaded": (_ls_mod is not None) or (_ls_delta_at is not None),
             "error": _LS_ERR,
+        },
+        "geocoding": {
+            "loaded": _geo_mod is not None,
+            "resolve_place_sig": _sig(_resolve_place) if _resolve_place else None,
+            "tz_from_coords_sig": _sig(_tz_from_coords) if _tz_from_coords else None,
+            "error": _GEO_RESOLVE_ERR or _GEO_TZ_ERR,
         },
     }
 
@@ -435,6 +474,8 @@ def _unwrap_params(body: Dict[str, Any]) -> Dict[str, Any]:
         # common geo + chart bits
         "mode", "frame", "center", "topocentric", "latitude", "longitude",
         "elevation_m", "elev_m", "elevation", "bodies", "points", "ayanamsa",
+        # NEW: place string support
+        "place", "place_name"
     )):
         return {
             "date": body.get("date"),
@@ -464,6 +505,9 @@ def _unwrap_params(body: Dict[str, Any]) -> Dict[str, Any]:
             "polar_hard_limit": body.get("polar_hard_limit"),
             "diagnostics": body.get("diagnostics"),
             "validation": body.get("validation"),
+            # NEW: place support
+            "place": body.get("place") or body.get("place_name"),
+            "place_name": body.get("place_name") or body.get("place"),
         }
 
     ts = body.get("timescales")
@@ -499,6 +543,25 @@ def ops_calculate():
 
     raw_params = _unwrap_params(body)
 
+    # ── OPTIONAL: place & tz injection before op handling ─────────────────────
+    # If caller supplied a place but omitted lat/lon (and/or tz), resolve now.
+    try:
+        place_str = raw_params.get("place") or raw_params.get("place_name")
+        if place_str and _resolve_place:
+            need_coords = (raw_params.get("latitude") is None or raw_params.get("longitude") is None)
+            need_tz = (raw_params.get("tz") is None and raw_params.get("timezone") is None and body.get("place_tz") is None)
+            if need_coords or need_tz:
+                rp = _resolve_place(str(place_str))  # type: ignore[misc]
+                if rp:
+                    if need_coords:
+                        raw_params["latitude"]  = rp.get("latitude")
+                        raw_params["longitude"] = rp.get("longitude")
+                    if need_tz and rp.get("tz"):
+                        raw_params["tz"] = rp.get("tz")
+    except Exception:
+        # best-effort; if geocoding fails we continue, normalizers will complain if required fields are missing
+        pass
+
     # ── TIMESCALES ────────────────────────────────────────────────────────────
     if op == "timescales":
         if _normalize_common:
@@ -507,6 +570,14 @@ def ops_calculate():
             except Exception as e:
                 return _err(400, "bad_request", f"normalize_common_payload failed: {e}", op=op)
             date = norm.get("date"); time_str = norm.get("time"); tz = norm.get("tz")
+            # If tz still missing but coords present, try tz_from_coords
+            if (not tz) and _tz_from_coords and (norm.get("latitude") is not None) and (norm.get("longitude") is not None):
+                try:
+                    tz_guess = _tz_from_coords(float(norm["latitude"]), float(norm["longitude"]))  # type: ignore[misc]
+                    if tz_guess:
+                        tz = tz_guess
+                except Exception:
+                    pass
             dut1 = norm.get("dut1_seconds", _env_dut1_seconds())
             if not (date and time_str and tz):
                 return _err(400, "bad_request", "Missing keys: date, time, tz", op=op)
@@ -514,6 +585,14 @@ def ops_calculate():
             date = raw_params.get("date")
             time_str = raw_params.get("time")
             tz = raw_params.get("tz") or raw_params.get("tz_name") or body.get("place_tz")
+            # If tz missing but coords present, try tz_from_coords
+            if (not tz) and _tz_from_coords and (raw_params.get("latitude") is not None) and (raw_params.get("longitude") is not None):
+                try:
+                    tz_guess = _tz_from_coords(float(raw_params["latitude"]), float(raw_params["longitude"]))  # type: ignore[misc]
+                    if tz_guess:
+                        tz = tz_guess
+                except Exception:
+                    pass
             dut1 = raw_params.get("dut1_seconds", _env_dut1_seconds())
             if not (date and time_str and tz):
                 return _err(400, "bad_request", "Missing keys: date, time, tz", op=op)
