@@ -16,5 +16,12 @@ jplephem==2.22
 spiceypy>=6.0.0
 tzdata==2024.1
 
+# --- Geocoding & timezone ---
+geopy==2.4.1
+timezonefinder==6.2.0
+
+# --- Safety pin (if a transitive dep requests h3, use a prebuilt wheel on py311)
+h3==3.7.7
+
 # --- Monitoring ---
 prometheus-client==0.20.0
