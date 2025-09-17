@@ -2,16 +2,13 @@
 """
 Professional House System Calculations — v11 GOLD STANDARD (research-grade; 22 declared)
 
-WHAT’S NEW vs v10
-- Unified certification thresholds:
-  * Doc target: ≤ 0.003°  (≈ 10.8″)
-  * ErrorBudget.certify_accuracy default now 10.8″
-  * Validation summary “gold certified” also uses 10.8″
-- Numeric knobs exposed via env (PLACIDUS_MAX_ITERS / PLACIDUS_TOL_F / PLACIDUS_TOL_STEP).
-- Topocentric semi-arc: preserves cos(δ) sign near δ≈±90° (robustness at singularities).
-- Light refactors for clarity; comments and docstrings tightened.
+Minor hardening (v11.1):
+- Replaced fragile acot(num/den) divisions with quadrant-safe atan2 usage via `_acotd_ratio`
+  in ASC, Koch cusp-from-H, and Vertex — removes near-singularity flips when denom≈0.
+- Secant solver step now uses circular delta to avoid wrap-induced large steps across 0/360°.
+- Kept interfaces, systems, diagnostics, and validation exactly compatible with v11.
 
-ACCURACY TARGET (unchanged in spirit)
+ACCURACY TARGET (unchanged)
 ≤ 0.003° agreement vs SwissEph/Solar Fire (1900–2650) with NO shortcuts:
 - Apparent sidereal time (GAST) via IAU 2006/2000A (PyERFA)
 - True obliquity: mean IAU 2006 + nutation in obliquity (IAU 2000A)
@@ -26,15 +23,10 @@ ACCURACY TARGET (unchanged in spirit)
 ASTROLOGICAL INTERPRETATION LAYERS (non-geometric)
 - Bhāva Chalit vs Cusp-lines (Vedic):
   • CUSPS are precise boundary lines (ecliptic longitudes) of the twelve houses.
-  • BHAVA CHALIT is a *placement* convention: planets are assigned to houses using chosen
-    bhāva boundaries (e.g. Sripati/Madhya Bhāva midpoints), which may differ from quadrant
-    cusp-lines used in Western practice. This file exposes both:
+  • BHAVA CHALIT is a placement convention (e.g., Sripati midpoints). This file exposes both:
       - 'sripati' cusps (midpoints from Porphyry boundaries)
       - aliases: 'bhava_chalit_sripati' and 'bhava_chalit_equal_from_mc'
-  Consumers should state clearly whether they display *cusps* or *bhāva boundaries*.
-
-- Gauquelin Sectors: PROVISIONAL equal hour-angle slices. Scholarly implementations use
-  semi-arc scaling; this placeholder is conservative and intentionally marked provisional.
+  Consumers should state clearly whether they display cusps or bhāva boundaries.
 
 Policy choices (fallbacks/lat gating) live in app/core/house.py.
 
@@ -102,7 +94,15 @@ def _acos_strict_deg(x: float, ctx: str) -> float:
     return math.degrees(math.acos(x))
 
 def _acotd(x: float) -> float:
+    # Retained for completeness; prefer _acotd_ratio for robust quadrant handling.
     return _norm_deg(math.degrees(math.atan2(1.0, x)))
+
+def _acotd_ratio(num: float, den: float) -> float:
+    """
+    Robust acot(num/den) that preserves quadrant using atan2(den, num).
+    Returns degrees on [0,360).
+    """
+    return _norm_deg(math.degrees(math.atan2(den, num)))
 
 def _split_jd(jd: float) -> Tuple[float, float]:
     d = math.floor(jd)
@@ -127,6 +127,11 @@ def _kahan_sum(values: List[float]) -> float:
 def _stable_angle_sum(angles: List[float]) -> float:
     return _norm_deg(_kahan_sum(angles))
 
+def _circ_delta(a: float, b: float) -> float:
+    """Signed circular difference a-b on (-180,180]."""
+    d = (a - b) % 360.0
+    return d - 360.0 if d > 180.0 else d
+
 # ───────────────────────── ERFA / fundamental angles ─────────────────────────
 
 def _gast_deg(jd_ut1: float, jd_tt: float) -> float:
@@ -148,22 +153,23 @@ def _mc_longitude_deg(ramc: float, eps: float) -> float:
     return _atan2d(_sind(ramc) * _cosd(eps), _cosd(ramc))
 
 def _asc_longitude_deg(phi: float, ramc: float, eps: float) -> float:
-    # ASC = arccot( - ( tan φ * sin ε + sin RAMC * cos ε ) / cos RAMC )
+    # Robust acot form using atan2 to preserve quadrant:
+    # λ_ASC = acot( -(tanφ·sinε + sinRAMC·cosε)/cosRAMC )
     num = -((_tand(phi) * _sind(eps)) + (_sind(ramc) * _cosd(eps)))
     den = _cosd(ramc)
-    return _acotd(num / max(1e-15, den))
+    return _acotd_ratio(num, den)
 
 def _eastpoint_longitude_deg(ramc: float, eps: float) -> float:
     ra = _norm_deg(ramc + 90.0)
     return _atan2d(_sind(ra) * _cosd(eps), _cosd(ra))
 
 def _vertex_longitude_deg(phi: float, ramc: float, eps: float) -> float:
-    # VTX = arccot( - ( cot φ * sin ε - sin RAMC * cos ε ) / cos RAMC )
+    # λ_VTX = acot( -(cotφ·sinε - sinRAMC·cosε)/cosRAMC )
     tphi = _tand(phi)
     cot_phi = (1.0 / tphi) if abs(tphi) > 1e-15 else 1e15
     num = -((cot_phi * _sind(eps)) - (_sind(ramc) * _cosd(eps)))
     den = _cosd(ramc)
-    return _acotd(num / max(1e-15, den))
+    return _acotd_ratio(num, den)
 
 # ───────────────────────── common cusp helpers ─────────────────────────
 
@@ -171,10 +177,8 @@ def _blank() -> List[Optional[float]]:
     """Return an empty 12-slot cusp holder."""
     return [None] * 12
 
-
 # exact amplitude for ±1 microarcsecond in degrees
 _MICRO_ARCSEC_DEG = 1.0 / 3600.0 / 1_000_000.0  # ≈ 2.777...e-10 deg
-
 
 def _deterministic_micro_jitter(base_deg: float, idx: int) -> float:
     """
@@ -185,23 +189,12 @@ def _deterministic_micro_jitter(base_deg: float, idx: int) -> float:
     s = math.sin(x * 1.61803398875) * math.cos(x * 2.41421356237)  # in [-1, 1]
     return s * _MICRO_ARCSEC_DEG
 
-
 def _fill_opposites(cusps: List[Optional[float]]) -> List[float]:
     """
     Fill opposing cusps by 180° with a deterministic ±1 μas micro-variation
     when the value is inferred from its opposite.
 
     Pairing (0-based indices): (9↔3), (10↔4), (11↔5), (0↔6), (1↔7), (2↔8)
-
-    Rules:
-      - If exactly one side of a pair is provided, compute the other as
-        (value + 180° + jitter) mod 360, where |jitter| ≤ 1 μas in degrees.
-      - If both sides are provided, both are just normalized (no jitter added).
-      - If after pair processing any index is still None, infer it from its
-        opposite with the same deterministic jitter; if the opposite is also
-        None, raise ValueError.
-
-    Returns 12 normalized float cusps.
     """
     if len(cusps) != 12:
         raise ValueError("cusps must have length 12")
@@ -234,7 +227,6 @@ def _fill_opposites(cusps: List[Optional[float]]) -> List[float]:
         result[i] = float(_norm_deg(v))
 
     return result
-
 
 # ───────────────────────── exact house engines (closed/solved) ─────────────────────────
 
@@ -313,9 +305,10 @@ def _koch(phi: float, eps: float, ramc: float, mc: float) -> List[float]:
     H3  = _norm_deg(H2 + DX)
 
     def cusp_from_H(H: float) -> float:
+        # Robust acot form using atan2:
         num = -((_tand(phi) * _sind(eps)) + (_sind(H) * _cosd(eps)))
         den = _cosd(H)
-        return _acotd(num / max(1e-15, den))
+        return _acotd_ratio(num, den)
 
     cusps = _blank()
     cusps[9]  = mc
@@ -360,7 +353,7 @@ def _placidus_secant_solver(
     label: str,
     _diag: Optional[dict] = None
 ) -> float:
-    """Adaptive secant with multi-seed strategy."""
+    """Adaptive secant with multi-seed strategy; circular-safe step metric."""
     best_result = None
     best_error = float('inf')
     used = None
@@ -383,7 +376,7 @@ def _placidus_secant_solver(
                     continue
                 x2 = _norm_deg((x0 * f1 - x1 * f0) / denom)
                 f2 = eq_func(x2)
-                step = abs(_norm_deg(x2 - x1))
+                step = abs(_circ_delta(x2, x1))  # circular-safe step
                 if abs(f2) < PLACIDUS_TOL_F or step < PLACIDUS_TOL_STEP:
                     if abs(f2) < best_error:
                         best_result = x2
@@ -527,7 +520,6 @@ def _sripati(_phi: float, _eps: float, asc: float, mc: float) -> List[float]:
     por = _porphyry(asc, mc)
     cusps = [0.0] * 12
     for i in range(12):
-        # Fixed: Use current and next cusp (not previous)
         next_cusp = (i + 1) % 12
         cusps[i] = _midpoint_wrap(por[i], por[next_cusp])
     return _fill_opposites(cusps)
@@ -538,7 +530,6 @@ def _equal_from_mc(mc: float) -> List[float]:
       cusp10 = MC
       cusp 1 = MC + 90°
       cusp 4 = MC + 180° (IC)
-    Compute all 12 cusps explicitly at 30° intervals starting from cusp 1.
     """
     base = _norm_deg(mc + 90.0)  # cusp 1
     return [_norm_deg(base + 30.0 * i) for i in range(12)]
@@ -728,7 +719,7 @@ class PreciseHouseCalculator:
                 eb = ErrorBudget(
                     coordinate_precision=sys.float_info.epsilon * 57.2958,  # rad→deg
                     algorithm_truncation=(PLACIDUS_TOL_F if vector.system == "placidus" else 1e-15),
-                    time_scale_uncertainty=0.0001,  # deg (≈0.1s TT-UT1 @ sidereal rate → 15°/h)
+                    time_scale_uncertainty=0.0001,  # deg
                     reference_comparison=max_err
                 )
                 eb.compute_total()
@@ -1116,7 +1107,6 @@ def gauquelin_sector(ra_deg: float, dec_deg: float, *, ramc_deg: float, phi_deg:
     NOTE: Scholarly Gauquelin uses semi-arc scaling; this simplified version treats equal
     hour-angle slices. Parameters dec_deg and phi_deg are reserved for the future exact model.
     """
-    # keep references to signal future use (avoid linter complaints)
     _ = dec_deg; __ = phi_deg
     ha = _norm_deg(ra_deg - ramc_deg)  # Hour angle HA = RA - RAMC
     sector = int(math.floor(ha / 10.0)) + 1
@@ -1183,7 +1173,6 @@ def run_comprehensive_validation(external_vectors_file: Optional[str] = None) ->
             'pass_rate': pass_rate,
             'max_error_arcsec': max_arc,
             'avg_error_arcsec': avg_arc,
-            # Gold certification aligned to GOLD_CERT_ARCSEC (default 10.8″)
             'gold_standard_certified': pass_rate >= 0.95 and max_arc <= GOLD_CERT_ARCSEC
         },
         'system_statistics': system_stats,
