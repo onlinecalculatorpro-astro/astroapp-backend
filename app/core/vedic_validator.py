@@ -18,7 +18,9 @@ Key points
 """
 
 from typing import Any, Dict, List, Optional, Tuple
+import os
 import re
+import inspect
 
 # ── Optional place resolver (geocoding + tz + elevation) via astronomy.py ──
 _resolve_place = None
@@ -41,12 +43,32 @@ except Exception:
 
 # ── Optional timescales (ERFA-aligned) for Vimśottarī only; NO jd_utc here ──
 try:
-    # Expected signature: build_timescales(date_str, time_str, tz_name, dut1_seconds)
+    # Usually: build_timescales(date_str, time_str, tz_name, dut1_seconds)
     from app.core.timescales import build_timescales  # type: ignore
     _TIMESCALES_OK = True
 except Exception:
     build_timescales = None  # type: ignore
     _TIMESCALES_OK = False
+
+def _env_dut1_seconds() -> float:
+    """Read DUT1 seconds from env with safe defaults."""
+    try:
+        return float(os.environ.get("ASTRO_DUT1_BROADCAST",
+                                    os.environ.get("ASTRO_DUT1", "0.0")) or 0.0)
+    except Exception:
+        return 0.0
+
+def _call_build_timescales(date: str, time_str: str, tz_name: str):
+    """Compat shim for build_timescales with/without dut1_seconds."""
+    if build_timescales is None:
+        raise RuntimeError("build_timescales_unavailable")
+    try:
+        sig = inspect.signature(build_timescales)  # type: ignore
+        if len(sig.parameters) >= 4:
+            return build_timescales(date, time_str, tz_name, _env_dut1_seconds())  # type: ignore[misc]
+        return build_timescales(date, time_str, tz_name)  # type: ignore[misc]
+    except Exception as e:
+        raise
 
 # ── Optional varga module (for key normalization only; no computation here) ──
 try:
@@ -210,7 +232,7 @@ def _collect_vargas(payload: Dict[str, Any]) -> Tuple[List[str], List[str]]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Vimśottarī normalization (unchanged behavior)
+# Vimśottarī normalization (unchanged behavior, with DUT1 compat)
 # ─────────────────────────────────────────────────────────────────────────────
 def normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str], str]:
     """
@@ -306,7 +328,7 @@ def normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List
 
     if _TIMESCALES_OK and (jd_tt is None or jd_ut1 is None) and date:
         try:
-            ts = build_timescales(date, time_str, tz_norm, 0.0)  # type: ignore[call-arg]
+            ts = _call_build_timescales(date, time_str, tz_norm)  # <— compat shim
             if isinstance(ts, dict):
                 if jd_tt is None and ts.get("jd_tt") is not None:
                     jd_tt = float(ts["jd_tt"])
@@ -462,7 +484,7 @@ def normalize_yoga_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], Lis
         warns.append("timescales_ignored:core_computes_internally")
 
     # Include/exclude controls & varga boost hints (for scoring only)
-    include = []
+    include: List[str] = []
     inc = payload.get("include") or payload.get("include_yogas") or payload.get("yogas")
     if inc:
         if isinstance(inc, (list, tuple)):
