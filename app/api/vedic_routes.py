@@ -109,29 +109,29 @@ except Exception:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Yoga core (Mode-C only) — prefer app.core.yoga, fallback to app.core.yogas
+# Yoga core (Mode-C only) — prefer singular module name, then fallback
 # ──────────────────────────────────────────────────────────────────────────────
 _YOGA_OK = False
 _compute_yogas = None  # type: ignore
 _yoga_list = None      # type: ignore
 
 try:
-    # Primary path (matches vedic_predictive.py)
-    from app.core.yoga import (
+    # Preferred: app/core/yoga.py
+    from app.core.yoga import (                                     # type: ignore
         compute_yogas as _compute_yogas,
         list_registered_yogas as _yoga_list,
-    )  # type: ignore
+    )
     _YOGA_OK = True
 except Exception:
     try:
-        # Back-compat alternate filename
-        from app.core.yogas import (
+        # Fallback: app/core/yogas.py (alternate filename)
+        from app.core.yogas import (                                # type: ignore
             compute_yogas as _compute_yogas,
             list_registered_yogas as _yoga_list,
-    )  # type: ignore
+        )
         _YOGA_OK = True
     except Exception:
-        pass
+        _YOGA_OK = False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
