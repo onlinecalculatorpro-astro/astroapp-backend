@@ -1,23 +1,24 @@
-# app/core/yogas.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
 """
 Classical Yogas — single pipeline (civil birth details → timescales → ephemeris → houses → yogas).
 
-What this file does
--------------------
-• Requires civil birth details + site:
-  - date (YYYY-MM-DD), time (HH:MM[:SS]), tz (IANA), latitude, longitude
-• Computes timescales using `time_kernel` (preferred) or `timescales` (fallback).
-• Computes houses via the same façade used by routes:
-    from app.core.house import compute_houses_with_policy
-• Computes planetary longitudes via the ephemeris adapter, converts to sidereal using ayanāṁśa.
-• Optional varga support via:
-    from app.core.varga_charts import compute_many_vargas
-
-Important: No legacy modes/fast paths.
-- Any payload keys like `points_deg`, `cusps_deg`, `jd_tt`, `jd_ut1` are ignored.
+Hardened version
+----------------
+This rewrite tightens permissive defaults and removes cross-request state
+mutations:
+• Conservative defaults:
+  - chandra_mangala_by_sign=False (use degree-orb unless explicitly requested)
+  - gajakesari_include_same_house=False (require 4/7/10 from Moon)
+  - include_mooltrikona_in_mahapurusha=False (only own/exalted by default)
+• Mahāpuruṣa mooltrikona logic is *never* inferred from "neutral" dignity.
+  If a proper checker is available in constants, it is used; otherwise the
+  option is ignored with a warning.
+• Tag gating is now *per-call* and does not flip global rule flags.
+• Varga scoring uses sidereal inputs consistently.
+• Registry does not capture options at definition time; options are read
+  per-call via an `opts` dict passed to each rule.
 
 Public API
 ----------
@@ -119,6 +120,12 @@ except Exception:
     _DEB = {"Sun": 6, "Moon": 7, "Mars": 3, "Mercury": 11, "Jupiter": 9, "Venus": 5, "Saturn": 0}
     _OWN = {"Sun": (4,), "Moon": (3,), "Mars": (0, 7), "Mercury": (2, 5), "Jupiter": (8, 11), "Venus": (1, 6), "Saturn": (9, 10)}
 
+# Optional mooltrikona checker (only used if present)
+try:
+    from app.core.constants_vedic import is_mooltrikona_position as _is_mt_pos  # type: ignore
+except Exception:
+    _is_mt_pos = None  # type: ignore
+
 # ─────────────────────────────────────────────────────────────────────
 # Utilities
 # ─────────────────────────────────────────────────────────────────────
@@ -147,8 +154,11 @@ def _house_delta(h_from: Optional[int], h_to: Optional[int]) -> Optional[int]:
     return ((h_to - h_from) % 12) + 1
 
 def _is_kendra(h: int) -> bool:   return h in (1, 4, 7, 10)
+
 def _is_trikona(h: int) -> bool:  return h in (1, 5, 9)
+
 def _is_upachaya(h: int) -> bool: return h in (3, 6, 10, 11)
+
 def _is_dusthana(h: int) -> bool: return h in (6, 8, 12)
 
 def _conj(a: float, b: float, orb: float) -> bool:
@@ -173,6 +183,15 @@ def _dignity(planet: str, sign_idx: int) -> str:
     if sign_idx in _OWN.get(planet, ()): return "own"
     return "neutral"
 
+# Mooltrikona checker wrapper (only if provided by constants)
+def _is_mooltrikona(planet: str, lon_sidereal: float) -> bool:
+    if callable(_is_mt_pos):
+        try:
+            return bool(_is_mt_pos(planet, float(lon_sidereal)))
+        except Exception:
+            return False
+    return False
+
 @lru_cache(maxsize=4096)
 def _waxing_moon_cached(jd_tt_bucket: int, ay_key: str) -> Optional[bool]:
     if _panchanga_elements_at is None: return None
@@ -192,6 +211,7 @@ def _benefic_set(jd_tt: float, ay_key: str) -> Set[str]:
 # ─────────────────────────────────────────────────────────────────────
 # Timescales, Ayanāṁśa & Ephemeris (cached)
 # ─────────────────────────────────────────────────────────────────────
+
 def _require_birth_details(payload: Dict[str, Any]) -> Tuple[str, str, str, float, float]:
     # Accept flat or nested "birth" keys
     d  = payload.get("date")     or payload.get("birth", {}).get("date")
@@ -202,6 +222,7 @@ def _require_birth_details(payload: Dict[str, Any]) -> Tuple[str, str, str, floa
     if not all((d, t, tz, lat, lon)):
         raise ValueError("birth_details_required (date, time, tz, latitude, longitude)")
     return str(d), str(t), str(tz), float(lat), float(lon)
+
 
 def _timescales_from_civil(date: str, time: str, tz: str) -> Tuple[float, float, List[str]]:
     """
@@ -314,6 +335,7 @@ def _ayanamsa_cached(jd_tt_bucket: int, key_or_deg: str) -> Tuple[str, float, Tu
 
 # lazy ephemeris adapter (single instance)
 _EPHEM: Optional[EphemerisAdapter] = None
+
 def _ephem() -> EphemerisAdapter:
     global _EPHEM
     if _EPHEM is None:
@@ -338,6 +360,7 @@ def _sidereal_longitudes(jd_tt: float, names: List[str], ay_deg: float) -> Dict[
 # ─────────────────────────────────────────────────────────────────────
 # Houses & mapping
 # ─────────────────────────────────────────────────────────────────────
+
 def _compute_houses_payload(lat: float, lon: float, jd_tt: float, jd_ut1: float, house_system: str) -> Dict[str, Any]:
     if not (_HOUSES_OK and callable(_compute_houses_with_policy)):
         raise RuntimeError("houses_module_unavailable")
@@ -352,6 +375,7 @@ def _compute_houses_payload(lat: float, lon: float, jd_tt: float, jd_ut1: float,
         validation=False,
     )
 
+
 def _house_map_for_planets(planet_lons: Dict[str, float], cusps: List[float]) -> Dict[str, int]:
     idxs = _assign_houses([planet_lons[p] for p in planet_lons], cusps)
     return {k: int(idxs[i]) for i, k in enumerate(planet_lons.keys())}
@@ -359,6 +383,7 @@ def _house_map_for_planets(planet_lons: Dict[str, float], cusps: List[float]) ->
 # ─────────────────────────────────────────────────────────────────────
 # Vargas (D9/D10 + vargottama)
 # ─────────────────────────────────────────────────────────────────────
+
 def _varga_context(
     pl_lons_sidereal: Dict[str, float],
     ay_key: str,
@@ -369,7 +394,8 @@ def _varga_context(
     if not (enable and _VARGA_OK and callable(_compute_many_vargas)):
         return {}, {}, {}, warns
     try:
-        res = _compute_many_vargas(pl_lons_sidereal, list(varga_keys), zodiac_mode="tropical", ayanamsa=None)  # type: ignore[misc]
+        # Inputs are sidereal, so call engine in sidereal mode and pass the key
+        res = _compute_many_vargas(pl_lons_sidereal, list(varga_keys), zodiac_mode="sidereal", ayanamsa=ay_key)  # type: ignore[misc]
     except Exception as e:
         warns.append(f"varga_compute_error:{e}")
         return {}, {}, {}, warns
@@ -396,6 +422,7 @@ def _varga_context(
 # ─────────────────────────────────────────────────────────────────────
 # Data structures & Registry
 # ─────────────────────────────────────────────────────────────────────
+
 @dataclass
 class YogaHit:
     name: str
@@ -405,12 +432,16 @@ class YogaHit:
     details: Dict[str, Any]
     tags: Tuple[str, ...] = ()
 
-_RULES: Dict[str, Dict[str, Any]] = {}  # name -> {"fn":callable, "tags":tuple, "enabled":bool, "meta":dict}
+# A rule function takes (ctx, opts) and returns a YogaHit or List[YogaHit]
+RuleFn = Callable[[Dict[str, Any], Dict[str, Any]], YogaHit | List[YogaHit]]
+
+_RULES: Dict[str, Dict[str, Any]] = {}  # name -> {"fn":RuleFn, "tags":tuple, "enabled":bool, "meta":dict}
 _BUILT = False
+
 
 def register_yoga(
     name: str,
-    fn: Callable[..., YogaHit] | Callable[..., List[YogaHit]],
+    fn: RuleFn,
     *,
     tags: Iterable[str] = (),
     enabled: bool = True,
@@ -418,131 +449,63 @@ def register_yoga(
 ) -> None:
     _RULES[name] = {"fn": fn, "tags": tuple(tags), "enabled": bool(enabled), "meta": dict(meta or {})}
 
-def _ensure_registry() -> None:
-    global _BUILT
-    if _BUILT:
-        return
-    _BUILT = True
-    _RULES.clear()
 
-    # — Mahapurusha (5) —
-    name_map = {"Mars": "Ruchaka", "Mercury": "Bhadra", "Jupiter": "Hamsa", "Venus": "Malavya", "Saturn": "Sasa"}
-    for p in ("Mars", "Mercury", "Jupiter", "Venus", "Saturn"):
-        def _make(pname: str) -> Callable[[Dict[str, Any]], YogaHit]:
-            return lambda ctx, _p=pname: _mahapurusha_rule(ctx, _p, name_map, include_mooltrikona=True)
-        register_yoga(name_map[p], _make(p), tags=("mahapurusha", "strength", "popular"))
-
-    # Core popular yogas
-    register_yoga("Gaja-Kesari",            lambda ctx: _gaja_kesari_rule(ctx, include_same_house=True), tags=("moon", "strength", "popular"))
-    register_yoga("Chandra-Mangala",        lambda ctx: _chandra_mangala_rule(ctx, by_sign=True, orb_deg=6.0), tags=("moon", "wealth", "popular"))
-    register_yoga("Adhi",                   _adhi_rule, tags=("moon", "benefic"))
-    register_yoga("Durudhara (Moon flanked)", _durudhara_rule, tags=("moon", "kartari"))
-
-    # Sun flankers
-    register_yoga("Veshi/Voshi/Ubhayachari", _veshi_voshi_ubhay_rule, tags=("sun", "kartari"))
-
-    # Kartari
-    register_yoga("Kartari around Lagna",   lambda ctx: _kartari_rule(ctx, "Lagna"), tags=("kartari", "lagna"))
-    register_yoga("Kartari around Moon",    lambda ctx: _kartari_rule(ctx, "Moon"),  tags=("kartari", "moon"))
-    register_yoga("Kartari around Sun",     lambda ctx: _kartari_rule(ctx, "Sun"),   tags=("kartari", "sun"))
-
-    # Raja family
-    register_yoga("Raja (k–t association)", _raja_rule, tags=("raja", "association"))
-    register_yoga("Dharma-Karmadhipati",    _dharma_karmadhipati_rule, tags=("raja", "dk"))
-    register_yoga("Parivartana (exchange)", _parivartana_rule, tags=("raja", "exchange"))
-    register_yoga("Neecha-bhanga (composite)", _neechabhanga_rule, tags=("raja", "cancellation"))
-    register_yoga("Vipareeta Raja (tri-dusthana lords)", _vipareeta_raja_rule, tags=("raja", "vipareeta"))
-
-    # Wealth / career
-    register_yoga("Amala from Lagna",       lambda ctx: _amala_rule(ctx, "Lagna"), tags=("amala", "career"))
-    register_yoga("Amala from Moon",        lambda ctx: _amala_rule(ctx, "Moon"),  tags=("amala", "career", "moon"))
-    register_yoga("Chatussagara",           _chatussagara_rule, tags=("kendras", "strength"))
-    register_yoga("Vasumati",               _vasumati_rule, tags=("moon", "wealth"))
-    register_yoga("Dhana (2/11[/5] association)", _dhana_rule, tags=("wealth", "association"))
-    register_yoga("Saraswati",              _saraswati_rule, tags=("education", "speech"))
-    register_yoga("Lakshmi",                _lakshmi_rule, tags=("wealth", "fortune"))
-
-    # Dosha / nodal frameworks
-    register_yoga("Kemadruma (Moon isolated)", _kemadruma_rule, tags=("moon", "dosha"))
-    register_yoga("Kala Sarpa / Amrita",       _kala_sarpa_rule, tags=("nodal", "dosha"))
-
-def list_registered_yogas() -> List[Dict[str, Any]]:
-    _ensure_registry()
-    out = []
-    for k, v in _RULES.items():
-        out.append({"name": k, "enabled": v["enabled"], "tags": list(v["tags"]), "meta": v["meta"]})
-    return sorted(out, key=lambda r: r["name"].lower())
-
-def enable_yogas(keys: Iterable[str]) -> None:
-    _ensure_registry()
-    keys = list(keys)
-    by_tag = {k for k in keys if str(k).startswith("tag:")}
-    names = set(keys) - by_tag
-    for nm in names:
-        if nm in _RULES: _RULES[nm]["enabled"] = True
-    for t in by_tag:
-        tag = str(t).split(":", 1)[1]
-        for _, rec in _RULES.items():
-            if tag in rec["tags"]: rec["enabled"] = True
-
-def disable_yogas(keys: Iterable[str]) -> None:
-    _ensure_registry()
-    keys = list(keys)
-    by_tag = {k for k in keys if str(k).startswith("tag:")}
-    names = set(keys) - by_tag
-    for nm in names:
-        if nm in _RULES: _RULES[nm]["enabled"] = False
-    for t in by_tag:
-        tag = str(t).split(":", 1)[1]
-        for _, rec in _RULES.items():
-            if tag in rec["tags"]:
-                rec["enabled"] = False
+def _mahapurusha_rule_for(planet: str, title: str) -> RuleFn:
+    def _fn(ctx: Dict[str, Any], opts: Dict[str, Any]) -> YogaHit:
+        lon = ctx["pl_lons"].get(planet)
+        if lon is None:
+            return YogaHit(title, False, 0.0, {}, {}, ("mahapurusha", "strength"))
+        si = _sign_index(lon)
+        house = ctx["pl_houses"].get(planet)
+        dign = _dignity(planet, si)
+        # Only include mooltrikona if a real checker exists and the option is ON
+        mt_opt = bool(opts.get("mahapurusha_include_mooltrikona", False))
+        mt_ok = mt_opt and _is_mooltrikona(planet, lon)
+        strong = dign in ("own", "exalted") or mt_ok
+        present = bool(house) and _is_kendra(house) and strong
+        levels = {"house": {"is_kendra": _is_kendra(house or 0), "house": house}, "sign": {"index": si, "dignity": dign, "mooltrikona": bool(mt_ok)}}
+        score = 0.9 if dign == "exalted" else (0.85 if dign == "own" else (0.83 if mt_ok else 0.0))
+        return YogaHit(title, present, score if present else 0.0, levels, {"planet": planet}, ("mahapurusha", "strength"))
+    return _fn
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Core rule implementations (unchanged)
-# ─────────────────────────────────────────────────────────────────────
-def _mahapurusha_rule(ctx: Dict[str, Any], planet: str, name_map: Dict[str, str], include_mooltrikona: bool) -> YogaHit:
-    lon = ctx["pl_lons"].get(planet)
-    if lon is None:
-        return YogaHit(name_map[planet], False, 0.0, {}, {}, ("mahapurusha", "strength"))
-    si = _sign_index(lon);  house = ctx["pl_houses"].get(planet)
-    dign = _dignity(planet, si)
-    strong = dign in ("own","exalted") or (include_mooltrikona and dign == "neutral" and planet in _PLANETS_MAIN)
-    present = bool(house) and _is_kendra(house) and strong
-    levels = {"house": {"is_kendra": _is_kendra(house or 0), "house": house}, "sign": {"index": si, "dignity": dign}}
-    score = 0.9 if dign == "exalted" else (0.85 if dign == "own" else (0.8 if present else 0.0))
-    return YogaHit(name_map[planet], present, score if present else 0.0, levels, {"planet": planet}, ("mahapurusha", "strength"))
-
-def _gaja_kesari_rule(ctx: Dict[str, Any], include_same_house: bool) -> YogaHit:
+def _gaja_kesari_rule(ctx: Dict[str, Any], opts: Dict[str, Any]) -> YogaHit:
+    include_same = bool(opts.get("gajakesari_include_same_house", False))
     h_m = ctx["pl_houses"].get("Moon");  h_j = ctx["pl_houses"].get("Jupiter")
     d = _house_delta(h_m, h_j)
-    present = bool(d and (d in (1,4,7,10) if include_same_house else d in (4,7,10)))
-    lev = {"house": {"from_moon_delta": d}}
+    present = bool(d and (d in (1,4,7,10) if include_same else d in (4,7,10)))
+    lev = {"house": {"from_moon_delta": d, "include_same_house": include_same}}
     jd = _dignity("Jupiter", _sign_index(ctx["pl_lons"].get("Jupiter", 0.0)))
     score = (0.82 + (0.05 if jd in ("own","exalted") else 0.0)) if present else 0.0
     return YogaHit("Gaja-Kesari", present, score, lev, {}, ("moon", "benefic", "strength"))
 
-def _chandra_mangala_rule(ctx: Dict[str, Any], by_sign: bool, orb_deg: float) -> YogaHit:
+
+def _chandra_mangala_rule(ctx: Dict[str, Any], opts: Dict[str, Any]) -> YogaHit:
+    by_sign = bool(opts.get("chandra_mangala_by_sign", False))
+    orb_deg = float(opts.get("conj_orb_deg", 6.0))
     m  = ctx["pl_lons"].get("Moon");  ma = ctx["pl_lons"].get("Mars")
     if m is None or ma is None:
         return YogaHit("Chandra-Mangala", False, 0.0, {}, {}, ("moon", "wealth"))
     if by_sign:
         present = _sign_index(m) == _sign_index(ma)
-        lev = {"sign": {"same_sign": present}};  score = 0.78 if present else 0.0
+        lev = {"sign": {"same_sign": present}}
+        score = 0.78 if present else 0.0
     else:
         present = _conj(m, ma, orb_deg)
-        lev = {"degree": {"orb_deg": orb_deg, "within_orb": present}};  score = 0.8 if present else 0.0
+        lev = {"degree": {"orb_deg": orb_deg, "within_orb": present}}
+        score = 0.8 if present else 0.0
     return YogaHit("Chandra-Mangala", present, score, lev, {}, ("moon", "wealth"))
 
-def _adhi_rule(ctx: Dict[str, Any]) -> YogaHit:
+
+def _adhi_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     h_m = ctx["pl_houses"].get("Moon")
     if not h_m: return YogaHit("Adhi", False, 0.0, {}, {}, ("moon", "benefic"))
     deltas = {g: _house_delta(h_m, ctx["pl_houses"].get(g)) for g in ("Mercury","Venus","Jupiter") if ctx["pl_houses"].get(g)}
     present = len(deltas) == 3 and all(d in (6,7,8) for d in deltas.values())
     return YogaHit("Adhi", present, 0.78 if present else 0.0, {"from_moon_deltas": deltas}, {}, ("moon", "benefic"))
 
-def _durudhara_rule(ctx: Dict[str, Any]) -> YogaHit:
+
+def _durudhara_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     moon = ctx["pl_lons"].get("Moon")
     if moon is None: return YogaHit("Durudhara (Moon flanked)", False, 0.0, {}, {}, ("moon", "kartari"))
     left  = any(0 < _angdiff(ctx["pl_lons"][p], moon) < 180 for p in _PLANETS_MAIN if p != "Moon")
@@ -550,7 +513,8 @@ def _durudhara_rule(ctx: Dict[str, Any]) -> YogaHit:
     present = left and right
     return YogaHit("Durudhara (Moon flanked)", present, 0.72 if present else 0.0, {}, {}, ("moon", "kartari"))
 
-def _veshi_voshi_ubhay_rule(ctx: Dict[str, Any]) -> List[YogaHit]:
+
+def _veshi_voshi_ubhay_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> List[YogaHit]:
     sun = ctx["pl_lons"].get("Sun")
     if sun is None: return [YogaHit("Veshi/Voshi/Ubhayachari", False, 0.0, {}, {}, ("sun", "kartari"))]
     left  = [p for p in _PLANETS_MAIN if p not in ("Sun","Moon") and 0 < _angdiff(ctx["pl_lons"][p], sun) < 180]
@@ -562,24 +526,29 @@ def _veshi_voshi_ubhay_rule(ctx: Dict[str, Any]) -> List[YogaHit]:
     if not hits:            hits.append(YogaHit("Veshi/Voshi/Ubhayachari", False, 0.0, {}, {}, ("sun", "kartari")))
     return hits
 
-def _kartari_rule(ctx: Dict[str, Any], around: str) -> List[YogaHit]:
-    center_house = 1 if around == "Lagna" else ctx["pl_houses"].get(around, 1)
-    h12 = ((center_house + 10 - 1) % 12) + 1
-    h2  = ((center_house + 1  - 1) % 12) + 1
-    benefics = ctx["benefics"]
-    malefics = {"Saturn","Mars","Sun","Rahu","Ketu"} | (set() if "Moon" in benefics else {"Moon"})
-    at_12 = [p for p, h in ctx["pl_houses"].items() if h == h12]
-    at_2  = [p for p, h in ctx["pl_houses"].items() if h == h2]
-    has_b = any(p in benefics for p in at_12) and any(p in benefics for p in at_2)
-    has_m = any(p in malefics for p in at_12) and any(p in malefics for p in at_2)
-    return [
-        YogaHit(f"Shubha Kartari around {around}", has_b, 0.75 if has_b else 0.0,
-                {"houses":{"h12":h12,"h2":h2}, "planets":{"h12":at_12,"h2":at_2}}, {}, ("kartari","benefic")),
-        YogaHit(f"Papa Kartari around {around}",  has_m, 0.65 if has_m else 0.0,
-                {"houses":{"h12":h12,"h2":h2}, "planets":{"h12":at_12,"h2":at_2}}, {}, ("kartari","malefic")),
-    ]
 
-def _raja_rule(ctx: Dict[str, Any], conj_only: bool = False) -> YogaHit:
+def _kartari_rule(around: str) -> RuleFn:
+    def _fn(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> List[YogaHit]:
+        center_house = 1 if around == "Lagna" else ctx["pl_houses"].get(around, 1)
+        h12 = ((center_house + 10 - 1) % 12) + 1
+        h2  = ((center_house + 1  - 1) % 12) + 1
+        benefics = ctx["benefics"]
+        malefics = {"Saturn","Mars","Sun","Rahu","Ketu"} | (set() if "Moon" in benefics else {"Moon"})
+        at_12 = [p for p, h in ctx["pl_houses"].items() if h == h12]
+        at_2  = [p for p, h in ctx["pl_houses"].items() if h == h2]
+        has_b = any(p in benefics for p in at_12) and any(p in benefics for p in at_2)
+        has_m = any(p in malefics for p in at_12) and any(p in malefics for p in at_2)
+        return [
+            YogaHit(f"Shubha Kartari around {around}", has_b, 0.75 if has_b else 0.0,
+                    {"houses":{"h12":h12,"h2":h2}, "planets":{"h12":at_12,"h2":at_2}}, {}, ("kartari","benefic")),
+            YogaHit(f"Papa Kartari around {around}",  has_m, 0.65 if has_m else 0.0,
+                    {"houses":{"h12":h12,"h2":h2}, "planets":{"h12":at_12,"h2":at_2}}, {}, ("kartari","malefic")),
+        ]
+    return _fn
+
+
+def _raja_rule(ctx: Dict[str, Any], opts: Dict[str, Any]) -> YogaHit:
+    conj_only = bool(opts.get("raja_conj_only", False))
     pairs = []
     for k in (1,4,7,10):
         for t in (1,5,9):
@@ -596,7 +565,8 @@ def _raja_rule(ctx: Dict[str, Any], conj_only: bool = False) -> YogaHit:
     present = bool(pairs)
     return YogaHit("Raja (k–t association)", present, 0.82 if present else 0.0, {"pairs": pairs}, {}, ("raja","association"))
 
-def _dharma_karmadhipati_rule(ctx: Dict[str, Any]) -> YogaHit:
+
+def _dharma_karmadhipati_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     L9 = ctx["house_lords"][9]; L10 = ctx["house_lords"][10]
     h9 = ctx["pl_houses"].get(L9); h10 = ctx["pl_houses"].get(L10)
     if not (h9 and h10): return YogaHit("Dharma-Karmadhipati", False, 0.0, {}, {}, ("raja","dk"))
@@ -607,7 +577,8 @@ def _dharma_karmadhipati_rule(ctx: Dict[str, Any]) -> YogaHit:
     lev = {"lords":{"L9":L9,"L10":L10}, "houses":{"L9":h9,"L10":h10}, "same_sign":same_sign}
     return YogaHit("Dharma-Karmadhipati", assoc, 0.86 if assoc else 0.0, lev, {}, ("raja","dk"))
 
-def _parivartana_rule(ctx: Dict[str, Any]) -> YogaHit:
+
+def _parivartana_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     lords = ctx["sign_lords"]; lagna_sign = ctx["lagna_sign"]
     def house_of_sign(si: int) -> int: return ((si - lagna_sign) % 12) + 1
     exchanges = []
@@ -628,7 +599,8 @@ def _parivartana_rule(ctx: Dict[str, Any]) -> YogaHit:
     present = bool(exchanges); types = sorted(set(ex["type"] for ex in exchanges)) if present else []
     return YogaHit("Parivartana (exchange)", present, 0.88 if present else 0.0, {"exchanges": exchanges}, {"types": types}, ("exchange","raja"))
 
-def _neechabhanga_rule(ctx: Dict[str, Any]) -> YogaHit:
+
+def _neechabhanga_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     lords = ctx["sign_lords"]; lagna = 1; moon_h = ctx["pl_houses"].get("Moon", 1)
     cancels = []
     for p, deb_s in _DEB.items():
@@ -648,7 +620,8 @@ def _neechabhanga_rule(ctx: Dict[str, Any]) -> YogaHit:
     present = bool(cancels); score = 0.8 if present else 0.0
     return YogaHit("Neecha-bhanga (composite)", present, score, {"cancellations": cancels}, {}, ("cancellation","raja"))
 
-def _vipareeta_raja_rule(ctx: Dict[str, Any]) -> YogaHit:
+
+def _vipareeta_raja_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     res = []
     for H, name in ((6,"Harsha"), (8,"Sarala"), (12,"Vimala")):
         lord = ctx["house_lords"][H]; h = ctx["pl_houses"].get(lord)
@@ -659,22 +632,27 @@ def _vipareeta_raja_rule(ctx: Dict[str, Any]) -> YogaHit:
     score = 0.82 if any(r["dignity"] in ("own","exalted") for r in res) else (0.76 if present else 0.0)
     return YogaHit("Vipareeta Raja (tri-dusthana lords)", present, score, {"instances": res}, {}, ("vipareeta","raja"))
 
-def _amala_rule(ctx: Dict[str, Any], from_ref: str) -> YogaHit:
-    center = 1 if from_ref == "Lagna" else ctx["pl_houses"].get("Moon", 1)
-    target = ((center + 8 - 1) % 12) + 1
-    benefics = ctx["benefics"]
-    pls = [p for p, h in ctx["pl_houses"].items() if h == target and p in benefics]
-    present = bool(pls)
-    return YogaHit(f"Amala (benefic 10th from {from_ref})", present, 0.78 if present else 0.0, {"house": target, "planets": pls}, {}, ("amala","career"))
 
-def _chatussagara_rule(ctx: Dict[str, Any]) -> YogaHit:
+def _amala_rule(from_ref: str) -> RuleFn:
+    def _fn(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
+        center = 1 if from_ref == "Lagna" else ctx["pl_houses"].get("Moon", 1)
+        target = ((center + 8 - 1) % 12) + 1
+        benefics = ctx["benefics"]
+        pls = [p for p, h in ctx["pl_houses"].items() if h == target and p in benefics]
+        present = bool(pls)
+        return YogaHit(f"Amala (benefic 10th from {from_ref})", present, 0.78 if present else 0.0, {"house": target, "planets": pls}, {}, ("amala","career"))
+    return _fn
+
+
+def _chatussagara_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     have = {1: False, 4: False, 7: False, 10: False}
     for p, h in ctx["pl_houses"].items():
         if p in _PLANETS_MAIN and h in have: have[h] = True
     present = all(have.values())
     return YogaHit("Chatussagara", present, 0.76 if present else 0.0, {"kendras": have}, {}, ("kendras","strength"))
 
-def _vasumati_rule(ctx: Dict[str, Any]) -> YogaHit:
+
+def _vasumati_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     m = ctx["pl_houses"].get("Moon", 1)
     upas = {((m+2-1)%12)+1, ((m+5-1)%12)+1, ((m+9-1)%12)+1, ((m+10-1)%12)+1}
     bens = ctx["benefics"]
@@ -682,7 +660,8 @@ def _vasumati_rule(ctx: Dict[str, Any]) -> YogaHit:
     present = count >= 2
     return YogaHit("Vasumati (benefics in Moon's upachayas)", present, 0.74 if present else 0.0, {"count": count}, {}, ("wealth","moon"))
 
-def _dhana_rule(ctx: Dict[str, Any]) -> YogaHit:
+
+def _dhana_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     L2, L11, L5 = ctx["house_lords"][2], ctx["house_lords"][11], ctx["house_lords"][5]
     combos = [(L2,L11,"2&11"), (L2,L5,"2&5"), (L5,L11,"5&11")]
     hits = []
@@ -697,7 +676,8 @@ def _dhana_rule(ctx: Dict[str, Any]) -> YogaHit:
     present = bool(hits)
     return YogaHit("Dhana (2/11[/5] association)", present, 0.78 if present else 0.0, {"pairs": hits}, {}, ("wealth","association"))
 
-def _saraswati_rule(ctx: Dict[str, Any]) -> YogaHit:
+
+def _saraswati_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     trio = ("Mercury","Venus","Jupiter")
     ok_h = all(_is_kendra(ctx["pl_houses"].get(g,0)) or _is_trikona(ctx["pl_houses"].get(g,0)) for g in trio)
     ok_d = all(_dignity(g, _sign_index(ctx["pl_lons"][g])) in ("own","exalted") for g in trio)
@@ -706,7 +686,8 @@ def _saraswati_rule(ctx: Dict[str, Any]) -> YogaHit:
               "sign":  {g: _dignity(g, _sign_index(ctx["pl_lons"][g])) for g in trio}}
     return YogaHit("Saraswati", present, 0.84 if present else 0.0, levels, {}, ("education","speech"))
 
-def _lakshmi_rule(ctx: Dict[str, Any]) -> YogaHit:
+
+def _lakshmi_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     LL = ctx["house_lords"][1]; L9 = ctx["house_lords"][9]
     hL, h9 = ctx["pl_houses"].get(LL), ctx["pl_houses"].get(L9)
     if not (hL and h9): return YogaHit("Lakshmi", False, 0.0, {}, {}, ("wealth","fortune"))
@@ -717,7 +698,8 @@ def _lakshmi_rule(ctx: Dict[str, Any]) -> YogaHit:
     levels = {"lords":{"LL":LL,"L9":L9}, "houses":{"LL":hL,"L9":h9}, "assoc":{"same_sign":same, "mutual_kendra": _is_kendra(hL) and _is_kendra(h9)}}
     return YogaHit("Lakshmi", present, 0.83 if present else 0.0, levels, {}, ("wealth","fortune"))
 
-def _kemadruma_rule(ctx: Dict[str, Any]) -> YogaHit:
+
+def _kemadruma_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     h_m = ctx["pl_houses"].get("Moon", 1)
     h12 = ((h_m + 10 - 1) % 12) + 1; h2 = ((h_m + 1 - 1) % 12) + 1
     flank = [p for p,h in ctx["pl_houses"].items() if p in _PLANETS_MAIN and h in (h12,h2) and p != "Moon"]
@@ -725,7 +707,8 @@ def _kemadruma_rule(ctx: Dict[str, Any]) -> YogaHit:
     present = (len(flank) == 0) and (not canceled)
     return YogaHit("Kemadruma (Moon isolated)", present, 0.7 if present else 0.0, {"flanking_planets": flank, "kendra_from_moon_present": canceled}, {}, ("moon","dosha"))
 
-def _kala_sarpa_rule(ctx: Dict[str, Any]) -> List[YogaHit]:
+
+def _kala_sarpa_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> List[YogaHit]:
     rahu = ctx["pl_lons"].get("Rahu"); ketu = ctx["pl_lons"].get("Ketu")
     if rahu is None or ketu is None:
         return [YogaHit("Kala Sarpa", False, 0.0, {}, {}, ("nodal","dosha")),
@@ -743,6 +726,7 @@ def _kala_sarpa_rule(ctx: Dict[str, Any]) -> List[YogaHit]:
 # ─────────────────────────────────────────────────────────────────────
 # Varga-aware scoring (quick bumps)
 # ─────────────────────────────────────────────────────────────────────
+
 def _score_with_vargas(hit: YogaHit, ctx: Dict[str, Any], strengthen_on: Tuple[str, ...]) -> YogaHit:
     if not hit.present: return hit
     bump = 0.0; vg = ctx.get("vargottama", {})
@@ -756,6 +740,97 @@ def _score_with_vargas(hit: YogaHit, ctx: Dict[str, Any], strengthen_on: Tuple[s
     if "D10" in strengthen_on: bump += 0.01
     sc = min(0.99, hit.score + bump) if hit.present else 0.0
     return YogaHit(hit.name, hit.present, sc, {**hit.levels, "varga": {"boost_keys": strengthen_on}}, hit.details, hit.tags)
+
+# ─────────────────────────────────────────────────────────────────────
+# Registry build
+# ─────────────────────────────────────────────────────────────────────
+
+def _ensure_registry() -> None:
+    global _BUILT
+    if _BUILT:
+        return
+    _BUILT = True
+    _RULES.clear()
+
+    # — Mahapurusha (5) —
+    name_map = {"Mars": "Ruchaka", "Mercury": "Bhadra", "Jupiter": "Hamsa", "Venus": "Malavya", "Saturn": "Sasa"}
+    for p in ("Mars", "Mercury", "Jupiter", "Venus", "Saturn"):
+        register_yoga(name_map[p], _mahapurusha_rule_for(p, name_map[p]), tags=("mahapurusha", "strength", "popular"))
+
+    # Core popular yogas
+    register_yoga("Gaja-Kesari",            _gaja_kesari_rule, tags=("moon", "strength", "popular"))
+    register_yoga("Chandra-Mangala",        _chandra_mangala_rule, tags=("moon", "wealth", "popular"))
+    register_yoga("Adhi",                   _adhi_rule, tags=("moon", "benefic"))
+    register_yoga("Durudhara (Moon flanked)", _durudhara_rule, tags=("moon", "kartari"))
+
+    # Sun flankers
+    register_yoga("Veshi/Voshi/Ubhayachari", _veshi_voshi_ubhay_rule, tags=("sun", "kartari"))
+
+    # Kartari
+    register_yoga("Kartari around Lagna",   _kartari_rule("Lagna"), tags=("kartari", "lagna"))
+    register_yoga("Kartari around Moon",    _kartari_rule("Moon"),  tags=("kartari", "moon"))
+    register_yoga("Kartari around Sun",     _kartari_rule("Sun"),   tags=("kartari", "sun"))
+
+    # Raja family
+    register_yoga("Raja (k–t association)", _raja_rule, tags=("raja", "association"))
+    register_yoga("Dharma-Karmadhipati",    _dharma_karmadhipati_rule, tags=("raja", "dk"))
+    register_yoga("Parivartana (exchange)", _parivartana_rule, tags=("raja", "exchange"))
+    register_yoga("Neecha-bhanga (composite)", _neechabhanga_rule, tags=("raja", "cancellation"))
+    register_yoga("Vipareeta Raja (tri-dusthana lords)", _vipareeta_raja_rule, tags=("raja", "vipareeta"))
+
+    # Wealth / career
+    register_yoga("Amala from Lagna",       _amala_rule("Lagna"), tags=("amala", "career"))
+    register_yoga("Amala from Moon",        _amala_rule("Moon"),  tags=("amala", "career", "moon"))
+    register_yoga("Chatussagara",           _chatussagara_rule, tags=("kendras", "strength"))
+    register_yoga("Vasumati",               _vasumati_rule, tags=("moon", "wealth"))
+    register_yoga("Dhana (2/11[/5] association)", _dhana_rule, tags=("wealth", "association"))
+    register_yoga("Saraswati",              _saraswati_rule, tags=("education", "speech"))
+    register_yoga("Lakshmi",                _lakshmi_rule, tags=("wealth", "fortune"))
+
+    # Dosha / nodal frameworks
+    register_yoga("Kemadruma (Moon isolated)", _kemadruma_rule, tags=("moon", "dosha"))
+    register_yoga("Kala Sarpa / Amrita",       _kala_sarpa_rule, tags=("nodal", "dosha"))
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Public helpers
+# ─────────────────────────────────────────────────────────────────────
+
+def list_registered_yogas() -> List[Dict[str, Any]]:
+    _ensure_registry()
+    out = []
+    for k, v in _RULES.items():
+        out.append({"name": k, "enabled": v["enabled"], "tags": list(v["tags"]), "meta": v["meta"]})
+    return sorted(out, key=lambda r: r["name"].lower())
+
+
+def enable_yogas(keys: Iterable[str]) -> None:
+    _ensure_registry()
+    keys = list(keys)
+    by_tag = {k for k in keys if str(k).startswith("tag:")}
+    names = set(keys) - by_tag
+    for nm in names:
+        if nm in _RULES: _RULES[nm]["enabled"] = True
+    for t in by_tag:
+        tag = str(t).split(":", 1)[1]
+        for _, rec in _RULES.items():
+            if tag in rec["tags"]: rec["enabled"] = True
+
+
+def disable_yogas(keys: Iterable[str]) -> None:
+    _ensure_registry()
+    keys = list(keys)
+    by_tag = {k for k in keys if str(k).startswith("tag:")}
+    names = set(keys) - by_tag
+    for nm in names:
+        if nm in _RULES: _RULES[nm]["enabled"] = False
+    for t in by_tag:
+        tag = str(t).split(":", 1)[1]
+        for _, rec in _RULES.items():
+            if tag in rec["tags"]:
+                rec["enabled"] = False
+
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Public orchestrator (Mode-C only)
