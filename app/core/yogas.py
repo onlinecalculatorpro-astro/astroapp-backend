@@ -36,6 +36,7 @@ Each yoga item:
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Callable, Iterable, Set
 import math
+import os
 from functools import lru_cache
 
 # ─────────────────────────────────────────────────────────────────────
@@ -124,6 +125,14 @@ except Exception:
 _PLANETS_MAIN = ("Sun", "Moon", "Mars", "Mercury", "Jupiter", "Venus", "Saturn")
 _PLANETS_ALL  = ("Sun", "Moon", "Mars", "Mercury", "Jupiter", "Venus", "Saturn", "Rahu", "Ketu")
 
+def _env_dut1_seconds() -> float:
+    """Read DUT1 seconds from env; default 0.0 if not set."""
+    try:
+        return float(os.environ.get("ASTRO_DUT1_BROADCAST",
+                                    os.environ.get("ASTRO_DUT1", "0.0")) or 0.0)
+    except Exception:
+        return 0.0
+
 def _norm360(x: float) -> float:
     r = math.fmod(float(x), 360.0);  return r + 360.0 if r < 0.0 else r
 
@@ -195,32 +204,81 @@ def _require_birth_details(payload: Dict[str, Any]) -> Tuple[str, str, str, floa
     return str(d), str(t), str(tz), float(lat), float(lon)
 
 def _timescales_from_civil(date: str, time: str, tz: str) -> Tuple[float, float, List[str]]:
+    """
+    Resolve (jd_tt, jd_ut1) from civil inputs using:
+      1) app.core.time_kernel.* if available (preferred)
+      2) app.core.timescales.* fallback
+    Ensures build_timescales receives dut1_seconds when required.
+    """
     warns: List[str] = []
-    # prefer rich kernel
+    dut1 = _env_dut1_seconds()
+
+    # preferred rich kernel
     if _tk is not None:
-        for fname in ("timescales_from_civil","compute_timescales","build_timescales","to_timescales","from_civil"):
+        for fname in ("timescales_from_civil", "compute_timescales", "build_timescales", "to_timescales", "from_civil"):
             fn = getattr(_tk, fname, None)
-            if callable(fn):
+            if not callable(fn):
+                continue
+            try:
+                # Try with keyword arguments (and dut1 where applicable)
+                if fname == "build_timescales":
+                    out = fn(date=date, time=time, tz=tz, dut1_seconds=dut1)
+                else:
+                    # Some kernels accept dut1_seconds here too; attempt, then fallback
+                    try:
+                        out = fn(date=date, time=time, tz=tz, dut1_seconds=dut1)
+                    except TypeError:
+                        out = fn(date=date, time=time, tz=tz)
+            except TypeError:
+                # Try positional variants
                 try:
-                    out = fn(date=date, time=time, tz=tz)
+                    if fname == "build_timescales":
+                        out = fn(date, time, tz, dut1)
+                    else:
+                        try:
+                            out = fn(date, time, tz, dut1)
+                        except TypeError:
+                            out = fn(date, time, tz)
                 except TypeError:
-                    out = fn(date, time, tz)
-                if isinstance(out, dict):
-                    jt = float(out.get("jd_tt") or out.get("tt") or 0.0)
-                    ju = float(out.get("jd_ut1") or out.get("ut1") or jt)
-                    return jt, ju, warns
-                if isinstance(out, (list, tuple)) and len(out) >= 3:
-                    ju, jt = float(out[1]), float(out[0])
-                    return jt, ju, warns
-    # fallback
+                    continue
+
+            # Parse outputs
+            if isinstance(out, dict):
+                jt = float(out.get("jd_tt") or out.get("tt") or 0.0)
+                ju = float(out.get("jd_ut1") or out.get("ut1") or jt)
+                return jt, ju, warns
+            if isinstance(out, (list, tuple)) and len(out) >= 3:
+                # common shape: (tt, ut1, tzoff) or similar
+                ju, jt = float(out[1]), float(out[0])
+                return jt, ju, warns
+            # Unknown shape → try next candidate
+
+    # fallback module
     if _ts is None:
         raise RuntimeError("timescales_unavailable")
-    jd_ut = float(_ts.julian_day_utc(date, time, tz))
+    # If the fallback has a build_timescales, use it (with dut1)
+    try:
+        _bts = getattr(_ts, "build_timescales", None)
+        if callable(_bts):
+            try:
+                out = _bts(date=date, time=time, tz=tz, dut1_seconds=dut1)
+            except TypeError:
+                out = _bts(date, time, tz, dut1)
+            if isinstance(out, dict):
+                jt = float(out.get("jd_tt") or out.get("tt") or 0.0)
+                ju = float(out.get("jd_ut1") or out.get("ut1") or jt)
+                return jt, ju, warns
+    except Exception:
+        # fall through to manual path
+        pass
+
+    # last-resort manual path (UTC JD -> TT with simple ΔT fallback)
+    jd_ut = float(_ts.julian_day_utc(date, time, tz))  # type: ignore[attr-defined]
     try:
         y, m = map(int, str(date).split("-")[:2])
-        jd_tt = float(_ts.jd_tt_from_utc_jd(jd_ut, y, m))
+        jd_tt = float(_ts.jd_tt_from_utc_jd(jd_ut, y, m))  # type: ignore[attr-defined]
     except Exception:
-        jd_tt = jd_ut + 69.0/86400.0
+        jd_tt = jd_ut + 69.0/86400.0  # ~ΔT fallback
         warns.append("deltaT_fallback_69s")
     return jd_tt, jd_ut, warns
 
@@ -437,7 +495,7 @@ def disable_yogas(keys: Iterable[str]) -> None:
     for t in by_tag:
         tag = str(t).split(":", 1)[1]
         for _, rec in _RULES.items():
-            if tag in rec["tags"]: rec["enabled"] = False
+            if tag in rec["tags"]): rec["enabled"] = False
 
 # ─────────────────────────────────────────────────────────────────────
 # Core rule implementations (unchanged)
