@@ -1,3 +1,4 @@
+# app/core/yogas.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
@@ -6,36 +7,20 @@ Classical Yogas — single pipeline (civil birth details → timescales → ephe
 
 Hardened version
 ----------------
-This rewrite tightens permissive defaults and removes cross-request state
-mutations:
-• Conservative defaults:
+• Conservative defaults (caller can loosen via options):
   - chandra_mangala_by_sign=False (use degree-orb unless explicitly requested)
   - gajakesari_include_same_house=False (require 4/7/10 from Moon)
   - include_mooltrikona_in_mahapurusha=False (only own/exalted by default)
-• Mahāpuruṣa mooltrikona logic is *never* inferred from "neutral" dignity.
-  If a proper checker is available in constants, it is used; otherwise the
-  option is ignored with a warning.
-• Tag gating is now *per-call* and does not flip global rule flags.
+• Mahāpuruṣa mooltrikona uses a real checker only if available; otherwise it's ignored with a warning.
+• Tag gating is *per-call* (no global flag flips).
 • Varga scoring uses sidereal inputs consistently.
-• Registry does not capture options at definition time; options are read
-  per-call via an `opts` dict passed to each rule.
-
-Public API
-----------
-    compute_yogas(payload, **options) -> dict
-    list_registered_yogas() -> list[dict]
-    enable_yogas(names_or_tag_keys), disable_yogas(names_or_tag_keys)
-
-Return shape
-------------
-{ ok: bool, yogas: [...], context: {...}, warnings: [...] }
-
-Each yoga item:
-{ name, present, score, levels, details, tags }
+• Registry passes an `opts` dict to each rule; no capture at definition time.
+• Ephemeris names are canonicalized (Sun..Saturn, Rahu/Ketu), and the opposite node is synthesized if missing.
+• House indices from assign_houses are normalized to 1..12.
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Callable, Iterable, Set
+from typing import Any, Dict, List, Optional, Tuple, Callable, Iterable, Set, Union
 import math
 import os
 from functools import lru_cache
@@ -120,7 +105,7 @@ except Exception:
     _DEB = {"Sun": 6, "Moon": 7, "Mars": 3, "Mercury": 11, "Jupiter": 9, "Venus": 5, "Saturn": 0}
     _OWN = {"Sun": (4,), "Moon": (3,), "Mars": (0, 7), "Mercury": (2, 5), "Jupiter": (8, 11), "Venus": (1, 6), "Saturn": (9, 10)}
 
-# Optional mooltrikona checker (only used if present)
+# Optional mooltrikona checker (used only if present)
 try:
     from app.core.constants_vedic import is_mooltrikona_position as _is_mt_pos  # type: ignore
 except Exception:
@@ -129,11 +114,10 @@ except Exception:
 # ─────────────────────────────────────────────────────────────────────
 # Utilities
 # ─────────────────────────────────────────────────────────────────────
-_PLANETS_MAIN = ("Sun", "Moon", "Mars", "Mercury", "Jupiter", "Venus", "Saturn")
-_PLANETS_ALL  = ("Sun", "Moon", "Mars", "Mercury", "Jupiter", "Venus", "Saturn", "Rahu", "Ketu")
+_PLANETS_MAIN: Tuple[str, ...] = ("Sun", "Moon", "Mars", "Mercury", "Jupiter", "Venus", "Saturn")
+_PLANETS_ALL: Tuple[str, ...]  = ("Sun", "Moon", "Mars", "Mercury", "Jupiter", "Venus", "Saturn", "Rahu", "Ketu")
 
 def _env_dut1_seconds() -> float:
-    """Read DUT1 seconds from env; default 0.0 if not set."""
     try:
         return float(os.environ.get("ASTRO_DUT1_BROADCAST",
                                     os.environ.get("ASTRO_DUT1", "0.0")) or 0.0)
@@ -141,7 +125,8 @@ def _env_dut1_seconds() -> float:
         return 0.0
 
 def _norm360(x: float) -> float:
-    r = math.fmod(float(x), 360.0);  return r + 360.0 if r < 0.0 else r
+    r = math.fmod(float(x), 360.0)
+    return r + 360.0 if r < 0.0 else r
 
 def _angdiff(a: float, b: float) -> float:
     return ((_norm360(a) - _norm360(b) + 540.0) % 360.0) - 180.0
@@ -150,15 +135,13 @@ def _sign_index(lon: float) -> int:
     return int(math.floor(_norm360(lon) / 30.0)) % 12
 
 def _house_delta(h_from: Optional[int], h_to: Optional[int]) -> Optional[int]:
-    if not h_from or not h_to: return None
+    if not h_from or not h_to:
+        return None
     return ((h_to - h_from) % 12) + 1
 
 def _is_kendra(h: int) -> bool:   return h in (1, 4, 7, 10)
-
 def _is_trikona(h: int) -> bool:  return h in (1, 5, 9)
-
 def _is_upachaya(h: int) -> bool: return h in (3, 6, 10, 11)
-
 def _is_dusthana(h: int) -> bool: return h in (6, 8, 12)
 
 def _conj(a: float, b: float, orb: float) -> bool:
@@ -183,7 +166,6 @@ def _dignity(planet: str, sign_idx: int) -> str:
     if sign_idx in _OWN.get(planet, ()): return "own"
     return "neutral"
 
-# Mooltrikona checker wrapper (only if provided by constants)
 def _is_mooltrikona(planet: str, lon_sidereal: float) -> bool:
     if callable(_is_mt_pos):
         try:
@@ -211,9 +193,7 @@ def _benefic_set(jd_tt: float, ay_key: str) -> Set[str]:
 # ─────────────────────────────────────────────────────────────────────
 # Timescales, Ayanāṁśa & Ephemeris (cached)
 # ─────────────────────────────────────────────────────────────────────
-
 def _require_birth_details(payload: Dict[str, Any]) -> Tuple[str, str, str, float, float]:
-    # Accept flat or nested "birth" keys
     d  = payload.get("date")     or payload.get("birth", {}).get("date")
     t  = payload.get("time")     or payload.get("birth", {}).get("time")
     tz = payload.get("tz")       or payload.get("birth", {}).get("tz") or payload.get("place_tz")
@@ -223,35 +203,24 @@ def _require_birth_details(payload: Dict[str, Any]) -> Tuple[str, str, str, floa
         raise ValueError("birth_details_required (date, time, tz, latitude, longitude)")
     return str(d), str(t), str(tz), float(lat), float(lon)
 
-
 def _timescales_from_civil(date: str, time: str, tz: str) -> Tuple[float, float, List[str]]:
-    """
-    Resolve (jd_tt, jd_ut1) from civil inputs using:
-      1) app.core.time_kernel.* if available (preferred)
-      2) app.core.timescales.* fallback
-    Ensures build_timescales receives dut1_seconds when required.
-    """
     warns: List[str] = []
     dut1 = _env_dut1_seconds()
 
-    # preferred rich kernel
     if _tk is not None:
         for fname in ("timescales_from_civil", "compute_timescales", "build_timescales", "to_timescales", "from_civil"):
             fn = getattr(_tk, fname, None)
             if not callable(fn):
                 continue
             try:
-                # Try with keyword arguments (and dut1 where applicable)
                 if fname == "build_timescales":
                     out = fn(date=date, time=time, tz=tz, dut1_seconds=dut1)
                 else:
-                    # Some kernels accept dut1_seconds here too; attempt, then fallback
                     try:
                         out = fn(date=date, time=time, tz=tz, dut1_seconds=dut1)
                     except TypeError:
                         out = fn(date=date, time=time, tz=tz)
             except TypeError:
-                # Try positional variants
                 try:
                     if fname == "build_timescales":
                         out = fn(date, time, tz, dut1)
@@ -263,21 +232,17 @@ def _timescales_from_civil(date: str, time: str, tz: str) -> Tuple[float, float,
                 except TypeError:
                     continue
 
-            # Parse outputs
             if isinstance(out, dict):
                 jt = float(out.get("jd_tt") or out.get("tt") or 0.0)
                 ju = float(out.get("jd_ut1") or out.get("ut1") or jt)
                 return jt, ju, warns
             if isinstance(out, (list, tuple)) and len(out) >= 3:
-                # common shape: (tt, ut1, tzoff) or similar
                 ju, jt = float(out[1]), float(out[0])
                 return jt, ju, warns
-            # Unknown shape → try next candidate
 
-    # fallback module
     if _ts is None:
         raise RuntimeError("timescales_unavailable")
-    # If the fallback has a build_timescales, use it (with dut1)
+
     try:
         _bts = getattr(_ts, "build_timescales", None)
         if callable(_bts):
@@ -290,24 +255,20 @@ def _timescales_from_civil(date: str, time: str, tz: str) -> Tuple[float, float,
                 ju = float(out.get("jd_ut1") or out.get("ut1") or jt)
                 return jt, ju, warns
     except Exception:
-        # fall through to manual path
         pass
 
-    # last-resort manual path (UTC JD -> TT with simple ΔT fallback)
     jd_ut = float(_ts.julian_day_utc(date, time, tz))  # type: ignore[attr-defined]
     try:
         y, m = map(int, str(date).split("-")[:2])
         jd_tt = float(_ts.jd_tt_from_utc_jd(jd_ut, y, m))  # type: ignore[attr-defined]
     except Exception:
-        jd_tt = jd_ut + 69.0/86400.0  # ~ΔT fallback
+        jd_tt = jd_ut + 69.0 / 86400.0  # ~ΔT fallback
         warns.append("deltaT_fallback_69s")
     return jd_tt, jd_ut, warns
 
-# Ayanāṁśa cache: bucket by microdays (stable + precise)
 @lru_cache(maxsize=4096)
 def _ayanamsa_cached(jd_tt_bucket: int, key_or_deg: str) -> Tuple[str, float, Tuple[str, ...]]:
     warns: List[str] = []
-    # numeric input -> explicit degrees
     try:
         val = float(key_or_deg)
         return "explicit", val, tuple(warns)
@@ -333,7 +294,9 @@ def _ayanamsa_cached(jd_tt_bucket: int, key_or_deg: str) -> Tuple[str, float, Tu
         warns.append("ayanamsa_fallback_lahiri_linearized")
         return key, ay, tuple(warns)
 
-# lazy ephemeris adapter (single instance)
+# ─────────────────────────────────────────────────────────────────────
+# Ephemeris (canonicalization + caching)
+# ─────────────────────────────────────────────────────────────────────
 _EPHEM: Optional[EphemerisAdapter] = None
 
 def _ephem() -> EphemerisAdapter:
@@ -347,10 +310,43 @@ def _ephem() -> EphemerisAdapter:
             _EPHEM = EphemerisAdapter()  # type: ignore
     return _EPHEM
 
+def _canon_planet_key(s: Union[str, None]) -> Optional[str]:
+    if s is None:
+        return None
+    k = str(s).strip().lower().replace("(true)", "").replace("(mean)", "").strip()
+    base = {
+        "sun": "Sun", "sol": "Sun",
+        "moon": "Moon", "luna": "Moon",
+        "mercury": "Mercury",
+        "venus": "Venus",
+        "mars": "Mars",
+        "jupiter": "Jupiter",
+        "saturn": "Saturn",
+        # nodes (lots of spellings)
+        "rahu": "Rahu", "north node": "Rahu", "ascending node": "Rahu", "true node": "Rahu", "mean node": "Rahu",
+        "ketu": "Ketu", "south node": "Ketu", "descending node": "Ketu",
+    }
+    return base.get(k)
+
 @lru_cache(maxsize=4096)
 def _ecliptic_lons_cached(jd_tt_bucket: int, names_key: Tuple[str, ...]) -> Dict[str, float]:
-    rows = _ephem().ecliptic_longitudes(float(jd_tt_bucket)/1e6, list(names_key)).get("results", [])
-    return {str(r["name"]): float(r["longitude"]) for r in (rows or [])}
+    # ask adapter; canonicalize names; synthesize missing node
+    res = _ephem().ecliptic_longitudes(float(jd_tt_bucket)/1e6, list(names_key))
+    rows = (res or {}).get("results", []) if isinstance(res, dict) else []
+    out: Dict[str, float] = {}
+    for r in rows or []:
+        nm = _canon_planet_key(r.get("name"))
+        if nm:
+            try:
+                out[nm] = float(r["longitude"])
+            except Exception:
+                continue
+    # if only one node present, synthesize the other
+    if "Rahu" in out and "Ketu" not in out:
+        out["Ketu"] = _norm360(out["Rahu"] + 180.0)
+    elif "Ketu" in out and "Rahu" not in out:
+        out["Rahu"] = _norm360(out["Ketu"] + 180.0)
+    return out
 
 def _sidereal_longitudes(jd_tt: float, names: List[str], ay_deg: float) -> Dict[str, float]:
     jd_bucket = int(round(float(jd_tt) * 1e6))  # microday bucket
@@ -360,7 +356,6 @@ def _sidereal_longitudes(jd_tt: float, names: List[str], ay_deg: float) -> Dict[
 # ─────────────────────────────────────────────────────────────────────
 # Houses & mapping
 # ─────────────────────────────────────────────────────────────────────
-
 def _compute_houses_payload(lat: float, lon: float, jd_tt: float, jd_ut1: float, house_system: str) -> Dict[str, Any]:
     if not (_HOUSES_OK and callable(_compute_houses_with_policy)):
         raise RuntimeError("houses_module_unavailable")
@@ -375,15 +370,19 @@ def _compute_houses_payload(lat: float, lon: float, jd_tt: float, jd_ut1: float,
         validation=False,
     )
 
-
 def _house_map_for_planets(planet_lons: Dict[str, float], cusps: List[float]) -> Dict[str, int]:
     idxs = _assign_houses([planet_lons[p] for p in planet_lons], cusps)
-    return {k: int(idxs[i]) for i, k in enumerate(planet_lons.keys())}
+    # normalize to 1..12
+    ints = [int(round(i)) for i in idxs]
+    if all(0 <= i <= 11 for i in ints):
+        ints = [((i % 12) + 1) for i in ints]
+    else:
+        ints = [i if 1 <= i <= 12 else (((i - 1) % 12) + 1) for i in ints]
+    return {k: ints[i] for i, k in enumerate(planet_lons.keys())}
 
 # ─────────────────────────────────────────────────────────────────────
 # Vargas (D9/D10 + vargottama)
 # ─────────────────────────────────────────────────────────────────────
-
 def _varga_context(
     pl_lons_sidereal: Dict[str, float],
     ay_key: str,
@@ -394,7 +393,7 @@ def _varga_context(
     if not (enable and _VARGA_OK and callable(_compute_many_vargas)):
         return {}, {}, {}, warns
     try:
-        # Inputs are sidereal, so call engine in sidereal mode and pass the key
+        # Inputs are SIDERAL; tell the engine and pass the key
         res = _compute_many_vargas(pl_lons_sidereal, list(varga_keys), zodiac_mode="sidereal", ayanamsa=ay_key)  # type: ignore[misc]
     except Exception as e:
         warns.append(f"varga_compute_error:{e}")
@@ -422,7 +421,6 @@ def _varga_context(
 # ─────────────────────────────────────────────────────────────────────
 # Data structures & Registry
 # ─────────────────────────────────────────────────────────────────────
-
 @dataclass
 class YogaHit:
     name: str
@@ -432,12 +430,9 @@ class YogaHit:
     details: Dict[str, Any]
     tags: Tuple[str, ...] = ()
 
-# A rule function takes (ctx, opts) and returns a YogaHit or List[YogaHit]
-RuleFn = Callable[[Dict[str, Any], Dict[str, Any]], YogaHit | List[YogaHit]]
-
+RuleFn = Callable[[Dict[str, Any], Dict[str, Any]], Union[YogaHit, List[YogaHit]]]
 _RULES: Dict[str, Dict[str, Any]] = {}  # name -> {"fn":RuleFn, "tags":tuple, "enabled":bool, "meta":dict}
 _BUILT = False
-
 
 def register_yoga(
     name: str,
@@ -449,7 +444,9 @@ def register_yoga(
 ) -> None:
     _RULES[name] = {"fn": fn, "tags": tuple(tags), "enabled": bool(enabled), "meta": dict(meta or {})}
 
-
+# ─────────────────────────────────────────────────────────────────────
+# Core rule implementations
+# ─────────────────────────────────────────────────────────────────────
 def _mahapurusha_rule_for(planet: str, title: str) -> RuleFn:
     def _fn(ctx: Dict[str, Any], opts: Dict[str, Any]) -> YogaHit:
         lon = ctx["pl_lons"].get(planet)
@@ -458,16 +455,17 @@ def _mahapurusha_rule_for(planet: str, title: str) -> RuleFn:
         si = _sign_index(lon)
         house = ctx["pl_houses"].get(planet)
         dign = _dignity(planet, si)
-        # Only include mooltrikona if a real checker exists and the option is ON
         mt_opt = bool(opts.get("mahapurusha_include_mooltrikona", False))
         mt_ok = mt_opt and _is_mooltrikona(planet, lon)
         strong = dign in ("own", "exalted") or mt_ok
         present = bool(house) and _is_kendra(house) and strong
-        levels = {"house": {"is_kendra": _is_kendra(house or 0), "house": house}, "sign": {"index": si, "dignity": dign, "mooltrikona": bool(mt_ok)}}
+        levels = {
+            "house": {"is_kendra": _is_kendra(house or 0), "house": house},
+            "sign": {"index": si, "dignity": dign, "mooltrikona": bool(mt_ok)}
+        }
         score = 0.9 if dign == "exalted" else (0.85 if dign == "own" else (0.83 if mt_ok else 0.0))
         return YogaHit(title, present, score if present else 0.0, levels, {"planet": planet}, ("mahapurusha", "strength"))
     return _fn
-
 
 def _gaja_kesari_rule(ctx: Dict[str, Any], opts: Dict[str, Any]) -> YogaHit:
     include_same = bool(opts.get("gajakesari_include_same_house", False))
@@ -478,7 +476,6 @@ def _gaja_kesari_rule(ctx: Dict[str, Any], opts: Dict[str, Any]) -> YogaHit:
     jd = _dignity("Jupiter", _sign_index(ctx["pl_lons"].get("Jupiter", 0.0)))
     score = (0.82 + (0.05 if jd in ("own","exalted") else 0.0)) if present else 0.0
     return YogaHit("Gaja-Kesari", present, score, lev, {}, ("moon", "benefic", "strength"))
-
 
 def _chandra_mangala_rule(ctx: Dict[str, Any], opts: Dict[str, Any]) -> YogaHit:
     by_sign = bool(opts.get("chandra_mangala_by_sign", False))
@@ -496,14 +493,12 @@ def _chandra_mangala_rule(ctx: Dict[str, Any], opts: Dict[str, Any]) -> YogaHit:
         score = 0.8 if present else 0.0
     return YogaHit("Chandra-Mangala", present, score, lev, {}, ("moon", "wealth"))
 
-
 def _adhi_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     h_m = ctx["pl_houses"].get("Moon")
     if not h_m: return YogaHit("Adhi", False, 0.0, {}, {}, ("moon", "benefic"))
     deltas = {g: _house_delta(h_m, ctx["pl_houses"].get(g)) for g in ("Mercury","Venus","Jupiter") if ctx["pl_houses"].get(g)}
     present = len(deltas) == 3 and all(d in (6,7,8) for d in deltas.values())
     return YogaHit("Adhi", present, 0.78 if present else 0.0, {"from_moon_deltas": deltas}, {}, ("moon", "benefic"))
-
 
 def _durudhara_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     moon = ctx["pl_lons"].get("Moon")
@@ -512,7 +507,6 @@ def _durudhara_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     right = any(0 < _angdiff(moon, ctx["pl_lons"][p]) < 180 for p in _PLANETS_MAIN if p != "Moon")
     present = left and right
     return YogaHit("Durudhara (Moon flanked)", present, 0.72 if present else 0.0, {}, {}, ("moon", "kartari"))
-
 
 def _veshi_voshi_ubhay_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> List[YogaHit]:
     sun = ctx["pl_lons"].get("Sun")
@@ -525,7 +519,6 @@ def _veshi_voshi_ubhay_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> List[
     if left and right:      hits.append(YogaHit("Ubhayachari (both sides of Sun)", True, 0.75, {"left": left, "right": right}, {}, ("sun", "kartari")))
     if not hits:            hits.append(YogaHit("Veshi/Voshi/Ubhayachari", False, 0.0, {}, {}, ("sun", "kartari")))
     return hits
-
 
 def _kartari_rule(around: str) -> RuleFn:
     def _fn(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> List[YogaHit]:
@@ -546,7 +539,6 @@ def _kartari_rule(around: str) -> RuleFn:
         ]
     return _fn
 
-
 def _raja_rule(ctx: Dict[str, Any], opts: Dict[str, Any]) -> YogaHit:
     conj_only = bool(opts.get("raja_conj_only", False))
     pairs = []
@@ -565,7 +557,6 @@ def _raja_rule(ctx: Dict[str, Any], opts: Dict[str, Any]) -> YogaHit:
     present = bool(pairs)
     return YogaHit("Raja (k–t association)", present, 0.82 if present else 0.0, {"pairs": pairs}, {}, ("raja","association"))
 
-
 def _dharma_karmadhipati_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     L9 = ctx["house_lords"][9]; L10 = ctx["house_lords"][10]
     h9 = ctx["pl_houses"].get(L9); h10 = ctx["pl_houses"].get(L10)
@@ -576,7 +567,6 @@ def _dharma_karmadhipati_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> Yog
     )
     lev = {"lords":{"L9":L9,"L10":L10}, "houses":{"L9":h9,"L10":h10}, "same_sign":same_sign}
     return YogaHit("Dharma-Karmadhipati", assoc, 0.86 if assoc else 0.0, lev, {}, ("raja","dk"))
-
 
 def _parivartana_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     lords = ctx["sign_lords"]; lagna_sign = ctx["lagna_sign"]
@@ -599,7 +589,6 @@ def _parivartana_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     present = bool(exchanges); types = sorted(set(ex["type"] for ex in exchanges)) if present else []
     return YogaHit("Parivartana (exchange)", present, 0.88 if present else 0.0, {"exchanges": exchanges}, {"types": types}, ("exchange","raja"))
 
-
 def _neechabhanga_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     lords = ctx["sign_lords"]; lagna = 1; moon_h = ctx["pl_houses"].get("Moon", 1)
     cancels = []
@@ -620,7 +609,6 @@ def _neechabhanga_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     present = bool(cancels); score = 0.8 if present else 0.0
     return YogaHit("Neecha-bhanga (composite)", present, score, {"cancellations": cancels}, {}, ("cancellation","raja"))
 
-
 def _vipareeta_raja_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     res = []
     for H, name in ((6,"Harsha"), (8,"Sarala"), (12,"Vimala")):
@@ -632,7 +620,6 @@ def _vipareeta_raja_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     score = 0.82 if any(r["dignity"] in ("own","exalted") for r in res) else (0.76 if present else 0.0)
     return YogaHit("Vipareeta Raja (tri-dusthana lords)", present, score, {"instances": res}, {}, ("vipareeta","raja"))
 
-
 def _amala_rule(from_ref: str) -> RuleFn:
     def _fn(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
         center = 1 if from_ref == "Lagna" else ctx["pl_houses"].get("Moon", 1)
@@ -643,14 +630,12 @@ def _amala_rule(from_ref: str) -> RuleFn:
         return YogaHit(f"Amala (benefic 10th from {from_ref})", present, 0.78 if present else 0.0, {"house": target, "planets": pls}, {}, ("amala","career"))
     return _fn
 
-
 def _chatussagara_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     have = {1: False, 4: False, 7: False, 10: False}
     for p, h in ctx["pl_houses"].items():
         if p in _PLANETS_MAIN and h in have: have[h] = True
     present = all(have.values())
     return YogaHit("Chatussagara", present, 0.76 if present else 0.0, {"kendras": have}, {}, ("kendras","strength"))
-
 
 def _vasumati_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     m = ctx["pl_houses"].get("Moon", 1)
@@ -659,7 +644,6 @@ def _vasumati_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     count = sum(1 for p,h in ctx["pl_houses"].items() if p in bens and h in upas)
     present = count >= 2
     return YogaHit("Vasumati (benefics in Moon's upachayas)", present, 0.74 if present else 0.0, {"count": count}, {}, ("wealth","moon"))
-
 
 def _dhana_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     L2, L11, L5 = ctx["house_lords"][2], ctx["house_lords"][11], ctx["house_lords"][5]
@@ -676,7 +660,6 @@ def _dhana_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     present = bool(hits)
     return YogaHit("Dhana (2/11[/5] association)", present, 0.78 if present else 0.0, {"pairs": hits}, {}, ("wealth","association"))
 
-
 def _saraswati_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     trio = ("Mercury","Venus","Jupiter")
     ok_h = all(_is_kendra(ctx["pl_houses"].get(g,0)) or _is_trikona(ctx["pl_houses"].get(g,0)) for g in trio)
@@ -685,7 +668,6 @@ def _saraswati_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     levels = {"house": {g: ctx["pl_houses"].get(g) for g in trio},
               "sign":  {g: _dignity(g, _sign_index(ctx["pl_lons"][g])) for g in trio}}
     return YogaHit("Saraswati", present, 0.84 if present else 0.0, levels, {}, ("education","speech"))
-
 
 def _lakshmi_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     LL = ctx["house_lords"][1]; L9 = ctx["house_lords"][9]
@@ -698,7 +680,6 @@ def _lakshmi_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     levels = {"lords":{"LL":LL,"L9":L9}, "houses":{"LL":hL,"L9":h9}, "assoc":{"same_sign":same, "mutual_kendra": _is_kendra(hL) and _is_kendra(h9)}}
     return YogaHit("Lakshmi", present, 0.83 if present else 0.0, levels, {}, ("wealth","fortune"))
 
-
 def _kemadruma_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     h_m = ctx["pl_houses"].get("Moon", 1)
     h12 = ((h_m + 10 - 1) % 12) + 1; h2 = ((h_m + 1 - 1) % 12) + 1
@@ -706,7 +687,6 @@ def _kemadruma_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> YogaHit:
     canceled = any(_is_kendra(_house_delta(h_m, ctx["pl_houses"].get(p,0)) or 0) for p in _PLANETS_MAIN if p != "Moon")
     present = (len(flank) == 0) and (not canceled)
     return YogaHit("Kemadruma (Moon isolated)", present, 0.7 if present else 0.0, {"flanking_planets": flank, "kendra_from_moon_present": canceled}, {}, ("moon","dosha"))
-
 
 def _kala_sarpa_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> List[YogaHit]:
     rahu = ctx["pl_lons"].get("Rahu"); ketu = ctx["pl_lons"].get("Ketu")
@@ -726,7 +706,6 @@ def _kala_sarpa_rule(ctx: Dict[str, Any], _opts: Dict[str, Any]) -> List[YogaHit
 # ─────────────────────────────────────────────────────────────────────
 # Varga-aware scoring (quick bumps)
 # ─────────────────────────────────────────────────────────────────────
-
 def _score_with_vargas(hit: YogaHit, ctx: Dict[str, Any], strengthen_on: Tuple[str, ...]) -> YogaHit:
     if not hit.present: return hit
     bump = 0.0; vg = ctx.get("vargottama", {})
@@ -744,7 +723,6 @@ def _score_with_vargas(hit: YogaHit, ctx: Dict[str, Any], strengthen_on: Tuple[s
 # ─────────────────────────────────────────────────────────────────────
 # Registry build
 # ─────────────────────────────────────────────────────────────────────
-
 def _ensure_registry() -> None:
     global _BUILT
     if _BUILT:
@@ -791,18 +769,15 @@ def _ensure_registry() -> None:
     register_yoga("Kemadruma (Moon isolated)", _kemadruma_rule, tags=("moon", "dosha"))
     register_yoga("Kala Sarpa / Amrita",       _kala_sarpa_rule, tags=("nodal", "dosha"))
 
-
 # ─────────────────────────────────────────────────────────────────────
 # Public helpers
 # ─────────────────────────────────────────────────────────────────────
-
 def list_registered_yogas() -> List[Dict[str, Any]]:
     _ensure_registry()
     out = []
     for k, v in _RULES.items():
         out.append({"name": k, "enabled": v["enabled"], "tags": list(v["tags"]), "meta": v["meta"]})
     return sorted(out, key=lambda r: r["name"].lower())
-
 
 def enable_yogas(keys: Iterable[str]) -> None:
     _ensure_registry()
@@ -815,7 +790,6 @@ def enable_yogas(keys: Iterable[str]) -> None:
         tag = str(t).split(":", 1)[1]
         for _, rec in _RULES.items():
             if tag in rec["tags"]: rec["enabled"] = True
-
 
 def disable_yogas(keys: Iterable[str]) -> None:
     _ensure_registry()
@@ -830,8 +804,6 @@ def disable_yogas(keys: Iterable[str]) -> None:
             if tag in rec["tags"]:
                 rec["enabled"] = False
 
-
-
 # ─────────────────────────────────────────────────────────────────────
 # Public orchestrator (Mode-C only)
 # ─────────────────────────────────────────────────────────────────────
@@ -841,10 +813,10 @@ def compute_yogas(
     ayanamsa: str | float = "lahiri",
     house_system: str = "placidus",
     sign_lord_variant: str = "classical",
-    chandra_mangala_by_sign: bool = True,
+    chandra_mangala_by_sign: bool = False,
     conj_orb_deg: float = 6.0,
-    gajakesari_include_same_house: bool = True,
-    include_mooltrikona_in_mahapurusha: bool = True,
+    gajakesari_include_same_house: bool = False,
+    include_mooltrikona_in_mahapurusha: bool = False,
     use_vargas_for_scoring: bool = True,
     varga_keys_for_boost: Tuple[str, ...] = ("D9","D10"),
     include_arudha_notes: bool = False,  # reserved
@@ -853,25 +825,24 @@ def compute_yogas(
 ) -> Dict[str, Any]:
     _ensure_registry()
 
-    # 1) Require civil + site; ignore any legacy keys if present
     warnings: List[str] = []
     try:
         date, time, tz, lat_f, lon_f = _require_birth_details(payload)
     except Exception as e:
         return {"ok": False, "error": str(e), "yogas": [], "warnings": []}
 
-    # 2) Timescales
+    # Timescales
     try:
         jd_tt, jd_ut1, warns_ts = _timescales_from_civil(date, time, tz)
         warnings.extend(warns_ts)
     except Exception as e:
         return {"ok": False, "error": f"timescales_unavailable:{e}", "yogas": [], "warnings": warnings}
 
-    # 3) Ayanāṁśa (cached; microday bucket for precision)
+    # Ayanāṁśa
     ay_key, ay_deg, warns_ay = _ayanamsa_cached(int(round(jd_tt * 1e6)), str(ayanamsa))
     warnings.extend(list(warns_ay))
 
-    # 4) Houses
+    # Houses
     try:
         hp = _compute_houses_payload(lat_f, lon_f, jd_tt, jd_ut1, house_system)
     except Exception as e:
@@ -881,27 +852,28 @@ def compute_yogas(
     asc_sid  = _norm360(asc_trop - ay_deg)
     lagna_sign = _sign_index(asc_sid)
 
-    # 5) Longitudes (sidereal) & houses
+    # Longitudes (sidereal) & houses
     if not _EPH_OK:
         return {"ok": False, "error": "ephemeris_unavailable", "yogas": [], "warnings": warnings}
     try:
         pl_lons = _sidereal_longitudes(jd_tt, list(_PLANETS_ALL), ay_deg)
     except Exception as e:
         return {"ok": False, "error": f"ephemeris_unavailable:{e}", "yogas": [], "warnings": warnings}
+
     if not _ASSIGN_OK:
         return {"ok": False, "error": "assign_houses_unavailable", "yogas": [], "warnings": warnings}
-    pl_houses = _house_map_for_planets({k: v for k,v in pl_lons.items() if k in _PLANETS_ALL}, cusps)
+    pl_houses = _house_map_for_planets({k: v for k, v in pl_lons.items() if k in _PLANETS_ALL}, cusps)
 
-    # 6) Lords, benefics
+    # Lords, benefics
     sign_lords  = _sign_lords(sign_lord_variant)
     house_lords = {i: sign_lords[(lagna_sign + (i-1)) % 12] for i in range(1,13)}
     benefics    = _benefic_set(jd_tt, ay_key)
 
-    # 7) Vargas (optional)
+    # Vargas (optional)
     vargottama, d9_signs, d10_signs, warns_v = _varga_context(pl_lons, ay_key, use_vargas_for_scoring, varga_keys_for_boost)
     warnings.extend(warns_v)
 
-    # 8) Build evaluation context
+    # Build evaluation context
     ctx = {
         "jd_tt": jd_tt, "ay_key": ay_key, "ay_deg": ay_deg,
         "lat": lat_f, "lon": lon_f,
@@ -913,31 +885,50 @@ def compute_yogas(
         "vargottama": vargottama, "d9_signs": d9_signs, "d10_signs": d10_signs,
     }
 
-    # 9) Tag gating (optional)
-    if enable_catalog_tags:
-        for _nm, rec in _RULES.items():
-            rec["enabled"] = any(t in rec["tags"] for t in enable_catalog_tags)
-    for tag in disable_catalog_tags:
-        for _nm, rec in _RULES.items():
-            if tag in rec["tags"]:
-                rec["enabled"] = False
+    # Per-call options dict for rules
+    opts = {
+        "chandra_mangala_by_sign": bool(chandra_mangala_by_sign),
+        "conj_orb_deg": float(conj_orb_deg),
+        "gajakesari_include_same_house": bool(gajakesari_include_same_house),
+        "mahapurusha_include_mooltrikona": bool(include_mooltrikona_in_mahapurusha),
+        "raja_conj_only": False,  # reserved knob
+    }
+    if opts["mahapurusha_include_mooltrikona"] and not callable(_is_mt_pos):
+        warnings.append("mahapurusha_mooltrikona_option_ignored_no_checker")
 
-    # 10) Evaluate rules
+    # Per-call tag gating WITHOUT mutating registry state
+    enable_tags = tuple(enable_catalog_tags or ())
+    disable_tags = set(disable_catalog_tags or ())
+    def _should_run(name: str, rec: Dict[str, Any]) -> bool:
+        if not rec.get("enabled", True):
+            return False
+        rtags = set(rec.get("tags", ()))
+        if enable_tags:
+            if not (rtags & set(enable_tags)):
+                return False
+        if rtags & disable_tags:
+            return False
+        return True
+
+    # Evaluate rules
     hits: List[YogaHit] = []
     for name, rec in _RULES.items():
-        if not rec["enabled"]: continue
-        fn = rec["fn"]
+        if not _should_run(name, rec):
+            continue
+        fn: RuleFn = rec["fn"]
         try:
-            out = fn(ctx)
+            out = fn(ctx, opts)
             if isinstance(out, list): hits.extend(out)
             elif isinstance(out, YogaHit): hits.append(out)
         except Exception:
-            continue  # robust: skip faulty rule
+            # robust: skip faulty rule
+            continue
 
-    # 11) Optional varga-aware scoring bumps
+    # Optional varga-aware scoring bumps
     final_hits: List[YogaHit] = []
     if use_vargas_for_scoring:
-        for h in hits: final_hits.append(_score_with_vargas(h, ctx, varga_keys_for_boost))
+        for h in hits:
+            final_hits.append(_score_with_vargas(h, ctx, varga_keys_for_boost))
     else:
         final_hits = hits
 
