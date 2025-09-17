@@ -18,7 +18,6 @@ tzdata==2024.1
 
 # --- Geocoding & timezone (simplified) ---
 requests==2.32.3
-timezonefinder==6.2.0
 
 # --- Monitoring ---
 prometheus-client==0.20.0
