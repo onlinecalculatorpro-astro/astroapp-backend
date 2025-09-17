@@ -495,7 +495,9 @@ def disable_yogas(keys: Iterable[str]) -> None:
     for t in by_tag:
         tag = str(t).split(":", 1)[1]
         for _, rec in _RULES.items():
-            if tag in rec["tags"]): rec["enabled"] = False
+            if tag in rec["tags"]:
+                rec["enabled"] = False
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Core rule implementations (unchanged)
