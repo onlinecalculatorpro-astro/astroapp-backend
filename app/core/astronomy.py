@@ -1300,6 +1300,14 @@ def _compute_angles(
     warnings: List[str],
     seen: set[str],
 ) -> Tuple[Optional[float], Optional[float], Dict[str, float]]:
+    """
+    Compute Ascendant and MC (ecliptic longitudes, true-of-date).
+
+    Fix applied:
+      - Ensure ASC is the *eastern* horizon intersection (not DESC).
+        If the forward angular distance MC→ASC exceeds 180°, flip ASC by 180°.
+        This resolves cases where the raw formula returns the opposite node.
+    """
     if latitude is None or longitude is None:
         _warn_add(warnings, seen, _W.ANGLES_MISSING_GEO)
         return None, None, {}
@@ -1316,9 +1324,17 @@ def _compute_angles(
 
     asc = _acotd_safe(-((_tand(float(latitude)) * _sind(eps)) + (_sind(ramc) * _cosd(eps))), _cosd(ramc))
 
+    # Apply sidereal shift if requested
     if mode == "sidereal" and ayanamsa_deg is not None:
         asc = _norm360(asc - float(ayanamsa_deg))
-        mc = _norm360(mc - float(ayanamsa_deg))
+        mc  = _norm360(mc  - float(ayanamsa_deg))
+
+    # --- ASC EASTERN FIX ---
+    # Choose the eastern intersection: ensure forward distance MC→ASC ∈ [0, 180).
+    # If it's on the opposite side (>180°), flip ASC by 180°.
+    delta = (float(asc) - float(mc) + 360.0) % 360.0
+    if delta > 180.0:
+        asc = _norm360(float(asc) + 180.0)
 
     dbg = {"eps_true_deg": float(eps), "gast_deg": float(gast), "ramc_deg": float(ramc)}
     return float(asc), float(mc), dbg
