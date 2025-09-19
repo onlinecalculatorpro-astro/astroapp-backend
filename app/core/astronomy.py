@@ -1247,8 +1247,14 @@ def _gast_deg(jd_ut1: float, jd_tt: float, warnings: List[str], seen: set[str]) 
             return _norm360(math.degrees(gst_rad))
         except Exception:
             pass
+    # Meeus fallback
     T = (float(jd_ut1) - 2451545.0) / 36525.0
-    theta = 280.46061837 + 360.98564736629 * (float(jd_ut1) - 2451545.0) + 0.000387933 * (T**2) - (T**3) / 38710000.0
+    theta = (
+        280.46061837
+        + 360.98564736629 * (float(jd_ut1) - 2451545.0)
+        + 0.000387933 * (T ** 2)
+        - (T ** 3) / 38710000.0
+    )
     _warn_add(warnings, seen, _W.ANGLES_MEEUS)
     return _norm360(theta)
 
@@ -1262,8 +1268,9 @@ def _true_obliquity_deg(jd_tt: float, warnings: List[str], seen: set[str]) -> fl
             return math.degrees(eps0 + deps)
         except Exception:
             pass
+    # Meeus fallback
     T = (float(jd_tt) - 2451545.0) / 36525.0
-    eps_arcsec = 84381.448 - 46.8150 * T - 0.00059 * (T**2) + 0.001813 * (T**3)
+    eps_arcsec = 84381.448 - 46.8150 * T - 0.00059 * (T ** 2) + 0.001813 * (T ** 3)
     _warn_add(warnings, seen, _W.ANGLES_MEEUS)
     return eps_arcsec / 3600.0
 
@@ -1284,7 +1291,7 @@ def _compute_angles(
 
     EASTERN-ASC RULE (robust):
       Let ASC_raw be the initial intersection. Define hour-angle:
-          H = wrap[-180,+180) of (RAMC − ASC_raw).
+          H = wrap(-180,+180] of (RAMC − ASC_raw).
       If H < 0 → ASC_raw is WEST → flip ASC = ASC_raw + 180°.
       (Apply sidereal shift to ASC_raw & MC before the rule when in sidereal mode.)
     """
@@ -1299,17 +1306,20 @@ def _compute_angles(
     # MC (true-of-date, ecliptic)
     mc = _atan2d(_sind(ramc) * _cosd(eps), _cosd(ramc))
 
-    # ASC raw (true-of-date, ecliptic) — Meeus-derivative form
+    # ASC raw (true-of-date, ecliptic) — stable acot form
     def _acotd_safe(num: float, den: float) -> float:
         den = den if abs(den) > 1e-15 else math.copysign(1e-15, den if den != 0 else 1.0)
         return _acotd(num / den)
 
-    asc_raw = _acotd_safe(-((_tand(float(latitude)) * _sind(eps)) + (_sind(ramc) * _cosd(eps))), _cosd(ramc))
+    asc_raw = _acotd_safe(
+        -((_tand(float(latitude)) * _sind(eps)) + (_sind(ramc) * _cosd(eps))),
+        _cosd(ramc),
+    )
 
     # Apply sidereal shift equally to both angles, if needed
     if mode == "sidereal" and ayanamsa_deg is not None:
         asc_raw = _norm360(asc_raw - float(ayanamsa_deg))
-        mc      = _norm360(mc      - float(ayanamsa_deg))
+        mc = _norm360(mc - float(ayanamsa_deg))
 
     # Hour-angle test: ensure ASC is on the east
     H = ((float(ramc) - float(asc_raw) + 540.0) % 360.0) - 180.0  # ∈ (-180,+180]
