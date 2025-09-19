@@ -1289,51 +1289,46 @@ def _compute_angles(
     """
     Compute Ascendant and MC (ecliptic longitudes, true-of-date).
 
-    EASTERN-ASC RULE (robust):
-      Let ASC_raw be the initial intersection. Define hour-angle:
-          H = wrap(-180,+180] of (RAMC − ASC_raw).
-      If H < 0 → ASC_raw is WEST → flip ASC = ASC_raw + 180°.
-      (Apply sidereal shift to ASC_raw & MC before the rule when in sidereal mode.)
+    EAST-SIDE ENFORCEMENT (final):
+      Ensure the forward angular distance MC → ASC is ≤ 180°. If it’s > 180°,
+      flip ASC by 180° so the returned ASC is the eastern intersection.
     """
     if latitude is None or longitude is None:
         _warn_add(warnings, seen, _W.ANGLES_MISSING_GEO)
         return None, None, {}
 
-    eps = _true_obliquity_deg(jd_tt, warnings, seen)
+    # True obliquity and Greenwich apparent sidereal time
+    eps  = _true_obliquity_deg(jd_tt, warnings, seen)
     gast = _gast_deg(jd_ut1, jd_tt, warnings, seen)
     ramc = _norm360(gast + float(longitude))
 
     # MC (true-of-date, ecliptic)
     mc = _atan2d(_sind(ramc) * _cosd(eps), _cosd(ramc))
 
-    # ASC raw (true-of-date, ecliptic) — stable acot form
+    # ASC raw (true-of-date, ecliptic) — stable acot formulation
     def _acotd_safe(num: float, den: float) -> float:
         den = den if abs(den) > 1e-15 else math.copysign(1e-15, den if den != 0 else 1.0)
         return _acotd(num / den)
 
     asc_raw = _acotd_safe(
         -((_tand(float(latitude)) * _sind(eps)) + (_sind(ramc) * _cosd(eps))),
-        _cosd(ramc),
+        _cosd(ramc)
     )
 
-    # Apply sidereal shift equally to both angles, if needed
+    # Apply sidereal shift (both angles shift equally)
     if mode == "sidereal" and ayanamsa_deg is not None:
         asc_raw = _norm360(asc_raw - float(ayanamsa_deg))
-        mc = _norm360(mc - float(ayanamsa_deg))
+        mc      = _norm360(mc      - float(ayanamsa_deg))
 
-    # Hour-angle test: ensure ASC is on the east
-    H = ((float(ramc) - float(asc_raw) + 540.0) % 360.0) - 180.0  # ∈ (-180,+180]
-    asc = asc_raw if H >= 0.0 else _norm360(float(asc_raw) + 180.0)
-
-    # Diagnostics (post-fix forward separation MC→ASC)
-    d_fwd = (float(asc) - float(mc) + 360.0) % 360.0
+    # --- EAST-SIDE ENFORCEMENT: MC→ASC forward ≤ 180° ---
+    d_mc_to_asc = (float(asc_raw) - float(mc) + 360.0) % 360.0
+    asc = asc_raw if d_mc_to_asc <= 180.0 else _norm360(float(asc_raw) + 180.0)
 
     dbg = {
         "eps_true_deg": float(eps),
         "gast_deg": float(gast),
         "ramc_deg": float(ramc),
-        "H_deg": float(H),  # < 0 means west; we flipped
-        "d_MC_to_ASC_forward_deg": float(d_fwd),
+        "d_MC_to_ASC_forward_deg": float(d_mc_to_asc),
     }
     return float(asc), float(mc), dbg
 
