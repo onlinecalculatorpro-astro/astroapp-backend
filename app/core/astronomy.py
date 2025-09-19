@@ -1329,11 +1329,13 @@ def _compute_angles(
         asc = _norm360(asc - float(ayanamsa_deg))
         mc  = _norm360(mc  - float(ayanamsa_deg))
 
-    # --- ASC EASTERN FIX ---
-    # Choose the eastern intersection: ensure forward distance MC→ASC ∈ [0, 180).
-    # If it's on the opposite side (>180°), flip ASC by 180°.
-    delta = (float(asc) - float(mc) + 360.0) % 360.0
-    if delta > 180.0:
+    # --- ASC EASTERN FIX (hour-angle based) ---
+    # Decide east/west using the hour angle of the ASC point relative to the RAMC.
+    # If the computed intersection is on the western horizon (H < 0), flip by 180°.
+    # Note: this uses ecliptic longitudes; ayanamsa shifts ASC/MC equally and
+    # does not change the east/west decision.
+    H = ((float(ramc) - float(asc) + 540.0) % 360.0) - 180.0  # hour-angle-like
+    if H < 0.0:
         asc = _norm360(float(asc) + 180.0)
 
     dbg = {"eps_true_deg": float(eps), "gast_deg": float(gast), "ramc_deg": float(ramc)}
