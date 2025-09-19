@@ -1063,14 +1063,18 @@ def _cached_positions(
                     continue
                 except Exception:
                     continue
+            
             try:
                 extra = dict(geo_kw)
                 if "jd_tt" in bk:
+                    # JD(TT) first, then names list, then the rest of geo kwargs
                     return fn(bk["jd_tt"], names_list, **{k: v for k, v in extra.items() if k != "jd_tt"})
                 if "jd" in bk:
-                    return fn(bk["jd"], names_list, **{k: v for k, v in extra items() if k != "jd"})
+                    # JD (generic) first, then names list, then the rest of geo kwargs
+                    return fn(bk["jd"], names_list, **{k: v for k, v in extra.items() if k != "jd"})
             except Exception:
                 pass
+
             try:
                 return fn(jd_tt_q, names_list)
             except Exception:
