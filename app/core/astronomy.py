@@ -630,20 +630,6 @@ def _validate_and_normalize_geo_for_topo(
 def _ayanamsa_deg_cached(jd_tt_q: float, ay_key: str) -> Tuple[float, str]:
     """
     Resolve ayanāṁśa using app.core.ayanamsa, with robust shape handling.
-
-    Preferred path:
-      - get_ayanamsa_with_resolution(jd_tt, scheme) → (deg, canonical, is_alias, is_unknown)
-        If available, we build a note like "lahiri[,alias][,fallback]".
-        The presence of "fallback" signals an unknown key that defaulted to Lahiri.
-
-    Legacy path:
-      - get_ayanamsa_deg(jd_tt, scheme) → float | (deg, note) | {ayanamsa_deg|deg|value: number, ...}
-
-    Returns
-    -------
-    (degrees, note)
-      note will include "fallback" when an unknown key defaulted to Lahiri.
-      _resolve_ayanamsa() uses that to emit _W.AYA_FALLBACK.
     """
     try:
         mod = __import__("app.core.ayanamsa", fromlist=[
@@ -653,7 +639,6 @@ def _ayanamsa_deg_cached(jd_tt_q: float, ay_key: str) -> Tuple[float, str]:
         # 1) Preferred helper with resolution flags
         helper = getattr(mod, "get_ayanamsa_with_resolution", None)
         if callable(helper):
-            # Try (jd, key), then (key, jd) to be tolerant of swapped signatures.
             try:
                 val, canonical, is_alias, is_unknown = helper(jd_tt_q, ay_key)
             except TypeError:
@@ -673,16 +658,13 @@ def _ayanamsa_deg_cached(jd_tt_q: float, ay_key: str) -> Tuple[float, str]:
         try:
             res = fn(jd_tt_q, ay_key)
         except TypeError:
-            # support swapped-arg signature (key, jd_tt)
             res = fn(ay_key, jd_tt_q)
 
-        # tuple/list: (value [, note])
         if isinstance(res, (tuple, list)) and len(res) >= 1:
             val = float(res[0])
             note = str(res[1]) if len(res) >= 2 else str(ay_key)
             return val, note
 
-        # dict with common keys
         if isinstance(res, dict):
             for k in ("ayanamsa_deg", "deg", "value"):
                 if k in res and isinstance(res[k], (int, float)):
@@ -691,7 +673,6 @@ def _ayanamsa_deg_cached(jd_tt_q: float, ay_key: str) -> Tuple[float, str]:
                     return val, note
             raise ValueError("unexpected dict shape from get_ayanamsa_deg")
 
-        # plain float
         return float(res), str(ay_key)
 
     except Exception as e:
@@ -703,12 +684,6 @@ def _resolve_ayanamsa(
 ) -> Tuple[Optional[float], Optional[str]]:
     """
     Resolve ayanāṁśa from payload value or default and return (deg, note).
-
-    Behavior
-    --------
-    - Numeric ayanamsa  → use verbatim, note="explicit".
-    - String/None       → resolve via ayanamsa module (cached).
-    - If the resolver note contains "fallback", emit _W.AYA_FALLBACK.
     """
     if ayanamsa is None or (isinstance(ayanamsa, str) and not str(ayanamsa).strip()):
         key = CFG.ayanamsa_default
@@ -1303,10 +1278,10 @@ def _compute_angles(
     """
     Compute Ascendant and MC (ecliptic longitudes, true-of-date).
 
-    Fix applied:
-      - Ensure ASC is the *eastern* horizon intersection (not DESC).
-        If the forward angular distance MC→ASC exceeds 180°, flip ASC by 180°.
-        This resolves cases where the raw formula returns the opposite node.
+    EASTERN-ASC GUARANTEE:
+      After computing MC and ASC, enforce that the forward angular distance
+      MC → ASC (in the direction of diurnal motion) is ≤ 180°. If it exceeds
+      180°, flip ASC by 180°. This guarantees the returned ASC is on the east.
     """
     if latitude is None or longitude is None:
         _warn_add(warnings, seen, _W.ANGLES_MISSING_GEO)
@@ -1316,29 +1291,33 @@ def _compute_angles(
     gast = _gast_deg(jd_ut1, jd_tt, warnings, seen)
     ramc = _norm360(gast + float(longitude))
 
+    # MC (true-of-date, ecliptic)
     mc = _atan2d(_sind(ramc) * _cosd(eps), _cosd(ramc))
 
+    # ASC (true-of-date, ecliptic) — Meeus-derivative form
     def _acotd_safe(num: float, den: float) -> float:
         den = den if abs(den) > 1e-15 else math.copysign(1e-15, den if den != 0 else 1.0)
         return _acotd(num / den)
 
     asc = _acotd_safe(-((_tand(float(latitude)) * _sind(eps)) + (_sind(ramc) * _cosd(eps))), _cosd(ramc))
 
-    # Apply sidereal shift if requested
+    # Apply sidereal shift if requested (both angles shift by same ayanamsa)
     if mode == "sidereal" and ayanamsa_deg is not None:
         asc = _norm360(asc - float(ayanamsa_deg))
         mc  = _norm360(mc  - float(ayanamsa_deg))
 
-    # --- ASC EASTERN FIX (hour-angle based) ---
-    # Decide east/west using the hour angle of the ASC point relative to the RAMC.
-    # If the computed intersection is on the western horizon (H < 0), flip by 180°.
-    # Note: this uses ecliptic longitudes; ayanamsa shifts ASC/MC equally and
-    # does not change the east/west decision.
-    H = ((float(ramc) - float(asc) + 540.0) % 360.0) - 180.0  # hour-angle-like
-    if H < 0.0:
-        asc = _norm360(float(asc) + 180.0)
+    # --- EAST-SIDE ENFORCEMENT (simple, robust) -----------------------
+    # Forward angle MC->ASC in [0, 360)
+    d_mc_to_asc = (float(asc) - float(mc) + 360.0) % 360.0
+    if d_mc_to_asc > 180.0:
+        asc = _norm360(float(asc) + 180.0)  # flip to the opposite intersection
 
-    dbg = {"eps_true_deg": float(eps), "gast_deg": float(gast), "ramc_deg": float(ramc)}
+    dbg = {
+        "eps_true_deg": float(eps),
+        "gast_deg": float(gast),
+        "ramc_deg": float(ramc),
+        "d_MC_to_ASC_forward_deg": float(d_mc_to_asc),
+    }
     return float(asc), float(mc), dbg
 
 
@@ -1355,10 +1334,8 @@ def _pick_elev(p: Dict[str, Any]) -> Optional[float]:
             if v is None:
                 continue
             try:
-                # Allow numeric strings; keep zeros
                 return float(str(v).strip()) if isinstance(v, str) else float(v)
             except Exception:
-                # Ignore non-numeric garbage and continue
                 continue
     return None
 
@@ -1415,10 +1392,7 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
     ay_deg: Optional[float] = None
     aya_meta: Optional[Dict[str, Any]] = None
     if mode == "sidereal":
-        # Primary path: use engine resolver (emits fallback warning when needed)
         ay_deg, _ = _resolve_ayanamsa(jd_tt, payload.get("ayanamsa"), warnings_list, _seen)
-
-        # Best-effort meta enrichment from ayanamsa module (v1.3+ helpers).
         try:
             from app.core.ayanamsa import get_ayanamsa_with_resolution, resolve_ayanamsa_scheme  # type: ignore
             val, canonical, is_alias, is_unknown = get_ayanamsa_with_resolution(jd_tt, payload.get("ayanamsa"))
@@ -1431,7 +1405,6 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "is_unknown": bool(is_unknown),
             }
         except Exception:
-            # Fallback: try resolve_ayanamsa_scheme if available
             try:
                 from app.core.ayanamsa import resolve_ayanamsa_scheme  # type: ignore
                 canonical, is_alias, is_unknown = resolve_ayanamsa_scheme(payload.get("ayanamsa"))
@@ -1558,7 +1531,9 @@ def compute_chart(payload: Dict[str, Any]) -> Dict[str, Any]:
         "source": str(source_tag),
         "module": _PROJECT_SOURCE_TAG,
         **dbg,
-        "timescales_locked": False,  # allow DUT1-shift test to run
+        "angles_east_fix": True,                   # sentinel → confirms this build
+        "angles_east_rule": "forward(MC→ASC)≤180", # rule in effect
+        "timescales_locked": False,                # allow DUT1-shift test to run
         "timescales": {
             "jd_utc": float(jd_ut),
             "jd_ut": float(jd_ut),   # echo for convenience
