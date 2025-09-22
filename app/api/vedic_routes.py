@@ -728,7 +728,7 @@ def vedic_gochar_drishti():
         "step_minutes": body.get("step_minutes", "auto"),
         "prebatch_refinement": bool(body.get("prebatch_refinement", False)),
     }
-    kwargs = _filter_kwargs_for_fn(_gochar_drishti, base_kwargs)
+    kwargs = base_kwargs
 
     try:
         res = _gochar_drishti(**kwargs)  # type: ignore[misc]
