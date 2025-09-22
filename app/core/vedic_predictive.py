@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 """
-Vedic predictive helpers — daśā, varga wrappers, and Yoga detection (wired to app.core.yoga).
+Vedic predictive helpers — daśā, varga wrappers, Yoga detection,
+and (NEW) gochar/ingress/station wrappers wired to app.core.vedic_gochar.
 
 What’s here
 -----------
@@ -14,6 +15,11 @@ What’s here
 - Yoga detection:
     • Primary path delegates to `app.core.yoga.compute_yogas` (sidereal-first)
     • Legacy “basic” detectors are kept as a fallback for precomputed points/cusps.
+- (NEW) Vedic Gochar:
+    • graha dṛṣṭi transit hits (degree-true)
+    • rāśi & nakṣatra ingresses
+    • retrograde/direct stations
+    • feature_drishti_proximity re-export
 
 Conventions
 -----------
@@ -22,7 +28,7 @@ Conventions
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Tuple, Literal, Optional, Set
+from typing import Any, Dict, Iterable, List, Tuple, Literal, Optional, Set, Union
 from datetime import datetime, timezone
 import re
 
@@ -30,6 +36,20 @@ from app.core.common_predictive import (
     norm360, sign_index, angdiff, compute_houses, timescales_from_civil
 )
 from app.core.ephem_singleton import TS, PLANETS  # TS is used for TT<->UTC conversions
+
+# ───────────────────────── Gochar/Ingress/Stations (NEW) ─────────────────────
+_GOCHAR_OK = False
+try:
+    from app.core.vedic_gochar import (  # type: ignore
+        find_gochar_in_range as _find_gochar_in_range,
+        find_rashi_ingresses_in_range as _find_rashi_ingresses_in_range,
+        find_nakshatra_ingresses_in_range as _find_nakshatra_ingresses_in_range,
+        find_stations_in_range as _find_stations_in_range,
+        feature_drishti_proximity as _feature_drishti_proximity,
+    )
+    _GOCHAR_OK = True
+except Exception:
+    _GOCHAR_OK = False
 
 # ───────────────────────── Preferred Vimśottarī engine ───────────────────────
 try:
@@ -135,6 +155,9 @@ __all__ = [
     "detect_kemadruma_basic", "detect_yogas",
     # Features
     "feature_yoga_flags",
+    # NEW — Gochar/Ingress/Stations wrappers + feature
+    "gochar_drishti", "ingresses_rashi", "ingresses_nakshatra",
+    "stations_retro_direct", "feature_drishti_proximity",
 ]
 
 # =============================================================================
@@ -300,6 +323,19 @@ def _jd_tt_to_iso_utc(j_tt: float) -> str:
     except Exception:
         unix = (float(j_tt) - 2440587.5) * 86400.0
         return datetime.utcfromtimestamp(unix).replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+
+# NEW: civil window → TT window helper (safe pass-through for gochar wrappers)
+def _civil_window_to_tt(date_from: str, date_to: str, tz_name: str) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Convert civil YYYY-MM-DD (or RFC3339 date-times) + tz to start/end JD(TT).
+    If parsing fails, returns (None, None) and lets the callee decide.
+    """
+    try:
+        ts0 = timescales_from_civil(str(date_from), "00:00:00", str(tz_name))
+        ts1 = timescales_from_civil(str(date_to), "23:59:59", str(tz_name))
+        return float(ts0["jd_tt"]), float(ts1["jd_tt"])
+    except Exception:
+        return None, None
 
 # ───────────────────────────── Helpers for multi-system dasha ──────────────────
 
@@ -629,6 +665,180 @@ def predict_dasha_periods(
 
     # Unknown system
     return {"ok": False, "error": "unsupported_dasha"}
+
+# =============================================================================
+# (NEW) GOCHAR / INGRESSES / STATIONS — thin wrappers over app.core.vedic_gochar
+# =============================================================================
+
+def gochar_drishti(
+    *,
+    natal_chart: Dict[str, Any],
+    date_from: str,
+    date_to: str,
+    transiting_bodies: Optional[List[str]] = None,
+    natal_targets: Optional[List[str]] = None,
+    zodiac_mode: Literal["tropical","sidereal"] = "sidereal",
+    ayanamsa: Union[str, float] = "lahiri",
+    frame: str = "ecliptic-of-date",
+    include_nodes: bool = False,
+    treat_nodes_like_saturn: bool = False,
+    orb_deg: float = 12.0,
+    orb_map: Optional[Dict[str, float]] = None,
+    step_minutes: Union[str, float, int] = "auto",
+    prebatch_refinement: bool = False,
+) -> Dict[str, Any]:
+    """
+    Degree-true graha dṛṣṭi hits for a civil window [date_from, date_to].
+    Returns the exact TT instants with separation, orbs, and weights.
+    """
+    if not _GOCHAR_OK:
+        return {"ok": False, "error": "gochar_engine_unavailable"}
+
+    tz = str(natal_chart.get("place_tz") or natal_chart.get("tz") or "UTC")
+    jd0, jd1 = _civil_window_to_tt(date_from, date_to, tz)
+
+    # Prefer vedic_gochar’s robust wrapper that also accepts time_range
+    res = _find_gochar_in_range(
+        natal_chart=natal_chart,
+        start_jd_tt=jd0 if jd0 is not None else None,
+        end_jd_tt=jd1 if jd1 is not None else None,
+        time_range=[date_from, date_to] if (jd0 is None or jd1 is None) else None,
+        transiting_bodies=transiting_bodies,
+        natal_targets=natal_targets,
+        frame=frame,
+        zodiac_mode=zodiac_mode,
+        ayanamsa_deg=float(ayanamsa) if isinstance(ayanamsa, (int,float)) else None,
+        orb_deg=orb_deg,
+        orb_map=orb_map,
+        include_nodes=include_nodes,
+        treat_nodes_like_saturn=treat_nodes_like_saturn,
+        step_minutes=step_minutes,
+        prebatch_refinement=prebatch_refinement,
+    )
+    return res
+
+
+def ingresses_rashi(
+    *,
+    date_from: str,
+    date_to: str,
+    movers: Optional[List[str]] = None,
+    zodiac_mode: Literal["tropical","sidereal"] = "sidereal",
+    ayanamsa: Union[str,float] = "lahiri",
+    frame: str = "ecliptic-of-date",
+    observer: Literal["geocentric","topocentric"] = "geocentric",
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    elevation_m: Optional[float] = None,
+    tz_name: str = "UTC",
+    step_minutes: Union[str, float, int] = "auto",
+) -> Dict[str, Any]:
+    """Sign-boundary crossings for movers within [date_from, date_to]."""
+    if not _GOCHAR_OK:
+        return {"ok": False, "error": "gochar_engine_unavailable"}
+
+    jd0, jd1 = _civil_window_to_tt(date_from, date_to, tz_name)
+    if jd0 is None or jd1 is None:
+        return {"ok": False, "error": "invalid_time_window"}
+
+    return _find_rashi_ingresses_in_range(
+        start_jd_tt=float(jd0),
+        end_jd_tt=float(jd1),
+        movers=movers,
+        frame=frame,
+        zodiac_mode=zodiac_mode,
+        ayanamsa_deg=float(ayanamsa) if isinstance(ayanamsa, (int,float)) else 0.0,
+        step_minutes=step_minutes,
+        topocentric=(observer == "topocentric"),
+        latitude=latitude,
+        longitude=longitude,
+        elevation_m=elevation_m,
+    )
+
+
+def ingresses_nakshatra(
+    *,
+    date_from: str,
+    date_to: str,
+    movers: Optional[List[str]] = None,
+    zodiac_mode: Literal["tropical","sidereal"] = "sidereal",
+    ayanamsa: Union[str,float] = "lahiri",
+    frame: str = "ecliptic-of-date",
+    observer: Literal["geocentric","topocentric"] = "geocentric",
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    elevation_m: Optional[float] = None,
+    tz_name: str = "UTC",
+    step_minutes: Union[str, float, int] = "auto",
+) -> Dict[str, Any]:
+    """Nakṣatra-boundary crossings for movers within [date_from, date_to]."""
+    if not _GOCHAR_OK:
+        return {"ok": False, "error": "gochar_engine_unavailable"}
+
+    jd0, jd1 = _civil_window_to_tt(date_from, date_to, tz_name)
+    if jd0 is None or jd1 is None:
+        return {"ok": False, "error": "invalid_time_window"}
+
+    return _find_nakshatra_ingresses_in_range(
+        start_jd_tt=float(jd0),
+        end_jd_tt=float(jd1),
+        movers=movers,
+        frame=frame,
+        zodiac_mode=zodiac_mode,
+        ayanamsa_deg=float(ayanamsa) if isinstance(ayanamsa, (int,float)) else 0.0,
+        step_minutes=step_minutes,
+        topocentric=(observer == "topocentric"),
+        latitude=latitude,
+        longitude=longitude,
+        elevation_m=elevation_m,
+    )
+
+
+def stations_retro_direct(
+    *,
+    date_from: str,
+    date_to: str,
+    movers: Optional[List[str]] = None,   # defaults inside engine: Merc..Sat
+    zodiac_mode: Literal["tropical","sidereal"] = "sidereal",
+    ayanamsa: Union[str,float] = "lahiri",
+    frame: str = "ecliptic-of-date",
+    observer: Literal["geocentric","topocentric"] = "geocentric",
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    elevation_m: Optional[float] = None,
+    tz_name: str = "UTC",
+    step_minutes: Union[str, float, int] = "auto",
+) -> Dict[str, Any]:
+    """Velocity zero-crossings (retrograde/direct) for movers in [date_from, date_to]."""
+    if not _GOCHAR_OK:
+        return {"ok": False, "error": "gochar_engine_unavailable"}
+
+    jd0, jd1 = _civil_window_to_tt(date_from, date_to, tz_name)
+    if jd0 is None or jd1 is None:
+        return {"ok": False, "error": "invalid_time_window"}
+
+    return _find_stations_in_range(
+        start_jd_tt=float(jd0),
+        end_jd_tt=float(jd1),
+        movers=movers,
+        frame=frame,
+        zodiac_mode=zodiac_mode,
+        ayanamsa_deg=float(ayanamsa) if isinstance(ayanamsa, (int,float)) else 0.0,
+        step_minutes=step_minutes,
+        topocentric=(observer == "topocentric"),
+        latitude=latitude,
+        longitude=longitude,
+        elevation_m=elevation_m,
+    )
+
+
+def feature_drishti_proximity(*, hits: List[Dict[str, Any]], cap_deg: float = 12.0) -> List[float]:
+    """
+    Re-export: 0..1 proximity score per dṛṣṭi hit (1 at exact axis → 0 at cap).
+    """
+    if not _GOCHAR_OK:
+        return []
+    return _feature_drishti_proximity(hits=hits, cap_deg=cap_deg)
 
 # =============================================================================
 # VARGAS (DIVISIONAL CHARTS) — thin wrappers over app.core.varga_charts
