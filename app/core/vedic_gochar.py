@@ -73,6 +73,12 @@ try:
 except Exception:
     _ts = None
 
+# Angles / houses via astronomy.py (preferred)
+try:
+    import app.core.astronomy as _astro
+except Exception:
+    _astro = None  # type: ignore
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Adapter factory (backward-compatible; never passes timescale into Config)
@@ -226,7 +232,7 @@ def _tz_from_body(body: Dict[str, Any]) -> str:
     tz = body.get("tz_name") or body.get("tz") or body.get("place_tz") or "UTC"
     tzs = str(tz).strip()
     return tzs if tzs else "UTC"
-  
+
 def _window_from_body_to_jd_tt(body: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Dict[str, Any]]:
     """
     Convert any accepted window shape into (start_jd_tt, end_jd_tt).
@@ -282,6 +288,54 @@ def _window_from_body_to_jd_tt(body: Dict[str, Any]) -> Tuple[Optional[float], O
         "dut1_seconds": float(dut1_used),
     }
     return float(jt0), float(jt1), meta
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Angles helper (Asc/MC) — uses astronomy.py if available
+# ──────────────────────────────────────────────────────────────────────
+def _angles_sidereal_deg(*, jd_tt: float, lat: float, lon: float, eng: "VedicTransitEngine") -> Dict[str, float]:
+    """Return {'Asc': deg, 'MC': deg} in engine's zodiac (sidereal-adjusted if needed)."""
+    # Preferred: astronomy.py
+    if _astro:
+        cand = (
+            getattr(_astro, "compute_houses", None),
+            getattr(_astro, "houses_advanced", None),
+            getattr(_astro, "asc_mc_from", None),
+            getattr(_astro, "asc_mc", None),
+        )
+        for fn in cand:
+            if callable(fn):
+                try:
+                    try:
+                        res = fn(jd_tt=jd_tt, latitude=lat, longitude=lon)
+                    except TypeError:
+                        res = fn(jd_tt, lat, lon)  # type: ignore[misc]
+                    if isinstance(res, dict):
+                        asc = res.get("Asc") or res.get("asc") or res.get("ASC") or res.get("ascendant")
+                        mc  = res.get("MC")  or res.get("mc")  or res.get("midheaven") or res.get("Medium Coeli")
+                        if asc is None or mc is None:
+                            continue
+                        asc = float(asc); mc = float(mc)
+                        if eng.sidereal_mode:
+                            ay = float(eng.ayanamsa_deg)
+                            return {"Asc": norm360(asc - ay), "MC": norm360(mc - ay)}
+                        return {"Asc": norm360(asc), "MC": norm360(mc)}
+                except Exception:
+                    pass
+
+    # Optional: ephemeris adapter method (if present)
+    try:
+        if hasattr(eng.ephem, "angles_ecliptic"):
+            res = eng.ephem.angles_ecliptic(jd_tt, latitude=lat, longitude=lon, **eng.obs)  # type: ignore[misc]
+            asc = float(res.get("Asc")); mc = float(res.get("MC"))
+            if eng.sidereal_mode:
+                ay = float(eng.ayanamsa_deg)
+                return {"Asc": norm360(asc - ay), "MC": norm360(mc - ay)}
+            return {"Asc": norm360(asc), "MC": norm360(mc)}
+    except Exception:
+        pass
+
+    return {}  # fallback
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -546,23 +600,58 @@ def _pick_natal_targets_map(
     *, ep: EphemerisAdapter, eng: VedicTransitEngine, natal_chart: Dict[str, Any],
     tgts: List[str], ay: float
 ) -> Dict[str, float]:
-    # explicit longitudes
+    # 1) If explicit longitudes were provided, honor them (and add angles if requested)
     for key in ("longitudes", "ecliptic_longitudes"):
         m = natal_chart.get(key)
         if isinstance(m, dict) and m:
             got = {_node_canon(k): float(v) for k, v in m.items() if k is not None}
-            return {k: (norm360(v - ay) if eng.sidereal_mode else norm360(v)) for k, v in got.items()}
-    # use natal_jd_tt if provided
+            out = {k: (norm360(v - ay) if eng.sidereal_mode else norm360(v)) for k, v in got.items()}
+            need_angles = ("Asc" in tgts) or ("MC" in tgts)
+            if need_angles:
+                lat = natal_chart.get("latitude"); lon = natal_chart.get("longitude")
+                jd_tt = natal_chart.get("natal_jd_tt") or natal_chart.get("jd_tt")
+                if isinstance(lat, (int,float)) and isinstance(lon, (int,float)) and isinstance(jd_tt, (int,float)):
+                    out.update(_angles_sidereal_deg(jd_tt=float(jd_tt), lat=float(lat), lon=float(lon), eng=eng))
+            return out
+
+    # 2) natal_jd_tt → planets & angles at natal epoch (if site present)
     natal_jd_tt = None
     for k in ("natal_jd_tt","jd_tt","jd_utc"):
         if isinstance(natal_chart.get(k), (int, float)):
             natal_jd_tt = float(natal_chart[k]); break
+
+    out: Dict[str, float] = {}
+
     if isinstance(natal_jd_tt, float):
-        rows = ep.ecliptic_longitudes(float(natal_jd_tt), _batch_map_nodes(tgts)).get("results", [])
-        got = {_node_canon(str(r["name"])): float(r["longitude"]) for r in rows or []}
-        return {k: (norm360(v - ay) if eng.sidereal_mode else norm360(v)) for k, v in got.items()}
-    # fallback: empty; caller may compute at window start
-    return {}
+        planet_tgts = [x for x in tgts if x not in ("Asc","MC")]
+        if planet_tgts:
+            rows = ep.ecliptic_longitudes(float(natal_jd_tt), _batch_map_nodes(planet_tgts)).get("results", [])
+            got = {_node_canon(str(r["name"])): float(r["longitude"]) for r in rows or []}
+            out.update({k: (norm360(v - ay) if eng.sidereal_mode else norm360(v)) for k, v in got.items()})
+        if ("Asc" in tgts) or ("MC" in tgts):
+            lat = natal_chart.get("latitude"); lon = natal_chart.get("longitude")
+            if isinstance(lat, (int,float)) and isinstance(lon, (int,float)):
+                out.update(_angles_sidereal_deg(jd_tt=float(natal_jd_tt), lat=float(lat), lon=float(lon), eng=eng))
+        return out
+
+    # 3) No natal_jd_tt: try civil + site to get jd_tt and angles now; planets can be sampled later
+    date = natal_chart.get("date") or natal_chart.get("birth_date")
+    time = natal_chart.get("time") or natal_chart.get("birth_time") or "12:00:00"
+    tz   = natal_chart.get("tz") or natal_chart.get("place_tz")
+    lat  = natal_chart.get("latitude"); lon = natal_chart.get("longitude")
+
+    if isinstance(date, str) and isinstance(tz, str) and isinstance(lat, (int,float)) and isinstance(lon, (int,float)):
+        try:
+            ju = _civil_to_jd_utc(str(date), str(time), str(tz))
+            try: y, m = map(int, str(date).split("-")[:2])
+            except Exception: y, m = 2000, 1
+            jdtt = _jd_tt_from_utc_jd(float(ju), y, m)
+            if ("Asc" in tgts) or ("MC" in tgts):
+                out.update(_angles_sidereal_deg(jd_tt=float(jdtt), lat=float(lat), lon=float(lon), eng=eng))
+        except Exception:
+            pass
+
+    return out  # may be angles only; planets sampled at window-left edge as fallback
 
 def find_gochar_in_range(
     *,
@@ -607,7 +696,9 @@ def find_gochar_in_range(
     if use_nodes:
         if "Rahu" not in movers: movers.append("Rahu")
         if "Ketu" not in movers: movers.append("Ketu")
-    tgts = list(natal_targets or ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn"])
+
+    # Default targets include angles so DOB/TOB/POB works out of the box
+    tgts = list(natal_targets or ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn","Asc","MC"])
 
     ep = _make_ephem(frame)
     eng = VedicTransitEngine(
@@ -624,8 +715,8 @@ def find_gochar_in_range(
     else:
         targets = _pick_natal_targets_map(ep=ep, eng=eng, natal_chart=natal_chart or {}, tgts=tgts, ay=ay)
         if not targets:
-            # last-ditch: compute at left edge
-            rows = ep.ecliptic_longitudes(float(a), _batch_map_nodes(tgts)).get("results", [])
+            # last-ditch: compute planets at left edge; angles may be absent if site was missing
+            rows = ep.ecliptic_longitudes(float(a), _batch_map_nodes([x for x in tgts if x not in ("Asc","MC")])).get("results", [])
             nat_map = {_node_canon(str(r["name"])): float(r["longitude"]) for r in rows or []}
             targets = {k: (norm360(v - ay) if eng.sidereal_mode else norm360(v)) for k, v in nat_map.items()}
 
@@ -821,7 +912,6 @@ def find_nakshatra_ingresses_in_range(
 
     def nak_change(body: str, t0: float, t1: float) -> Optional[Tuple[float, int]]:
         l0 = lon_at(body, t0); l1 = lon_at(body, t1)
-        # index already respects ayanamsa via eng.sidereal_mode adjustment in lon_at
         n0 = nakshatra_index(l0); n1 = nakshatra_index(l1)
         if n0 == n1: return None
         def f(t: float) -> float:
@@ -1013,6 +1103,7 @@ def gochar_drishti(
     if date_from and date_to:
         body_like.update({"date_from": date_from, "date_to": date_to, "tz": tz_name or kwargs.get("tz") or kwargs.get("place_tz")})
 
+    # numeric ayanamsa value only (deg); strings handled sidereal elsewhere
     ay_deg = float(ayanamsa) if isinstance(ayanamsa, (int, float, str)) and str(ayanamsa).replace(".","",1).isdigit() else 0.0
     obs = _extract_observer(kwargs)
 
