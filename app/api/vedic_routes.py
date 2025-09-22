@@ -235,7 +235,7 @@ def _pick_times(norm: Dict[str, Any], original: Dict[str, Any]) -> Dict[str, Any
 
 def _build_civic_payload_vim(original: Dict[str, Any], norm: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Flexible flags for Vimśottarī (method/observer/ayanamsa/place/etc.).
+    Flexible flags for Vimśottarī (method/observer/ayanamsa/place/etc.)."
     """
     civ: Dict[str, Any] = {}
 
@@ -928,7 +928,7 @@ def vedic_ingress_rashi():
             zodiac_mode=(body.get("zodiac_mode") or body.get("method") or "sidereal"),
             ayanamsa=body.get("ayanamsa", "lahiri"),
             frame=str(body.get("frame") or "ecliptic-of-date"),
-            topocentric=bool(body.get("topocentric", False)),
+            observer=("topocentric" if bool(body.get("topocentric", False)) else "geocentric"),
             latitude=_coerce_float(body.get("latitude")),
             longitude=_coerce_float(body.get("longitude")),
             elevation_m=_coerce_float(body.get("elevation_m") or body.get("elevation")),
@@ -965,7 +965,7 @@ def vedic_ingress_nakshatra():
             zodiac_mode=(body.get("zodiac_mode") or body.get("method") or "sidereal"),
             ayanamsa=body.get("ayanamsa", "lahiri"),
             frame=str(body.get("frame") or "ecliptic-of-date"),
-            topocentric=bool(body.get("topocentric", False)),
+            observer=("topocentric" if bool(body.get("topocentric", False)) else "geocentric"),
             latitude=_coerce_float(body.get("latitude")),
             longitude=_coerce_float(body.get("longitude")),
             elevation_m=_coerce_float(body.get("elevation_m") or body.get("elevation")),
@@ -1002,7 +1002,7 @@ def vedic_stations():
             zodiac_mode=(body.get("zodiac_mode") or body.get("method") or "sidereal"),
             ayanamsa=body.get("ayanamsa", "lahiri"),
             frame=str(body.get("frame") or "ecliptic-of-date"),
-            topocentric=bool(body.get("topocentric", False)),
+            observer=("topocentric" if bool(body.get("topocentric", False)) else "geocentric"),
             latitude=_coerce_float(body.get("latitude")),
             longitude=_coerce_float(body.get("longitude")),
             elevation_m=_coerce_float(body.get("elevation_m") or body.get("elevation")),
