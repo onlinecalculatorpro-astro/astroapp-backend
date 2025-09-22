@@ -147,15 +147,15 @@ except Exception:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Gochar / Ingress / Stations wrappers (from vedic_predictive)
+# Gochar / Ingress / Stations wrappers  ✅ now from vedic_gochar
 # ──────────────────────────────────────────────────────────────────────────────
 _GOCHAR_OK = False
 try:
-    from app.core.vedic_predictive import (  # type: ignore
-        gochar_drishti as _gochar_drishti,
-        ingresses_rashi as _ingresses_rashi,
-        ingresses_nakshatra as _ingresses_nakshatra,
-        stations_retro_direct as _stations_retro_direct,
+    from app.core.vedic_gochar import (  # type: ignore
+        find_gochar_in_range as _gochar_drishti,
+        find_rashi_ingresses_in_range as _ingresses_rashi,
+        find_nakshatra_ingresses_in_range as _ingresses_nakshatra,
+        find_stations_in_range as _stations_retro_direct,
         feature_drishti_proximity as _feature_drishti_proximity,
     )
     _GOCHAR_OK = True
