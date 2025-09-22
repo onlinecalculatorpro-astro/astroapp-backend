@@ -6,25 +6,20 @@ Vedic API — Payload normalization & validation (strict geocoding)
 
 Public API
 ----------
-    # Existing:
     normalize_vim_payload(payload)      -> (norm, warns, tz_norm)
     normalize_yoga_payload(payload)     -> (norm, warns, tz_norm)
 
-    # Gochar / Ingress / Stations (for vedic_gochar.py):
+    # Gochar / Ingress / Stations:
     normalize_gochar_payload(payload)   -> (norm, warns, tz_norm)
     normalize_ingress_payload(payload)  -> (norm, warns, tz_norm)
     normalize_stations_payload(payload) -> (norm, warns, tz_norm)
 
-What’s different vs older validator
------------------------------------
-• **Mandatory geocoding when a place string/parts are provided.**
-  We call `astronomy.resolve_place()` and *require* it to return
-  lat/lon/tz (elev optional). If it fails or is unavailable:
-    - We record a warning and add `fatal: "place_resolution_failed"`
-      (or `"place_resolver_unavailable"`).
-    - We do **not** fabricate tz/coords.
+Highlights
+----------
+• **DOB/TOB/POB aliases** are accepted across validators.
+• **Mandatory geocoding** when any place string/parts are provided (incl. POB).
 • Sidereal-first defaults (zodiac_mode="sidereal", ayanamsa="lahiri").
-• Civil window parsing is tolerant; actual JD build happens downstream.
+• Gochar defaults now include angles in natal targets (Asc, Dsc, MC, IC).
 """
 
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -295,13 +290,13 @@ def _must_resolve_place_if_provided(p: Dict[str, Any],
                                     warns: List[str]) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[str], Optional[str]]:
     """
     If any place string/parts are present, we MUST resolve via astronomy.resolve_place().
-    Returns (lat, lon, elev_m, tz_norm, fatal_reason) — fatal_reason is a short code
-    the caller can bubble up (e.g., "place_resolver_unavailable" or "place_resolution_failed:...").
+    Returns (lat, lon, elev_m, tz_norm, fatal_reason).
     """
-    # Gather any place hints
+    # Gather any place hints (now includes POB alias)
     pob_str = _coerce_str(
         p.get(f"{place_prefix}place") or
         p.get(f"{place_prefix}birth_place") or
+        p.get(f"{place_prefix}POB") or
         _join_place(
             _coerce_str(p.get(f"{place_prefix}place_city")),
             _coerce_str(p.get(f"{place_prefix}place_state")),
@@ -309,9 +304,13 @@ def _must_resolve_place_if_provided(p: Dict[str, Any],
         )
     ).strip()
 
-    has_any_place = bool(pob_str or _coerce_str(p.get(f"{place_prefix}place_city")).strip()
-                         or _coerce_str(p.get(f"{place_prefix}place_state")).strip()
-                         or _coerce_str(p.get(f"{place_prefix}place_country")).strip())
+    has_any_place = bool(
+        pob_str or
+        _coerce_str(p.get(f"{place_prefix}place_city")).strip() or
+        _coerce_str(p.get(f"{place_prefix}place_state")).strip() or
+        _coerce_str(p.get(f"{place_prefix}place_country")).strip() or
+        _coerce_str(p.get(f"{place_prefix}POB")).strip()
+    )
 
     if not has_any_place:
         # No place input provided → do nothing; caller may still pass explicit lat/lon/tz.
@@ -358,9 +357,9 @@ def _must_resolve_place_if_provided(p: Dict[str, Any],
 def normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str], str]:
     warns: List[str] = []
 
-    # Civil primitives
-    date = _coerce_str(payload.get("date") or payload.get("birth_date") or "")
-    time_in = _coerce_str(payload.get("time") or payload.get("birth_time") or "12:00")
+    # Civil primitives (DOB/TOB accepted)
+    date = _coerce_str(payload.get("DOB") or payload.get("date") or payload.get("birth_date") or "")
+    time_in = _coerce_str(payload.get("TOB") or payload.get("time") or payload.get("birth_time") or "12:00")
     time_str = _pad_hms(time_in)
 
     # Method & ayanamsa
@@ -373,9 +372,14 @@ def normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List
     elevation_m = _as_float(payload.get("elevation_m") or payload.get("elevation"))
     tz_norm = _coerce_str(payload.get("tz") or payload.get("place_tz")).strip() or None
 
+    # Also accept POB
+    if not any([payload.get("place"), payload.get("birth_place"), payload.get("place_city"),
+                payload.get("place_state"), payload.get("place_country")]) and payload.get("POB"):
+        payload = dict(payload)
+        payload["place"] = payload.get("POB")
+
     lat_r, lon_r, elev_r, tz_r, fatal = _must_resolve_place_if_provided(payload, warns=warns)
     if fatal:
-        # Caller supplied a place; we failed to resolve → mark fatal and *do not* fabricate tz/coords
         norm = {
             "system": "vimshottari",
             "date": date, "time": time_str, "tz": tz_norm,
@@ -385,7 +389,6 @@ def normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List
             "jd_tt": None, "jd_ut1": None,
             "fatal": fatal,
             "raw": payload,
-            # Registry mirrors
             "tz_name": tz_norm, "ayanamsa_key": ayanamsa,
             "birth_date": date, "birth_time": time_str, "place_tz": tz_norm,
         }
@@ -452,10 +455,9 @@ def normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List
         "coordinate_mode": coordinate_mode, "topocentric": bool(topocentric),
         "jd_tt": jd_tt, "jd_ut1": jd_ut1,
         "raw": payload,
-        # Registry/common aliases
         "tz_name": tz_norm, "ayanamsa_key": ayanamsa,
         "birth_date": date, "birth_time": time_str, "place_tz": tz_norm,
-        "place_name": _coerce_str(payload.get("place") or payload.get("birth_place") or "").strip() or None,
+        "place_name": _coerce_str(payload.get("place") or payload.get("birth_place") or payload.get("POB") or "").strip() or None,
     }
     if varga_request:
         norm["varga_request"] = varga_request
@@ -473,14 +475,21 @@ def normalize_yoga_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], Lis
     ayanamsa = _norm_ayanamsa(payload.get("ayanamsa") or payload.get("ayanamsa_key"))
     house_system = _coerce_str(payload.get("house_system") or "placidus").strip() or "placidus"
 
-    date = _coerce_str(payload.get("date") or payload.get("birth_date") or "")
-    time_str = _pad_hms(_coerce_str(payload.get("time") or payload.get("birth_time") or "12:00"))
+    # DOB/TOB accepted
+    date = _coerce_str(payload.get("DOB") or payload.get("date") or payload.get("birth_date") or "")
+    time_str = _pad_hms(_coerce_str(payload.get("TOB") or payload.get("time") or payload.get("birth_time") or "12:00"))
 
     # Accept explicit coords/tz, but enforce geocoding if a place was given
     lat = _as_float(payload.get("latitude") or payload.get("lat"))
     lon = _as_float(payload.get("longitude") or payload.get("lon"))
     elevation_m = _as_float(payload.get("elevation_m") or payload.get("elevation"))
     tz_norm = _coerce_str(payload.get("tz") or payload.get("place_tz")).strip() or None
+
+    # Also accept POB
+    if not any([payload.get("place"), payload.get("birth_place"), payload.get("place_city"),
+                payload.get("place_state"), payload.get("place_country")]) and payload.get("POB"):
+        payload = dict(payload)
+        payload["place"] = payload.get("POB")
 
     lat_r, lon_r, elev_r, tz_r, fatal = _must_resolve_place_if_provided(payload, warns=warns)
     if fatal:
@@ -533,7 +542,7 @@ def normalize_yoga_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], Lis
         "use_vargas_for_scoring": bool(use_vargas_for_scoring),
         "varga_keys_for_boost": varga_keys_for_boost or None,
         "place_tz": tz_norm, "tz_name": tz_norm,
-        "place_name": _coerce_str(payload.get("place") or payload.get("birth_place") or "").strip() or None,
+        "place_name": _coerce_str(payload.get("place") or payload.get("birth_place") or payload.get("POB") or "").strip() or None,
         "raw": payload,
     }
 
@@ -545,7 +554,9 @@ def normalize_yoga_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], Lis
 
 # ───────────────────────────── Gochar bundle ──────────────────────────
 _DEFAULT_MOVERS  = ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn"]
-_DEFAULT_TARGETS = ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn"]
+# Expanded targets include angles; nodes are still opt-in via include_nodes
+_DEFAULT_TARGETS = ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn",
+                    "Ascendant","Descendant","MC","IC"]
 
 def normalize_gochar_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str], str]:
     warns: List[str] = []
@@ -557,6 +568,7 @@ def normalize_gochar_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], L
     treat_nodes_like_saturn = _norm_bool(payload.get("treat_nodes_like_saturn"), False)
     step_minutes: Union[str,float,int] = payload.get("step_minutes", "auto")
 
+    # Selectors are optional; defaults used when omitted
     movers = _collect_bodies(payload, key_order=("movers","bodies","transiting_bodies"), default=_DEFAULT_MOVERS)
     if include_nodes:
         if "Rahu" not in movers: movers.append("Rahu")
@@ -567,15 +579,21 @@ def normalize_gochar_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], L
     # Natal block (either nested "natal" or flat)
     natal_in = payload.get("natal") or payload
 
-    # Civil primitives for natal binding (optional if longitudes/jd supplied)
-    date = _coerce_str(natal_in.get("date") or natal_in.get("birth_date") or "")
-    time_str = _pad_hms(_coerce_str(natal_in.get("time") or natal_in.get("birth_time") or "12:00"))
+    # Civil primitives for natal binding (DOB/TOB accepted; optional if longitudes/jd supplied)
+    date = _coerce_str(natal_in.get("DOB") or natal_in.get("date") or natal_in.get("birth_date") or "")
+    time_str = _pad_hms(_coerce_str(natal_in.get("TOB") or natal_in.get("time") or natal_in.get("birth_time") or "12:00"))
     tz_norm = _coerce_str(natal_in.get("tz") or natal_in.get("place_tz")).strip() or None
 
-    # Accept explicit coords; but enforce geocoding if a place string/parts are present
+    # Accept explicit coords; but enforce geocoding if a place/POB string/parts are present
     lat = _as_float(natal_in.get("latitude") or natal_in.get("lat"))
     lon = _as_float(natal_in.get("longitude") or natal_in.get("lon"))
     elevation_m = _as_float(natal_in.get("elevation_m") or natal_in.get("elevation"))
+
+    # Accept POB in natal block
+    if not any([natal_in.get("place"), natal_in.get("birth_place"), natal_in.get("place_city"),
+                natal_in.get("place_state"), natal_in.get("place_country")]) and natal_in.get("POB"):
+        natal_in = dict(natal_in)
+        natal_in["place"] = natal_in.get("POB")
 
     lat_r, lon_r, elev_r, tz_r, fatal = _must_resolve_place_if_provided(natal_in, warns=warns)
     if fatal:
@@ -588,7 +606,7 @@ def normalize_gochar_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], L
             "natal_chart": {
                 "date": date or None, "time": time_str if date else None,
                 "tz": tz_norm, "place_tz": tz_norm,
-                "place_name": _coerce_str(natal_in.get("place") or natal_in.get("birth_place") or "").strip() or None,
+                "place_name": _coerce_str(natal_in.get("place") or natal_in.get("birth_place") or natal_in.get("POB") or "").strip() or None,
                 "latitude": None, "longitude": None, "elevation_m": None,
                 "longitudes": natal_in.get("longitudes") or natal_in.get("ecliptic_longitudes") or None,
                 "natal_jd_tt": _as_float(natal_in.get("natal_jd_tt") or natal_in.get("jd_tt")),
@@ -600,7 +618,6 @@ def normalize_gochar_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], L
             "transiting_bodies": movers, "ayanamsa_key": ayanamsa,
             "tz_name": tz_norm,
         }
-        # window still parsed to help the caller echo back
         d0, d1, _ = _collect_time_window(payload)
         if d0 and d1:
             norm["time_range"] = [d0, d1]
@@ -637,7 +654,7 @@ def normalize_gochar_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], L
             "time": time_str if date else None,
             "tz": tz_norm,
             "place_tz": tz_norm,
-            "place_name": _coerce_str(natal_in.get("place") or natal_in.get("birth_place") or "").strip() or None,
+            "place_name": _coerce_str(natal_in.get("place") or natal_in.get("birth_place") or natal_in.get("POB") or "").strip() or None,
             "latitude": lat,
             "longitude": lon,
             "elevation_m": elevation_m,
@@ -668,11 +685,16 @@ def normalize_ingress_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], 
     zodiac_mode = _norm_method(payload.get("zodiac_mode", payload.get("method", "sidereal")), default="sidereal")
     ayanamsa = _norm_ayanamsa(payload.get("ayanamsa") or payload.get("ayanamsa_key"))
 
-    # Optional topocentric (requires coords). If place is given, we must resolve it.
+    # Optional topocentric (requires coords). If place is given (incl. POB), we must resolve it.
     lat = _as_float(payload.get("latitude") or payload.get("lat"))
     lon = _as_float(payload.get("longitude") or payload.get("lon"))
     elevation_m = _as_float(payload.get("elevation_m") or payload.get("elevation"))
     tz_norm = _coerce_str(payload.get("tz") or payload.get("place_tz")).strip() or None
+
+    if not any([payload.get("place"), payload.get("birth_place"), payload.get("place_city"),
+                payload.get("place_state"), payload.get("place_country")]) and payload.get("POB"):
+        payload = dict(payload)
+        payload["place"] = payload.get("POB")
 
     lat_r, lon_r, elev_r, tz_r, fatal = _must_resolve_place_if_provided(payload, warns=warns)
     if fatal:
@@ -733,11 +755,16 @@ def normalize_stations_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any],
     zodiac_mode = _norm_method(payload.get("zodiac_mode", payload.get("method", "sidereal")), default="sidereal")
     ayanamsa = _norm_ayanamsa(payload.get("ayanamsa") or payload.get("ayanamsa_key"))
 
-    # Optional topocentric (requires coords). If place is given, we must resolve it.
+    # Optional topocentric (requires coords). If place is given (incl. POB), we must resolve it.
     lat = _as_float(payload.get("latitude") or payload.get("lat"))
     lon = _as_float(payload.get("longitude") or payload.get("lon"))
     elevation_m = _as_float(payload.get("elevation_m") or payload.get("elevation"))
     tz_norm = _coerce_str(payload.get("tz") or payload.get("place_tz")).strip() or None
+
+    if not any([payload.get("place"), payload.get("birth_place"), payload.get("place_city"),
+                payload.get("place_state"), payload.get("place_country")]) and payload.get("POB"):
+        payload = dict(payload)
+        payload["place"] = payload.get("POB")
 
     lat_r, lon_r, elev_r, tz_r, fatal = _must_resolve_place_if_provided(payload, warns=warns)
     if fatal:
