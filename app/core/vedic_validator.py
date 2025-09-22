@@ -30,20 +30,9 @@ import inspect
 # ── geocoding.resolve_place is our REQUIRED geocoder when place is present ──
 _RESOLVE_PLACE = None
 try:
-    import app.core.geocoding as _geo  # type: ignore
-    _RESOLVE_PLACE = getattr(_geo, "resolve_place", None)
+    from app.core.geocoding import resolve_place as _RESOLVE_PLACE  # type: ignore
 except Exception:
-    _geo = None  # type: ignore
     _RESOLVE_PLACE = None
-
-# Optional backward-compat fallback to astronomy.resolve_place
-if _RESOLVE_PLACE is None:
-    try:
-        import app.core.astronomy as _astro  # type: ignore
-        _RESOLVE_PLACE = getattr(_astro, "resolve_place", None)
-    except Exception:
-        _astro = None  # type: ignore
-        # keep _RESOLVE_PLACE = None
 
 # ── Optional timescales for Vimśottarī only (ERFA-aligned; no jd_utc here) ──
 try:
@@ -321,6 +310,13 @@ def _must_resolve_place_if_provided(p: Dict[str, Any],
         _coerce_str(p.get(f"{place_prefix}POB")).strip()
     )
 
+    # If caller already provided a full triple (lat, lon, tz), don't force a re-resolve
+    if (_as_float(p.get(f"{place_prefix}latitude") or p.get(f"{place_prefix}lat")) is not None and
+        _as_float(p.get(f"{place_prefix}longitude") or p.get(f"{place_prefix}lon")) is not None and
+        _coerce_str(p.get(f"{place_prefix}tz") or p.get(f"{place_prefix}place_tz")).strip()):
+        return None, None, None, None, None
+
+                                        
     if not has_any_place:
         # No place input provided → do nothing; caller may still pass explicit lat/lon/tz.
         return None, None, None, None, None
@@ -347,7 +343,8 @@ def _must_resolve_place_if_provided(p: Dict[str, Any],
         warns.append("place_resolution_failed:bad_shape")
         return None, None, None, None, "place_resolution_failed:bad_shape"
 
-    lat = pr.get("lat"); lon = pr.get("lon")
+    lat = pr.get("latitude") if "latitude" in pr else pr.get("lat")
+    lon = pr.get("longitude") if "longitude" in pr else pr.get("lon")
     tz  = pr.get("tz") or pr.get("timezone")
     elev = pr.get("elevation_m", pr.get("elevation"))
 
