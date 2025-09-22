@@ -27,14 +27,23 @@ import os
 import re
 import inspect
 
-# ── astronomy.resolve_place is our REQUIRED geocoder when place is present ──
+# ── geoging.resolve_place is our REQUIRED geocoder when place is present ──
 _RESOLVE_PLACE = None
 try:
-    import app.core.astronomy as _astro  # type: ignore
-    _RESOLVE_PLACE = getattr(_astro, "resolve_place", None)
+    import app.core.geoging as _geo  # type: ignore
+    _RESOLVE_PLACE = getattr(_geo, "resolve_place", None)
 except Exception:
-    _astro = None  # type: ignore
+    _geo = None  # type: ignore
     _RESOLVE_PLACE = None
+
+# Optional backward-compat fallback to astronomy.resolve_place
+if _RESOLVE_PLACE is None:
+    try:
+        import app.core.astronomy as _astro  # type: ignore
+        _RESOLVE_PLACE = getattr(_astro, "resolve_place", None)
+    except Exception:
+        _astro = None  # type: ignore
+        # keep _RESOLVE_PLACE = None
 
 # ── Optional timescales for Vimśottarī only (ERFA-aligned; no jd_utc here) ──
 try:
