@@ -325,7 +325,7 @@ def _jd_tt_to_iso_utc(j_tt: float) -> str:
         return datetime.utcfromtimestamp(unix).replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
 
 # NEW: civil window → TT window helper (safe pass-through for gochar wrappers)
-def _civil_window_to_tt(date_from: str, date_to: str, tz_name: str) -> Tuple[Optional[float], Optional[float]]]:
+def _civil_window_to_tt(date_from: str, date_to: str, tz_name: str) -> Tuple[Optional[float], Optional[float]]:
     """
     Convert civil YYYY-MM-DD (or RFC3339 date-times) + tz to start/end JD(TT).
     If parsing fails, returns (None, None) and lets the callee decide.
@@ -690,6 +690,9 @@ def gochar_drishti(
     """
     Degree-true graha dṛṣṭi hits for a civil window [date_from, date_to].
     Returns the exact TT instants with separation, orbs, and weights.
+
+    FIX: ensure civil→TT fallback path passes caller’s timezone to vedic_gochar,
+    otherwise UTC would be assumed. We always forward tz as 'place_tz'.
     """
     if not _GOCHAR_OK:
         return {"ok": False, "error": "gochar_engine_unavailable"}
@@ -697,7 +700,7 @@ def gochar_drishti(
     tz = str(natal_chart.get("place_tz") or natal_chart.get("tz") or "UTC")
     jd0, jd1 = _civil_window_to_tt(date_from, date_to, tz)
 
-    # Prefer vedic_gochar’s robust wrapper that also accepts time_range
+    # Use start/end TT when available; otherwise hand civil window + tz to gochar
     res = _find_gochar_in_range(
         natal_chart=natal_chart,
         start_jd_tt=jd0 if jd0 is not None else None,
@@ -707,13 +710,15 @@ def gochar_drishti(
         natal_targets=natal_targets,
         frame=frame,
         zodiac_mode=zodiac_mode,
-        ayanamsa_deg=float(ayanamsa) if isinstance(ayanamsa, (int,float)) else None,
+        ayanamsa_deg=float(ayanamsa) if isinstance(ayanamsa, (int, float)) else None,
         orb_deg=orb_deg,
         orb_map=orb_map,
         include_nodes=include_nodes,
         treat_nodes_like_saturn=treat_nodes_like_saturn,
         step_minutes=step_minutes,
         prebatch_refinement=prebatch_refinement,
+        # >>> critical for correct civil parsing in vedic_gochar:
+        place_tz=tz, tz=tz,
     )
     return res
 
@@ -757,7 +762,8 @@ def ingresses_rashi(
 
 
 def ingresses_nakshatra(
-    *,
+    *:
+    ,
     date_from: str,
     date_to: str,
     movers: Optional[List[str]] = None,
