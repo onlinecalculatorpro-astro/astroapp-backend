@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Tuple, Literal, Optional, Set, Union
 from datetime import datetime, timezone
 import re
+import math
 
 from app.core.common_predictive import (
     norm360, sign_index, angdiff, compute_houses, timescales_from_civil
@@ -178,13 +179,8 @@ def _nirayana(lon_tropical: float, ayanamsa_deg: float) -> float:
     return norm360(lon_tropical - ayanamsa_deg)
 
 def _nak_index(nirayana_lon: float) -> int:
-    # 0..26 (Aśvinī = 0)
     x = nirayana_lon / _NAK_WIDTH
-    i = int(x)
-    if i >= 27:
-        i %= 27
-    elif i < 0:
-        i = i % 27
+    i = int(math.floor(x)) % 27
     return i
 
 def _nak_lord(idx: int) -> str:
@@ -216,10 +212,6 @@ def vimsottari_dasha(
     levels: int = 3,            # supports 1..5
     span_years: float = 120.0,
 ) -> List[DashaPeriod]:
-    """
-    Legacy generator (kept for back-compat). Prefer using predict_dasha_periods()
-    which delegates to app.core.vimshottari_dasha.
-    """
     if levels < 1: levels = 1
     if levels > 5: levels = 5
 
@@ -301,7 +293,6 @@ def vimsottari_dasha(
 # ───────────────────────────── Time helpers (TT↔UTC) ──────────────────────────
 
 def _datetime_to_jd_tt(dt: datetime) -> float:
-    """Convert a datetime to TT Julian Day using Skyfield TimeScale (TS)."""
     try:
         if dt.tzinfo is None:
             t = TS.utc(dt.replace(tzinfo=timezone.utc))
@@ -316,7 +307,6 @@ def _datetime_to_jd_tt(dt: datetime) -> float:
         return 2440587.5 + (sec / 86400.0)
 
 def _jd_tt_to_iso_utc(j_tt: float) -> str:
-    """Convert TT Julian Day to ISO-8601 UTC (Z)."""
     try:
         dt_utc = TS.tt_jd(float(j_tt)).utc_datetime()
         return dt_utc.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
@@ -324,12 +314,7 @@ def _jd_tt_to_iso_utc(j_tt: float) -> str:
         unix = (float(j_tt) - 2440587.5) * 86400.0
         return datetime.utcfromtimestamp(unix).replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
 
-# NEW: civil window → TT window helper (safe pass-through for gochar wrappers)
 def _civil_window_to_tt(date_from: str, date_to: str, tz_name: str) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Convert civil YYYY-MM-DD (or RFC3339 date-times) + tz to start/end JD(TT).
-    If parsing fails, returns (None, None) and lets the callee decide.
-    """
     try:
         ts0 = timescales_from_civil(str(date_from), "00:00:00", str(tz_name))
         ts1 = timescales_from_civil(str(date_to), "23:59:59", str(tz_name))
@@ -363,11 +348,6 @@ def _normalize_system(name: str) -> str:
     return aliases.get(n, n)
 
 def _natal_to_payload(natal_chart: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Build a payload that the individual dasha engines accept.
-    Respects either jd_tt or {date,time,tz}. Passes through ayanamsa if present.
-    Also forwards helpful extras (lat/lon/asc) when present.
-    """
     payload: Dict[str, Any] = {}
     if "jd_tt" in natal_chart:
         payload["jd_tt"] = float(natal_chart["jd_tt"])
@@ -456,11 +436,6 @@ def predict_dasha_periods(
     include_antardasha: bool = True,
     levels: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """
-    Build daśā periods covering [start_date, end_date] using the selected engine.
-    Supports: vimshottari, ashtottari, yogini, chara, kalachakra.
-    Returns rows from all depths 1..L that intersect the window.
-    """
     system = _normalize_system(dasha_system)
 
     # Resolve birth TT
@@ -687,13 +662,6 @@ def gochar_drishti(
     step_minutes: Union[str, float, int] = "auto",
     prebatch_refinement: bool = False,
 ) -> Dict[str, Any]:
-    """
-    Degree-true graha dṛṣṭi hits for a civil window [date_from, date_to].
-    Returns the exact TT instants with separation, orbs, and weights.
-
-    FIX: ensure civil→TT fallback path passes caller’s timezone to vedic_gochar,
-    otherwise UTC would be assumed. We always forward tz as 'place_tz'.
-    """
     if not _GOCHAR_OK:
         return {"ok": False, "error": "gochar_engine_unavailable"}
 
@@ -717,7 +685,7 @@ def gochar_drishti(
         treat_nodes_like_saturn=treat_nodes_like_saturn,
         step_minutes=step_minutes,
         prebatch_refinement=prebatch_refinement,
-        # >>> critical for correct civil parsing in vedic_gochar:
+        # Be explicit for downstream civil parsing:
         place_tz=tz, tz=tz,
     )
     return res
@@ -738,7 +706,6 @@ def ingresses_rashi(
     tz_name: str = "UTC",
     step_minutes: Union[str, float, int] = "auto",
 ) -> Dict[str, Any]:
-    """Sign-boundary crossings for movers within [date_from, date_to]."""
     if not _GOCHAR_OK:
         return {"ok": False, "error": "gochar_engine_unavailable"}
 
@@ -762,8 +729,7 @@ def ingresses_rashi(
 
 
 def ingresses_nakshatra(
-    *:
-    ,
+    *,
     date_from: str,
     date_to: str,
     movers: Optional[List[str]] = None,
@@ -815,7 +781,6 @@ def stations_retro_direct(
     tz_name: str = "UTC",
     step_minutes: Union[str, float, int] = "auto",
 ) -> Dict[str, Any]:
-    """Velocity zero-crossings (retrograde/direct) for movers in [date_from, date_to]."""
     if not _GOCHAR_OK:
         return {"ok": False, "error": "gochar_engine_unavailable"}
 
@@ -839,9 +804,6 @@ def stations_retro_direct(
 
 
 def feature_drishti_proximity(*, hits: List[Dict[str, Any]], cap_deg: float = 12.0) -> List[float]:
-    """
-    Re-export: 0..1 proximity score per dṛṣṭi hit (1 at exact axis → 0 at cap).
-    """
     if not _GOCHAR_OK:
         return []
     return _feature_drishti_proximity(hits=hits, cap_deg=cap_deg)
@@ -857,7 +819,6 @@ def compute_vargas_for_point(
     ayanamsa: Any = "lahiri",
     include: Iterable[str] = ("D1","D2","D3","D9","D10","D12"),
 ) -> Dict[str, int]:
-    """Return {"D9": sign_index, ...} for a single point."""
     if not _VARGA_OK or _varga_position is None:
         return {}
     out: Dict[str, int] = {}
@@ -878,7 +839,6 @@ def compute_vargas(
     ayanamsa: Any = "lahiri",
     include: Iterable[str] = ("D1","D2","D3","D9","D10","D12"),
 ) -> Dict[str, Dict[str, int]]:
-    """Return { planet: {"D9": sign_index, ...}, ... } using varga_charts."""
     if not _VARGA_OK or _compute_many_vargas is None:
         return {}
     varga_list = [str(v) for v in include]
@@ -906,7 +866,6 @@ def compute_varga_for_point_full(
     zodiac_mode: Literal["tropical","sidereal"] = "sidereal",
     ayanamsa: Any = "lahiri",
 ) -> Dict[str, Any]:
-    """Return the full placement dict from `varga_charts.varga_position`."""
     if not _VARGA_OK or _varga_position is None:
         return {"error": "varga_engine_unavailable"}
     return _varga_position(float(lon_deg), str(varga), zodiac_mode=zodiac_mode, ayanamsa=ayanamsa)
@@ -919,7 +878,6 @@ def compute_varga_full(
     zodiac_mode: Literal["tropical","sidereal"] = "sidereal",
     ayanamsa: Any = "lahiri",
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
-    """Return { 'D9': { 'Sun': {...}, ... }, ... } exactly as `varga_charts` emits."""
     if not _VARGA_OK or _compute_many_vargas is None:
         return {"error": "varga_engine_unavailable"}
     return _compute_many_vargas(points_deg, [str(v) for v in vargas], zodiac_mode=zodiac_mode, ayanamsa=ayanamsa)
@@ -929,7 +887,6 @@ def compute_varga_full(
 # =============================================================================
 
 def list_yoga_catalog() -> Dict[str, Any]:
-    """Expose the registry catalog (name/tags/meta) when core is available."""
     if not _YOGA_CORE_OK or _yoga_list is None:
         return {"ok": False, "error": "yoga_core_unavailable"}
     try:
@@ -937,18 +894,9 @@ def list_yoga_catalog() -> Dict[str, Any]:
     except Exception as e:
         return {"ok": False, "error": f"yoga_catalog_error:{e}"}
 
-# --- include-name normalization helpers --------------------------------------
-
 _WS_RE = re.compile(r"\s+")
 
 def _canon_name(s: str) -> str:
-    """
-    Normalize a yoga name for robust matching:
-    lowercased, spaces/hyphens -> underscores, drop surrounding punctuation.
-    Examples:
-      'Chandra-Mangal' -> 'chandra_mangal'
-      'Viparita-Rajayoga (basic)' -> 'viparita_rajayoga_basic'
-    """
     t = (s or "").strip().lower()
     t = _WS_RE.sub(" ", t)
     t = t.replace("-", " ").replace("/", " ")
@@ -962,18 +910,12 @@ def _canon_set(seq: Iterable[str]) -> Set[str]:
     return { _canon_name(x) for x in seq if str(x).strip() }
 
 def yoga_detect(norm: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Run Yoga detection given a *normalized* yoga payload.
-    Returns:
-      { ok, yogas, context, warnings, present }  // `present` is a convenience list of matched names
-    """
     include_raw = list(norm.get("include") or ())
     include_names = _canon_set(include_raw)
 
     # ── Primary path: registry/core ──
     if _YOGA_CORE_OK and _compute_yogas_core is not None:
         payload = {
-            # timescales/site (core will compute as needed)
             "jd_tt": norm.get("jd_tt"),
             "jd_ut1": norm.get("jd_ut1"),
             "date": norm.get("date"),
@@ -987,14 +929,12 @@ def yoga_detect(norm: Dict[str, Any]) -> Dict[str, Any]:
                 payload,
                 ayanamsa=norm.get("ayanamsa", "lahiri"),
                 house_system=str(norm.get("house_system") or "placidus"),
-                # honor tag gates (names are filtered post-hoc below)
                 enable_catalog_tags=tuple(norm.get("enable_catalog_tags") or ()),
                 disable_catalog_tags=tuple(norm.get("disable_catalog_tags") or ()),
             )
         except Exception as e:
             return {"ok": False, "error": f"yoga_engine_error:{e}"}
 
-        # Filter and normalize names for the include gate (if provided)
         yogas_full = list(res.get("yogas") or [])
         if include_names:
             filtered: List[Dict[str, Any]] = []
@@ -1019,19 +959,14 @@ def yoga_detect(norm: Dict[str, Any]) -> Dict[str, Any]:
             "warnings": list(res.get("warnings", [])),
             "present": present_list,
         }
-        # Bubble up specific error text if core provided one (prevents generic 'failed')
         if not ok:
-            if res.get("error"):
-                out["error"] = res["error"]
-            else:
-                out["error"] = "yoga_detect_failed"
+            out["error"] = res.get("error", "yoga_detect_failed")
         return out
 
     # ── Fallback: legacy-basic detectors; requires precomputed points + cusps ──
     pts = norm.get("points_deg") or {}
     cusps = norm.get("cusps_deg") or []
     if pts and isinstance(cusps, list) and len(cusps) == 12:
-        # default include when caller didn't specify
         default_inc = (
             "panch_mahapurusha","gajakesari","chandra_mangal","parivartana",
             "adhi","vesi_vasi_ubhayachari","viparita_rajayoga_basic",
@@ -1236,7 +1171,6 @@ def detect_yogas(
     ),
     orbs: Optional[Dict[str, float]] = None
 ) -> List[Dict[str, Any]]:
-    """Legacy-basic aggregator, used as a fallback and for backwards-compat."""
     out: List[Dict[str, Any]] = []
     inc = set(include)
     if "panch_mahapurusha" in inc: out.extend(detect_panch_mahapurusha(points_deg, cusps_deg))
@@ -1258,11 +1192,6 @@ def detect_yogas(
 # =============================================================================
 
 def feature_dasha_lords_onehot(periods: List[Dict[str, Any]], *, levels: int = 2) -> List[List[int]]:
-    """
-    One-hot encode the leading Ketu..Mercury sequence from period 'chain' up to `levels`.
-    Output shape: [n_periods x (levels*9)].
-    Order per level is fixed as _VIM_ORDER.
-    """
     L = levels if 1 <= int(levels) <= 5 else 2
     idx = {p:i for i,p in enumerate(_VIM_ORDER)}
     out: List[List[int]] = []
@@ -1278,11 +1207,9 @@ def feature_dasha_lords_onehot(periods: List[Dict[str, Any]], *, levels: int = 2
     return out
 
 def feature_yoga_flags(yogas: List[Dict[str, Any]], *, include: Optional[Iterable[str]] = None) -> Dict[str, int]:
-    """Produce simple binary flags per yoga name."""
     inc = set(include) if include else None
     flags: Dict[str, int] = {}
     for y in yogas:
-        # works with both legacy-basic (key 'yoga') and core output (key 'name')
         name = str(y.get("yoga") or y.get("name") or "").strip()
         if not name:
             continue
@@ -1290,7 +1217,6 @@ def feature_yoga_flags(yogas: List[Dict[str, Any]], *, include: Optional[Iterabl
             continue
         present = y.get("present")
         if present is None:
-            # legacy-basic only lists positives
             flags[name] = 1
         else:
             flags[name] = 1 if bool(present) else 0
