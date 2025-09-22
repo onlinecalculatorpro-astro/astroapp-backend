@@ -203,14 +203,31 @@ def _last_of_day_jd_utc(date: str, tz: str) -> float:
     return _civil_to_jd_utc(date, "23:59:59", tz)
 
 def _parse_dates_from_body(body: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    # Prefer explicit time_range if present
     if isinstance(body.get("time_range"), (list, tuple)) and len(body["time_range"]) >= 2:
         return str(body["time_range"][0]), str(body["time_range"][1])
+
     d0 = (body.get("date_from") or body.get("from") or None)
     d1 = (body.get("date_to")   or body.get("to")   or None)
-    return (str(d0) if d0 else None, str(d1) if d1 else None)
+    if not d0 or not d1:
+        return None, None
+
+    s0, s1 = str(d0), str(d1)
+
+    # Allow callers to pass full ISO datetimes; for windowing we only need the date
+    def _just_date(s: str) -> str:
+        # accepts YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS...
+        if "T" in s:
+            return s.split("T", 1)[0]
+        if " " in s:
+            return s.split(" ", 1)[0]
+        return s
+
+    return _just_date(s0), _just_date(s1)
 
 def _tz_from_body(body: Dict[str, Any]) -> str:
-    tz = body.get("place_tz") or body.get("tz") or "UTC"
+    # accept tz_name, tz, or place_tz (in that priority)
+    tz = body.get("tz_name") or body.get("tz") or body.get("place_tz") or "UTC"
     tzs = str(tz).strip()
     return tzs if tzs else "UTC"
 
