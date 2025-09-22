@@ -35,8 +35,16 @@ except Exception as _e:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Engines: central registry (preferred) + direct module fallbacks (dasha only)
+# Predictive (preferred dasha wrapper)
 # ──────────────────────────────────────────────────────────────────────────────
+_PRED_OK = False
+try:
+    from app.core.vedic_predictive import predict_dasha_periods as _predict_dasha  # type: ignore
+    _PRED_OK = True
+except Exception:
+    _PRED_OK = False
+
+# Optional: central dasha registry (fallback if predictive wrapper missing)
 _compute_dasha_registry = None
 _available_schemes_fn = None
 try:
@@ -46,7 +54,7 @@ except Exception:
     _compute_dasha_registry = None  # type: ignore
     _available_schemes_fn = None  # type: ignore
 
-# Optional dasha module fallbacks
+# Optional per-module fallbacks (last resort)
 try:
     from app.core.vimshottari_dasha import compute_vimshottari as _compute_vim_module  # type: ignore
 except Exception:
@@ -107,9 +115,13 @@ except Exception:
     get_ayanamsa_deg = None  # type: ignore
     _AY_OK = False
 
+# Skyfield TS (for TT<->UTC)
+from app.core.ephem_singleton import TS  # type: ignore
+from datetime import datetime, timezone
+
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Yoga core (Mode-C only) — prefer singular module name, then fallback
+# Yoga core (Mode-C only)
 # ──────────────────────────────────────────────────────────────────────────────
 _YOGA_OK = False
 _compute_yogas = None  # type: ignore
@@ -236,14 +248,13 @@ def _tz_from_payload(body: Dict[str, Any]) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Timescales & window normalization (used by gochar/ingress/stations)
+# Timescales & window normalization (used by dasha/gochar/ingress/stations)
 # ──────────────────────────────────────────────────────────────────────────────
 def _build_timescales_safe(date: str, time: str, tz: str) -> Optional[Dict[str, Any]]:
     if not _TS_OK or build_timescales is None:
         return None
     try:
         ts = build_timescales(date, time, tz, _env_dut1_seconds())  # type: ignore[misc]
-        # Be generous with return shapes (dict or object with attributes)
         return ts if isinstance(ts, dict) else {
             "jd_tt": getattr(ts, "jd_tt", None),
             "jd_ut1": getattr(ts, "jd_ut1", None),
@@ -254,7 +265,6 @@ def _build_timescales_safe(date: str, time: str, tz: str) -> Optional[Dict[str, 
 
 
 def _extract_civil_dates(body: Dict[str, Any]) -> Tuple[str, str]:
-    """Pull any civil date shape."""
     d_from = str(body.get("date_from") or body.get("from") or "").strip()
     d_to   = str(body.get("date_to")   or body.get("to")   or "").strip()
     return d_from, d_to
@@ -282,12 +292,12 @@ def _resolve_window_jd_tt(body: Dict[str, Any]) -> Tuple[Optional[float], Option
     warns: List[str] = []
     tz_name = _tz_from_payload(body)
 
-    # Direct JD window first
+    # Direct JD window
     a, b = _extract_jd_window(body)
     if isinstance(a, float) and isinstance(b, float):
         return a, b, warns, tz_name
 
-    # Civil → JD_TT (at day edges)
+    # Civil → JD_TT (day edges)
     d_from, d_to = _extract_civil_dates(body)
     if d_from and d_to and _TS_OK:
         ts0 = _build_timescales_safe(d_from, "00:00:00", tz_name)
@@ -301,23 +311,21 @@ def _resolve_window_jd_tt(body: Dict[str, Any]) -> Tuple[Optional[float], Option
     return None, None, warns, tz_name
 
 
-def _filter_kwargs_for_fn(fn, kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    """Keep only kwargs that target function accepts."""
+def _jd_tt_to_dt_utc(jd_tt: float) -> datetime:
     try:
-        sig = inspect.signature(fn)  # type: ignore[arg-type]
-        params = sig.parameters
-        allowed = set(k for k, p in params.items() if p.kind in (
-            inspect.Parameter.KEYWORD_ONLY,
-            inspect.Parameter.POSITIONAL_OR_KEYWORD
-        ))
-        # If function is *args/**kwargs heavy, be permissive
-        has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
-        if has_varkw:
-            return kwargs
-        return {k: v for k, v in kwargs.items() if k in allowed}
+        dt = TS.tt_jd(float(jd_tt)).utc_datetime()
+        return dt.replace(tzinfo=timezone.utc)
     except Exception:
-        # If we can't inspect, pass through
-        return kwargs
+        # extremely unlikely; fallback via Unix epoch
+        unix = (float(jd_tt) - 2440587.5) * 86400.0
+        return datetime.utcfromtimestamp(unix).replace(tzinfo=timezone.utc)
+
+
+def _window_datetimes_from_body(body: Dict[str, Any]) -> Tuple[Optional[datetime], Optional[datetime], List[str], str]:
+    a, b, warns, tz = _resolve_window_jd_tt(body)
+    if isinstance(a, float) and isinstance(b, float):
+        return _jd_tt_to_dt_utc(a), _jd_tt_to_dt_utc(b), warns, tz
+    return None, None, warns, tz
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -331,7 +339,6 @@ def _norm_method(v: Any, default: str = "sidereal") -> str:
     return default
 
 def _norm_ayanamsa(v: Any) -> Any:
-    # pass through floats/ints; normalize strings; default lahiri
     if v is None: return "lahiri"
     if isinstance(v, (int, float)): return float(v)
     return str(v).strip().lower() or "lahiri"
@@ -354,7 +361,6 @@ def _pick_vargas(body: Dict[str, Any]) -> List[str]:
         return [str(x).upper() for x in v if str(x).strip()]
     if isinstance(v, str) and v.strip():
         return [s.strip().upper() for s in v.split(",") if s.strip()]
-    # sensible default if caller forgot (match common UI)
     return ["D1", "D9", "D10", "D12"]
 
 def _wrap_varga_meta(route: str, method: str, ay_meta: Dict[str, Any]) -> Dict[str, Any]:
@@ -363,11 +369,9 @@ def _wrap_varga_meta(route: str, method: str, ay_meta: Dict[str, Any]) -> Dict[s
     return base
 
 def _jd_tt_from_body(body: Dict[str, Any]) -> Optional[float]:
-    # direct overrides
     jd = _coerce_float(body.get("jd_tt") or body.get("birth_jd_tt"))
     if isinstance(jd, float):
         return jd
-    # civil → JD_TT
     if not _TS_OK:
         return None
     date = str(body.get("date") or body.get("birth_date") or "").strip()
@@ -414,30 +418,107 @@ def vedic_diag():
     return jsonify({
         "validator_loaded": (normalize_vim_payload is not None) and (normalize_yoga_payload is not None),
         "validator_error": _VALIDATOR_IMPORT_ERR,
+        "predictive_present": _PRED_OK,
         "registry_compute_present": bool(_compute_dasha_registry),
         "registry_compute_sig": sigs(_compute_dasha_registry) if _compute_dasha_registry else None,
         "registry_available": _available_schemes_fn() if callable(_available_schemes_fn) else None,
         "module_vimshottari_present": bool(_compute_vim_module),
-        "module_vimshottari_sig": sigs(_compute_vim_module) if _compute_vim_module else None,
         "module_ashtottari_present": bool(_compute_ashto_module),
-        "module_ashtottari_sig": sigs(_compute_ashto_module) if _compute_ashto_module else None,
         "module_yogini_present": bool(_compute_yogini_module),
-        "module_yogini_sig": sigs(_compute_yogini_module) if _compute_yogini_module else None,
         "module_chara_present": bool(_compute_chara_module),
-        "module_chara_sig": sigs(_compute_chara_module) if _compute_chara_module else None,
         "module_kalachakra_present": bool(_compute_kcd_module),
-        "module_kalachakra_sig": sigs(_compute_kcd_module) if _compute_kcd_module else None,
         "varga_engine_present": _VARGA_OK,
         "timescales_present": _TS_OK,
         "ayanamsa_adapter_present": _AY_OK,
-        # Yoga diagnostics
         "yoga_core_present": _YOGA_OK,
-        # Gochar diagnostics
         "gochar_present": _GOCHAR_OK,
         "rl_cap_per_min": RL_VEDIC_PREDICTIVE,
         "rl_bucket_key": "20",
         "dut1_seconds_env": _env_dut1_seconds(),
     }), 200
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Dasha helpers (use predictive wrapper if present; then registry; then modules)
+# ──────────────────────────────────────────────────────────────────────────────
+def _run_dasha_generic(body: Dict[str, Any], *, system: str) -> Dict[str, Any]:
+    if normalize_vim_payload is None:
+        return {"ok": False, "error": "validator_unavailable"}
+
+    # Normalize natal side (tz/place/coords; may provide jd_tt)
+    natal, warns, tz_norm = normalize_vim_payload(body)  # type: ignore[misc]
+
+    # Window: prefer explicit jd_tt window; else civil dates in tz
+    dt0, dt1, w_warns, _ = _window_datetimes_from_body(body)
+    warns = list(warns or []) + list(w_warns or [])
+    if dt0 is None or dt1 is None:
+        return {
+            "ok": False,
+            "error": "missing_date_window",
+            "warnings": warns,
+            "meta": {"route": f"dasha/{system}", "branch": "predictive", "tz_normalized": tz_norm},
+            "hints": [
+                "Provide 'date_from' and 'date_to' (YYYY-MM-DD), or",
+                "Provide 'jd_tt_window': [start,end] (TT days)."
+            ],
+        }
+
+    levels = body.get("levels", body.get("depth", body.get("max_levels", 3)))
+
+    # Preferred: predictive wrapper
+    if _PRED_OK and callable(_predict_dasha):
+        try:
+            res = _predict_dasha(
+                natal_chart=natal,
+                start_date=dt0,
+                end_date=dt1,
+                dasha_system=system,
+                include_antardasha=True if int(levels) >= 2 else False,
+                levels=int(levels) if str(levels).strip() else None,
+            )
+            res.setdefault("meta", {})
+            res["meta"].update({"route": f"dasha/{system}", "branch": "predictive", "tz_normalized": tz_norm})
+            res.setdefault("warnings", []).extend(warns)
+            return res
+        except Exception as e:
+            return {"ok": False, "error": f"{system}_failed", "detail": str(e)}
+
+    # Fallback: central registry (shape may differ between deployments)
+    if callable(_compute_dasha_registry):
+        try:
+            payload = {
+                "system": system,
+                "natal": natal,
+                "start_date": dt0.isoformat(),
+                "end_date": dt1.isoformat(),
+                "levels": int(levels) if str(levels).strip() else 3,
+            }
+            res = _compute_dasha_registry(payload)  # type: ignore[misc]
+            res.setdefault("meta", {})
+            res["meta"].update({"route": f"dasha/{system}", "branch": "registry", "tz_normalized": tz_norm})
+            res.setdefault("warnings", []).extend(warns)
+            return res
+        except Exception as e:
+            return {"ok": False, "error": f"{system}_registry_failed", "detail": str(e)}
+
+    # Last resort: direct module calls (very implementation-specific)
+    return {"ok": False, "error": f"{system}_engine_unavailable"}
+
+
+def _run_vimshottari(body: Dict[str, Any]) -> Dict[str, Any]:
+    return _run_dasha_generic(body, system="vimshottari")
+
+def _run_ashtottari(body: Dict[str, Any]) -> Dict[str, Any]:
+    return _run_dasha_generic(body, system="ashtottari")
+
+def _run_yogini(body: Dict[str, Any]) -> Dict[str, Any]:
+    return _run_dasha_generic(body, system="yogini")
+
+def _run_chara(body: Dict[str, Any]) -> Dict[str, Any]:
+    return _run_dasha_generic(body, system="chara")
+
+def _run_kalachakra(body: Dict[str, Any]) -> Dict[str, Any]:
+    return _run_dasha_generic(body, system="kalachakra")
 
 
 # ──────────────── Dasha routes ────────────────
@@ -494,7 +575,6 @@ def vedic_kalachakra():
 @rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
 def vedic_yoga_catalog():
     if not (_YOGA_OK and callable(_yoga_list)):
-        # Gracefully return empty when yoga core absent
         return jsonify({"ok": True, "catalog": [], "meta": {"route": "yoga/catalog", "branch": "none"}}), 200
     try:
         catalog = _yoga_list() or []
@@ -508,8 +588,8 @@ def vedic_yoga_catalog():
 def vedic_yoga_detect():
     """
     Yoga detection (civil/time + site only).
-    Requires: date, time, tz, latitude, longitude (place is optional; if provided and a resolver is available, it can fill missing tz/coords).
-    No precomputed points/cusps accepted here.
+    Requires: date, time, tz, latitude, longitude.
+    If 'place' is provided and a resolver is available, it can fill missing tz/coords.
     """
     if normalize_yoga_payload is None:
         return jsonify({"ok": False, "error": "validator_unavailable"}), 503
@@ -519,7 +599,7 @@ def vedic_yoga_detect():
     body = request.get_json(silent=True) or {}
     norm, warns, tz_norm = normalize_yoga_payload(body)  # type: ignore[misc]
 
-    # Basic input guardrails
+    # Guardrails
     if not norm.get("date") or not norm.get("time"):
         return jsonify({
             "ok": False,
@@ -535,11 +615,11 @@ def vedic_yoga_detect():
             "meta": {"route": "yoga/detect", "branch": "needs_coordinates", "tz_normalized": tz_norm},
             "hints": [
                 "Provide 'latitude' and 'longitude' (in degrees).",
-                "Optionally send a 'place' string (city/state/country) if a resolver is enabled.",
+                "Optionally send a 'place' string to auto-resolve.",
             ],
         }), 400
 
-    # Call the core yoga engine
+    # Call yoga core
     try:
         res = _compute_yogas(
             {
@@ -549,12 +629,10 @@ def vedic_yoga_detect():
                 "latitude": norm["latitude"],
                 "longitude": norm["longitude"],
                 "elevation_m": norm.get("elevation_m"),
-                # passthrough for any future core-side needs
                 "include": norm.get("include") or [],
             },
             ayanamsa=norm.get("ayanamsa", "lahiri"),
             house_system=norm.get("house_system", "placidus"),
-            # defaults below mirror core defaults; override if you expose UI toggles
             sign_lord_variant="classical",
             chandra_mangala_by_sign=True,
             conj_orb_deg=6.0,
@@ -593,7 +671,7 @@ def vedic_gochar_drishti():
     """
     Degree-true graha dṛṣṭi transit hits within a window.
     Accepts:
-      - date_from, date_to (YYYY-MM-DD or RFC3339 date-only; treated as day edges in tz)
+      - date_from, date_to (YYYY-MM-DD or RFC3339 date-only; day edges in tz)
       - or jd_tt_window: [start, end]
       - or start_jd_tt + end_jd_tt
     Optional:
@@ -607,7 +685,7 @@ def vedic_gochar_drishti():
 
     body = request.get_json(silent=True) or {}
 
-    # Normalize natal payload enough to pass through (tz/place/coords if available)
+    # Normalize natal payload (tz/place/coords)
     if normalize_vim_payload is None:
         natal_chart = body
         warns: List[str] = []
@@ -630,7 +708,6 @@ def vedic_gochar_drishti():
             "meta": {"route": "gochar/drishti", "branch": "vedic_predictive", "tz_normalized": tz_norm},
         }), 400
 
-    # Build kwargs and only keep what core accepts
     civil_from, civil_to = _extract_civil_dates(body)
     base_kwargs = {
         "natal_chart": natal_chart,
@@ -712,7 +789,7 @@ def vedic_ingress_rashi():
         "zodiac_mode": (body.get("zodiac_mode") or body.get("method") or "sidereal"),
         "ayanamsa": body.get("ayanamsa", "lahiri"),
         "frame": str(body.get("frame") or "ecliptic-of-date"),
-        "topocentric": bool(body.get("topocentric", False)),
+        "observer": "topocentric" if bool(body.get("topocentric", False)) else "geocentric",
         "latitude": _coerce_float(body.get("latitude")),
         "longitude": _coerce_float(body.get("longitude")),
         "elevation_m": _coerce_float(body.get("elevation_m") or body.get("elevation")),
@@ -758,7 +835,7 @@ def vedic_ingress_nakshatra():
         "zodiac_mode": (body.get("zodiac_mode") or body.get("method") or "sidereal"),
         "ayanamsa": body.get("ayanamsa", "lahiri"),
         "frame": str(body.get("frame") or "ecliptic-of-date"),
-        "topocentric": bool(body.get("topocentric", False)),
+        "observer": "topocentric" if bool(body.get("topocentric", False)) else "geocentric",
         "latitude": _coerce_float(body.get("latitude")),
         "longitude": _coerce_float(body.get("longitude")),
         "elevation_m": _coerce_float(body.get("elevation_m") or body.get("elevation")),
@@ -804,7 +881,7 @@ def vedic_stations():
         "zodiac_mode": (body.get("zodiac_mode") or body.get("method") or "sidereal"),
         "ayanamsa": body.get("ayanamsa", "lahiri"),
         "frame": str(body.get("frame") or "ecliptic-of-date"),
-        "topocentric": bool(body.get("topocentric", False)),
+        "observer": "topocentric" if bool(body.get("topocentric", False)) else "geocentric",
         "latitude": _coerce_float(body.get("latitude")),
         "longitude": _coerce_float(body.get("longitude")),
         "elevation_m": _coerce_float(body.get("elevation_m") or body.get("elevation")),
