@@ -147,7 +147,7 @@ except Exception:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Gochar / Ingress / Stations wrappers  ✅ now from vedic_gochar
+# Gochar / Ingress / Stations wrappers (from vedic_gochar)
 # ──────────────────────────────────────────────────────────────────────────────
 _GOCHAR_OK = False
 try:
@@ -397,6 +397,30 @@ def _ayanamsa_deg_from_key(jd_tt: Optional[float], key: str) -> Optional[float]:
         return float(get_ayanamsa_deg(None, key))  # type: ignore[misc]
     except Exception:
         return None
+
+def _ayanamsa_deg_for_window(body: Dict[str, Any], start_jd: float, end_jd: float) -> Optional[float]:
+    """
+    Compute ayanāṁśa degrees once per request at the midpoint of the window.
+    Priority:
+      1) explicit numeric `ayanamsa_deg`
+      2) numeric `ayanamsa`
+      3) string key `ayanamsa` (e.g., 'lahiri') via adapter
+      4) default 'lahiri' via adapter
+    """
+    # 1) explicit numeric deg
+    v = _coerce_float(body.get("ayanamsa_deg"))
+    if isinstance(v, float):
+        return v
+    # 2) numeric ayanamsa
+    v2 = _coerce_float(body.get("ayanamsa"))
+    if isinstance(v2, float):
+        return v2
+    # 3/4) key → degrees (fallback to 'lahiri')
+    key = _norm_ayanamsa(body.get("ayanamsa"))
+    if not isinstance(key, str) or not key:
+        key = "lahiri"
+    mid = 0.5 * (float(start_jd) + float(end_jd))
+    return _ayanamsa_deg_from_key(mid, key)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -708,8 +732,11 @@ def vedic_gochar_drishti():
             "meta": {"route": "gochar/drishti", "branch": "vedic_predictive", "tz_normalized": tz_norm},
         }), 400
 
+    # Resolve ayanamsa degrees once for this window
+    ay_deg = _ayanamsa_deg_for_window(body, start_jd, end_jd)
+
     civil_from, civil_to = _extract_civil_dates(body)
-    base_kwargs = {
+    kwargs = {
         "natal_chart": natal_chart,
         "date_from": civil_from or None,
         "date_to": civil_to or None,
@@ -719,7 +746,7 @@ def vedic_gochar_drishti():
         "transiting_bodies": body.get("transiting_bodies"),
         "natal_targets": body.get("natal_targets"),
         "zodiac_mode": (body.get("zodiac_mode") or body.get("method") or "sidereal"),
-        "ayanamsa": body.get("ayanamsa", "lahiri"),
+        "ayanamsa_deg": ay_deg,
         "frame": str(body.get("frame") or "ecliptic-of-date"),
         "include_nodes": bool(body.get("include_nodes", False)),
         "treat_nodes_like_saturn": bool(body.get("treat_nodes_like_saturn", False)),
@@ -728,7 +755,6 @@ def vedic_gochar_drishti():
         "step_minutes": body.get("step_minutes", "auto"),
         "prebatch_refinement": bool(body.get("prebatch_refinement", False)),
     }
-    kwargs = base_kwargs
 
     try:
         res = _gochar_drishti(**kwargs)  # type: ignore[misc]
@@ -778,8 +804,10 @@ def vedic_ingress_rashi():
         return jsonify({"ok": False, "error": "missing_date_window",
                         "hints": ["Send jd_tt_window or start_jd_tt/end_jd_tt, or date_from/date_to with tz/place."]}), 400
 
+    ay_deg = _ayanamsa_deg_for_window(body, start_jd, end_jd)
+
     civil_from, civil_to = _extract_civil_dates(body)
-    base_kwargs = {
+    kwargs = {
         "date_from": civil_from or None,
         "date_to": civil_to or None,
         "start_jd_tt": start_jd,
@@ -787,7 +815,7 @@ def vedic_ingress_rashi():
         "jd_tt_window": [start_jd, end_jd],
         "movers": body.get("movers"),
         "zodiac_mode": (body.get("zodiac_mode") or body.get("method") or "sidereal"),
-        "ayanamsa": body.get("ayanamsa", "lahiri"),
+        "ayanamsa_deg": ay_deg,
         "frame": str(body.get("frame") or "ecliptic-of-date"),
         "topocentric": bool(body.get("topocentric", False)),
         "latitude": _coerce_float(body.get("latitude")),
@@ -796,7 +824,6 @@ def vedic_ingress_rashi():
         "step_minutes": body.get("step_minutes", "auto"),
         "tz_name": tz_name,
     }
-    kwargs = _filter_kwargs_for_fn(_ingresses_rashi, base_kwargs)
 
     try:
         res = _ingresses_rashi(**kwargs)  # type: ignore[misc]
@@ -824,8 +851,10 @@ def vedic_ingress_nakshatra():
         return jsonify({"ok": False, "error": "missing_date_window",
                         "hints": ["Send jd_tt_window or start_jd_tt/end_jd_tt, or date_from/date_to with tz/place."]}), 400
 
+    ay_deg = _ayanamsa_deg_for_window(body, start_jd, end_jd)
+
     civil_from, civil_to = _extract_civil_dates(body)
-    base_kwargs = {
+    kwargs = {
         "date_from": civil_from or None,
         "date_to": civil_to or None,
         "start_jd_tt": start_jd,
@@ -833,7 +862,7 @@ def vedic_ingress_nakshatra():
         "jd_tt_window": [start_jd, end_jd],
         "movers": body.get("movers"),
         "zodiac_mode": (body.get("zodiac_mode") or body.get("method") or "sidereal"),
-        "ayanamsa": body.get("ayanamsa", "lahiri"),
+        "ayanamsa_deg": ay_deg,
         "frame": str(body.get("frame") or "ecliptic-of-date"),
         "topocentric": bool(body.get("topocentric", False)),
         "latitude": _coerce_float(body.get("latitude")),
@@ -842,7 +871,6 @@ def vedic_ingress_nakshatra():
         "step_minutes": body.get("step_minutes", "auto"),
         "tz_name": tz_name,
     }
-    kwargs = _filter_kwargs_for_fn(_ingresses_nakshatra, base_kwargs)
 
     try:
         res = _ingresses_nakshatra(**kwargs)  # type: ignore[misc]
@@ -870,8 +898,10 @@ def vedic_stations():
         return jsonify({"ok": False, "error": "missing_date_window",
                         "hints": ["Send jd_tt_window or start_jd_tt/end_jd_tt, or date_from/date_to with tz/place."]}), 400
 
+    ay_deg = _ayanamsa_deg_for_window(body, start_jd, end_jd)
+
     civil_from, civil_to = _extract_civil_dates(body)
-    base_kwargs = {
+    kwargs = {
         "date_from": civil_from or None,
         "date_to": civil_to or None,
         "start_jd_tt": start_jd,
@@ -879,7 +909,7 @@ def vedic_stations():
         "jd_tt_window": [start_jd, end_jd],
         "movers": body.get("movers"),
         "zodiac_mode": (body.get("zodiac_mode") or body.get("method") or "sidereal"),
-        "ayanamsa": body.get("ayanamsa", "lahiri"),
+        "ayanamsa_deg": ay_deg,
         "frame": str(body.get("frame") or "ecliptic-of-date"),
         "topocentric": bool(body.get("topocentric", False)),
         "latitude": _coerce_float(body.get("latitude")),
@@ -888,7 +918,6 @@ def vedic_stations():
         "step_minutes": body.get("step_minutes", "auto"),
         "tz_name": tz_name,
     }
-    kwargs = _filter_kwargs_for_fn(_stations_retro_direct, base_kwargs)
 
     try:
         res = _stations_retro_direct(**kwargs)  # type: ignore[misc]
