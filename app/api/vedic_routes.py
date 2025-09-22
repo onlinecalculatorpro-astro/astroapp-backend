@@ -119,7 +119,6 @@ except Exception:
 from app.core.ephem_singleton import TS  # type: ignore
 from datetime import datetime, timezone
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Yoga core (Mode-C only)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -147,7 +146,7 @@ except Exception:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Gochar / Ingress / Stations wrappers (from vedic_gochar)
+# Gochar / Ingress / Stations wrappers (now from vedic_gochar)
 # ──────────────────────────────────────────────────────────────────────────────
 _GOCHAR_OK = False
 try:
@@ -205,12 +204,6 @@ def _levels_from(norm: Dict[str, Any]) -> int:
     """Clamp requested depth to [1..5]."""
     L = _coerce_int(norm.get("levels", norm.get("depth", norm.get("max_levels", 5))), 5)
     return max(1, min(5, L))
-
-
-def _add_levels_and_limit(payload: Dict[str, Any], norm: Dict[str, Any]) -> None:
-    payload["levels"] = _levels_from(norm)
-    if "limit_jd_tt" in norm and norm["limit_jd_tt"] is not None:
-        payload["limit_jd_tt"] = norm["limit_jd_tt"]
 
 
 def _pad_hms(t: Any) -> str:
@@ -398,29 +391,29 @@ def _ayanamsa_deg_from_key(jd_tt: Optional[float], key: str) -> Optional[float]:
     except Exception:
         return None
 
-def _ayanamsa_deg_for_window(body: Dict[str, Any], start_jd: float, end_jd: float) -> Optional[float]:
-    """
-    Compute ayanāṁśa degrees once per request at the midpoint of the window.
-    Priority:
-      1) explicit numeric `ayanamsa_deg`
-      2) numeric `ayanamsa`
-      3) string key `ayanamsa` (e.g., 'lahiri') via adapter
-      4) default 'lahiri' via adapter
-    """
-    # 1) explicit numeric deg
-    v = _coerce_float(body.get("ayanamsa_deg"))
-    if isinstance(v, float):
-        return v
-    # 2) numeric ayanamsa
-    v2 = _coerce_float(body.get("ayanamsa"))
-    if isinstance(v2, float):
-        return v2
-    # 3/4) key → degrees (fallback to 'lahiri')
-    key = _norm_ayanamsa(body.get("ayanamsa"))
-    if not isinstance(key, str) or not key:
-        key = "lahiri"
-    mid = 0.5 * (float(start_jd) + float(end_jd))
-    return _ayanamsa_deg_from_key(mid, key)
+# Compute ayanamsa degrees for gochar/ingress/stations window
+def _resolve_ayanamsa_deg_for_window(body: Dict[str, Any], zodiac_mode: str) -> float:
+    # Tropical: no ayanamsa
+    if str(zodiac_mode or "").lower().startswith("trop"):
+        return 0.0
+    key = _norm_ayanamsa(body.get("ayanamsa") or "lahiri")
+    a, b, _warns, _tz = _resolve_window_jd_tt(body)
+    if isinstance(a, float) and isinstance(b, float):
+        mid = 0.5 * (float(a) + float(b))
+    else:
+        mid = _jd_tt_from_body(body) or None
+    if isinstance(key, (int, float)):
+        return float(key)
+    if isinstance(key, str) and _AY_OK and callable(get_ayanamsa_deg):
+        try:
+            return float(get_ayanamsa_deg(mid, key))  # type: ignore[misc]
+        except Exception:
+            pass
+    # fallback: try default lahiri with mid
+    try:
+        return float(get_ayanamsa_deg(mid, "lahiri")) if _AY_OK and callable(get_ayanamsa_deg) else 0.0  # type: ignore[misc]
+    except Exception:
+        return 0.0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -695,9 +688,7 @@ def vedic_gochar_drishti():
     """
     Degree-true graha dṛṣṭi transit hits within a window.
     Accepts:
-      - date_from, date_to (YYYY-MM-DD or RFC3339 date-only; day edges in tz)
-      - or jd_tt_window: [start, end]
-      - or start_jd_tt + end_jd_tt
+      - date_from, date_to (YYYY-MM-DD) OR jd_tt_window OR start_jd_tt/end_jd_tt
     Optional:
       transiting_bodies, natal_targets, zodiac_mode/method, ayanamsa,
       include_nodes, treat_nodes_like_saturn, orb_deg, orb_map,
@@ -732,32 +723,27 @@ def vedic_gochar_drishti():
             "meta": {"route": "gochar/drishti", "branch": "vedic_predictive", "tz_normalized": tz_norm},
         }), 400
 
-    # Resolve ayanamsa degrees once for this window
-    ay_deg = _ayanamsa_deg_for_window(body, start_jd, end_jd)
-
-    civil_from, civil_to = _extract_civil_dates(body)
-    kwargs = {
-        "natal_chart": natal_chart,
-        "date_from": civil_from or None,
-        "date_to": civil_to or None,
-        "start_jd_tt": start_jd,
-        "end_jd_tt": end_jd,
-        "jd_tt_window": [start_jd, end_jd],
-        "transiting_bodies": body.get("transiting_bodies"),
-        "natal_targets": body.get("natal_targets"),
-        "zodiac_mode": (body.get("zodiac_mode") or body.get("method") or "sidereal"),
-        "ayanamsa_deg": ay_deg,
-        "frame": str(body.get("frame") or "ecliptic-of-date"),
-        "include_nodes": bool(body.get("include_nodes", False)),
-        "treat_nodes_like_saturn": bool(body.get("treat_nodes_like_saturn", False)),
-        "orb_deg": float(body.get("orb_deg", 12.0)),
-        "orb_map": body.get("orb_map"),
-        "step_minutes": body.get("step_minutes", "auto"),
-        "prebatch_refinement": bool(body.get("prebatch_refinement", False)),
-    }
+    zodiac_mode = (body.get("zodiac_mode") or body.get("method") or "sidereal")
+    ay_deg = _resolve_ayanamsa_deg_for_window(body, zodiac_mode)
 
     try:
-        res = _gochar_drishti(**kwargs)  # type: ignore[misc]
+        res = _gochar_drishti(
+            natal_chart=natal_chart,
+            start_jd_tt=float(start_jd),
+            end_jd_tt=float(end_jd),
+            transiting_bodies=body.get("transiting_bodies"),
+            natal_targets=body.get("natal_targets"),
+            frame=str(body.get("frame") or "ecliptic-of-date"),
+            zodiac_mode=zodiac_mode,
+            ayanamsa_deg=ay_deg,
+            orb_deg=float(body.get("orb_deg", 12.0)),
+            orb_map=body.get("orb_map"),
+            include_nodes=bool(body.get("include_nodes", False)),
+            treat_nodes_like_saturn=bool(body.get("treat_nodes_like_saturn", False)),
+            step_minutes=body.get("step_minutes", "auto"),
+            target_lon_map=body.get("target_lon_map"),
+            prebatch_refinement=bool(body.get("prebatch_refinement", False)),
+        )  # type: ignore[misc]
     except Exception as e:
         return jsonify({"ok": False, "error": "gochar_drishti_failed", "detail": str(e)}), 400
 
@@ -804,29 +790,23 @@ def vedic_ingress_rashi():
         return jsonify({"ok": False, "error": "missing_date_window",
                         "hints": ["Send jd_tt_window or start_jd_tt/end_jd_tt, or date_from/date_to with tz/place."]}), 400
 
-    ay_deg = _ayanamsa_deg_for_window(body, start_jd, end_jd)
-
-    civil_from, civil_to = _extract_civil_dates(body)
-    kwargs = {
-        "date_from": civil_from or None,
-        "date_to": civil_to or None,
-        "start_jd_tt": start_jd,
-        "end_jd_tt": end_jd,
-        "jd_tt_window": [start_jd, end_jd],
-        "movers": body.get("movers"),
-        "zodiac_mode": (body.get("zodiac_mode") or body.get("method") or "sidereal"),
-        "ayanamsa_deg": ay_deg,
-        "frame": str(body.get("frame") or "ecliptic-of-date"),
-        "topocentric": bool(body.get("topocentric", False)),
-        "latitude": _coerce_float(body.get("latitude")),
-        "longitude": _coerce_float(body.get("longitude")),
-        "elevation_m": _coerce_float(body.get("elevation_m") or body.get("elevation")),
-        "step_minutes": body.get("step_minutes", "auto"),
-        "tz_name": tz_name,
-    }
+    zodiac_mode = (body.get("zodiac_mode") or body.get("method") or "sidereal")
+    ay_deg = _resolve_ayanamsa_deg_for_window(body, zodiac_mode)
 
     try:
-        res = _ingresses_rashi(**kwargs)  # type: ignore[misc]
+        res = _ingresses_rashi(
+            start_jd_tt=float(start_jd),
+            end_jd_tt=float(end_jd),
+            movers=body.get("movers"),
+            frame=str(body.get("frame") or "ecliptic-of-date"),
+            zodiac_mode=zodiac_mode,
+            ayanamsa_deg=float(ay_deg),
+            step_minutes=body.get("step_minutes", "auto"),
+            topocentric=bool(body.get("topocentric", False)),
+            latitude=_coerce_float(body.get("latitude")),
+            longitude=_coerce_float(body.get("longitude")),
+            elevation_m=_coerce_float(body.get("elevation_m") or body.get("elevation")),
+        )  # type: ignore[misc]
     except Exception as e:
         return jsonify({"ok": False, "error": "rashi_ingress_failed", "detail": str(e)}), 400
 
@@ -851,29 +831,23 @@ def vedic_ingress_nakshatra():
         return jsonify({"ok": False, "error": "missing_date_window",
                         "hints": ["Send jd_tt_window or start_jd_tt/end_jd_tt, or date_from/date_to with tz/place."]}), 400
 
-    ay_deg = _ayanamsa_deg_for_window(body, start_jd, end_jd)
-
-    civil_from, civil_to = _extract_civil_dates(body)
-    kwargs = {
-        "date_from": civil_from or None,
-        "date_to": civil_to or None,
-        "start_jd_tt": start_jd,
-        "end_jd_tt": end_jd,
-        "jd_tt_window": [start_jd, end_jd],
-        "movers": body.get("movers"),
-        "zodiac_mode": (body.get("zodiac_mode") or body.get("method") or "sidereal"),
-        "ayanamsa_deg": ay_deg,
-        "frame": str(body.get("frame") or "ecliptic-of-date"),
-        "topocentric": bool(body.get("topocentric", False)),
-        "latitude": _coerce_float(body.get("latitude")),
-        "longitude": _coerce_float(body.get("longitude")),
-        "elevation_m": _coerce_float(body.get("elevation_m") or body.get("elevation")),
-        "step_minutes": body.get("step_minutes", "auto"),
-        "tz_name": tz_name,
-    }
+    zodiac_mode = (body.get("zodiac_mode") or body.get("method") or "sidereal")
+    ay_deg = _resolve_ayanamsa_deg_for_window(body, zodiac_mode)
 
     try:
-        res = _ingresses_nakshatra(**kwargs)  # type: ignore[misc]
+        res = _ingresses_nakshatra(
+            start_jd_tt=float(start_jd),
+            end_jd_tt=float(end_jd),
+            movers=body.get("movers"),
+            frame=str(body.get("frame") or "ecliptic-of-date"),
+            zodiac_mode=zodiac_mode,
+            ayanamsa_deg=float(ay_deg),
+            step_minutes=body.get("step_minutes", "auto"),
+            topocentric=bool(body.get("topocentric", False)),
+            latitude=_coerce_float(body.get("latitude")),
+            longitude=_coerce_float(body.get("longitude")),
+            elevation_m=_coerce_float(body.get("elevation_m") or body.get("elevation")),
+        )  # type: ignore[misc]
     except Exception as e:
         return jsonify({"ok": False, "error": "nakshatra_ingress_failed", "detail": str(e)}), 400
 
@@ -898,29 +872,23 @@ def vedic_stations():
         return jsonify({"ok": False, "error": "missing_date_window",
                         "hints": ["Send jd_tt_window or start_jd_tt/end_jd_tt, or date_from/date_to with tz/place."]}), 400
 
-    ay_deg = _ayanamsa_deg_for_window(body, start_jd, end_jd)
-
-    civil_from, civil_to = _extract_civil_dates(body)
-    kwargs = {
-        "date_from": civil_from or None,
-        "date_to": civil_to or None,
-        "start_jd_tt": start_jd,
-        "end_jd_tt": end_jd,
-        "jd_tt_window": [start_jd, end_jd],
-        "movers": body.get("movers"),
-        "zodiac_mode": (body.get("zodiac_mode") or body.get("method") or "sidereal"),
-        "ayanamsa_deg": ay_deg,
-        "frame": str(body.get("frame") or "ecliptic-of-date"),
-        "topocentric": bool(body.get("topocentric", False)),
-        "latitude": _coerce_float(body.get("latitude")),
-        "longitude": _coerce_float(body.get("longitude")),
-        "elevation_m": _coerce_float(body.get("elevation_m") or body.get("elevation")),
-        "step_minutes": body.get("step_minutes", "auto"),
-        "tz_name": tz_name,
-    }
+    zodiac_mode = (body.get("zodiac_mode") or body.get("method") or "sidereal")
+    ay_deg = _resolve_ayanamsa_deg_for_window(body, zodiac_mode)
 
     try:
-        res = _stations_retro_direct(**kwargs)  # type: ignore[misc]
+        res = _stations_retro_direct(
+            start_jd_tt=float(start_jd),
+            end_jd_tt=float(end_jd),
+            movers=body.get("movers"),
+            frame=str(body.get("frame") or "ecliptic-of-date"),
+            zodiac_mode=zodiac_mode,
+            ayanamsa_deg=float(ay_deg),
+            step_minutes=body.get("step_minutes", "auto"),
+            topocentric=bool(body.get("topocentric", False)),
+            latitude=_coerce_float(body.get("latitude")),
+            longitude=_coerce_float(body.get("longitude")),
+            elevation_m=_coerce_float(body.get("elevation_m") or body.get("elevation")),
+        )  # type: ignore[misc]
     except Exception as e:
         return jsonify({"ok": False, "error": "stations_failed", "detail": str(e)}), 400
 
