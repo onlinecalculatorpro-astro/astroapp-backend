@@ -27,10 +27,10 @@ import os
 import re
 import inspect
 
-# ── geoging.resolve_place is our REQUIRED geocoder when place is present ──
+# ── geocoding.resolve_place is our REQUIRED geocoder when place is present ──
 _RESOLVE_PLACE = None
 try:
-    import app.core.geoging as _geo  # type: ignore
+    import app.core.geocoding as _geo  # type: ignore
     _RESOLVE_PLACE = getattr(_geo, "resolve_place", None)
 except Exception:
     _geo = None  # type: ignore
