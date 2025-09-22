@@ -24,7 +24,7 @@ def fixed_key(*_a, **_k) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 try:
     from app.core.vedic_validator import (
-        normalize_vim_payload,    # for dasha routes
+        normalize_vim_payload,    # for dasha routes & common tz/site hints
         normalize_yoga_payload,   # for yoga routes (Mode-C only)
     )  # type: ignore
     _VALIDATOR_IMPORT_ERR = None
@@ -135,6 +135,28 @@ except Exception:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Gochar / Ingress / Stations wrappers (from vedic_predictive)
+# ──────────────────────────────────────────────────────────────────────────────
+_GOCHAR_OK = False
+try:
+    from app.core.vedic_predictive import (  # type: ignore
+        gochar_drishti as _gochar_drishti,
+        ingresses_rashi as _ingresses_rashi,
+        ingresses_nakshatra as _ingresses_nakshatra,
+        stations_retro_direct as _stations_retro_direct,
+        feature_drishti_proximity as _feature_drishti_proximity,
+    )
+    _GOCHAR_OK = True
+except Exception:
+    _GOCHAR_OK = False
+    _gochar_drishti = None               # type: ignore
+    _ingresses_rashi = None              # type: ignore
+    _ingresses_nakshatra = None          # type: ignore
+    _stations_retro_direct = None        # type: ignore
+    _feature_drishti_proximity = None    # type: ignore
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 def _env_dut1_seconds() -> float:
@@ -177,6 +199,17 @@ def _add_levels_and_limit(payload: Dict[str, Any], norm: Dict[str, Any]) -> None
     payload["levels"] = _levels_from(norm)
     if "limit_jd_tt" in norm and norm["limit_jd_tt"] is not None:
         payload["limit_jd_tt"] = norm["limit_jd_tt"]
+
+
+def _tz_from_payload(body: Dict[str, Any]) -> str:
+    """Best-effort: prefer validator normalization, else raw tz, else UTC."""
+    try:
+        if normalize_vim_payload is not None:
+            _, _warns, tz_norm = normalize_vim_payload(body)  # type: ignore[misc]
+            return tz_norm or str(body.get("tz") or "UTC")
+    except Exception:
+        pass
+    return str(body.get("tz") or body.get("place_tz") or "UTC")
 
 
 # ---- civic payload builders (dasha) ------------------------------------------
@@ -639,6 +672,8 @@ def vedic_diag():
         "ayanamsa_adapter_present": _AY_OK,
         # Yoga diagnostics
         "yoga_core_present": _YOGA_OK,
+        # Gochar diagnostics
+        "gochar_present": _GOCHAR_OK,
         "rl_cap_per_min": RL_VEDIC_PREDICTIVE,
         "rl_bucket_key": "20",
         "dut1_seconds_env": _env_dut1_seconds(),
@@ -789,6 +824,198 @@ def vedic_yoga_detect():
         out["error"] = res.get("error", "yoga_detect_failed")
         return jsonify(out), (503 if str(out["error"]).endswith("unavailable") else 400)
     return jsonify(out), 200
+
+
+# ──────────────── Gochar / Ingress / Stations routes ────────────────
+@vedic_api.post("/gochar/drishti")
+@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
+def vedic_gochar_drishti():
+    """
+    Degree-true graha dṛṣṭi transit hits within a civil window.
+    Body:
+      - date_from, date_to (YYYY-MM-DD or RFC3339)
+      - Optional: transiting_bodies, natal_targets, zodiac_mode/method, ayanamsa,
+                  include_nodes, treat_nodes_like_saturn, orb_deg, orb_map,
+                  step_minutes ("auto"|number), prebatch_refinement (bool),
+                  frame ("ecliptic-of-date"), plus any natal/site fields.
+    """
+    if not (_GOCHAR_OK and callable(_gochar_drishti)):
+        return jsonify({"ok": False, "error": "gochar_engine_unavailable"}), 503
+
+    body = request.get_json(silent=True) or {}
+    date_from = str(body.get("date_from") or body.get("from") or "").strip()
+    date_to   = str(body.get("date_to") or body.get("to") or "").strip()
+    if not date_from or not date_to:
+        return jsonify({"ok": False, "error": "missing_date_window",
+                        "hints": ["Provide 'date_from' and 'date_to' (YYYY-MM-DD)."]}), 400
+
+    # Normalize natal payload enough to pass through (tz/place/coords if available)
+    if normalize_vim_payload is None:
+        natal_chart = body
+        warns: List[str] = []
+        tz_norm = _tz_from_payload(body)
+    else:
+        natal_chart, warns, tz_norm = normalize_vim_payload(body)  # type: ignore[misc]
+
+    try:
+        res = _gochar_drishti(
+            natal_chart=natal_chart,
+            date_from=date_from,
+            date_to=date_to,
+            transiting_bodies=body.get("transiting_bodies"),
+            natal_targets=body.get("natal_targets"),
+            zodiac_mode=(body.get("zodiac_mode") or body.get("method") or "sidereal"),
+            ayanamsa=body.get("ayanamsa", "lahiri"),
+            frame=str(body.get("frame") or "ecliptic-of-date"),
+            include_nodes=bool(body.get("include_nodes", False)),
+            treat_nodes_like_saturn=bool(body.get("treat_nodes_like_saturn", False)),
+            orb_deg=float(body.get("orb_deg", 12.0)),
+            orb_map=body.get("orb_map"),
+            step_minutes=body.get("step_minutes", "auto"),
+            prebatch_refinement=bool(body.get("prebatch_refinement", False)),
+        )
+    except Exception as e:
+        return jsonify({"ok": False, "error": "gochar_drishti_failed", "detail": str(e)}), 400
+
+    if isinstance(res, dict):
+        res.setdefault("meta", {})
+        res["meta"].update({"route": "gochar/drishti", "tz_normalized": tz_norm, "branch": "vedic_predictive"})
+        if normalize_vim_payload is not None and warns:
+            res.setdefault("warnings", []).extend(warns)
+    ok = bool(res.get("ok", False))
+    return jsonify(res), (200 if ok else 400)
+
+
+@vedic_api.post("/gochar/drishti/proximity")
+@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
+def vedic_gochar_drishti_proximity():
+    """
+    Score helper for drishti hits: returns [0..1] proximity per hit to the axis.
+    Body:
+      - hits: array from /gochar/drishti response's "gochar"
+      - cap_deg (default 12)
+    """
+    if not (_GOCHAR_OK and callable(_feature_drishti_proximity)):
+        return jsonify({"ok": False, "error": "gochar_engine_unavailable"}), 503
+    body = request.get_json(silent=True) or {}
+    hits = body.get("hits") or body.get("gochar") or []
+    cap = float(body.get("cap_deg", 12.0))
+    try:
+        scores = _feature_drishti_proximity(hits=hits, cap_deg=cap)
+        return jsonify({"ok": True, "scores": scores, "meta": {"route": "gochar/drishti/proximity"}}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": "feature_drishti_proximity_failed", "detail": str(e)}), 400
+
+
+@vedic_api.post("/ingress/rashi")
+@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
+def vedic_ingress_rashi():
+    if not (_GOCHAR_OK and callable(_ingresses_rashi)):
+        return jsonify({"ok": False, "error": "gochar_engine_unavailable"}), 503
+
+    body = request.get_json(silent=True) or {}
+    date_from = str(body.get("date_from") or body.get("from") or "").strip()
+    date_to   = str(body.get("date_to") or body.get("to") or "").strip()
+    if not date_from or not date_to:
+        return jsonify({"ok": False, "error": "missing_date_window"}), 400
+
+    tz_name = _tz_from_payload(body)
+    try:
+        res = _ingresses_rashi(
+            date_from=date_from,
+            date_to=date_to,
+            movers=body.get("movers"),
+            zodiac_mode=(body.get("zodiac_mode") or body.get("method") or "sidereal"),
+            ayanamsa=body.get("ayanamsa", "lahiri"),
+            frame=str(body.get("frame") or "ecliptic-of-date"),
+            topocentric=bool(body.get("topocentric", False)),
+            latitude=_coerce_float(body.get("latitude")),
+            longitude=_coerce_float(body.get("longitude")),
+            elevation_m=_coerce_float(body.get("elevation_m") or body.get("elevation")),
+            step_minutes=body.get("step_minutes", "auto"),
+            tz_name=tz_name,
+        )
+    except Exception as e:
+        return jsonify({"ok": False, "error": "rashi_ingress_failed", "detail": str(e)}), 400
+
+    if isinstance(res, dict):
+        res.setdefault("meta", {})
+        res["meta"].update({"route": "ingress/rashi", "tz_normalized": tz_name, "branch": "vedic_predictive"})
+    return jsonify(res), (200 if res.get("ok") else 400)
+
+
+@vedic_api.post("/ingress/nakshatra")
+@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
+def vedic_ingress_nakshatra():
+    if not (_GOCHAR_OK and callable(_ingresses_nakshatra)):
+        return jsonify({"ok": False, "error": "gochar_engine_unavailable"}), 503
+
+    body = request.get_json(silent=True) or {}
+    date_from = str(body.get("date_from") or body.get("from") or "").strip()
+    date_to   = str(body.get("date_to") or body.get("to") or "").strip()
+    if not date_from or not date_to:
+        return jsonify({"ok": False, "error": "missing_date_window"}), 400
+
+    tz_name = _tz_from_payload(body)
+    try:
+        res = _ingresses_nakshatra(
+            date_from=date_from,
+            date_to=date_to,
+            movers=body.get("movers"),
+            zodiac_mode=(body.get("zodiac_mode") or body.get("method") or "sidereal"),
+            ayanamsa=body.get("ayanamsa", "lahiri"),
+            frame=str(body.get("frame") or "ecliptic-of-date"),
+            topocentric=bool(body.get("topocentric", False)),
+            latitude=_coerce_float(body.get("latitude")),
+            longitude=_coerce_float(body.get("longitude")),
+            elevation_m=_coerce_float(body.get("elevation_m") or body.get("elevation")),
+            step_minutes=body.get("step_minutes", "auto"),
+            tz_name=tz_name,
+        )
+    except Exception as e:
+        return jsonify({"ok": False, "error": "nakshatra_ingress_failed", "detail": str(e)}), 400
+
+    if isinstance(res, dict):
+        res.setdefault("meta", {})
+        res["meta"].update({"route": "ingress/nakshatra", "tz_normalized": tz_name, "branch": "vedic_predictive"})
+    return jsonify(res), (200 if res.get("ok") else 400)
+
+
+@vedic_api.post("/stations")
+@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
+def vedic_stations():
+    if not (_GOCHAR_OK and callable(_stations_retro_direct)):
+        return jsonify({"ok": False, "error": "gochar_engine_unavailable"}), 503
+
+    body = request.get_json(silent=True) or {}
+    date_from = str(body.get("date_from") or body.get("from") or "").strip()
+    date_to   = str(body.get("date_to") or body.get("to") or "").strip()
+    if not date_from or not date_to:
+        return jsonify({"ok": False, "error": "missing_date_window"}), 400
+
+    tz_name = _tz_from_payload(body)
+    try:
+        res = _stations_retro_direct(
+            date_from=date_from,
+            date_to=date_to,
+            movers=body.get("movers"),
+            zodiac_mode=(body.get("zodiac_mode") or body.get("method") or "sidereal"),
+            ayanamsa=body.get("ayanamsa", "lahiri"),
+            frame=str(body.get("frame") or "ecliptic-of-date"),
+            topocentric=bool(body.get("topocentric", False)),
+            latitude=_coerce_float(body.get("latitude")),
+            longitude=_coerce_float(body.get("longitude")),
+            elevation_m=_coerce_float(body.get("elevation_m") or body.get("elevation")),
+            step_minutes=body.get("step_minutes", "auto"),
+            tz_name=tz_name,
+        )
+    except Exception as e:
+        return jsonify({"ok": False, "error": "stations_failed", "detail": str(e)}), 400
+
+    if isinstance(res, dict):
+        res.setdefault("meta", {})
+        res["meta"].update({"route": "stations", "tz_normalized": tz_name, "branch": "vedic_predictive"})
+    return jsonify(res), (200 if res.get("ok") else 400)
 
 
 # ──────────────── Varga routes (varga_charts) ────────────────
