@@ -2,24 +2,29 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 """
-Vedic API — Payload normalization & validation
+Vedic API — Payload normalization & validation (strict geocoding)
 
-Public API:
+Public API
+----------
     # Existing:
-    normalize_vim_payload(payload) -> (norm, warns, tz_norm)
-    normalize_yoga_payload(payload) -> (norm, warns, tz_norm)
+    normalize_vim_payload(payload)      -> (norm, warns, tz_norm)
+    normalize_yoga_payload(payload)     -> (norm, warns, tz_norm)
 
-    # New (for Gochar engine integration):
-    normalize_gochar_payload(payload) -> (norm, warns, tz_norm)
-    normalize_ingress_payload(payload) -> (norm, warns, tz_norm)
+    # Gochar / Ingress / Stations (for vedic_gochar.py):
+    normalize_gochar_payload(payload)   -> (norm, warns, tz_norm)
+    normalize_ingress_payload(payload)  -> (norm, warns, tz_norm)
     normalize_stations_payload(payload) -> (norm, warns, tz_norm)
 
-Key points
-----------
+What’s different vs older validator
+-----------------------------------
+• **Mandatory geocoding when a place string/parts are provided.**
+  We call `astronomy.resolve_place()` and *require* it to return
+  lat/lon/tz (elev optional). If it fails or is unavailable:
+    - We record a warning and add `fatal: "place_resolution_failed"`
+      (or `"place_resolver_unavailable"`).
+    - We do **not** fabricate tz/coords.
 • Sidereal-first defaults (zodiac_mode="sidereal", ayanamsa="lahiri").
-• Resilient parsing of place/time/bodies/orbs/windows.
-• For Gochar we DO NOT require natal longitudes; you may pass them,
-  or we’ll bind by natal JD (left to core) via civil strings + tz.
+• Civil window parsing is tolerant; actual JD build happens downstream.
 """
 
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -27,28 +32,17 @@ import os
 import re
 import inspect
 
-# ── Optional place resolver (geocoding + tz + elevation) via astronomy.py ──
-_resolve_place = None
+# ── astronomy.resolve_place is our REQUIRED geocoder when place is present ──
+_RESOLVE_PLACE = None
 try:
     import app.core.astronomy as _astro  # type: ignore
-    for _fname in (
-        "resolve_place",          # preferred
-        "geocode_place",
-        "place_to_site",
-        "lookup_place",
-        "city_to_coords",
-        "resolve_site",
-    ):
-        _resolve_place = getattr(_astro, _fname, None)
-        if callable(_resolve_place):
-            break
+    _RESOLVE_PLACE = getattr(_astro, "resolve_place", None)
 except Exception:
     _astro = None  # type: ignore
-    _resolve_place = None
+    _RESOLVE_PLACE = None
 
-# ── Optional timescales (ERFA-aligned) for Vimśottarī only; NO jd_utc here ──
+# ── Optional timescales for Vimśottarī only (ERFA-aligned; no jd_utc here) ──
 try:
-    # Usually: build_timescales(date_str, time_str, tz_name, dut1_seconds)
     from app.core.timescales import build_timescales  # type: ignore
     _TIMESCALES_OK = True
 except Exception:
@@ -70,7 +64,7 @@ def _call_build_timescales(date: str, time_str: str, tz_name: str):
         return build_timescales(date, time_str, tz_name, _env_dut1_seconds())  # type: ignore[misc]
     return build_timescales(date, time_str, tz_name)  # type: ignore[misc]
 
-# ── Optional varga module (for key normalization only; no computation here) ──
+# ── Optional varga key normalizer (no computation here) ──
 try:
     from app.core import varga_charts as _varga  # type: ignore
     _VARGA_OK = True
@@ -79,7 +73,7 @@ except Exception:
     _VARGA_OK = False
 
 
-# ── Helpers ──
+# ── Basic helpers ──
 _NUM_RE = re.compile(r"^[+-]?\d+(?:\.\d+)?$")
 
 def _coerce_str(x: Any, default: str = "") -> str:
@@ -90,8 +84,7 @@ def _coerce_str(x: Any, default: str = "") -> str:
             return x.decode("utf-8", "ignore")
         except Exception:
             return default
-    s = str(x)
-    return s
+    return str(x)
 
 def _as_float(x: Any) -> Optional[float]:
     if isinstance(x, (int, float)):
@@ -119,15 +112,8 @@ def _clamp_levels(v: Any, default: int = 5) -> int:
     try:
         depth = int(v)
     except Exception:
-        if isinstance(v, list):
-            depth = len(v)
-        else:
-            depth = default
-    if depth < 1:
-        depth = 1
-    if depth > 5:
-        depth = 5
-    return depth
+        depth = len(v) if isinstance(v, list) else default
+    return max(1, min(5, depth))
 
 def _norm_method(v: Any, default: str = "sidereal") -> str:
     if isinstance(v, str):
@@ -159,12 +145,11 @@ def _norm_bool(v: Any, default: bool = False) -> bool:
     return default
 
 def _norm_ayanamsa(v: Any) -> str | float:
-    # Default to LAHIRI; allow numeric degrees as pass-through
     if v is None:
         return "lahiri"
     if isinstance(v, (int, float)) or (isinstance(v, str) and _NUM_RE.match(v.strip())):
         try:
-            return float(v)  # explicit degrees
+            return float(v)
         except Exception:
             pass
     s = str(v).strip().lower()
@@ -184,8 +169,7 @@ def _split_csv_or_list(v: Any) -> List[str]:
             if s:
                 out.append(s)
         return out
-    txt = _coerce_str(v)
-    for p in re.split(r"[,\s]+", txt):
+    for p in re.split(r"[,\s]+", _coerce_str(v)):
         if p:
             out.append(p.strip())
     return out
@@ -214,11 +198,8 @@ def _collect_orb_map(payload: Dict[str, Any], *, base_orb: float) -> Tuple[float
                 om[_coerce_str(k)] = f
     return float(orb_deg), om
 
-def _collect_time_window(payload: Dict[str, Any], tz_fallback: str) -> Tuple[Optional[str], Optional[str], List[str]]:
-    """Parse date window; return (from, to, warns). Accepts:
-       • window: {from,to} | time_range: [from,to] | date_from/date_to
-       • from/to may be YYYY-MM-DD or RFC3339; we pass-through as strings.
-    """
+def _collect_time_window(payload: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], List[str]]:
+    """Parse date window; return (from, to, warns)."""
     warns: List[str] = []
     date_from = None
     date_to = None
@@ -226,7 +207,7 @@ def _collect_time_window(payload: Dict[str, Any], tz_fallback: str) -> Tuple[Opt
     win = payload.get("window") or payload.get("time_window") or payload.get("range") or {}
     if isinstance(win, dict):
         date_from = _coerce_str(win.get("from") or win.get("start"))
-        date_to   = _coerce_str(win.get("to") or win.get("end"))
+        date_to   = _coerce_str(win.get("to")   or win.get("end"))
 
     tr = payload.get("time_range") or payload.get("timerange")
     if (not date_from or not date_to) and isinstance(tr, (list, tuple)) and len(tr) == 2:
@@ -241,7 +222,7 @@ def _collect_time_window(payload: Dict[str, Any], tz_fallback: str) -> Tuple[Opt
     return (date_from or None, date_to or None, warns)
 
 
-# ── Varga key collection & normalization (no computation here) ──
+# ── Varga key normalization (no computation here) ──
 _VARGA_ALIAS_MIN = {
     "rasi": "D1", "d1": "D1",
     "hora": "D2", "d2": "D2",
@@ -282,7 +263,6 @@ def _canon_varga_key(x: str) -> Optional[str]:
     return None
 
 def _collect_vargas(payload: Dict[str, Any]) -> Tuple[List[str], List[str]]:
-    """Return (canon_vargas, warnings). Accept list or comma strings across multiple keys."""
     warns: List[str] = []
     raw_keys: List[str] = []
     for key in ("vargas", "varga", "divisional", "divisional_charts", "varga_boost", "varga_keys_for_boost"):
@@ -308,11 +288,74 @@ def _collect_vargas(payload: Dict[str, Any]) -> Tuple[List[str], List[str]]:
     return canon, warns
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Vimśottarī normalization (kept; small grooming)
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────── Strict place resolution ──────────────────────────
+def _must_resolve_place_if_provided(p: Dict[str, Any],
+                                    *,
+                                    place_prefix: str = "",
+                                    warns: List[str]) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[str], Optional[str]]:
+    """
+    If any place string/parts are present, we MUST resolve via astronomy.resolve_place().
+    Returns (lat, lon, elev_m, tz_norm, fatal_reason) — fatal_reason is a short code
+    the caller can bubble up (e.g., "place_resolver_unavailable" or "place_resolution_failed:...").
+    """
+    # Gather any place hints
+    pob_str = _coerce_str(
+        p.get(f"{place_prefix}place") or
+        p.get(f"{place_prefix}birth_place") or
+        _join_place(
+            _coerce_str(p.get(f"{place_prefix}place_city")),
+            _coerce_str(p.get(f"{place_prefix}place_state")),
+            _coerce_str(p.get(f"{place_prefix}place_country")),
+        )
+    ).strip()
+
+    has_any_place = bool(pob_str or _coerce_str(p.get(f"{place_prefix}place_city")).strip()
+                         or _coerce_str(p.get(f"{place_prefix}place_state")).strip()
+                         or _coerce_str(p.get(f"{place_prefix}place_country")).strip())
+
+    if not has_any_place:
+        # No place input provided → do nothing; caller may still pass explicit lat/lon/tz.
+        return None, None, None, None, None
+
+    # Resolver is required when place is present
+    if not callable(_RESOLVE_PLACE):
+        warns.append("place_resolver_unavailable")
+        return None, None, None, None, "place_resolver_unavailable"
+
+    city = _coerce_str(p.get(f"{place_prefix}place_city")).strip() or None
+    state = _coerce_str(p.get(f"{place_prefix}place_state")).strip() or None
+    country = _coerce_str(p.get(f"{place_prefix}place_country")).strip() or None
+
+    try:
+        try:
+            pr = _RESOLVE_PLACE(pob_str, place_city=city, place_state=state, place_country=country)  # type: ignore[misc]
+        except TypeError:
+            pr = _RESOLVE_PLACE(pob_str)  # type: ignore[misc]
+    except Exception as e:
+        warns.append(f"place_resolution_failed:{e!s}")
+        return None, None, None, None, f"place_resolution_failed:{e!s}"
+
+    if not isinstance(pr, dict):
+        warns.append("place_resolution_failed:bad_shape")
+        return None, None, None, None, "place_resolution_failed:bad_shape"
+
+    lat = pr.get("lat"); lon = pr.get("lon")
+    tz  = pr.get("tz") or pr.get("timezone")
+    elev = pr.get("elevation_m", pr.get("elevation"))
+
+    if lat is None or lon is None or not tz:
+        warns.append("place_resolution_failed:incomplete_result")
+        return None, None, None, None, "place_resolution_failed:incomplete_result"
+
+    latf = _as_float(lat); lonf = _as_float(lon)
+    elevf = _as_float(elev) if elev not in (None, "") else None
+    tz_norm = _coerce_str(tz).strip() or None
+
+    return latf, lonf, elevf, tz_norm, None
+
+
+# ───────────────────────────── Vimśottarī ─────────────────────────────
 def normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str], str]:
-    """Normalize inputs for Vimśottarī."""
     warns: List[str] = []
 
     # Civil primitives
@@ -320,81 +363,53 @@ def normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List
     time_in = _coerce_str(payload.get("time") or payload.get("birth_time") or "12:00")
     time_str = _pad_hms(time_in)
 
-    # Place of Birth
-    pob_str = _coerce_str(
-        payload.get("Place of Birth")
-        or payload.get("place")
-        or payload.get("birth_place")
-        or payload.get("birthPlace")
-        or ""
-    ).strip()
-    if not pob_str:
-        pob_str = _join_place(
-            _coerce_str(payload.get("place_city")),
-            _coerce_str(payload.get("place_state")),
-            _coerce_str(payload.get("place_country")),
-        )
-
-    # Observer & method & ayanamsa
+    # Method & ayanamsa
     method = _norm_method(payload.get("method", payload.get("mode", "sidereal")), default="sidereal")
-    observer = _norm_observer(payload.get("observer", "geocentric"))
     ayanamsa = _norm_ayanamsa(payload.get("ayanamsa") or payload.get("ayanamsa_key"))
-    tz_norm = _coerce_str(payload.get("tz") or payload.get("place_tz") or "UTC").strip() or "UTC"
 
-    # Optional site fields
+    # Explicit site fields (accepted), but if place is present we must geocode
     lat = _as_float(payload.get("latitude") or payload.get("lat"))
     lon = _as_float(payload.get("longitude") or payload.get("lon"))
     elevation_m = _as_float(payload.get("elevation_m") or payload.get("elevation"))
+    tz_norm = _coerce_str(payload.get("tz") or payload.get("place_tz")).strip() or None
 
-    # Levels / depth
-    depth = _clamp_levels(payload.get("levels", payload.get("depth", payload.get("max_levels", 5))), default=5)
+    lat_r, lon_r, elev_r, tz_r, fatal = _must_resolve_place_if_provided(payload, warns=warns)
+    if fatal:
+        # Caller supplied a place; we failed to resolve → mark fatal and *do not* fabricate tz/coords
+        norm = {
+            "system": "vimshottari",
+            "date": date, "time": time_str, "tz": tz_norm,
+            "method": method, "ayanamsa": ayanamsa,
+            "latitude": None, "longitude": None, "elevation_m": None,
+            "coordinate_mode": "geocentric", "topocentric": False,
+            "jd_tt": None, "jd_ut1": None,
+            "fatal": fatal,
+            "raw": payload,
+            # Registry mirrors
+            "tz_name": tz_norm, "ayanamsa_key": ayanamsa,
+            "birth_date": date, "birth_time": time_str, "place_tz": tz_norm,
+        }
+        return norm, warns + ["fatal"], tz_norm or "UTC"
 
-    # Resolve place
-    if not pob_str:
-        warns.append("missing_place_of_birth")
-    else:
-        if callable(_resolve_place):
-            try:
-                city = _coerce_str(payload.get("place_city")).strip() or None
-                state = _coerce_str(payload.get("place_state")).strip() or None
-                country = _coerce_str(payload.get("place_country")).strip() or None
-                try:
-                    pr = _resolve_place(pob_str, place_city=city, place_state=state, place_country=country)  # type: ignore[misc]
-                except TypeError:
-                    pr = _resolve_place(pob_str)  # type: ignore[misc]
+    # Adopt resolved values when available; otherwise keep explicit ones
+    if lat_r is not None and lon_r is not None:
+        lat, lon = lat_r, lon_r
+    if elevation_m is None and elev_r is not None:
+        elevation_m = elev_r
+    if tz_r:
+        tz_norm = tz_r
 
-                _lat = pr.get("lat") if isinstance(pr, dict) else getattr(pr, "lat", None)
-                _lon = pr.get("lon") if isinstance(pr, dict) else getattr(pr, "lon", None)
-                _tz = pr.get("tz") if isinstance(pr, dict) else getattr(pr, "tz", None)
-                _elev = pr.get("elevation_m") if isinstance(pr, dict) else getattr(pr, "elevation_m", None)
-
-                if _lat is not None and _lon is not None:
-                    lat = _as_float(_lat)
-                    lon = _as_float(_lon)
-                if _elev is not None:
-                    elevation_m = _as_float(_elev)
-                if _tz:
-                    tz_norm = _coerce_str(_tz).strip() or tz_norm
-                else:
-                    warns.append("place_resolved_without_tz:fallback_tz_applied")
-            except Exception as e:
-                warns.append(f"place_resolution_failed:{e!s}")
-        else:
-            warns.append("place_resolver_unavailable")
-
-    # Observer normalization
-    coordinate_mode = observer
+    coordinate_mode = _norm_observer(payload.get("observer"), "geocentric")
     topocentric = (coordinate_mode == "topocentric")
     if topocentric and (lat is None or lon is None):
         coordinate_mode = "geocentric"
         topocentric = False
         warns.append("topocentric_requires_coordinates:fallback_geocentric")
 
-    # Timescales → jd_tt / jd_ut1
+    # Timescales → jd_tt / jd_ut1 (only for Vim)
     jd_tt: Optional[float] = _as_float(payload.get("jd_tt"))
     jd_ut1: Optional[float] = _as_float(payload.get("jd_ut1"))
-
-    if _TIMESCALES_OK and (jd_tt is None or jd_ut1 is None) and date:
+    if _TIMESCALES_OK and (jd_tt is None or jd_ut1 is None) and date and tz_norm:
         try:
             ts = _call_build_timescales(date, time_str, tz_norm)
             if isinstance(ts, dict):
@@ -410,13 +425,12 @@ def normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List
         except Exception as e:
             warns.append(f"timescales_failed:{e!s}")
 
-    # Varga request (for consumers that want it)
+    # Varga request hints (optional)
     vargas, varga_warns = _collect_vargas(payload)
     warns.extend(varga_warns)
     include_vargas = bool(payload.get("include_vargas") or vargas)
     varga_mode = _norm_method(payload.get("varga_zodiac_mode"), default="sidereal")
     varga_ayan = payload.get("varga_ayanamsa", ayanamsa)
-
     varga_request = None
     if include_vargas and vargas:
         varga_request = {
@@ -428,121 +442,68 @@ def normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List
 
     norm: Dict[str, Any] = {
         "system": "vimshottari",
-        "date": date,
-        "time": time_str,
+        "date": date or None,
+        "time": time_str if date else None,
         "tz": tz_norm,
-
         "method": method,
         "ayanamsa": ayanamsa,
-
-        "levels": depth,
-        "max_levels": depth,
-
-        "latitude": lat,
-        "longitude": lon,
-        "elevation_m": elevation_m,
-
-        "coordinate_mode": coordinate_mode,
-        "topocentric": bool(topocentric),
-
-        "place_name": pob_str or None,
-
-        "jd_tt": jd_tt,
-        "jd_ut1": jd_ut1,
-
+        "levels": _clamp_levels(payload.get("levels", payload.get("depth", payload.get("max_levels", 5))), default=5),
+        "latitude": lat, "longitude": lon, "elevation_m": elevation_m,
+        "coordinate_mode": coordinate_mode, "topocentric": bool(topocentric),
+        "jd_tt": jd_tt, "jd_ut1": jd_ut1,
         "raw": payload,
+        # Registry/common aliases
+        "tz_name": tz_norm, "ayanamsa_key": ayanamsa,
+        "birth_date": date, "birth_time": time_str, "place_tz": tz_norm,
+        "place_name": _coerce_str(payload.get("place") or payload.get("birth_place") or "").strip() or None,
     }
-
-    # Registry/common aliases
-    norm.update({
-        "tz_name": tz_norm,
-        "ayanamsa_key": ayanamsa,
-        "birth_date": date,
-        "birth_time": time_str,
-        "place_tz": tz_norm,
-        "depth": depth,
-    })
     if varga_request:
         norm["varga_request"] = varga_request
 
-    if not date:
-        warns.append("missing_date")
-    if not time_str:
-        warns.append("missing_time")
-
-    return norm, warns, tz_norm
+    if not date: warns.append("missing_date")
+    if not time_str: warns.append("missing_time")
+    return norm, warns, tz_norm or "UTC"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Yoga normalization — Mode-C only (birth details → core computes everything)
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────── Yoga (Mode-C) ──────────────────────────
 def normalize_yoga_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str], str]:
-    """Normalize inputs for Yoga detection (Mode-C only)."""
     warns: List[str] = []
 
-    # Global switches (sidereal-first)
     zodiac_mode = _norm_method(payload.get("zodiac_mode", payload.get("method", "sidereal")), default="sidereal")
     ayanamsa = _norm_ayanamsa(payload.get("ayanamsa") or payload.get("ayanamsa_key"))
     house_system = _coerce_str(payload.get("house_system") or "placidus").strip() or "placidus"
 
-    # Civil/site inputs
     date = _coerce_str(payload.get("date") or payload.get("birth_date") or "")
     time_str = _pad_hms(_coerce_str(payload.get("time") or payload.get("birth_time") or "12:00"))
-    tz_norm = _coerce_str(payload.get("tz") or payload.get("place_tz") or "UTC").strip() or "UTC"
 
+    # Accept explicit coords/tz, but enforce geocoding if a place was given
     lat = _as_float(payload.get("latitude") or payload.get("lat"))
     lon = _as_float(payload.get("longitude") or payload.get("lon"))
     elevation_m = _as_float(payload.get("elevation_m") or payload.get("elevation"))
+    tz_norm = _coerce_str(payload.get("tz") or payload.get("place_tz")).strip() or None
 
-    # Optional place resolution
-    pob_str = _coerce_str(
-        payload.get("place")
-        or payload.get("birth_place")
-        or _join_place(
-            _coerce_str(payload.get("place_city")),
-            _coerce_str(payload.get("place_state")),
-            _coerce_str(payload.get("place_country")),
-        )
-    ).strip()
+    lat_r, lon_r, elev_r, tz_r, fatal = _must_resolve_place_if_provided(payload, warns=warns)
+    if fatal:
+        norm = {
+            "system": "yoga",
+            "zodiac_mode": zodiac_mode, "method": zodiac_mode,
+            "ayanamsa": ayanamsa, "house_system": house_system,
+            "date": date or None, "time": time_str if date else None,
+            "tz": tz_norm, "latitude": None, "longitude": None, "elevation_m": None,
+            "use_vargas_for_scoring": bool(payload.get("use_vargas_for_scoring", True)),
+            "enable_catalog_tags": [], "disable_catalog_tags": [],
+            "fatal": fatal,
+            "raw": payload,
+        }
+        return norm, warns + ["fatal"], tz_norm or "UTC"
 
-    if pob_str:
-        if callable(_resolve_place):
-            try:
-                city = _coerce_str(payload.get("place_city")).strip() or None
-                state = _coerce_str(payload.get("place_state")).strip() or None
-                country = _coerce_str(payload.get("place_country")).strip() or None
-                try:
-                    pr = _resolve_place(pob_str, place_city=city, place_state=state, place_country=country)  # type: ignore[misc]
-                except TypeError:
-                    pr = _resolve_place(pob_str)  # type: ignore[misc]
-                _lat = pr.get("lat") if isinstance(pr, dict) else getattr(pr, "lat", None)
-                _lon = pr.get("lon") if isinstance(pr, dict) else getattr(pr, "lon", None)
-                _tz = pr.get("tz") if isinstance(pr, dict) else getattr(pr, "tz", None)
-                _elev = pr.get("elevation_m") if isinstance(pr, dict) else getattr(pr, "elevation_m", None)
+    if lat_r is not None and lon_r is not None:
+        lat, lon = lat_r, lon_r
+    if elevation_m is None and elev_r is not None:
+        elevation_m = elev_r
+    if tz_r:
+        tz_norm = tz_r
 
-                if _lat is not None and _lon is not None:
-                    lat = _as_float(_lat)
-                    lon = _as_float(_lon)
-                if _elev is not None:
-                    elevation_m = _as_float(_elev)
-                if _tz:
-                    tz_norm = _coerce_str(_tz).strip() or tz_norm
-                else:
-                    warns.append("place_resolved_without_tz:fallback_tz_applied")
-            except Exception as e:
-                warns.append(f"place_resolution_failed:{e!s}")
-        else:
-            warns.append("place_resolver_unavailable")
-    else:
-        warns.append("missing_place_of_birth")
-
-    # Reject/ignore any legacy or precomputed fields
-    if any(k in payload for k in ("points_deg", "points_sidereal_deg", "points", "cusps_deg", "cusps_sidereal_deg", "cusps")):
-        warns.append("precomputed_points_cusps_ignored")
-    if any(k in payload for k in ("jd_tt", "jd_ut1")):
-        warns.append("timescales_ignored:core_computes_internally")
-
-    # Include/exclude controls & varga boost hints
     include: List[str] = []
     inc = payload.get("include") or payload.get("include_yogas") or payload.get("yogas")
     if inc:
@@ -561,71 +522,34 @@ def normalize_yoga_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], Lis
 
     norm: Dict[str, Any] = {
         "system": "yoga",
-
-        # Global switches
-        "zodiac_mode": zodiac_mode,
-        "method": zodiac_mode,          # mirror
-        "ayanamsa": ayanamsa,
-        "house_system": house_system,
-
-        # Civil/site (REQUIRED)
-        "date": date or None,
-        "time": time_str if date else None,
+        "zodiac_mode": zodiac_mode, "method": zodiac_mode,
+        "ayanamsa": ayanamsa, "house_system": house_system,
+        "date": date or None, "time": time_str if date else None,
         "tz": tz_norm,
-        "latitude": lat,
-        "longitude": lon,
-        "elevation_m": elevation_m,
-
-        # Request-scope filters
+        "latitude": lat, "longitude": lon, "elevation_m": elevation_m,
         "include": include,
         "enable_catalog_tags": list(enable_tags) if enable_tags else [],
         "disable_catalog_tags": list(disable_tags) if disable_tags else [],
-
-        # Scoring hints
         "use_vargas_for_scoring": bool(use_vargas_for_scoring),
         "varga_keys_for_boost": varga_keys_for_boost or None,
-
-        # Meta & passthrough
-        "place_tz": tz_norm,
-        "tz_name": tz_norm,
-        "place_name": pob_str or None,
+        "place_tz": tz_norm, "tz_name": tz_norm,
+        "place_name": _coerce_str(payload.get("place") or payload.get("birth_place") or "").strip() or None,
         "raw": payload,
     }
 
-    if not date:
-        warns.append("missing_date")
-    if not time_str:
-        warns.append("missing_time")
-    if lat is None or lon is None:
-        warns.append("missing_coordinates")
-
-    return norm, warns, tz_norm
+    if not date: warns.append("missing_date")
+    if not time_str: warns.append("missing_time")
+    if lat is None or lon is None: warns.append("missing_coordinates")
+    return norm, warns, tz_norm or "UTC"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# NEW: Gochar / Ingress / Stations normalizers (for vedic_gochar.py)
-# ─────────────────────────────────────────────────────────────────────────────
-_DEFAULT_MOVERS = ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn"]
+# ───────────────────────────── Gochar bundle ──────────────────────────
+_DEFAULT_MOVERS  = ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn"]
 _DEFAULT_TARGETS = ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn"]
 
 def normalize_gochar_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str], str]:
-    """
-    Normalize inputs for Vedic gochar (dṛṣṭi hits + ingresses/stations via routes).
-
-    Accepts:
-      - natal: { date, time, tz, place / (lat,lon,elev), longitudes?, jd_tt? }
-      - window: {from,to} | time_range [from,to] | date_from/date_to
-      - movers/transiting_bodies, natal_targets
-      - switches: zodiac_mode (sidereal default), ayanamsa, include_nodes, treat_nodes_like_saturn
-      - orbs: orb_deg / orb, orb_map
-      - performance: step_minutes ("auto" default)
-      - frame (ecliptic-of-date default)
-
-    Returns (norm, warns, tz_norm).
-    """
     warns: List[str] = []
 
-    # --- Global switches ---
     frame = _coerce_str(payload.get("frame") or "ecliptic-of-date").strip() or "ecliptic-of-date"
     zodiac_mode = _norm_method(payload.get("zodiac_mode", payload.get("method", "sidereal")), default="sidereal")
     ayanamsa = _norm_ayanamsa(payload.get("ayanamsa") or payload.get("ayanamsa_key"))
@@ -633,7 +557,6 @@ def normalize_gochar_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], L
     treat_nodes_like_saturn = _norm_bool(payload.get("treat_nodes_like_saturn"), False)
     step_minutes: Union[str,float,int] = payload.get("step_minutes", "auto")
 
-    # --- Bodies/targets/orbs ---
     movers = _collect_bodies(payload, key_order=("movers","bodies","transiting_bodies"), default=_DEFAULT_MOVERS)
     if include_nodes:
         if "Rahu" not in movers: movers.append("Rahu")
@@ -641,143 +564,147 @@ def normalize_gochar_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], L
     natal_targets = _collect_targets(payload, key_order=("targets","natal_targets"), default=_DEFAULT_TARGETS)
     orb_deg, orb_map = _collect_orb_map(payload, base_orb=12.0)
 
-    # --- Natal block (civil/site or direct longitudes) ---
-    natal_in = payload.get("natal") or payload  # allow flat payloads too
+    # Natal block (either nested "natal" or flat)
+    natal_in = payload.get("natal") or payload
 
+    # Civil primitives for natal binding (optional if longitudes/jd supplied)
     date = _coerce_str(natal_in.get("date") or natal_in.get("birth_date") or "")
     time_str = _pad_hms(_coerce_str(natal_in.get("time") or natal_in.get("birth_time") or "12:00"))
-    tz_norm = _coerce_str(natal_in.get("tz") or natal_in.get("place_tz") or payload.get("tz") or "UTC").strip() or "UTC"
+    tz_norm = _coerce_str(natal_in.get("tz") or natal_in.get("place_tz")).strip() or None
 
+    # Accept explicit coords; but enforce geocoding if a place string/parts are present
     lat = _as_float(natal_in.get("latitude") or natal_in.get("lat"))
     lon = _as_float(natal_in.get("longitude") or natal_in.get("lon"))
     elevation_m = _as_float(natal_in.get("elevation_m") or natal_in.get("elevation"))
 
-    # Optional place resolution
-    pob_str = _coerce_str(
-        natal_in.get("place")
-        or natal_in.get("birth_place")
-        or _join_place(
-            _coerce_str(natal_in.get("place_city")),
-            _coerce_str(natal_in.get("place_state")),
-            _coerce_str(natal_in.get("place_country")),
-        )
-    ).strip()
-    if pob_str and callable(_resolve_place):
-        try:
-            city = _coerce_str(natal_in.get("place_city")).strip() or None
-            state = _coerce_str(natal_in.get("place_state")).strip() or None
-            country = _coerce_str(natal_in.get("place_country")).strip() or None
-            try:
-                pr = _resolve_place(pob_str, place_city=city, place_state=state, place_country=country)  # type: ignore[misc]
-            except TypeError:
-                pr = _resolve_place(pob_str)  # type: ignore[misc]
-            _lat = pr.get("lat") if isinstance(pr, dict) else getattr(pr, "lat", None)
-            _lon = pr.get("lon") if isinstance(pr, dict) else getattr(pr, "lon", None)
-            _tz = pr.get("tz") if isinstance(pr, dict) else getattr(pr, "tz", None)
-            _elev = pr.get("elevation_m") if isinstance(pr, dict) else getattr(pr, "elevation_m", None)
-            if _lat is not None and _lon is not None:
-                lat = _as_float(_lat)
-                lon = _as_float(_lon)
-            if _elev is not None:
-                elevation_m = _as_float(_elev)
-            if _tz:
-                tz_norm = _coerce_str(_tz).strip() or tz_norm
-        except Exception as e:
-            warns.append(f"place_resolution_failed:{e!s}")
+    lat_r, lon_r, elev_r, tz_r, fatal = _must_resolve_place_if_provided(natal_in, warns=warns)
+    if fatal:
+        norm = {
+            "frame": frame, "zodiac_mode": zodiac_mode, "ayanamsa": ayanamsa,
+            "include_nodes": bool(include_nodes), "treat_nodes_like_saturn": bool(treat_nodes_like_saturn),
+            "step_minutes": step_minutes,
+            "movers": movers, "natal_targets": natal_targets,
+            "orb_deg": float(orb_deg), "orb_map": orb_map or {},
+            "natal_chart": {
+                "date": date or None, "time": time_str if date else None,
+                "tz": tz_norm, "place_tz": tz_norm,
+                "place_name": _coerce_str(natal_in.get("place") or natal_in.get("birth_place") or "").strip() or None,
+                "latitude": None, "longitude": None, "elevation_m": None,
+                "longitudes": natal_in.get("longitudes") or natal_in.get("ecliptic_longitudes") or None,
+                "natal_jd_tt": _as_float(natal_in.get("natal_jd_tt") or natal_in.get("jd_tt")),
+                "jd_utc": _as_float(natal_in.get("jd_utc")),
+            },
+            "time_range": None,  # filled below if present
+            "fatal": fatal,
+            "raw": payload,
+            "transiting_bodies": movers, "ayanamsa_key": ayanamsa,
+            "tz_name": tz_norm,
+        }
+        # window still parsed to help the caller echo back
+        d0, d1, _ = _collect_time_window(payload)
+        if d0 and d1:
+            norm["time_range"] = [d0, d1]
+        return norm, warns + ["fatal"], tz_norm or "UTC"
 
-    # Allow direct natal longitudes / jd fields for exact binding
-    longitudes = natal_in.get("longitudes") or natal_in.get("ecliptic_longitudes") or None
-    natal_jd_tt = _as_float(natal_in.get("natal_jd_tt") or natal_in.get("jd_tt"))
-    natal_jd_utc = _as_float(natal_in.get("jd_utc"))  # tolerated; core handles as fallback
+    if lat_r is not None and lon_r is not None:
+        lat, lon = lat_r, lon_r
+    if elevation_m is None and elev_r is not None:
+        elevation_m = elev_r
+    if tz_r:
+        tz_norm = tz_r
 
-    # --- Time window parsing (civil strings) ---
-    date_from, date_to, win_warns = _collect_time_window(payload, tz_norm)
+    # Time window (civil strings)
+    date_from, date_to, win_warns = _collect_time_window(payload)
     warns.extend(win_warns)
 
-    # --- Build canonical structure matching vedic_gochar API expectations ---
+    longitudes = natal_in.get("longitudes") or natal_in.get("ecliptic_longitudes") or None
+    natal_jd_tt = _as_float(natal_in.get("natal_jd_tt") or natal_in.get("jd_tt"))
+    natal_jd_utc = _as_float(natal_in.get("jd_utc"))
+
     norm: Dict[str, Any] = {
         "frame": frame,
         "zodiac_mode": zodiac_mode,
         "ayanamsa": ayanamsa,
-
         "include_nodes": bool(include_nodes),
         "treat_nodes_like_saturn": bool(treat_nodes_like_saturn),
         "step_minutes": step_minutes,
-
         "movers": movers,
         "natal_targets": natal_targets,
-
         "orb_deg": float(orb_deg),
         "orb_map": orb_map or {},
-
-        # Route will pass this to find_gochar_in_range as `natal_chart`
         "natal_chart": {
             "date": date or None,
             "time": time_str if date else None,
             "tz": tz_norm,
             "place_tz": tz_norm,
-            "place_name": pob_str or None,
+            "place_name": _coerce_str(natal_in.get("place") or natal_in.get("birth_place") or "").strip() or None,
             "latitude": lat,
             "longitude": lon,
             "elevation_m": elevation_m,
-            # Optional precise bindings:
             "longitudes": longitudes or None,
             "natal_jd_tt": natal_jd_tt,
             "jd_utc": natal_jd_utc,
         },
-
-        # Pass -through civil window; route can also compute JD if desired
         "time_range": [date_from, date_to] if (date_from and date_to) else None,
-
         "raw": payload,
-    }
-
-    # Registry-style mirrors (if your router expects these names)
-    norm.update({
         "transiting_bodies": movers,
         "ayanamsa_key": ayanamsa,
         "tz_name": tz_norm,
-    })
+    }
 
-    # Sanity notes
-    if not (date_from and date_to):
-        warns.append("gochar_missing_window")
-    if not movers:
-        warns.append("gochar_missing_movers")
-    if not natal_targets:
-        warns.append("gochar_missing_targets")
-    if longitudes is None and not (date and tz_norm):
+    if not (date_from and date_to): warns.append("gochar_missing_window")
+    if not movers: warns.append("gochar_missing_movers")
+    if not natal_targets: warns.append("gochar_missing_targets")
+    if longitudes is None and not (natal_jd_tt or natal_jd_utc or (date and tz_norm)):
         warns.append("gochar_missing_natal_binding")
 
-    return norm, warns, tz_norm
+    return norm, warns, tz_norm or "UTC"
 
 
+# ───────────────────────────── Ingress scans ──────────────────────────
 def normalize_ingress_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str], str]:
-    """
-    Normalize inputs for rāśi / nakṣatra ingress scans.
-    Expected by routes that call:
-        find_rashi_ingresses_in_range(...) / find_nakshatra_ingresses_in_range(...)
-    """
     warns: List[str] = []
     frame = _coerce_str(payload.get("frame") or "ecliptic-of-date").strip() or "ecliptic-of-date"
     zodiac_mode = _norm_method(payload.get("zodiac_mode", payload.get("method", "sidereal")), default="sidereal")
     ayanamsa = _norm_ayanamsa(payload.get("ayanamsa") or payload.get("ayanamsa_key"))
-    tz_norm = _coerce_str(payload.get("tz") or payload.get("place_tz") or "UTC").strip() or "UTC"
 
-    movers = _collect_bodies(payload, key_order=("movers","bodies","transiting_bodies"), default=["Sun","Mercury","Venus","Mars","Jupiter","Saturn"])
-    include_moon = _norm_bool(payload.get("include_moon"), True)
-    if include_moon and "Moon" not in movers:
-        movers.insert(0, "Moon")
-
-    date_from, date_to, win_warns = _collect_time_window(payload, tz_norm)
-    warns.extend(win_warns)
-
-    topocentric = _norm_observer(payload.get("observer"), "geocentric") == "topocentric"
+    # Optional topocentric (requires coords). If place is given, we must resolve it.
     lat = _as_float(payload.get("latitude") or payload.get("lat"))
     lon = _as_float(payload.get("longitude") or payload.get("lon"))
     elevation_m = _as_float(payload.get("elevation_m") or payload.get("elevation"))
+    tz_norm = _coerce_str(payload.get("tz") or payload.get("place_tz")).strip() or None
 
-    step_minutes: Union[str,float,int] = payload.get("step_minutes", "auto")
+    lat_r, lon_r, elev_r, tz_r, fatal = _must_resolve_place_if_provided(payload, warns=warns)
+    if fatal:
+        norm = {
+            "frame": frame, "zodiac_mode": zodiac_mode, "ayanamsa": ayanamsa,
+            "movers": [], "time_range": None, "step_minutes": payload.get("step_minutes", "auto"),
+            "topocentric": False, "latitude": None, "longitude": None, "elevation_m": None,
+            "tz_name": tz_norm, "fatal": fatal, "raw": payload,
+        }
+        d0, d1, _ = _collect_time_window(payload)
+        if d0 and d1:
+            norm["time_range"] = [d0, d1]
+        return norm, warns + ["fatal"], tz_norm or "UTC"
+
+    if lat_r is not None and lon_r is not None:
+        lat, lon = lat_r, lon_r
+    if elevation_m is None and elev_r is not None:
+        elevation_m = elev_r
+    if tz_r:
+        tz_norm = tz_r
+
+    movers = _collect_bodies(payload, key_order=("movers","bodies","transiting_bodies"), default=["Sun","Mercury","Venus","Mars","Jupiter","Saturn"])
+    if _norm_bool(payload.get("include_moon"), True) and "Moon" not in movers:
+        movers.insert(0, "Moon")
+
+    date_from, date_to, win_warns = _collect_time_window(payload)
+    warns.extend(win_warns)
+
+    topocentric = _norm_observer(payload.get("observer"), "geocentric") == "topocentric"
+    if topocentric and (lat is None or lon is None):
+        topocentric = False
+        warns.append("topocentric_requires_coordinates:fallback_geocentric")
 
     norm = {
         "frame": frame,
@@ -785,7 +712,7 @@ def normalize_ingress_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], 
         "ayanamsa": ayanamsa,
         "movers": movers,
         "time_range": [date_from, date_to] if (date_from and date_to) else None,
-        "step_minutes": step_minutes,
+        "step_minutes": payload.get("step_minutes", "auto"),
         "topocentric": bool(topocentric),
         "latitude": lat,
         "longitude": lon,
@@ -796,31 +723,50 @@ def normalize_ingress_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], 
     if not (date_from and date_to):
         warns.append("ingress_missing_window")
 
-    return norm, warns, tz_norm
+    return norm, warns, tz_norm or "UTC"
 
 
+# ───────────────────────────── Stations scans ─────────────────────────
 def normalize_stations_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str], str]:
-    """
-    Normalize inputs for retrograde/direct station scans.
-    Expected by routes calling find_stations_in_range(...).
-    """
     warns: List[str] = []
     frame = _coerce_str(payload.get("frame") or "ecliptic-of-date").strip() or "ecliptic-of-date"
     zodiac_mode = _norm_method(payload.get("zodiac_mode", payload.get("method", "sidereal")), default="sidereal")
     ayanamsa = _norm_ayanamsa(payload.get("ayanamsa") or payload.get("ayanamsa_key"))
-    tz_norm = _coerce_str(payload.get("tz") or payload.get("place_tz") or "UTC").strip() or "UTC"
 
-    movers = _collect_bodies(payload, key_order=("movers","bodies","transiting_bodies"), default=["Mercury","Venus","Mars","Jupiter","Saturn"])
-
-    date_from, date_to, win_warns = _collect_time_window(payload, tz_norm)
-    warns.extend(win_warns)
-
-    topocentric = _norm_observer(payload.get("observer"), "geocentric") == "topocentric"
+    # Optional topocentric (requires coords). If place is given, we must resolve it.
     lat = _as_float(payload.get("latitude") or payload.get("lat"))
     lon = _as_float(payload.get("longitude") or payload.get("lon"))
     elevation_m = _as_float(payload.get("elevation_m") or payload.get("elevation"))
+    tz_norm = _coerce_str(payload.get("tz") or payload.get("place_tz")).strip() or None
 
-    step_minutes: Union[str,float,int] = payload.get("step_minutes", "auto")
+    lat_r, lon_r, elev_r, tz_r, fatal = _must_resolve_place_if_provided(payload, warns=warns)
+    if fatal:
+        norm = {
+            "frame": frame, "zodiac_mode": zodiac_mode, "ayanamsa": ayanamsa,
+            "movers": [], "time_range": None, "step_minutes": payload.get("step_minutes", "auto"),
+            "topocentric": False, "latitude": None, "longitude": None, "elevation_m": None,
+            "tz_name": tz_norm, "fatal": fatal, "raw": payload,
+        }
+        d0, d1, _ = _collect_time_window(payload)
+        if d0 and d1:
+            norm["time_range"] = [d0, d1]
+        return norm, warns + ["fatal"], tz_norm or "UTC"
+
+    if lat_r is not None and lon_r is not None:
+        lat, lon = lat_r, lon_r
+    if elevation_m is None and elev_r is not None:
+        elevation_m = elev_r
+    if tz_r:
+        tz_norm = tz_r
+
+    movers = _collect_bodies(payload, key_order=("movers","bodies","transiting_bodies"), default=["Mercury","Venus","Mars","Jupiter","Saturn"])
+    date_from, date_to, win_warns = _collect_time_window(payload)
+    warns.extend(win_warns)
+
+    topocentric = _norm_observer(payload.get("observer"), "geocentric") == "topocentric"
+    if topocentric and (lat is None or lon is None):
+        topocentric = False
+        warns.append("topocentric_requires_coordinates:fallback_geocentric")
 
     norm = {
         "frame": frame,
@@ -828,7 +774,7 @@ def normalize_stations_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any],
         "ayanamsa": ayanamsa,
         "movers": movers,
         "time_range": [date_from, date_to] if (date_from and date_to) else None,
-        "step_minutes": step_minutes,
+        "step_minutes": payload.get("step_minutes", "auto"),
         "topocentric": bool(topocentric),
         "latitude": lat,
         "longitude": lon,
@@ -839,4 +785,4 @@ def normalize_stations_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any],
     if not (date_from and date_to):
         warns.append("stations_missing_window")
 
-    return norm, warns, tz_norm
+    return norm, warns, tz_norm or "UTC"
