@@ -91,7 +91,7 @@ except Exception:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Timescales + Ayanāṁśa (used by varga helpers and NEW gochar windowing)
+# Timescales + Ayanāṁśa (used by varga helpers and gochar windowing)
 # ──────────────────────────────────────────────────────────────────────────────
 try:
     from app.core.timescales import build_timescales  # type: ignore
@@ -201,21 +201,9 @@ def _add_levels_and_limit(payload: Dict[str, Any], norm: Dict[str, Any]) -> None
         payload["limit_jd_tt"] = norm["limit_jd_tt"]
 
 
-def _tz_from_payload(body: Dict[str, Any]) -> str:
-    """Best-effort: prefer validator normalization, else raw tz, else UTC."""
-    try:
-        if normalize_vim_payload is not None:
-            _, _warns, tz_norm = normalize_vim_payload(body)  # type: ignore[misc]
-            return tz_norm or str(body.get("tz") or "UTC")
-    except Exception:
-        pass
-    return str(body.get("tz") or body.get("place_tz") or "UTC")
-
-
 def _pad_hms(t: Any) -> str:
     s = str(t or "").strip()
-    if not s:
-        return "12:00:00"
+    if not s: return "12:00:00"
     parts = s.split(":")
     if len(parts) == 1: return f"{parts[0]}:00:00"
     if len(parts) == 2: return f"{parts[0]}:{parts[1]}:00"
@@ -232,9 +220,39 @@ def _coerce_float(x: Any) -> Optional[float]:
     return None
 
 
+def _tz_from_payload(body: Dict[str, Any]) -> str:
+    """
+    Best-effort tz name: prefer validator normalization (place→tz),
+    else explicit tz/place_tz, else default to UTC.
+    """
+    try:
+        if normalize_vim_payload is not None:
+            _, _warns, tz_norm = normalize_vim_payload(body)  # type: ignore[misc]
+            if tz_norm:
+                return tz_norm
+    except Exception:
+        pass
+    return str(body.get("tz") or body.get("place_tz") or "UTC")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Window normalization for gochar/ingress/stations
+# Timescales & window normalization (used by gochar/ingress/stations)
 # ──────────────────────────────────────────────────────────────────────────────
+def _build_timescales_safe(date: str, time: str, tz: str) -> Optional[Dict[str, Any]]:
+    if not _TS_OK or build_timescales is None:
+        return None
+    try:
+        ts = build_timescales(date, time, tz, _env_dut1_seconds())  # type: ignore[misc]
+        # Be generous with return shapes (dict or object with attributes)
+        return ts if isinstance(ts, dict) else {
+            "jd_tt": getattr(ts, "jd_tt", None),
+            "jd_ut1": getattr(ts, "jd_ut1", None),
+            "jd_utc": getattr(ts, "jd_utc", None),
+        }
+    except Exception:
+        return None
+
+
 def _extract_civil_dates(body: Dict[str, Any]) -> Tuple[str, str]:
     """Pull any civil date shape."""
     d_from = str(body.get("date_from") or body.get("from") or "").strip()
@@ -252,38 +270,26 @@ def _extract_jd_window(body: Dict[str, Any]) -> Tuple[Optional[float], Optional[
     return a, b
 
 
-def _build_timescales_safe(date: str, time: str, tz: str) -> Optional[Dict[str, Any]]:
-    if not _TS_OK or build_timescales is None:
-        return None
-    try:
-        ts = build_timescales(date, time, tz, _env_dut1_seconds())  # type: ignore[misc]
-        return ts if isinstance(ts, dict) else {
-            "jd_tt": getattr(ts, "jd_tt", None),
-            "jd_ut1": getattr(ts, "jd_ut1", None),
-            "jd_utc": getattr(ts, "jd_utc", None),
-        }
-    except Exception:
-        return None
-
-
 def _resolve_window_jd_tt(body: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], List[str], str]:
     """
-    Returns (start_jd_tt, end_jd_tt, warnings, tz_used).
-    Accepts jd_tt_window / start_jd_tt,end_jd_tt / or civil dates (date_from/date_to),
-    in which case we compute [00:00:00 .. 23:59:59] in the user's tz.
+    Returns: (start_jd_tt, end_jd_tt, warnings, tz_used).
+
+    Accepts any of:
+      - jd_tt_window: [start, end]
+      - start_jd_tt + end_jd_tt
+      - date_from + date_to  → resolves to day edges in tz (00:00:00 .. 23:59:59)
     """
     warns: List[str] = []
     tz_name = _tz_from_payload(body)
 
-    # Direct JD window?
+    # Direct JD window first
     a, b = _extract_jd_window(body)
     if isinstance(a, float) and isinstance(b, float):
         return a, b, warns, tz_name
 
-    # Civil → JD_TT
+    # Civil → JD_TT (at day edges)
     d_from, d_to = _extract_civil_dates(body)
     if d_from and d_to and _TS_OK:
-        # day edges in the user's tz
         ts0 = _build_timescales_safe(d_from, "00:00:00", tz_name)
         ts1 = _build_timescales_safe(d_to,   "23:59:59", tz_name)
         a = (ts0 or {}).get("jd_tt")
@@ -315,7 +321,7 @@ def _filter_kwargs_for_fn(fn, kwargs: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Varga helpers (request-scoped; will compute ayanāṁśa deg from jd_tt if possible)
+# Varga helpers (request-scoped; computes ayanāṁśa deg from jd_tt if possible)
 # ──────────────────────────────────────────────────────────────────────────────
 def _norm_method(v: Any, default: str = "sidereal") -> str:
     if isinstance(v, str):
@@ -587,9 +593,9 @@ def vedic_gochar_drishti():
     """
     Degree-true graha dṛṣṭi transit hits within a window.
     Accepts:
-      - date_from, date_to (YYYY-MM-DD or RFC3339 *date-only* treated as day edges in tz)
-      - or jd_tt_window: [start,end]
-      - or start_jd_tt/end_jd_tt
+      - date_from, date_to (YYYY-MM-DD or RFC3339 date-only; treated as day edges in tz)
+      - or jd_tt_window: [start, end]
+      - or start_jd_tt + end_jd_tt
     Optional:
       transiting_bodies, natal_targets, zodiac_mode/method, ayanamsa,
       include_nodes, treat_nodes_like_saturn, orb_deg, orb_map,
@@ -612,7 +618,6 @@ def vedic_gochar_drishti():
     start_jd, end_jd, w_warns, _ = _resolve_window_jd_tt(body)
     warns = list(warns or []) + list(w_warns or [])
     if not (isinstance(start_jd, float) and isinstance(end_jd, float)):
-        # Provide a clear, consistent error (what the client code was logging)
         return jsonify({
             "ok": False,
             "error": "missing_date_window",
@@ -625,7 +630,7 @@ def vedic_gochar_drishti():
             "meta": {"route": "gochar/drishti", "branch": "vedic_predictive", "tz_normalized": tz_norm},
         }), 400
 
-    # Build kwargs; include both civil and jd flavors, then filter by signature
+    # Build kwargs and only keep what core accepts
     civil_from, civil_to = _extract_civil_dates(body)
     base_kwargs = {
         "natal_chart": natal_chart,
