@@ -325,7 +325,7 @@ def _jd_tt_to_iso_utc(j_tt: float) -> str:
         return datetime.utcfromtimestamp(unix).replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
 
 # NEW: civil window → TT window helper (safe pass-through for gochar wrappers)
-def _civil_window_to_tt(date_from: str, date_to: str, tz_name: str) -> Tuple[Optional[float], Optional[float]]:
+def _civil_window_to_tt(date_from: str, date_to: str, tz_name: str) -> Tuple[Optional[float], Optional[float]]]:
     """
     Convert civil YYYY-MM-DD (or RFC3339 date-times) + tz to start/end JD(TT).
     If parsing fails, returns (None, None) and lets the callee decide.
