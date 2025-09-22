@@ -11,7 +11,7 @@ Public surface (used by routes):
   • stations_retro_direct(**kwargs)
   • feature_drishti_proximity(hits, cap_deg)
 
-Internals (can be used elsewhere):
+Internals:
   • find_gochar_in_range(...)
   • find_rashi_ingresses_in_range(...)
   • find_nakshatra_ingresses_in_range(...)
@@ -75,6 +75,37 @@ except Exception:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Adapter factory (backward-compatible; never passes timescale into Config)
+# ──────────────────────────────────────────────────────────────────────
+def _make_ephem(frame: str = "ecliptic-of-date") -> EphemerisAdapter:
+    """
+    Robust construction across adapter versions:
+      1) cfg = EphemConfig(frame=..., planets=PLANETS?)      (NO 'timescale' here)
+      2) EphemerisAdapter(cfg, timescale=TS)
+      3) EphemerisAdapter(cfg, TS)
+      4) EphemerisAdapter(cfg)
+    """
+    # Build Config without 'timescale'
+    try:
+        if PLANETS is not None:
+            cfg = EphemConfig(frame=frame, planets=PLANETS)  # type: ignore
+        else:
+            cfg = EphemConfig(frame=frame)  # type: ignore
+    except TypeError:
+        # Very old Config without 'planets'
+        cfg = EphemConfig(frame=frame)  # type: ignore
+
+    # Build Adapter with best available signature
+    try:
+        return EphemerisAdapter(cfg, timescale=TS)  # type: ignore[arg-type]
+    except TypeError:
+        try:
+            return EphemerisAdapter(cfg, TS)  # type: ignore[misc]
+        except TypeError:
+            return EphemerisAdapter(cfg)  # type: ignore
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Small utilities
 # ──────────────────────────────────────────────────────────────────────
 _NODE_ALIAS = {
@@ -108,7 +139,7 @@ def angdiff(a2: float, a1: float) -> float:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Timescale model (no “resolver unavailable” surprises)
+# Timescale model (strict-friendly metadata like houses_advanced)
 # ──────────────────────────────────────────────────────────────────────
 def _env_dut1_seconds() -> float:
     for k in ("ASTRO_DUT1_BROADCAST", "ASTRO_DUT1", "OCP_DUT1_SECONDS"):
@@ -172,7 +203,6 @@ def _last_of_day_jd_utc(date: str, tz: str) -> float:
     return _civil_to_jd_utc(date, "23:59:59", tz)
 
 def _parse_dates_from_body(body: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
-    # Supports: time_range[0,1], or date_from/date_to, or from/to
     if isinstance(body.get("time_range"), (list, tuple)) and len(body["time_range"]) >= 2:
         return str(body["time_range"][0]), str(body["time_range"][1])
     d0 = (body.get("date_from") or body.get("from") or None)
@@ -187,7 +217,7 @@ def _tz_from_body(body: Dict[str, Any]) -> str:
 def _window_from_body_to_jd_tt(body: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Dict[str, Any]]:
     """
     Convert any accepted window shape into (start_jd_tt, end_jd_tt).
-    Returns meta with jd_utc window, tz, dut1_seconds used.
+    Meta also includes jd_utc window, jd_ut1 window, tz, and dut1_seconds.
     """
     # Numeric fast-paths
     if isinstance(body.get("jd_tt_window"), (list, tuple)) and len(body["jd_tt_window"]) == 2:
@@ -220,7 +250,7 @@ def _window_from_body_to_jd_tt(body: Dict[str, Any]) -> Tuple[Optional[float], O
     jt0 = _jd_tt_from_utc_jd(ju0, Y0, M0)
     jt1 = _jd_tt_from_utc_jd(ju1, Y1, M1)
 
-    # Deterministic UT1 (meta trace only)
+    # Deterministic UT1 (meta)
     dut1 = body.get("dut1") if isinstance(body.get("dut1"), (int,float)) else body.get("dut1_seconds")
     if isinstance(dut1, (int, float, str)) and str(dut1).strip() != "":
         try: dut1_used = _clamp_dut1(float(dut1))
@@ -228,7 +258,16 @@ def _window_from_body_to_jd_tt(body: Dict[str, Any]) -> Tuple[Optional[float], O
     else:
         dut1_used = _clamp_dut1(_env_dut1_seconds())
 
-    meta = {"from": "civil", "tz": tz, "jd_utc_window": [float(ju0), float(ju1)], "dut1_seconds": float(dut1_used)}
+    ju_ut1_0 = float(ju0 + dut1_used/86400.0)
+    ju_ut1_1 = float(ju1 + dut1_used/86400.0)
+
+    meta = {
+        "from": "civil",
+        "tz": tz,
+        "jd_utc_window": [float(ju0), float(ju1)],
+        "jd_ut1_window": [ju_ut1_0, ju_ut1_1],
+        "dut1_seconds": float(dut1_used),
+    }
     return float(jt0), float(jt1), meta
 
 
@@ -282,7 +321,7 @@ class VedicTransitEngine:
     ):
         if not _EPH_OK:
             raise RuntimeError("EphemerisAdapter unavailable; enable app.core.ephemeris_adapter")
-        self.ephem = ephem or EphemerisAdapter(EphemConfig(frame=frame, timescale=TS, planets=PLANETS))  # type: ignore
+        self.ephem = ephem or _make_ephem(frame)
         self.frame = frame
         self.obs = dict(topocentric=bool(topocentric), latitude=latitude, longitude=longitude, elevation_m=elevation_m)
         self.prebatch_refinement = bool(prebatch_refinement)
@@ -557,7 +596,7 @@ def find_gochar_in_range(
         if "Ketu" not in movers: movers.append("Ketu")
     tgts = list(natal_targets or ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn"])
 
-    ep = EphemerisAdapter(EphemConfig(frame=frame, timescale=TS, planets=PLANETS))  # type: ignore
+    ep = _make_ephem(frame)
     eng = VedicTransitEngine(
         ephem=ep, frame=frame,
         prebatch_refinement=bool(kwargs.get("prebatch_refinement", False)),
@@ -603,12 +642,17 @@ def find_gochar_in_range(
             "exact_datetime_utc": None,
         })
 
-    return {
-        "ok": True, "technique": "gochar_drishti", "gochar": hits,
-        "meta": {"movers": movers, "natal_targets": list(targets.keys()),
-                 "window_jd_tt": [float(a), float(b)],
-                 "frame": frame, "zodiac_mode": zodiac_mode, "ayanamsa_deg": ay, **meta_ts},
+    meta_out = {
+        "movers": movers,
+        "natal_targets": list(targets.keys()),
+        "window_jd_tt": [float(a), float(b)],
+        **meta_ts,
+        "frame": frame,
+        "zodiac_mode": zodiac_mode,
+        "ayanamsa_deg": ay
     }
+
+    return {"ok": True, "technique": "gochar_drishti", "gochar": hits, "meta": meta_out}
 
 def _auto_step_minutes_for_signs(movers: List[str]) -> float:
     caps: List[int] = []
@@ -663,7 +707,7 @@ def find_rashi_ingresses_in_range(
         return {"ok": True, "ingresses": [], "meta": {"window_jd_tt": [a,b], **meta_ts}}
 
     movers = list(movers or ["Sun","Mercury","Venus","Mars","Jupiter","Saturn"])
-    ep = EphemerisAdapter(EphemConfig(frame=frame, timescale=TS, planets=PLANETS))  # type: ignore
+    ep = _make_ephem(frame)
     eng = VedicTransitEngine(
         ephem=ep, frame=frame,
         topocentric=topocentric, latitude=latitude, longitude=longitude, elevation_m=elevation_m
@@ -740,7 +784,7 @@ def find_nakshatra_ingresses_in_range(
         return {"ok": True, "ingresses": [], "meta": {"window_jd_tt": [a,b], **meta_ts}}
 
     movers = list(movers or ["Moon","Sun","Mercury","Venus","Mars","Jupiter","Saturn"])
-    ep = EphemerisAdapter(EphemConfig(frame=frame, timescale=TS, planets=PLANETS))  # type: ignore
+    ep = _make_ephem(frame)
     eng = VedicTransitEngine(
         ephem=ep, frame=frame,
         topocentric=topocentric, latitude=latitude, longitude=longitude, elevation_m=elevation_m
@@ -825,7 +869,7 @@ def find_stations_in_range(
         return {"ok": True, "stations": [], "meta": {"window_jd_tt": [a,b], **meta_ts}}
 
     movers = list(movers or ["Mercury","Venus","Mars","Jupiter","Saturn"])
-    ep = EphemerisAdapter(EphemConfig(frame=frame, timescale=TS, planets=PLANETS))  # type: ignore
+    ep = _make_ephem(frame)
     eng = VedicTransitEngine(
         ephem=ep, frame=frame,
         topocentric=topocentric, latitude=latitude, longitude=longitude, elevation_m=elevation_m
