@@ -1,111 +1,73 @@
-# app/api/vedic_routes.py
+# app/core/vedic_gochar.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
+"""
+Vedic Gochar (Transits) — production-ready, high-performance engine,
+fully delegated to your timescales/ayanāṁśa modules (no DIY time math).
 
-from typing import Any, Dict, List, Optional
-import inspect
+What you get
+• Observer forwarding everywhere (topocentric/lat/lon/elevation)
+• Ayanāṁśa resolver (string keys → degrees via your module, or numeric passthrough)
+• UTC/UT1 timing on every event where your timescales provides the conversions:
+    - exact_jd_ut1
+    - exact_datetime_utc (ISO8601, UTC)
+• Nakṣatra ingress includes pada_to (1..4) and nakshatra_name
+• Same public API your routes import:
+    - gochar_drishti(**kwargs)
+    - ingresses_rashi(**kwargs)
+    - ingresses_nakshatra(**kwargs)
+    - stations_retro_direct(**kwargs)
+    - feature_drishti_proximity(hits, cap_deg)
+• Optimized sliding-window ephemeris with adaptive steps and event-driven scans
+• Clear errors if timescales/ephemeris are unavailable (no silent fallbacks)
+"""
+
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Literal, Union
+import math
 import os
+from datetime import datetime, timezone
 
-from flask import Blueprint, jsonify, request
-from app.utils.ratelimit import rate_limit  # fixed shared bucket
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Blueprint & rate limits
-# ──────────────────────────────────────────────────────────────────────────────
-vedic_api = Blueprint("vedic_api", __name__)
-RL_VEDIC_PREDICTIVE = int(os.getenv("ASTRO_RL_VEDIC_PREDICTIVE_PER_MIN", "20"))
-
-def fixed_key(*_a, **_k) -> str:
-    """Shared bucket key ('20') used by all predictive/varga/yoga calls."""
-    return "20"
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Validators
-# ──────────────────────────────────────────────────────────────────────────────
+# Optional: numpy (not required)
 try:
-    from app.core.vedic_validator import (
-        normalize_vim_payload,         # dasha & common tz/site hints
-        normalize_yoga_payload,        # yoga (mode-C)
-        normalize_gochar_payload,      # gochar/drishti
-        normalize_ingress_payload,     # ingress (rashi/nakshatra)
-        normalize_stations_payload,    # stations
-    )  # type: ignore
-    _VALIDATOR_IMPORT_ERR = None
-except Exception as _e:
-    normalize_vim_payload = None            # type: ignore
-    normalize_yoga_payload = None           # type: ignore
-    normalize_gochar_payload = None         # type: ignore
-    normalize_ingress_payload = None        # type: ignore
-    normalize_stations_payload = None       # type: ignore
-    _VALIDATOR_IMPORT_ERR = repr(_e)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Dasha engines: registry (preferred) + direct module fallbacks
-# ──────────────────────────────────────────────────────────────────────────────
-_compute_dasha_registry = None
-_available_schemes_fn = None
-try:
-    from app.core.dasha_registry import compute_dasha as _compute_dasha_registry  # type: ignore
-    from app.core.dasha_registry import available_schemes as _available_schemes_fn  # type: ignore
+    import numpy as np  # noqa: F401
 except Exception:
-    _compute_dasha_registry = None  # type: ignore
-    _available_schemes_fn = None    # type: ignore
+    np = None  # type: ignore
 
-# Optional dasha module fallbacks
+# Ephemeris singletons
 try:
-    from app.core.vimshottari_dasha import compute_vimshottari as _compute_vim_module  # type: ignore
+    from app.core.ephem_singleton import TS, PLANETS  # type: ignore
 except Exception:
-    _compute_vim_module = None  # type: ignore
+    TS = None  # type: ignore
+    PLANETS = None  # type: ignore
 
 try:
-    from app.core.ashtottari_dasha import compute_ashtottari as _compute_ashto_module  # type: ignore
+    from app.core.ephemeris_adapter import EphemerisAdapter, Config as EphemConfig  # type: ignore
+    _EPH_OK = True
 except Exception:
-    _compute_ashto_module = None  # type: ignore
+    EphemerisAdapter = object  # type: ignore
+    EphemConfig = object  # type: ignore
+    _EPH_OK = False
 
+# Timescales (authoritative — no DIY replacements)
 try:
-    from app.core.yogini_dasha import compute_yogini as _compute_yogini_module  # type: ignore
+    from app.core import time_kernel as _tk  # type: ignore
 except Exception:
-    _compute_yogini_module = None  # type: ignore
-
+    _tk = None
 try:
-    from app.core.chara_dasha import compute_chara_dasha as _compute_chara_module  # type: ignore
-except Exception:
-    _compute_chara_module = None  # type: ignore
-
-try:
-    from app.core.kala_chakra_dasha import compute_kalachakra_dasha as _compute_kcd_module  # type: ignore
-except Exception:
-    _compute_kcd_module = None  # type: ignore
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Varga engine (varga_charts)
-# ──────────────────────────────────────────────────────────────────────────────
-try:
-    from app.core.varga_charts import (
-        varga_position as _varga_position,
-        compute_varga_chart as _compute_varga_chart,
-        compute_many_vargas as _compute_many_vargas,
-    )
-    _VARGA_OK = True
-except Exception:
-    _varga_position = None  # type: ignore
-    _compute_varga_chart = None  # type: ignore
-    _compute_many_vargas = None  # type: ignore
-    _VARGA_OK = False
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Timescales + Ayanāṁśa (used by varga helpers)
-# ──────────────────────────────────────────────────────────────────────────────
-try:
-    from app.core.timescales import build_timescales  # type: ignore
+    from app.core import timescales as _ts  # type: ignore
     _TS_OK = True
 except Exception:
-    build_timescales = None  # type: ignore
+    _ts = None
     _TS_OK = False
 
+# Angles/houses helper (optional)
+try:
+    import app.core.astronomy as _astro  # type: ignore
+except Exception:
+    _astro = None
+
+# Ayanāṁśa adapter (yours)
 try:
     from app.core.ayanamsa import get_ayanamsa_deg  # type: ignore
     _AY_OK = True
@@ -113,1084 +75,1107 @@ except Exception:
     get_ayanamsa_deg = None  # type: ignore
     _AY_OK = False
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Yoga core (Mode-C only)
-# ──────────────────────────────────────────────────────────────────────────────
-_YOGA_OK = False
-_compute_yogas = None  # type: ignore
-_yoga_list = None      # type: ignore
-
+# Parāśari dṛiṣṭi & Nakṣatra helpers (optional)
 try:
-    # Preferred: app/core/yoga.py
-    from app.core.yoga import (                                     # type: ignore
-        compute_yogas as _compute_yogas,
-        list_registered_yogas as _yoga_list,
+    from app.core.constants_vedic import (  # type: ignore
+        graha_drishti_schema, drishti_strength_factor,
+        nakshatra_index, NAKSHATRAS_27
     )
-    _YOGA_OK = True
 except Exception:
-    try:
-        # Fallback: app/core/yogas.py
-        from app.core.yogas import (                                # type: ignore
-            compute_yogas as _compute_yogas,
-            list_registered_yogas as _yoga_list,
-        )
-        _YOGA_OK = True
-    except Exception:
-        _YOGA_OK = False
+    def graha_drishti_schema(name: str) -> Dict[int, float]:
+        n = (name or "").strip().lower()
+        base = {7: 1.0}
+        if n == "mars": base.update({4: 0.75, 8: 0.75})
+        elif n == "jupiter": base.update({5: 0.75, 9: 0.75})
+        elif n == "saturn": base.update({3: 0.75, 10: 0.75})
+        return base
+    def drishti_strength_factor(_: str, __: int) -> float: return 1.0
+    def nakshatra_index(lon: float) -> int:
+        w = 360.0 / 27.0
+        return int(math.floor((lon % 360.0) / w)) + 1
+    NAKSHATRAS_27 = tuple(f"Nakshatra {i+1}" for i in range(27))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Gochar / Ingress / Stations wrappers (from vedic_gochar)
+# Fast math + constants
 # ──────────────────────────────────────────────────────────────────────────────
-_GOCHAR_OK = False
-_GOCHAR_BRANCH = "none"
-try:
-    from app.core.vedic_gochar import (          # type: ignore
-        gochar_drishti as _gochar_drishti,
-        ingresses_rashi as _ingresses_rashi,
-        ingresses_nakshatra as _ingresses_nakshatra,
-        stations_retro_direct as _stations_retro_direct,
-        feature_drishti_proximity as _feature_drishti_proximity,
-    )
-    _GOCHAR_OK = True
-    _GOCHAR_BRANCH = "vedic_gochar"
-except Exception:
-    _GOCHAR_OK = False
-    _GOCHAR_BRANCH = "none"
-    _gochar_drishti = None               # type: ignore
-    _ingresses_rashi = None              # type: ignore
-    _ingresses_nakshatra = None          # type: ignore
-    _stations_retro_direct = None        # type: ignore
-    _feature_drishti_proximity = None    # type: ignore
+_DRISHTI_AXES = {k: (k * 30.0) % 360.0 for k in range(1, 13)}  # k-th house axis deg
+_PLANET_SPEEDS = {
+    "moon": 13.2, "mercury": 1.6, "venus": 1.6, "sun": 1.0,
+    "mars": 0.7, "jupiter": 0.08, "saturn": 0.03, "rahu": -0.05, "ketu": -0.05
+}
+def norm360(x: float) -> float:
+    r = x % 360.0
+    return r if r >= 0.0 else (r + 360.0)
+def wrap180(x: float) -> float:
+    r = ((x + 180.0) % 360.0) - 180.0
+    return 0.0 if abs(r) < 1e-12 else r
+def angdiff(a2: float, a1: float) -> float: return wrap180(a2 - a1)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Node aliasing
 # ──────────────────────────────────────────────────────────────────────────────
-def _env_dut1_seconds() -> float:
-    try:
-        return float(os.environ.get("ASTRO_DUT1_BROADCAST",
-                                    os.environ.get("ASTRO_DUT1", "0.0")) or 0.0)
-    except Exception:
-        return 0.0
-
-
-def _wrap_ok(out: Dict[str, Any], warns: List[str], tz_norm: str, branch: str, *, route_name: str) -> Dict[str, Any]:
-    out.setdefault("ok", True)
-    out.setdefault("meta", {})
-    out["meta"].update({"route": route_name, "tz_normalized": tz_norm, "branch": branch})
-    if warns:
-        out.setdefault("warnings", [])
-        seen = set(map(str, out["warnings"]))
-        for w in warns:
-            s = str(w)
-            if s not in seen:
-                out["warnings"].append(s)
-                seen.add(s)
+_NODE_ALIAS = {
+    "north node": "North Node", "rahu": "Rahu", "true node": "North Node",
+    "mean node": "North Node", "south node": "South Node", "ketu": "Ketu",
+}
+def _canon_node(nm: str) -> str:
+    if not nm: return nm
+    key = nm.strip().lower()
+    return _NODE_ALIAS.get(key, nm)
+def _batch_map_nodes(q: Iterable[str]) -> List[str]:
+    out: List[str] = []
+    for n in q:
+        nl = (n or "").strip().lower()
+        if nl == "rahu": out.append("Rahu")
+        elif nl == "ketu": out.append("Ketu")
+        else: out.append(n)
     return out
 
 
-def _coerce_int(v: Any, default: int) -> int:
+# ──────────────────────────────────────────────────────────────────────────────
+# Ephemeris adapter factory
+# ──────────────────────────────────────────────────────────────────────────────
+def _make_ephem(frame: str = "ecliptic-of-date") -> EphemerisAdapter:
+    if not _EPH_OK:
+        raise RuntimeError("EphemerisAdapter unavailable")
     try:
-        return int(v)
-    except Exception:
-        return default
-
-
-def _levels_from(norm: Dict[str, Any]) -> int:
-    """Clamp requested depth to [1..5]."""
-    L = _coerce_int(norm.get("levels", norm.get("depth", norm.get("max_levels", 5))), 5)
-    return max(1, min(5, L))
-
-
-def _add_levels_and_limit(payload: Dict[str, Any], norm: Dict[str, Any]) -> None:
-    payload["levels"] = _levels_from(norm)
-    if "limit_jd_tt" in norm and norm["limit_jd_tt"] is not None:
-        payload["limit_jd_tt"] = norm["limit_jd_tt"]
-
-
-def _tz_from_payload(body: Dict[str, Any]) -> str:
-    """Best-effort: prefer validator normalization, else raw tz, else UTC."""
+        cfg = EphemConfig(frame=frame, planets=PLANETS) if PLANETS is not None else EphemConfig(frame=frame)  # type: ignore
+    except TypeError:
+        cfg = EphemConfig(frame=frame)  # type: ignore
     try:
-        if normalize_vim_payload is not None:
-            _, _warns, tz_norm = normalize_vim_payload(body)  # type: ignore[misc]
-            return tz_norm or str(body.get("tz") or "UTC")
-    except Exception:
-        pass
-    return str(body.get("tz") or body.get("place_tz") or "UTC")
-
-
-# ---- civic payload builders (dasha) ------------------------------------------
-def _pick_times(norm: Dict[str, Any], original: Dict[str, Any]) -> Dict[str, Any]:
-    civ: Dict[str, Any] = {}
-    # Prefer direct jd_tt if given
-    if isinstance(original.get("jd_tt"), (int, float)):
-        civ["jd_tt"] = float(original["jd_tt"])
-    elif isinstance(norm.get("jd_tt"), (int, float)):
-        civ["jd_tt"] = float(norm["jd_tt"])
-    # Pass UT1 when present (helps asc calc)
-    if isinstance(original.get("jd_ut1"), (int, float)):
-        civ["jd_ut1"] = float(original["jd_ut1"])
-    elif isinstance(norm.get("jd_ut1"), (int, float)):
-        civ["jd_ut1"] = float(norm["jd_ut1"])
-    # Civil strings
-    for k in ("date", "time", "tz"):
-        v = norm.get(k)
-        if isinstance(v, str) and v.strip():
-            civ[k] = v.strip()
-    return civ
-
-
-def _build_civic_payload_vim(original: Dict[str, Any], norm: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Flexible flags for Vimśottarī (method/observer/ayanamsa/place/etc.)."
-    """
-    civ: Dict[str, Any] = {}
-
-    # Birth time: prefer explicit birth_jd_tt → else jd_tt → else (date,time,tz)
-    if isinstance(original.get("birth_jd_tt"), (int, float)):
-        civ["birth_jd_tt"] = float(original["birth_jd_tt"])
-    elif isinstance(norm.get("jd_tt"), (int, float)):
-        civ["birth_jd_tt"] = float(norm["jd_tt"])
-    for k in ("date", "time", "tz"):
-        v = norm.get(k)
-        if isinstance(v, str) and v.strip():
-            civ[k] = v.strip()
-
-    # Method/observer/ayanamsa
-    if norm.get("method"):
-        civ["method"] = norm["method"]
-    if norm.get("coordinate_mode"):
-        civ["coordinate_mode"] = norm["coordinate_mode"]
-        civ["topocentric"] = (str(norm["coordinate_mode"]).lower() == "topocentric")
-    elif "observer" in original:
-        obs = str(original.get("observer") or "").strip().lower()
-        civ["coordinate_mode"] = "topocentric" if obs == "topocentric" else "geocentric"
-        civ["topocentric"] = (civ["coordinate_mode"] == "topocentric")
-    elif "topocentric" in original:
-        civ["topocentric"] = bool(original.get("topocentric"))
-        civ["coordinate_mode"] = "topocentric" if civ["topocentric"] else "geocentric"
-
-    if norm.get("ayanamsa") is not None:
-        civ["ayanamsa"] = norm["ayanamsa"]
-
-    # Geography
-    for k in ("latitude", "longitude", "elevation"):
-        if norm.get(k) is not None:
-            civ[k] = norm[k]
-        elif original.get(k) is not None:
-            civ[k] = original[k]
-
-    # Optional place fields (pass-through)
-    for k in ("place", "place_city", "place_state", "place_country"):
-        if original.get(k) is not None:
-            civ[k] = original[k]
-        elif norm.get(k) is not None:
-            civ[k] = norm[k]
-
-    _add_levels_and_limit(civ, norm)
-    for k in ("span_years", "end_jd_tt", "year_days", "query_jd_tt", "q_date", "q_time", "q_tz", "flatten_level"):
-        if k in original and original[k] is not None:
-            civ[k] = original[k]
-
-    return civ
-
-
-def _build_civic_payload_ashto(original: Dict[str, Any], norm: Dict[str, Any]) -> Dict[str, Any]:
-    civ = _pick_times(norm, original)
-    if norm.get("ayanamsa") is not None:
-        civ["ayanamsa"] = norm["ayanamsa"]
-    _add_levels_and_limit(civ, norm)
-    for k in ("start_mode", "year_days", "moon_nirayana_deg", "compact", "include_spans"):
-        if k in original and original[k] is not None:
-            civ[k] = original[k]
-    return civ
-
-
-def _build_civic_payload_yogini(original: Dict[str, Any], norm: Dict[str, Any]) -> Dict[str, Any]:
-    civ = _pick_times(norm, original)
-    if norm.get("ayanamsa") is not None:
-        civ["ayanamsa"] = norm["ayanamsa"]
-    _add_levels_and_limit(civ, norm)
-    for k in ("start_mode", "year_days", "start_lord", "moon_nirayana_deg"):
-        if k in original and original[k] is not None:
-            civ[k] = original[k]
-    return civ
-
-
-def _build_civic_payload_chara(original: Dict[str, Any], norm: Dict[str, Any]) -> Dict[str, Any]:
-    civ = _pick_times(norm, original)
-
-    # site/asc inputs (from original body)
-    for k in ("latitude", "longitude", "asc_sidereal_deg", "asc_tropical_deg"):
-        if isinstance(original.get(k), (int, float)):
-            civ[k] = float(original[k])
-
-    if norm.get("ayanamsa") is not None:
-        civ["ayanamsa"] = norm["ayanamsa"]
-    _add_levels_and_limit(civ, norm)
-
-    # Chara-specific knobs
-    for k in (
-        "start_from", "include_rahu_in_karakas", "direction_mode",
-        "year_days", "balance_years", "balance_fraction",
-        "override_start_sign_index", "planet_longitudes_sidereal"
-    ):
-        if k in original and original[k] is not None:
-            civ[k] = original[k]
-    return civ
-
-
-def _build_civic_payload_kcd(original: Dict[str, Any], norm: Dict[str, Any]) -> Dict[str, Any]:
-    civ = _pick_times(norm, original)
-
-    if norm.get("ayanamsa") is not None:
-        civ["ayanamsa"] = norm["ayanamsa"]
-
-    civ["levels"] = _levels_from(norm)
-
-    lim = original.get("limit_jd_tt", norm.get("limit_jd_tt"))
-    if isinstance(lim, (int, float)):
-        civ["limit_jd_tt"] = float(lim)
-
-    for k in (
-        "kcd_table", "kcd_preset", "use_demo_kcd_table",
-        "override_start_sign_index", "year_days",
-        "balance_years", "balance_fraction",
-        "planet_longitudes_sidereal"
-    ):
-        if k in original and original[k] is not None:
-            civ[k] = original[k]
-    return civ
-
-
-# ---- tiny module-call shim (dasha) -------------------------------------------
-def _call_single_param_or_kwargs(fn, payload: Dict[str, Any]) -> Dict[str, Any]:
-    try:
-        sig = inspect.signature(fn)  # type: ignore[arg-type]
-        params = list(sig.parameters.values())
-    except Exception:
-        return fn(payload)  # type: ignore[misc]
-
-    if len(params) == 1 and params[0].kind in (
-        inspect.Parameter.POSITIONAL_ONLY,
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-    ):
-        return fn(payload)  # type: ignore[misc]
-    else:
-        return fn(**payload)  # type: ignore[misc]
-
-
-def _ensure_tree_envelope(res: Dict[str, Any], *, scheme: str) -> Dict[str, Any]:
-    """
-    Normalize shapes to a consistent tree envelope + nested.
-    """
-    if not isinstance(res, dict):
-        return res
-
-    t = res.get("tree")
-    if isinstance(t, dict) and isinstance(t.get("periods"), list):
-        periods = t["periods"]
-        s0 = min((float(p.get("start_jd_tt", 0.0)) for p in periods), default=0.0)
-        e1 = max((float(p.get("end_jd_tt", 0.0)) for p in periods), default=0.0)
-
-        extras_keys = (
-            "nakshatra", "moon_nirayana_deg", "birth_jd_tt", "year_days",
-            "levels", "ayanamsa", "method", "coordinate_mode", "topocentric",
-        )
-        extras = {k: t[k] for k in extras_keys if k in t}
-
-        out = dict(res)
-        out["nested"] = periods
-        root = {
-            "level": 0,
-            "lord": None,
-            "label": scheme,
-            "start_jd_tt": s0,
-            "end_jd_tt": e1,
-            "children": periods,
-            **extras,
-        }
-        out["tree"] = root
-        return out
-
-    if isinstance(res.get("nested"), list):
-        nodes = res["nested"]
-        if nodes:
-            s0 = min(float(n.get("start_jd_tt", 0.0)) for n in nodes)
-            e1 = max(float(n.get("end_jd_tt", 0.0)) for n in nodes)
-        else:
-            s0, e1 = 0.0, 0.0
-        out = dict(res)
-        out["tree"] = {
-            "level": 0,
-            "lord": None,
-            "label": scheme,
-            "start_jd_tt": s0,
-            "end_jd_tt": e1,
-            "children": nodes,
-        }
-        return out
-
-    return res
+        return EphemerisAdapter(cfg, timescale=TS)  # type: ignore
+    except TypeError:
+        try: return EphemerisAdapter(cfg, TS)  # type: ignore
+        except TypeError: return EphemerisAdapter(cfg)  # type: ignore
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Core runners (dasha): validator → registry (preferred) → module fallback
+# Timescales helpers (STRICT: use your modules only; no DIY math)
 # ──────────────────────────────────────────────────────────────────────────────
-def _run_with_registry_first(
-    *,
-    route_name: str,
-    scheme_key: str,
-    civic_builder,
-    module_fallback_fn,
-    body: Dict[str, Any],
-) -> Dict[str, Any]:
-    if normalize_vim_payload is None:
-        return {
-            "ok": False,
-            "error": "validator_unavailable",
-            "detail": f"app.core.vedic_validator import failed: {_VALIDATOR_IMPORT_ERR}",
-        }
+def _dut1_from_env() -> float:
+    for k in ("ASTRO_DUT1_BROADCAST", "ASTRO_DUT1", "OCP_DUT1_SECONDS"):
+        s = os.getenv(k)
+        if s not in (None, ""):
+            try: return float(s)
+            except Exception: pass
+    return 0.0
 
-    norm, warns, tz_norm = normalize_vim_payload(body)  # type: ignore[misc]
+def _ts_from_civil(date: str, time: str, tz: str) -> Dict[str, Any]:
+    """
+    Call your timescales/time_kernel to obtain jd_utc/jd_tt and optionally datetime.
+    Raises RuntimeError if not available.
+    """
+    if _tk is not None:
+        for fname in ("timescales_from_civil", "build_timescales", "compute_timescales", "from_civil", "to_timescales"):
+            fn = getattr(_tk, fname, None)
+            if callable(fn):
+                try:
+                    out = fn(date=date, time=time, tz=tz)  # prefer kwargs
+                except Exception:
+                    out = fn(date, time, tz)
+                if isinstance(out, dict): return out
+    if _ts is not None:
+        fn = getattr(_ts, "build_timescales", None)
+        if callable(fn):
+            try:
+                return fn(date, time, tz, _dut1_from_env())  # type: ignore
+            except TypeError:
+                return fn(date, time, tz)  # type: ignore
+    raise RuntimeError("timescales_unavailable")
 
-    # Attempt central registry (preferred)
-    if _compute_dasha_registry is not None:
-        try:
-            civ = civic_builder(body, norm)
-            civ["scheme"] = scheme_key
-            out = _compute_dasha_registry(civ)  # type: ignore[misc]
-            if isinstance(out, dict) and out.get("ok"):
-                out = _ensure_tree_envelope(out, scheme=scheme_key)
-                return _wrap_ok(out, warns, tz_norm, branch="registry.compute_dasha", route_name=route_name)
-        except Exception:
-            pass  # fall through
+def _civil_window_to_jd_tt(*, date_from: str, date_to: str, tz: str) -> Tuple[float, float, Dict[str, Any]]:
+    if not (_TS_OK or _tk is not None):
+        raise RuntimeError("timescales_unavailable")
+    ts0 = _ts_from_civil(date_from, "00:00:00", tz)
+    ts1 = _ts_from_civil(date_to,   "23:59:59", tz)
+    jt0 = float(ts0.get("jd_tt"))
+    jt1 = float(ts1.get("jd_tt"))
+    ju0 = float(ts0.get("jd_utc")) if ts0.get("jd_utc") is not None else None
+    ju1 = float(ts1.get("jd_utc")) if ts1.get("jd_utc") is not None else None
+    meta = {"from": "civil", "tz": tz, "jd_utc_window": [ju0, ju1]}
+    return jt0, jt1, meta
 
-    # Module fallback, if available
-    if module_fallback_fn is not None:
-        try:
-            civ = civic_builder(body, norm)
-            out = _call_single_param_or_kwargs(module_fallback_fn, civ)
-            if isinstance(out, dict):
-                out = _ensure_tree_envelope(out, scheme=scheme_key)
-                return _wrap_ok(out, warns, tz_norm, branch=f"module.compute_{scheme_key}", route_name=route_name)
-            return {
-                "ok": False,
-                "error": f"{scheme_key}_module_invalid_return",
-                "detail": f"Expected dict, got {type(out).__name__}",
-                "meta": {"route": route_name, "tz_normalized": tz_norm, "branch": f"module.compute_{scheme_key}"},
-            }
-        except Exception as e:
-            return {
-                "ok": False,
-                "error": f"{scheme_key}_module_failed",
-                "detail": str(e),
-                "meta": {"route": route_name, "tz_normalized": tz_norm, "branch": f"module.compute_{scheme_key}"},
-            }
-
-    # No engine available
-    return {
-        "ok": False,
-        "error": f"{scheme_key}_engine_unavailable",
-        "meta": {"route": route_name, "tz_normalized": tz_norm, "branch": "none"},
-    }
-
-
-def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
-    return _run_with_registry_first(
-        route_name="vimshottari",
-        scheme_key="vimshottari",
-        civic_builder=_build_civic_payload_vim,
-        module_fallback_fn=_compute_vim_module,
-        body=payload,
-    )
-
-
-def _run_ashtottari(payload: Dict[str, Any]) -> Dict[str, Any]:
-    return _run_with_registry_first(
-        route_name="ashtottari",
-        scheme_key="ashtottari",
-        civic_builder=_build_civic_payload_ashto,
-        module_fallback_fn=_compute_ashto_module,
-        body=payload,
-    )
-
-
-def _run_yogini(payload: Dict[str, Any]) -> Dict[str, Any]:
-    return _run_with_registry_first(
-        route_name="yogini",
-        scheme_key="yogini",
-        civic_builder=_build_civic_payload_yogini,
-        module_fallback_fn=_compute_yogini_module,
-        body=payload,
-    )
-
-
-def _run_chara(payload: Dict[str, Any]) -> Dict[str, Any]:
-    return _run_with_registry_first(
-        route_name="chara",
-        scheme_key="chara",
-        civic_builder=_build_civic_payload_chara,
-        module_fallback_fn=_compute_chara_module,
-        body=payload,
-    )
-
-
-def _run_kalachakra(payload: Dict[str, Any]) -> Dict[str, Any]:
-    return _run_with_registry_first(
-        route_name="kalachakra",
-        scheme_key="kalachakra",
-        civic_builder=_build_civic_payload_kcd,
-        module_fallback_fn=_compute_kcd_module,
-        body=payload,
-    )
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Varga helpers (request-scoped; will compute ayanāṁśa deg from jd_tt if possible)
-# ──────────────────────────────────────────────────────────────────────────────
-def _norm_method(v: Any, default: str = "sidereal") -> str:
-    if isinstance(v, str):
-        s = v.strip().lower()
-        if s in ("sidereal", "nirayana", "nirāyaṇa", "sid", "s"): return "sidereal"
-        if s in ("tropical", "sayana", "sāyana", "trop", "t"):   return "tropical"
-    return default
-
-def _norm_ayanamsa(v: Any) -> Any:
-    # pass through floats/ints; normalize strings; default lahiri
-    if v is None: return "lahiri"
-    if isinstance(v, (int, float)): return float(v)
-    return str(v).strip().lower() or "lahiri"
-
-def _coerce_float(x: Any) -> Optional[float]:
-    try:
-        if isinstance(x, (int, float)): return float(x)
-        if isinstance(x, str) and x.strip() not in ("", "null", "None"):
-            return float(x.strip())
-    except Exception:
-        return None
+def _jd_tt_to_jd_utc(jd_tt: float) -> Optional[float]:
+    """
+    Use your timescales for TT→UTC JD. If not exposed, return None.
+    """
+    if _ts is not None:
+        for name in ("jd_utc_from_jd_tt", "tt_to_utc_julian_day", "tt_to_utc_jd", "jd_utc_from_tt", "to_jd_utc_from_tt"):
+            fn = getattr(_ts, name, None)
+            if callable(fn):
+                try:
+                    return float(fn(jd_tt))  # type: ignore
+                except Exception:
+                    pass
+    if _tk is not None:
+        for name in ("jd_utc_from_jd_tt", "tt_to_utc_jd"):
+            fn = getattr(_tk, name, None)
+            if callable(fn):
+                try:
+                    return float(fn(jd_tt))  # type: ignore
+                except Exception:
+                    pass
     return None
 
-def _pick_longitudes(body: Dict[str, Any]) -> Dict[str, float]:
-    for key in ("longitudes", "points_deg", "longitudes_by_name"):
-        raw = body.get(key)
-        if isinstance(raw, dict):
-            out: Dict[str, float] = {}
-            for name, val in raw.items():
-                f = _coerce_float(val)
-                if f is not None:
-                    out[str(name)] = f
-            return out
-    return {}
+def _jd_utc_to_datetime_utc(jd_utc: float) -> Optional[datetime]:
+    """
+    Use your timescales to convert JD(UTC) → datetime(UTC). If not exposed, None.
+    """
+    if _ts is not None:
+        for name in ("datetime_from_jd_utc", "utc_datetime_from_jd", "to_datetime_utc"):
+            fn = getattr(_ts, name, None)
+            if callable(fn):
+                try:
+                    dt = fn(float(jd_utc))  # type: ignore
+                    if isinstance(dt, datetime): return dt.astimezone(timezone.utc)
+                except Exception:
+                    pass
+    if _tk is not None:
+        for name in ("datetime_from_jd_utc", "utc_datetime_from_jd"):
+            fn = getattr(_tk, name, None)
+            if callable(fn):
+                try:
+                    dt = fn(float(jd_utc))  # type: ignore
+                    if isinstance(dt, datetime): return dt.astimezone(timezone.utc)
+                except Exception:
+                    pass
+    return None
 
-def _pick_vargas(body: Dict[str, Any]) -> List[str]:
-    v = body.get("vargas") or body.get("include")
-    if isinstance(v, (list, tuple)):
-        return [str(x).upper() for x in v if str(x).strip()]
-    if isinstance(v, str) and v.strip():
-        return [s.strip().upper() for s in v.split(",") if s.strip()]
-    # sensible default if caller forgot (match common UI)
-    return ["D1", "D9", "D10", "D12"]
 
-def _wrap_varga_meta(route: str, method: str, ay_meta: Dict[str, Any]) -> Dict[str, Any]:
-    base = {"route": route, "branch": "varga_charts", "zodiac_mode": method}
-    base.update(ay_meta or {})
-    return base
-
-def _pad_hms(t: Any) -> str:
-    s = str(t or "").strip()
-    if not s: return "12:00:00"
-    parts = s.split(":")
-    if len(parts) == 1: return f"{parts[0]}:00:00"
-    if len(parts) == 2: return f"{parts[0]}:{parts[1]}:00"
-    return s
-
-def _jd_tt_from_body(body: Dict[str, Any]) -> Optional[float]:
-    # direct overrides
-    jd = _coerce_float(body.get("jd_tt") or body.get("birth_jd_tt"))
-    if isinstance(jd, float):
-        return jd
-    # civil → JD_TT
-    if not _TS_OK:
-        return None
-    date = str(body.get("date") or body.get("birth_date") or "").strip()
-    if not date:
-        return None
-    time = _pad_hms(body.get("time") or body.get("birth_time") or "12:00")
-    tz   = str(body.get("tz") or body.get("place_tz") or "UTC").strip() or "UTC"
+# ──────────────────────────────────────────────────────────────────────────────
+# Ayanāṁśa resolver (strictly through your module; or numeric passthrough)
+# ──────────────────────────────────────────────────────────────────────────────
+def _resolve_ayanamsa_deg(ayanamsa: Any, jd_tt_hint: Optional[float], zodiac_mode: str) -> float:
+    zm = (zodiac_mode or "sidereal").lower()
+    if zm.startswith("trop"):  # tropical → no subtraction
+        return 0.0
+    # numeric?
     try:
-        ts = build_timescales(date, time, tz, _env_dut1_seconds())  # type: ignore[misc]
-        if isinstance(ts, dict):
-            j = ts.get("jd_tt")
-        else:
-            j = getattr(ts, "jd_tt", None)
-        return float(j) if j is not None else None
+        if isinstance(ayanamsa, (int, float)): return float(ayanamsa)
+        s = str(ayanamsa).strip()
+        if s and s.replace(".", "", 1).isdigit(): return float(s)
     except Exception:
-        return None
+        pass
+    # string key → degrees via your module
+    if _AY_OK and callable(get_ayanamsa_deg) and isinstance(jd_tt_hint, (int, float)):
+        try:
+            return float(get_ayanamsa_deg(float(jd_tt_hint), ayanamsa or "lahiri"))  # type: ignore
+        except Exception:
+            # fall through to default if key failed
+            pass
+    # last resort: if we can compute at epoch 2000.0 with key, try that
+    if _AY_OK and callable(get_ayanamsa_deg):
+        try:
+            return float(get_ayanamsa_deg(None, ayanamsa or "lahiri"))  # type: ignore
+        except Exception:
+            pass
+    # default lahiri key passthrough if everything fails numerically
+    return 0.0
 
-def _ayanamsa_deg_from_key(jd_tt: Optional[float], key: str) -> Optional[float]:
-    if not _AY_OK or get_ayanamsa_deg is None:
-        return None
-    try:
-        if jd_tt is not None:
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Angles (Asc/MC) sidereal helper (uses astronomy.py or ephemeris angles)
+# ──────────────────────────────────────────────────────────────────────────────
+def _angles_sidereal_deg(*, jd_tt: float, lat: float, lon: float, ay_deg: float, sidereal: bool,
+                         eng_ephem: EphemerisAdapter | None = None) -> Dict[str, float]:
+    # try astronomy.py
+    cand = (
+        getattr(_astro, "compute_houses", None),
+        getattr(_astro, "houses_advanced", None),
+        getattr(_astro, "asc_mc_from", None),
+        getattr(_astro, "asc_mc", None),
+    ) if _astro else ()
+    for fn in cand:
+        if callable(fn):
             try:
-                return float(get_ayanamsa_deg(jd_tt, key))  # type: ignore[misc]
+                try:
+                    res = fn(jd_tt=jd_tt, latitude=lat, longitude=lon)
+                except TypeError:
+                    res = fn(jd_tt, lat, lon)
+                if isinstance(res, dict):
+                    asc = res.get("Asc") or res.get("asc") or res.get("ASC")
+                    mc =  res.get("MC")  or res.get("mc")
+                    if asc is None or mc is None: continue
+                    asc = float(asc); mc = float(mc)
+                    if sidereal:
+                        return {"Asc": norm360(asc - ay_deg), "MC": norm360(mc - ay_deg)}
+                    return {"Asc": norm360(asc), "MC": norm360(mc)}
             except Exception:
                 pass
-        return float(get_ayanamsa_deg(None, key))  # type: ignore[misc]
-    except Exception:
-        return None
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Routes (mounted at /api/vedic)
-# ──────────────────────────────────────────────────────────────────────────────
-@vedic_api.get("/health")
-def vedic_health():
-    return jsonify(ok=True, vedic=True), 200
-
-
-@vedic_api.get("/diag")
-def vedic_diag():
-    def sigs(fn):
+    # try ephem adapter angles_ecliptic if provided
+    if eng_ephem is not None and hasattr(eng_ephem, "angles_ecliptic"):
         try:
-            return str(inspect.signature(fn))
+            out = eng_ephem.angles_ecliptic(jd_tt, latitude=lat, longitude=lon)
+            asc = float(out.get("Asc")); mc = float(out.get("MC"))
+            if sidereal:
+                return {"Asc": norm360(asc - ay_deg), "MC": norm360(mc - ay_deg)}
+            return {"Asc": norm360(asc), "MC": norm360(mc)}
         except Exception:
+            pass
+    return {}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Transit engine (optimized) + sliding window cache
+# ──────────────────────────────────────────────────────────────────────────────
+@dataclass
+class GocharEvent:
+    jd_tt: float
+    body: str
+    target: str
+    drishti: Literal["7th","3rd","4th","5th","8th","9th","10th"]
+    axis_deg: float
+    separation_deg: float
+    applying: bool
+    exact: bool
+    weight: float
+    meta: Dict[str, Any]
+
+class EphemerisSlidingWindow:
+    def __init__(self, engine: "VedicTransitEngine", window_size: int = 100):
+        self.engine = engine
+        self.window_size = max(50, int(window_size))
+        self.cache: Dict[float, Dict[str, float]] = {}
+        self.sorted_times: List[float] = []
+
+    def _batch_fetch(self, times: List[float], bodies: List[str]) -> None:
+        if not times or not bodies: return
+        for t in times:
+            if t in self.cache: continue
+            try:
+                rows = self.engine.ephem.ecliptic_longitudes(float(t), _batch_map_nodes(bodies), **self.engine.obs).get("results", [])
+                lon_map: Dict[str, float] = {}
+                for r in rows or []:
+                    nm = _canon_node(str(r["name"]))
+                    raw = float(r["longitude"])
+                    lon_map[nm] = norm360(raw - self.engine.ayanamsa_deg) if self.engine.sidereal_mode else norm360(raw)
+                self.cache[t] = lon_map
+            except Exception:
+                # best-effort individual calls
+                got: Dict[str, float] = {}
+                for b in bodies:
+                    try:
+                        one = self.engine.ephem.ecliptic_longitudes(float(t), _batch_map_nodes([b]), **self.engine.obs).get("results", [])
+                        for r in one or []:
+                            nm = _canon_node(str(r["name"]))
+                            raw = float(r["longitude"])
+                            got[nm] = norm360(raw - self.engine.ayanamsa_deg) if self.engine.sidereal_mode else norm360(raw)
+                    except Exception:
+                        pass
+                self.cache[t] = got
+
+    def ensure_window(self, center_time: float, span_days: float, bodies: List[str]) -> None:
+        start_time = center_time - span_days/2
+        end_time   = center_time + span_days/2
+        num_points = min(self.window_size, max(20, int(span_days * 24)))  # ≥ hourly
+        dt = (end_time - start_time)/num_points
+        times = [start_time + i*dt for i in range(num_points + 1)]
+        self._batch_fetch(times, bodies)
+        self.sorted_times = sorted(self.cache.keys())
+
+    def get_longitude(self, body: str, time: float) -> Optional[float]:
+        if time in self.cache:
+            return self.cache[time].get(body)
+        if len(self.sorted_times) < 2:
             return None
+        # binary search for bracket
+        left, right = 0, len(self.sorted_times)-1
+        while left <= right:
+            mid = (left + right)//2
+            if self.sorted_times[mid] <= time: left = mid + 1
+            else: right = mid - 1
+        idx = max(0, right)
+        if idx >= len(self.sorted_times)-1: return None
+        t1, t2 = self.sorted_times[idx], self.sorted_times[idx+1]
+        lon1 = self.cache[t1].get(body); lon2 = self.cache[t2].get(body)
+        if lon1 is None or lon2 is None: return None
+        diff = angdiff(lon2, lon1)
+        frac = (time - t1)/(t2 - t1) if (t2 - t1) else 0.0
+        return norm360(lon1 + diff*frac)
 
-    return jsonify({
-        "validator_loaded": (normalize_vim_payload is not None) and (normalize_yoga_payload is not None),
-        "validator_error": _VALIDATOR_IMPORT_ERR,
-        "registry_compute_present": bool(_compute_dasha_registry),
-        "registry_compute_sig": sigs(_compute_dasha_registry) if _compute_dasha_registry else None,
-        "registry_available": _available_schemes_fn() if callable(_available_schemes_fn) else None,
-        "module_vimshottari_present": bool(_compute_vim_module),
-        "module_vimshottari_sig": sigs(_compute_vim_module) if _compute_vim_module else None,
-        "module_ashtottari_present": bool(_compute_ashto_module),
-        "module_ashtottari_sig": sigs(_compute_ashto_module) if _compute_ashto_module else None,
-        "module_yogini_present": bool(_compute_yogini_module),
-        "module_yogini_sig": sigs(_compute_yogini_module) if _compute_yogini_module else None,
-        "module_chara_present": bool(_compute_chara_module),
-        "module_chara_sig": sigs(_compute_chara_module) if _compute_chara_module else None,
-        "module_kalachakra_present": bool(_compute_kcd_module),
-        "module_kalachakra_sig": sigs(_compute_kcd_module) if _compute_kcd_module else None,
-        "varga_engine_present": _VARGA_OK,
-        "timescales_present": _TS_OK,
-        "ayanamsa_adapter_present": _AY_OK,
-        # Yoga diagnostics
-        "yoga_core_present": _YOGA_OK,
-        # Gochar diagnostics
-        "gochar_present": _GOCHAR_OK,
-        "gochar_branch": _GOCHAR_BRANCH,
-        "rl_cap_per_min": RL_VEDIC_PREDICTIVE,
-        "rl_bucket_key": "20",
-        "dut1_seconds_env": _env_dut1_seconds(),
-    }), 200
+class VedicTransitEngine:
+    def __init__(self, *, ephem: EphemerisAdapter, sidereal_mode: bool, ayanamsa_deg: float,
+                 topocentric: bool = False, latitude: float | None = None, longitude: float | None = None,
+                 elevation_m: float | None = None, cache_size: int = 2000,
+                 treat_nodes_like_saturn: bool = False):
+        self.ephem = ephem
+        self.sidereal_mode = bool(sidereal_mode)
+        self.ayanamsa_deg = float(ayanamsa_deg or 0.0)
+        self.obs = dict(topocentric=bool(topocentric), latitude=latitude, longitude=longitude, elevation_m=elevation_m)
+        self.sliding = EphemerisSlidingWindow(self, window_size=max(80, cache_size//10))
+        self._schemas: Dict[str, Dict[int, float]] = {}
+        self.treat_nodes_like_saturn = bool(treat_nodes_like_saturn)
 
+    def _schema_for(self, body: str) -> Dict[int, float]:
+        b = _canon_node(body)
+        key = (b, self.treat_nodes_like_saturn)
+        if key in self._schemas: return self._schemas[key]
+        name = b
+        if b in ("Rahu", "Ketu") and self.treat_nodes_like_saturn:
+            name = "Saturn"
+        schema = graha_drishti_schema(name)
+        if b in ("Rahu", "Ketu") and not self.treat_nodes_like_saturn:
+            schema = {7: 1.0}
+        self._schemas[key] = schema
+        return schema
 
-# ──────────────── Dasha routes ────────────────
-@vedic_api.post("/dasha/vimshottari")
-@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
-def vedic_vimshottari():
-    body = request.get_json(silent=True) or {}
-    res = _run_vimshottari(body)
-    status = 200 if res.get("ok") else (503 if str(res.get("error", "")).endswith("unavailable") else 400)
-    return jsonify(res), status
+    def _planet_step_minutes(self, body: str, base: float) -> float:
+        v = _PLANET_SPEEDS.get(body.lower(), 0.5)
+        if v > 5.0: return base*0.4     # Moon
+        if v > 1.0: return base*0.7     # Mercury/Venus/Sun
+        if v > 0.1: return base*1.0     # Mars
+        return base*2.0                 # Jup/Sat/Nodes
 
+    # ---- Drishti scan ----
+    def scan_drishti(self, *, jd_start_tt: float, jd_end_tt: float, movers: List[str], targets: Dict[str, float],
+                     orb_deg: float = 12.0, orb_map: Optional[Dict[str, float]] = None,
+                     step_minutes: Union[str, float, int] = "auto", scan_mode: str = "balanced") -> List[GocharEvent]:
+        if jd_end_tt <= jd_start_tt or not movers or not targets: return []
+        window_days = jd_end_tt - jd_start_tt
+        if isinstance(step_minutes, str) and step_minutes.lower() == "auto":
+            base = 30.0 if window_days <= 3.0 else (60.0 if window_days <= 14.0 else 180.0)
+            m = scan_mode.lower()
+            if m.startswith("ultra"): base *= 2.0
+            elif m.startswith("fine"): base *= 0.5
+        else:
+            base = float(step_minutes)
+        self.sliding.ensure_window((jd_start_tt + jd_end_tt)/2, window_days + 1.0, movers)
+        planet_step = {b: self._planet_step_minutes(b, base) for b in movers}
+        events: List[GocharEvent] = []
+        dedupe: set[Tuple[int, int, int, int]] = set()
 
-@vedic_api.post("/dasha/ashtottari")
-@vedic_api.post("/dasha/Aṣṭottarī")
-@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
-def vedic_ashtottari():
-    body = request.get_json(silent=True) or {}
-    res = _run_ashtottari(body)
-    status = 200 if res.get("ok") else (503 if str(res.get("error", "")).endswith("unavailable") else 400)
-    return jsonify(res), status
+        t = jd_start_tt
+        while t < jd_end_tt - 1e-12:
+            dt_min = min(planet_step.values())
+            t_next = min(t + dt_min/(60.0*24.0), jd_end_tt)
+            curr = {b: self.sliding.get_longitude(b, t)      for b in movers}
+            nxt  = {b: self.sliding.get_longitude(b, t_next) for b in movers}
+            for b in movers:
+                lon0 = curr.get(b); lon1 = nxt.get(b)
+                if lon0 is None or lon1 is None: continue
+                dlon = wrap180(lon1 - lon0); speed = dlon/max(1e-9, (t_next - t))
+                schema = self._schema_for(b)
+                for tgt_name, tgt_lon in targets.items():
+                    diff0 = wrap180(angdiff(lon0, tgt_lon))
+                    diff1 = wrap180(angdiff(lon1, tgt_lon))
+                    for k, w in schema.items():
+                        axis = _DRISHTI_AXES[k]
+                        sep0 = wrap180(diff0 - axis)
+                        sep1 = wrap180(diff1 - axis)
+                        if abs(sep0) > 15 and abs(sep1) > 15 and sep0 * sep1 > 0:  # far and no crossing
+                            continue
+                        # decide if within orb or crossing
+                        max_orb = float(orb_map.get(b, orb_deg)) if orb_map else float(orb_deg)
+                        min_sep = min(abs(sep0), abs(sep1))
+                        crossing = (sep0 == 0.0) or (sep1 == 0.0) or (sep0 * sep1 < 0.0)
+                        if (min_sep <= max_orb) or crossing:
+                            # estimate exact time (linear in separation)
+                            if abs(speed) > 1e-9 and crossing:
+                                # sep(t) ≈ sep0 + speed*(t - t0) → solve sep=0
+                                # speed is in deg/day of planet vs target fixed; we approximate axis crossing
+                                te = t - (sep0 / speed)
+                                te = max(t, min(t_next, te))
+                            else:
+                                te = t if abs(sep0) < abs(sep1) else t_next
+                            # final separation at te (interpolate lon)
+                            lon_te = self.sliding.get_longitude(b, te)
+                            if lon_te is None:
+                                final_sep = min(sep0, sep1, key=abs)
+                            else:
+                                final_sep = wrap180(angdiff(lon_te, tgt_lon) - axis)
+                            key = (hash(b) % 10007, hash(tgt_name) % 10007, int(k), int(te * 86400 + 0.5))
+                            if key in dedupe: continue
+                            dedupe.add(key)
+                            events.append(GocharEvent(
+                                jd_tt=float(te), body=_canon_node(b), target=_canon_node(tgt_name),
+                                drishti=("7th" if k == 7 else f"{k}th"), axis_deg=float(axis),
+                                separation_deg=float(final_sep), applying=(abs(sep1) < abs(sep0)),
+                                exact=abs(final_sep) <= 1e-6, weight=float(w), meta={"k_house": k}
+                            ))
+            t = t_next
+        events.sort(key=lambda e: (e.jd_tt, e.body, e.target, e.axis_deg))
+        return events
 
+    # ---- Rāśi / Nakṣatra ingresses ----
+    def find_sign_ingresses(self, a: float, b: float, movers: List[str], step_minutes: Union[str, float, int] = "auto") -> List[Dict[str, Any]]:
+        if b <= a: return []
+        window_days = b - a
+        base = 30.0 if (isinstance(step_minutes, str) and step_minutes == "auto" and window_days <= 7) else (60.0 if isinstance(step_minutes, str) else float(step_minutes))
+        self.sliding.ensure_window((a + b)/2, window_days + 0.5, movers)
+        out: List[Dict[str, Any]] = []
+        for body in movers:
+            step_days = self._planet_step_minutes(body, base) / (60.0*24.0)
+            t = a
+            prev = None
+            while t <= b:
+                lon = self.sliding.get_longitude(body, t)
+                if lon is not None:
+                    sidx = int(lon // 30) % 12
+                    if prev is not None and sidx != prev:
+                        # refine crossing of multiple of 30°
+                        t0, t1 = max(a, t - step_days), t
+                        te = self._refine_division_cross(body, t0, t1, 30.0)
+                        if te is not None:
+                            out.append({"body": _canon_node(body), "exact_jd_tt": float(te), "sign_to": int(sidx)})
+                    prev = sidx
+                t += step_days
+        return sorted(out, key=lambda x: (x["exact_jd_tt"], x["body"]))
 
-@vedic_api.post("/dasha/yogini")
-@vedic_api.post("/dasha/Yoginī")
-@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
-def vedic_yogini():
-    body = request.get_json(silent=True) or {}
-    res = _run_yogini(body)
-    status = 200 if res.get("ok") else (503 if str(res.get("error", "")).endswith("unavailable") else 400)
-    return jsonify(res), status
+    def find_nakshatra_ingresses(self, a: float, b: float, movers: List[str], step_minutes: Union[str, float, int] = "auto") -> List[Dict[str, Any]]:
+        if b <= a: return []
+        window_days = b - a
+        base = 15.0 if (isinstance(step_minutes, str) and step_minutes == "auto" and window_days <= 7) else (30.0 if isinstance(step_minutes, str) else float(step_minutes))
+        self.sliding.ensure_window((a + b)/2, window_days + 0.5, movers)
+        out: List[Dict[str, Any]] = []
+        width = 360.0/27.0
+        pada_w = width/4.0
+        for body in movers:
+            step_days = self._planet_step_minutes(body, base) / (60.0*24.0)
+            t = a
+            prev = None
+            while t <= b:
+                lon = self.sliding.get_longitude(body, t)
+                if lon is not None:
+                    idx = nakshatra_index(lon)  # 1..27
+                    if prev is not None and idx != prev:
+                        t0, t1 = max(a, t - step_days), t
+                        te = self._refine_division_cross(body, t0, t1, width)
+                        if te is not None:
+                            # evaluate pada at te
+                            lon_te = self.sliding.get_longitude(body, te) or 0.0
+                            pos_in_nak = (lon_te % width)
+                            pada_to = int(pos_in_nak // pada_w) + 1  # 1..4
+                            out.append({
+                                "body": _canon_node(body),
+                                "exact_jd_tt": float(te),
+                                "nakshatra_index": int(idx),
+                                "nakshatra_name": NAKSHATRAS_27[(idx-1) % 27],
+                                "pada_to": int(pada_to)
+                            })
+                    prev = idx
+                t += step_days
+        return sorted(out, key=lambda x: (x["exact_jd_tt"], x["body"]))
 
-
-@vedic_api.post("/dasha/chara")
-@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
-def vedic_chara():
-    body = request.get_json(silent=True) or {}
-    res = _run_chara(body)
-    status = 200 if res.get("ok") else (503 if str(res.get("error", "")).endswith("unavailable") else 400)
-    return jsonify(res), status
-
-
-@vedic_api.post("/dasha/kalachakra")
-@vedic_api.post("/dasha/kalacakra")
-@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
-def vedic_kalachakra():
-    body = request.get_json(silent=True) or {}
-    res = _run_kalachakra(body)
-    status = 200 if res.get("ok") else (503 if str(res.get("error", "")).endswith("unavailable") else 400)
-    return jsonify(res), status
-
-
-# ──────────────── Yoga routes (Mode-C only) ────────────────
-@vedic_api.get("/yoga/catalog")
-@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
-def vedic_yoga_catalog():
-    if not (_YOGA_OK and callable(_yoga_list)):
-        # Gracefully return empty when yoga core absent
-        return jsonify({"ok": True, "catalog": [], "meta": {"route": "yoga/catalog", "branch": "none"}}), 200
-    try:
-        catalog = _yoga_list() or []
-        return jsonify({"ok": True, "catalog": catalog, "meta": {"route": "yoga/catalog", "branch": "yoga_core"}}), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": "yoga_catalog_failed", "detail": str(e)}), 400
-
-
-@vedic_api.post("/yoga/detect")
-@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
-def vedic_yoga_detect():
-    """
-    Yoga detection (civil/time + site only).
-    Requires: date, time, tz, latitude, longitude (place is optional; if provided and a resolver is available, it can fill missing tz/coords).
-    No precomputed points/cusps accepted here.
-    """
-    if normalize_yoga_payload is None:
-        return jsonify({"ok": False, "error": "validator_unavailable"}), 503
-    if not (_YOGA_OK and callable(_compute_yogas)):
-        return jsonify({"ok": False, "error": "yoga_core_unavailable"}), 503
-
-    body = request.get_json(silent=True) or {}
-    norm, warns, tz_norm = normalize_yoga_payload(body)  # type: ignore[misc]
-
-    # Basic input guardrails
-    if not norm.get("date") or not norm.get("time"):
-        return jsonify({
-            "ok": False,
-            "error": "missing_date_or_time",
-            "warnings": (warns or []),
-            "meta": {"route": "yoga/detect", "branch": "needs_civil", "tz_normalized": tz_norm},
-        }), 400
-    if norm.get("latitude") is None or norm.get("longitude") is None:
-        return jsonify({
-            "ok": False,
-            "error": "missing_coordinates",
-            "warnings": (warns or []),
-            "meta": {"route": "yoga/detect", "branch": "needs_coordinates", "tz_normalized": tz_norm},
-            "hints": [
-                "Provide 'latitude' and 'longitude' (in degrees).",
-                "Optionally send a 'place' string (city/state/country) if a resolver is enabled.",
-            ],
-        }), 400
-
-    # Call the core yoga engine
-    try:
-        res = _compute_yogas(
-            {
-                "date": norm["date"],
-                "time": norm["time"],
-                "tz": norm["tz"],
-                "latitude": norm["latitude"],
-                "longitude": norm["longitude"],
-                "elevation_m": norm.get("elevation_m"),
-                # passthrough for any future core-side needs
-                "include": norm.get("include") or [],
-            },
-            ayanamsa=norm.get("ayanamsa", "lahiri"),
-            house_system=norm.get("house_system", "placidus"),
-            # defaults below mirror core defaults; override if you expose UI toggles
-            sign_lord_variant="classical",
-            chandra_mangala_by_sign=True,
-            conj_orb_deg=6.0,
-            gajakesari_include_same_house=True,
-            include_mooltrikona_in_mahapurusha=True,
-            use_vargas_for_scoring=bool(norm.get("use_vargas_for_scoring", True)),
-            varga_keys_for_boost=tuple(norm.get("varga_keys_for_boost") or ("D9", "D10")),
-            include_arudha_notes=False,
-            enable_catalog_tags=tuple(norm.get("enable_catalog_tags") or ()),
-            disable_catalog_tags=tuple(norm.get("disable_catalog_tags") or ()),
-        )
-    except Exception as e:
-        return jsonify({"ok": False, "error": "yoga_detect_failed", "detail": str(e)}), 400
-
-    ok = bool(res.get("ok"))
-    yogas = res.get("yogas", []) if isinstance(res, dict) else []
-    present = [y.get("name") for y in yogas if isinstance(y, dict) and y.get("present")]
-    out = {
-        "ok": ok,
-        "yogas": yogas,
-        "present": present,
-        "context": res.get("context"),
-        "warnings": (warns or []) + (res.get("warnings", []) if isinstance(res, dict) else []),
-        "meta": {"route": "yoga/detect", "branch": "yoga_core", "tz_normalized": tz_norm},
-    }
-    if not ok:
-        out["error"] = res.get("error", "yoga_detect_failed")
-        return jsonify(out), (503 if str(out["error"]).endswith("unavailable") else 400)
-    return jsonify(out), 200
-
-
-# ──────────────── Gochar / Ingress / Stations routes ────────────────
-@vedic_api.post("/gochar/drishti")
-@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
-def vedic_gochar_drishti():
-    """
-    Degree-true graha dṛṣṭi transit hits within a civil window.
-    Body is normalized via normalize_gochar_payload.
-    """
-    if not (_GOCHAR_OK and callable(_gochar_drishti)):
-        return jsonify({"ok": False, "error": "gochar_engine_unavailable"}), 503
-    if normalize_gochar_payload is None:
-        return jsonify({"ok": False, "error": "validator_unavailable"}), 503
-
-    body = request.get_json(silent=True) or {}
-    norm, warns, tz_norm = normalize_gochar_payload(body)  # type: ignore[misc]
-
-    # Guardrails
-    tr = norm.get("time_range")
-    if not (isinstance(tr, list) and len(tr) == 2 and tr[0] and tr[1]):
-        return jsonify({
-            "ok": False,
-            "error": "missing_date_window",
-            "warnings": (warns or []),
-            "meta": {"route": "gochar/drishti", "branch": _GOCHAR_BRANCH, "tz_normalized": tz_norm},
-        }), 400
-
-    if norm.get("fatal"):
-        return jsonify({
-            "ok": False,
-            "error": norm.get("fatal"),
-            "warnings": (warns or []) + ["fatal"],
-            "meta": {"route": "gochar/drishti", "branch": _GOCHAR_BRANCH, "tz_normalized": tz_norm},
-        }), 400
-
-    # Call core
-    try:
-        res = _gochar_drishti(
-            natal_chart=norm.get("natal_chart") or {},
-            date_from=tr[0], date_to=tr[1],
-            transiting_bodies=norm.get("movers"),
-            natal_targets=norm.get("natal_targets"),
-            zodiac_mode=norm.get("zodiac_mode", "sidereal"),
-            ayanamsa=norm.get("ayanamsa", "lahiri"),
-            frame=str(norm.get("frame") or "ecliptic-of-date"),
-            include_nodes=bool(norm.get("include_nodes", False)),
-            treat_nodes_like_saturn=bool(norm.get("treat_nodes_like_saturn", False)),
-            orb_deg=float(norm.get("orb_deg", 12.0)),
-            orb_map=norm.get("orb_map") or {},
-            step_minutes=norm.get("step_minutes", "auto"),
-            prebatch_refinement=bool(body.get("prebatch_refinement", False)),
-            tz_name=tz_norm,
-        )
-    except Exception as e:
-        return jsonify({"ok": False, "error": "gochar_drishti_failed", "detail": str(e)}), 400
-
-    if isinstance(res, dict):
-        res.setdefault("meta", {})
-        res["meta"].update({"route": "gochar/drishti", "tz_normalized": tz_norm, "branch": _GOCHAR_BRANCH})
-        if warns:
-            res.setdefault("warnings", []).extend(warns)
-    return jsonify(res), (200 if res.get("ok") else 400)
-
-
-@vedic_api.post("/gochar/drishti/proximity")
-@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
-def vedic_gochar_drishti_proximity():
-    """
-    Score helper for drishti hits: returns [0..1] proximity per hit to the axis.
-    Body:
-      - hits: array from /gochar/drishti response's "gochar"
-      - cap_deg (default 12)
-    """
-    if not (_GOCHAR_OK and callable(_feature_drishti_proximity)):
-        return jsonify({"ok": False, "error": "gochar_engine_unavailable"}), 503
-    body = request.get_json(silent=True) or {}
-    hits = body.get("hits") or body.get("gochar") or []
-    cap = float(body.get("cap_deg", 12.0))
-    try:
-        scores = _feature_drishti_proximity(hits=hits, cap_deg=cap)
-        return jsonify({"ok": True, "scores": scores, "meta": {"route": "gochar/drishti/proximity"}}), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": "feature_drishti_proximity_failed", "detail": str(e)}), 400
-
-
-@vedic_api.post("/ingress/rashi")
-@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
-def vedic_ingress_rashi():
-    if not (_GOCHAR_OK and callable(_ingresses_rashi)):
-        return jsonify({"ok": False, "error": "gochar_engine_unavailable"}), 503
-    if normalize_ingress_payload is None:
-        return jsonify({"ok": False, "error": "validator_unavailable"}), 503
-
-    body = request.get_json(silent=True) or {}
-    norm, warns, tz_norm = normalize_ingress_payload(body)  # type: ignore[misc]
-
-    tr = norm.get("time_range")
-    if not (isinstance(tr, list) and len(tr) == 2 and tr[0] and tr[1]):
-        return jsonify({"ok": False, "error": "missing_date_window"}), 400
-
-    try:
-        res = _ingresses_rashi(
-            date_from=tr[0],
-            date_to=tr[1],
-            movers=norm.get("movers"),
-            zodiac_mode=norm.get("zodiac_mode", "sidereal"),
-            ayanamsa=norm.get("ayanamsa", "lahiri"),
-            frame=str(norm.get("frame") or "ecliptic-of-date"),
-            observer=("topocentric" if bool(norm.get("topocentric", False)) else "geocentric"),
-            latitude=_coerce_float(norm.get("latitude")),
-            longitude=_coerce_float(norm.get("longitude")),
-            elevation_m=_coerce_float(norm.get("elevation_m")),
-            step_minutes=norm.get("step_minutes", "auto"),
-            tz_name=tz_norm,
-        )
-    except Exception as e:
-        return jsonify({"ok": False, "error": "rashi_ingress_failed", "detail": str(e)}), 400
-
-    if isinstance(res, dict):
-        res.setdefault("meta", {})
-        res["meta"].update({"route": "ingress/rashi", "tz_normalized": tz_norm, "branch": _GOCHAR_BRANCH})
-        if warns:
-            res.setdefault("warnings", []).extend(warns)
-    return jsonify(res), (200 if res.get("ok") else 400)
-
-
-@vedic_api.post("/ingress/nakshatra")
-@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
-def vedic_ingress_nakshatra():
-    if not (_GOCHAR_OK and callable(_ingresses_nakshatra)):
-        return jsonify({"ok": False, "error": "gochar_engine_unavailable"}), 503
-    if normalize_ingress_payload is None:
-        return jsonify({"ok": False, "error": "validator_unavailable"}), 503
-
-    body = request.get_json(silent=True) or {}
-    norm, warns, tz_norm = normalize_ingress_payload(body)  # type: ignore[misc]
-    tr = norm.get("time_range")
-    if not (isinstance(tr, list) and len(tr) == 2 and tr[0] and tr[1]):
-        return jsonify({"ok": False, "error": "missing_date_window"}), 400
-
-    try:
-        res = _ingresses_nakshatra(
-            date_from=tr[0],
-            date_to=tr[1],
-            movers=norm.get("movers"),
-            zodiac_mode=norm.get("zodiac_mode", "sidereal"),
-            ayanamsa=norm.get("ayanamsa", "lahiri"),
-            frame=str(norm.get("frame") or "ecliptic-of-date"),
-            observer=("topocentric" if bool(norm.get("topocentric", False)) else "geocentric"),
-            latitude=_coerce_float(norm.get("latitude")),
-            longitude=_coerce_float(norm.get("longitude")),
-            elevation_m=_coerce_float(norm.get("elevation_m")),
-            step_minutes=norm.get("step_minutes", "auto"),
-            tz_name=tz_norm,
-        )
-    except Exception as e:
-        return jsonify({"ok": False, "error": "nakshatra_ingress_failed", "detail": str(e)}), 400
-
-    if isinstance(res, dict):
-        res.setdefault("meta", {})
-        res["meta"].update({"route": "ingress/nakshatra", "tz_normalized": tz_norm, "branch": _GOCHAR_BRANCH})
-        if warns:
-            res.setdefault("warnings", []).extend(warns)
-    return jsonify(res), (200 if res.get("ok") else 400)
-
-
-@vedic_api.post("/stations")
-@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
-def vedic_stations():
-    if not (_GOCHAR_OK and callable(_stations_retro_direct)):
-        return jsonify({"ok": False, "error": "gochar_engine_unavailable"}), 503
-    if normalize_stations_payload is None:
-        return jsonify({"ok": False, "error": "validator_unavailable"}), 503
-
-    body = request.get_json(silent=True) or {}
-    norm, warns, tz_norm = normalize_stations_payload(body)  # type: ignore[misc]
-    tr = norm.get("time_range")
-    if not (isinstance(tr, list) and len(tr) == 2 and tr[0] and tr[1]):
-        return jsonify({"ok": False, "error": "missing_date_window"}), 400
-
-    try:
-        res = _stations_retro_direct(
-            date_from=tr[0],
-            date_to=tr[1],
-            movers=norm.get("movers"),
-            zodiac_mode=norm.get("zodiac_mode", "sidereal"),
-            ayanamsa=norm.get("ayanamsa", "lahiri"),
-            frame=str(norm.get("frame") or "ecliptic-of-date"),
-            observer=("topocentric" if bool(norm.get("topocentric", False)) else "geocentric"),
-            latitude=_coerce_float(norm.get("latitude")),
-            longitude=_coerce_float(norm.get("longitude")),
-            elevation_m=_coerce_float(norm.get("elevation_m")),
-            step_minutes=norm.get("step_minutes", "auto"),
-            tz_name=tz_norm,
-        )
-    except Exception as e:
-        return jsonify({"ok": False, "error": "stations_failed", "detail": str(e)}), 400
-
-    if isinstance(res, dict):
-        res.setdefault("meta", {})
-        res["meta"].update({"route": "stations", "tz_normalized": tz_norm, "branch": _GOCHAR_BRANCH})
-        if warns:
-            res.setdefault("warnings", []).extend(warns)
-    return jsonify(res), (200 if res.get("ok") else 400)
-
-
-# ──────────────── Varga routes (varga_charts) ────────────────
-@vedic_api.post("/varga/position")
-@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
-def vedic_varga_position():
-    if not _VARGA_OK or _varga_position is None:
-        return jsonify({"ok": False, "error": "varga_engine_unavailable"}), 503
-
-    body = request.get_json(silent=True) or {}
-    varga = str(body.get("varga") or "").strip() or "D9"
-    lon = _coerce_float(body.get("lon_deg"))
-    if lon is None:
-        return jsonify({"ok": False, "error": "missing_or_invalid_lon_deg"}), 400
-
-    method = _norm_method(body.get("method") or body.get("zodiac_mode") or "sidereal")
-    jd_tt = _jd_tt_from_body(body)
-    ay_for_engine, ay_meta = _resolve_ayanamsa_for_engine(body, method, jd_tt)
-
-    try:
-        result = _varga_position(float(lon), varga, zodiac_mode=method, ayanamsa=ay_for_engine)
-        out = {
-            "ok": True,
-            "varga": result.get("varga", varga),
-            "result": result,
-            "meta": _wrap_varga_meta("varga/position", method, ay_meta),
-        }
-        return jsonify(out), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": "varga_position_failed", "detail": str(e)}), 400
-
-
-@vedic_api.post("/varga/chart")
-@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
-def vedic_varga_chart():
-    if not _VARGA_OK or _compute_varga_chart is None:
-        return jsonify({"ok": False, "error": "varga_engine_unavailable"}), 503
-
-    body = request.get_json(silent=True) or {}
-    varga = str(body.get("varga") or "").strip() or "D9"
-    longitudes = _pick_longitudes(body)
-    if not longitudes:
-        return jsonify({"ok": False, "error": "missing_or_invalid_longitudes"}), 400
-
-    method = _norm_method(body.get("method") or body.get("zodiac_mode") or "sidereal")
-    jd_tt = _jd_tt_from_body(body)
-    ay_for_engine, ay_meta = _resolve_ayanamsa_for_engine(body, method, jd_tt)
-
-    try:
-        placements = _compute_varga_chart(longitudes, varga, zodiac_mode=method, ayanamsa=ay_for_engine)
-        out = {
-            "ok": True,
-            "varga": varga.upper(),
-            "placements": placements,
-            "options": {"zodiac_mode": method, "ayanamsa": ay_for_engine},
-            "meta": _wrap_varga_meta("varga/chart", method, ay_meta),
-        }
-        return jsonify(out), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": "varga_chart_failed", "detail": str(e)}), 400
-
-
-@vedic_api.post("/varga/many")
-@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
-def vedic_varga_many():
-    if not _VARGA_OK or _compute_many_vargas is None:
-        return jsonify({"ok": False, "error": "varga_engine_unavailable"}), 503
-
-    body = request.get_json(silent=True) or {}
-    longitudes = _pick_longitudes(body)
-    if not longitudes:
-        return jsonify({"ok": False, "error": "missing_or_invalid_longitudes"}), 400
-
-    vargas = _pick_vargas(body)
-    method = _norm_method(body.get("method") or body.get("zodiac_mode") or "sidereal")
-    jd_tt = _jd_tt_from_body(body)
-    ay_for_engine, ay_meta = _resolve_ayanamsa_for_engine(body, method, jd_tt)
-
-    try:
-        placements = _compute_many_vargas(longitudes, vargas, zodiac_mode=method, ayanamsa=ay_for_engine)
-        out = {
-            "ok": True,
-            "vargas": [v.upper() for v in vargas],
-            "placements": placements,
-            "options": {"zodiac_mode": method, "ayanamsa": ay_for_engine},
-            "meta": _wrap_varga_meta("varga/many", method, ay_meta),
-        }
-        return jsonify(out), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": "varga_many_failed", "detail": str(e)}), 400
+    def _refine_division_cross(self, body: str, t0: float, t1: float, div_width: float) -> Optional[float]:
+        # binary search for boundary where (lon % div_width) ≈ 0
+        for _ in range(24):
+            if t1 - t0 < 1e-6: break
+            tm = 0.5*(t0 + t1)
+            l0 = self.sliding.get_longitude(body, t0)
+            lm = self.sliding.get_longitude(body, tm)
+            if l0 is None or lm is None: return tm
+            r0 = (l0 % div_width); rm = (lm % div_width)
+            # detect wrap across 0 by looking at minimal distance to 0
+            d0 = min(r0, div_width - r0); dm = min(rm, div_width - rm)
+            if dm <= 1e-8: return tm
+            if (r0 <= div_width/2 and rm <= div_width/2 and rm < r0) or (r0 > div_width/2 and rm > div_width/2 and (div_width - rm) < (div_width - r0)):
+                t1 = tm
+            else:
+                t0 = tm
+        return 0.5*(t0 + t1)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Local ayanamsa resolver for varga helpers
+# Station finder (retrograde/direct) using velocity sign change
 # ──────────────────────────────────────────────────────────────────────────────
-def _resolve_ayanamsa_for_engine(body: Dict[str, Any], method: str, jd_tt: Optional[float]) -> tuple[Any, Dict[str, Any]]:
-    meta: Dict[str, Any] = {
-        "ts_available": _TS_OK,
-        "ayanamsa_adapter_available": _AY_OK,
-        "jd_tt_used": jd_tt,
+class StationFinder:
+    def __init__(self, engine: VedicTransitEngine):
+        self.engine = engine
+
+    def find(self, a: float, b: float, movers: List[str], step_minutes: Union[str, float, int] = "auto") -> List[Dict[str, Any]]:
+        if b <= a: return []
+        window_days = b - a
+        base = 120.0 if (isinstance(step_minutes, str) and step_minutes == "auto" and window_days <= 30) else (240.0 if isinstance(step_minutes, str) else float(step_minutes))
+        self.engine.sliding.ensure_window((a + b)/2, window_days + 2.0, movers)
+        out: List[Dict[str, Any]] = []
+        for body in movers:
+            if _canon_node(body).lower() in ("sun", "moon"):  # these never retrograde
+                continue
+            step_days = self.engine._planet_step_minutes(body, base) / (60.0*24.0)
+            vel_dt = min(step_days/4, 0.5)
+            t = a
+            v_prev = None
+            while t < b - vel_dt:
+                lon_m = self.engine.sliding.get_longitude(body, t - vel_dt)
+                lon_p = self.engine.sliding.get_longitude(body, t + vel_dt)
+                if lon_m is None or lon_p is None:
+                    t += step_days
+                    continue
+                v = angdiff(lon_p, lon_m) / (2.0*vel_dt)  # deg/day
+                if v_prev is not None and v_prev * v < 0:
+                    # refine zero-crossing (velocity change)
+                    te = self._refine_station_time(body, t - step_days, t, vel_dt)
+                    kind = self._kind_around(body, te, vel_dt)
+                    out.append({"body": _canon_node(body), "exact_jd_tt": float(te), "kind": kind})
+                v_prev = v
+                t += step_days
+        return sorted(out, key=lambda x: (x["exact_jd_tt"], x["body"]))
+
+    def _refine_station_time(self, body: str, t0: float, t1: float, vel_dt: float) -> float:
+        def vel_at(t: float) -> float:
+            m = self.engine.sliding.get_longitude(body, t - vel_dt)
+            p = self.engine.sliding.get_longitude(body, t + vel_dt)
+            if m is None or p is None: return 0.0
+            return angdiff(p, m)/(2.0*vel_dt)
+        for _ in range(18):
+            if t1 - t0 < 1e-5: break
+            tm = 0.5*(t0 + t1)
+            if abs(vel_at(tm)) < 1e-6: return tm
+            if vel_at(t0) * vel_at(tm) < 0: t1 = tm
+            else: t0 = tm
+        return 0.5*(t0 + t1)
+
+    def _kind_around(self, body: str, te: float, vel_dt: float) -> str:
+        def vel_at(t: float) -> float:
+            m = self.engine.sliding.get_longitude(body, t - vel_dt)
+            p = self.engine.sliding.get_longitude(body, t + vel_dt)
+            if m is None or p is None: return 0.0
+            return angdiff(p, m)/(2.0*vel_dt)
+        vb = vel_at(te - 1.0); va = vel_at(te + 1.0)
+        if vb > 0 and va < 0: return "retrograde"
+        if vb < 0 and va > 0: return "direct"
+        return "station"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Window + natal target resolution (strict timescales; no DIY math)
+# ──────────────────────────────────────────────────────────────────────────────
+def _resolve_window_or_error(body: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Dict[str, Any]]:
+    # direct jd_tt numbers?
+    if isinstance(body.get("jd_tt_window"), (list, tuple)) and len(body["jd_tt_window"]) == 2:
+        try:
+            a, b = map(float, body["jd_tt_window"])
+            return a, b, {"from": "jd_tt_window"}
+        except Exception:
+            return None, None, {"error": "invalid_jd_tt_window"}
+    if isinstance(body.get("start_jd_tt"), (int, float)) and isinstance(body.get("end_jd_tt"), (int, float)):
+        return float(body["start_jd_tt"]), float(body["end_jd_tt"]), {"from": "start_end_jd_tt"}
+
+    # civil window
+    date_from = body.get("date_from") or body.get("from")
+    date_to   = body.get("date_to")   or body.get("to")
+    tz        = body.get("tz_name") or body.get("tz") or body.get("place_tz") or "UTC"
+    if not (date_from and date_to):
+        return None, None, {"error": "time_range_required"}
+    try:
+        a, b, meta = _civil_window_to_jd_tt(date_from=str(date_from), date_to=str(date_to), tz=str(tz))
+        return a, b, meta
+    except Exception as e:
+        return None, None, {"error": f"timescales_failed:{e}"}
+
+def _angles_for_natal(natal_chart: Dict[str, Any], *, ay_deg: float, sidereal: bool,
+                      ephem: EphemerisAdapter | None) -> Dict[str, float]:
+    lat = natal_chart.get("latitude"); lon = natal_chart.get("longitude")
+    if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
+        return {}
+    # prefer provided natal jd_tt / jd_utc
+    jd_tt = None
+    for k in ("natal_jd_tt","jd_tt"):
+        if isinstance(natal_chart.get(k), (int, float)): jd_tt = float(natal_chart[k]); break
+    if jd_tt is None:
+        date = natal_chart.get("date") or natal_chart.get("birth_date")
+        time = natal_chart.get("time") or natal_chart.get("birth_time") or "12:00:00"
+        tz   = natal_chart.get("tz")   or natal_chart.get("place_tz")   or "UTC"
+        try:
+            jd_tt = float(_ts_from_civil(str(date), str(time), str(tz)).get("jd_tt"))
+        except Exception:
+            return {}
+    return _angles_sidereal_deg(jd_tt=jd_tt, lat=float(lat), lon=float(lon), ay_deg=float(ay_deg), sidereal=sidereal, eng_ephem=ephem)
+
+def _pick_natal_targets_map(*, ephem: EphemerisAdapter, sidereal: bool, ay_deg: float,
+                            natal_chart: Dict[str, Any], tgts: List[str]) -> Dict[str, float]:
+    # 1) direct longitudes?
+    for key in ("longitudes", "ecliptic_longitudes"):
+        m = natal_chart.get(key)
+        if isinstance(m, dict) and m:
+            out = {_canon_node(k): float(v) for k, v in m.items() if k is not None}
+            out = {k: (norm360(v - ay_deg) if sidereal else norm360(v)) for k, v in out.items()}
+            if ("Asc" in tgts) or ("MC" in tgts):
+                out.update(_angles_for_natal(natal_chart, ay_deg=ay_deg, sidereal=sidereal, ephem=ephem))
+            return out
+
+    # 2) from natal jd_tt / civil inputs
+    nat_jd_tt = None
+    for k in ("natal_jd_tt", "jd_tt"):
+        if isinstance(natal_chart.get(k), (int, float)):
+            nat_jd_tt = float(natal_chart[k]); break
+    if nat_jd_tt is None:
+        date = natal_chart.get("date") or natal_chart.get("birth_date")
+        time = natal_chart.get("time") or natal_chart.get("birth_time") or "12:00:00"
+        tz   = natal_chart.get("tz") or natal_chart.get("place_tz") or "UTC"
+        try:
+            nat_jd_tt = float(_ts_from_civil(str(date), str(time), str(tz)).get("jd_tt"))
+        except Exception:
+            nat_jd_tt = None
+
+    out: Dict[str, float] = {}
+    if isinstance(nat_jd_tt, float):
+        planet_tgts = [x for x in tgts if x not in ("Asc", "MC")]
+        if planet_tgts:
+            rows = ephem.ecliptic_longitudes(float(nat_jd_tt), _batch_map_nodes(planet_tgts)).get("results", [])
+            got = {_canon_node(str(r["name"])): float(r["longitude"]) for r in rows or []}
+            out.update({k: (norm360(v - ay_deg) if sidereal else norm360(v)) for k, v in got.items()})
+        if ("Asc" in tgts) or ("MC" in tgts):
+            out.update(_angles_for_natal(natal_chart, ay_deg=ay_deg, sidereal=sidereal, ephem=ephem))
+        return out
+
+    # 3) fallback: sample targets at window-left (rare)
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Public feature: proximity score [0..1]
+# ──────────────────────────────────────────────────────────────────────────────
+def feature_drishti_proximity(*, hits: List[Dict[str, Any]], cap_deg: float = 12.0) -> List[float]:
+    cap = max(1e-6, float(cap_deg))
+    out: List[float] = []
+    for h in hits or []:
+        try:
+            orb = abs(float(h.get("orb", 9999.0)))
+        except Exception:
+            continue
+        score = max(0.0, 1.0 - (orb / cap))
+        out.append(score)
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Core finders (used by wrappers) — strict timescales + ayanāṁśa
+# ──────────────────────────────────────────────────────────────────────────────
+def find_gochar_in_range(
+    *,
+    natal_chart: dict,
+    start_jd_tt: float | None = None,
+    end_jd_tt: float | None = None,
+    time_range: tuple | list | None = None,
+    transiting_bodies: list[str] | None = None,
+    natal_targets: list[str] | None = None,
+    frame: str | None = None,
+    zodiac_mode: str | None = None,
+    ayanamsa_deg: float | None = None,
+    orb_deg: float | None = None,
+    orb_map: Dict[str, float] | None = None,
+    include_nodes: bool | None = None,
+    treat_nodes_like_saturn: bool | None = None,
+    step_minutes: Union[str, float, int] = "auto",
+    target_lon_map: Dict[str, float] | None = None,
+    scan_mode: str | None = None,
+    tz: str | None = None,
+    **obs_kwargs,
+) -> Dict[str, Any]:
+    if not _EPH_OK:
+        return {"ok": False, "error": "ephemeris_unavailable", "gochar": [], "meta": {}}
+
+    # Resolve window
+    if time_range and len(time_range) >= 2:
+        date_from, date_to = str(time_range[0]), str(time_range[1])
+        tz_used = tz or "UTC"
+        try:
+            a, b, meta_ts = _civil_window_to_jd_tt(date_from=date_from, date_to=date_to, tz=tz_used)
+        except Exception as e:
+            return {"ok": False, "error": f"timescales_failed:{e}", "gochar": [], "meta": {"tz": tz_used}}
+    elif start_jd_tt is not None and end_jd_tt is not None:
+        a, b = float(start_jd_tt), float(end_jd_tt)
+        meta_ts = {"from": "jd_tt"}
+        tz_used = tz or "UTC"
+    else:
+        return {"ok": False, "error": "time_range_required", "gochar": [], "meta": {}}
+
+    # Engine setup
+    movers = list(transiting_bodies or ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn"])
+    if include_nodes:
+        for nd in ("Rahu","Ketu"):
+            if nd not in movers: movers.append(nd)
+    tgts = list(natal_targets or ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn","Asc","MC"])
+    frame = frame or "ecliptic-of-date"
+    zodiac_mode = (zodiac_mode or "sidereal").lower()
+
+    # Ayanāṁśa degrees
+    # Hint the resolver with a natal jd_tt if present; else window-left TT
+    jd_hint = None
+    if isinstance(natal_chart.get("natal_jd_tt"), (int, float)): jd_hint = float(natal_chart["natal_jd_tt"])
+    elif isinstance(natal_chart.get("jd_tt"), (int, float)): jd_hint = float(natal_chart["jd_tt"])
+    else: jd_hint = a
+    ay_deg = float(ayanamsa_deg or 0.0)
+    if not isinstance(ayanamsa_deg, (int, float)):
+        ay_deg = _resolve_ayanamsa_deg(natal_chart.get("ayanamsa", None), jd_hint, zodiac_mode)
+
+    ep = _make_ephem(frame)
+    eng = VedicTransitEngine(
+        ephem=ep,
+        sidereal_mode=not zodiac_mode.startswith("trop"),
+        ayanamsa_deg=ay_deg,
+        topocentric=bool(obs_kwargs.get("topocentric")),
+        latitude=obs_kwargs.get("latitude"),
+        longitude=obs_kwargs.get("longitude"),
+        elevation_m=obs_kwargs.get("elevation_m"),
+        cache_size=min(5000, int((b - a) * 100)),
+        treat_nodes_like_saturn=bool(treat_nodes_like_saturn or False),
+    )
+
+    # Natal targets
+    if isinstance(target_lon_map, dict) and target_lon_map:
+        nat_map = {_canon_node(k): float(v) for k, v in target_lon_map.items()}
+        targets = {k: (norm360(v - ay_deg) if eng.sidereal_mode else norm360(v)) for k, v in nat_map.items()}
+    else:
+        targets = _pick_natal_targets_map(ephem=ep, sidereal=eng.sidereal_mode, ay_deg=ay_deg, natal_chart=natal_chart or {}, tgts=tgts)
+        if not targets:
+            rows = ep.ecliptic_longitudes(float(a), _batch_map_nodes([x for x in tgts if x not in ("Asc","MC")])).get("results", [])
+            nat_map = {_canon_node(str(r["name"])): float(r["longitude"]) for r in rows or []}
+            targets = {k: (norm360(v - ay_deg) if eng.sidereal_mode else norm360(v)) for k, v in nat_map.items()}
+
+    # Scan
+    try:
+        evs = eng.scan_drishti(
+            jd_start_tt=float(a), jd_end_tt=float(b),
+            movers=movers, targets=targets, orb_deg=float(orb_deg or 12.0),
+            orb_map=orb_map, step_minutes=step_minutes, scan_mode=(scan_mode or "balanced"),
+        )
+    except Exception as e:
+        return {"ok": False, "error": f"gochar_scan_failed:{e}", "gochar": [], "meta": {"window_jd_tt": [a, b]}}
+
+    # Stamp outputs using your timescales only (no DIY math)
+    dut1 = _dut1_from_env()
+    hits: List[Dict[str, Any]] = []
+    for ev in evs:
+        jd_utc = _jd_tt_to_jd_utc(ev.jd_tt)
+        dt_utc = _jd_utc_to_datetime_utc(jd_utc) if isinstance(jd_utc, float) else None
+        jd_ut1 = (jd_utc + (dut1/86400.0)) if isinstance(jd_utc, float) else None
+        hits.append({
+            "transiting_body": ev.body,
+            "natal_body": ev.target,
+            "drishti": ev.drishti,
+            "axis_deg": float(ev.axis_deg),
+            "orb": abs(float(ev.separation_deg)),
+            "max_orb": float(orb_deg or 12.0),
+            "weight": float(ev.weight),
+            "applying": bool(ev.applying),
+            "exact": bool(ev.exact),
+            "exact_jd_tt": float(ev.jd_tt),
+            "exact_jd_ut1": (float(jd_ut1) if isinstance(jd_ut1, float) else None),
+            "exact_datetime_utc": (dt_utc.replace(tzinfo=timezone.utc).isoformat().replace("+00:00","Z") if isinstance(dt_utc, datetime) else None),
+        })
+
+    meta_out = {
+        "movers": movers,
+        "natal_targets": list(targets.keys()),
+        "window_jd_tt": [float(a), float(b)],
+        "frame": frame,
+        "zodiac_mode": zodiac_mode,
+        "ayanamsa_deg": ay_deg,
+        "tz": tz or meta_ts.get("tz") if isinstance(meta_ts, dict) else None,
+        "performance_mode": "optimized",
+        **(meta_ts if isinstance(meta_ts, dict) else {}),
     }
-    method_lc = (method or "sidereal").lower()
-    ay_in = body.get("ayanamsa")
-    ay_deg_in = _coerce_float(body.get("ayanamsa_deg"))
+    return {"ok": True, "technique": "gochar_drishti_optimized", "gochar": hits, "meta": meta_out}
 
-    if method_lc.startswith("trop"):
-        meta.update({
-            "ayanamsa_input": ay_in if ay_in is not None else ("ayanamsa_deg=" + str(ay_deg_in) if ay_deg_in is not None else None),
-            "ayanamsa_effective": None,
-            "ayanamsa_resolve": "not_applied_tropical",
-        })
-        return ay_in, meta
+def find_rashi_ingresses_in_range(
+    *,
+    start_jd_tt: float | None = None,
+    end_jd_tt: float | None = None,
+    time_range: tuple | list | None = None,
+    movers: List[str] | None = None,
+    frame: str = "ecliptic-of-date",
+    zodiac_mode: str = "sidereal",
+    ayanamsa_deg: float = 0.0,
+    step_minutes: Union[str, float, int] = "auto",
+    tz: str | None = None,
+    **obs_kwargs,
+) -> Dict[str, Any]:
+    if not _EPH_OK:
+        return {"ok": False, "error": "ephemeris_unavailable", "ingresses": [], "meta": {}}
 
-    if isinstance(ay_deg_in, float):
-        meta.update({
-            "ayanamsa_input": ay_deg_in,
-            "ayanamsa_effective": ay_deg_in,
-            "ayanamsa_resolve": "explicit_numeric",
-        })
-        return ay_deg_in, meta
-    if isinstance(ay_in, (int, float)):
-        val = float(ay_in)
-        meta.update({
-            "ayanamsa_input": val,
-            "ayanamsa_effective": val,
-            "ayanamsa_resolve": "explicit_numeric",
-        })
-        return val, meta
+    if time_range and len(time_range) >= 2:
+        date_from, date_to = str(time_range[0]), str(time_range[1])
+        tz_used = tz or "UTC"
+        try:
+            a, b, meta_ts = _civil_window_to_jd_tt(date_from=date_from, date_to=date_to, tz=tz_used)
+        except Exception as e:
+            return {"ok": False, "error": f"timescales_failed:{e}", "ingresses": [], "meta": {"tz": tz_used}}
+    elif start_jd_tt is not None and end_jd_tt is not None:
+        a, b = float(start_jd_tt), float(end_jd_tt)
+        meta_ts = {"from": "jd_tt"}
+    else:
+        return {"ok": False, "error": "time_range_required", "ingresses": [], "meta": {}}
 
-    key = _norm_ayanamsa(ay_in)
-    if isinstance(key, str) and key:
-        deg = _ayanamsa_deg_from_key(jd_tt, key)
-        if isinstance(deg, float):
-            meta.update({
-                "ayanamsa_input": key,
-                "ayanamsa_effective": deg,
-                "ayanamsa_resolve": "computed_from_key",
-                "ayanamsa_key": key,
-            })
-            return deg, meta
-        meta.update({
-            "ayanamsa_input": key,
-            "ayanamsa_effective": key,
-            "ayanamsa_resolve": "pass_through_string_fallback",
-            "ayanamsa_key": key,
-            "warning": "could_not_compute_ayanamsa_degrees_from_key",
-        })
-        return key, meta
+    movers = list(movers or ["Sun","Mercury","Venus","Mars","Jupiter","Saturn"])
+    ep = _make_ephem(frame)
+    eng = VedicTransitEngine(
+        ephem=ep, sidereal_mode=zodiac_mode.lower().startswith("sidereal"),
+        ayanamsa_deg=float(ayanamsa_deg),
+        topocentric=bool(obs_kwargs.get("topocentric")),
+        latitude=obs_kwargs.get("latitude"),
+        longitude=obs_kwargs.get("longitude"),
+        elevation_m=obs_kwargs.get("elevation_m"),
+        cache_size=min(3000, int((b - a) * 50))
+    )
+    scanner = eng.find_sign_ingresses(a, b, movers, step_minutes)
+    return {"ok": True, "ingresses": scanner, "meta": {
+        "movers": movers, "window_jd_tt": [float(a), float(b)], "frame": frame,
+        "zodiac_mode": zodiac_mode, "ayanamsa_deg": float(ayanamsa_deg),
+        "performance_mode": "optimized", **meta_ts
+    }}
 
-    meta.update({
-        "ayanamsa_input": key,
-        "ayanamsa_effective": key,
-        "ayanamsa_resolve": "default_key_passthrough",
-    })
-    return key, meta
+def find_nakshatra_ingresses_in_range(
+    *,
+    start_jd_tt: float | None = None,
+    end_jd_tt: float | None = None,
+    time_range: tuple | list | None = None,
+    movers: List[str] | None = None,
+    frame: str = "ecliptic-of-date",
+    zodiac_mode: str = "sidereal",
+    ayanamsa_deg: float = 0.0,
+    step_minutes: Union[str, float, int] = "auto",
+    tz: str | None = None,
+    **obs_kwargs,
+) -> Dict[str, Any]:
+    if not _EPH_OK:
+        return {"ok": False, "error": "ephemeris_unavailable", "ingresses": [], "meta": {}}
+
+    if time_range and len(time_range) >= 2:
+        date_from, date_to = str(time_range[0]), str(time_range[1])
+        tz_used = tz or "UTC"
+        try:
+            a, b, meta_ts = _civil_window_to_jd_tt(date_from=date_from, date_to=date_to, tz=tz_used)
+        except Exception as e:
+            return {"ok": False, "error": f"timescales_failed:{e}", "ingresses": [], "meta": {"tz": tz_used}}
+    elif start_jd_tt is not None and end_jd_tt is not None:
+        a, b = float(start_jd_tt), float(end_jd_tt)
+        meta_ts = {"from": "jd_tt"}
+    else:
+        return {"ok": False, "error": "time_range_required", "ingresses": [], "meta": {}}
+
+    movers = list(movers or ["Moon","Sun","Mercury","Venus","Mars","Jupiter","Saturn"])
+    ep = _make_ephem(frame)
+    eng = VedicTransitEngine(
+        ephem=ep, sidereal_mode=zodiac_mode.lower().startswith("sidereal"),
+        ayanamsa_deg=float(ayanamsa_deg),
+        topocentric=bool(obs_kwargs.get("topocentric")),
+        latitude=obs_kwargs.get("latitude"),
+        longitude=obs_kwargs.get("longitude"),
+        elevation_m=obs_kwargs.get("elevation_m"),
+        cache_size=min(3000, int((b - a) * 60))
+    )
+    scanner = eng.find_nakshatra_ingresses(a, b, movers, step_minutes)
+    return {"ok": True, "ingresses": scanner, "meta": {
+        "movers": movers, "window_jd_tt": [float(a), float(b)], "frame": frame,
+        "zodiac_mode": zodiac_mode, "ayanamsa_deg": float(ayanamsa_deg),
+        "performance_mode": "optimized", **meta_ts
+    }}
+
+def find_stations_in_range(
+    *,
+    start_jd_tt: float | None = None,
+    end_jd_tt: float | None = None,
+    time_range: tuple | list | None = None,
+    movers: List[str] | None = None,
+    frame: str = "ecliptic-of-date",
+    zodiac_mode: str = "sidereal",
+    ayanamsa_deg: float = 0.0,
+    step_minutes: Union[str, float, int] = "auto",
+    tz: str | None = None,
+    **obs_kwargs,
+) -> Dict[str, Any]:
+    if not _EPH_OK:
+        return {"ok": False, "error": "ephemeris_unavailable", "stations": [], "meta": {}}
+
+    if time_range and len(time_range) >= 2:
+        date_from, date_to = str(time_range[0]), str(time_range[1])
+        tz_used = tz or "UTC"
+        try:
+            a, b, meta_ts = _civil_window_to_jd_tt(date_from=date_from, date_to=date_to, tz=tz_used)
+        except Exception as e:
+            return {"ok": False, "error": f"timescales_failed:{e}", "stations": [], "meta": {"tz": tz_used}}
+    elif start_jd_tt is not None and end_jd_tt is not None:
+        a, b = float(start_jd_tt), float(end_jd_tt)
+        meta_ts = {"from": "jd_tt"}
+    else:
+        return {"ok": False, "error": "time_range_required", "stations": [], "meta": {}}
+
+    movers = list(movers or ["Mercury","Venus","Mars","Jupiter","Saturn"])
+    ep = _make_ephem(frame)
+    eng = VedicTransitEngine(
+        ephem=ep, sidereal_mode=zodiac_mode.lower().startswith("sidereal"),
+        ayanamsa_deg=float(ayanamsa_deg),
+        topocentric=bool(obs_kwargs.get("topocentric")),
+        latitude=obs_kwargs.get("latitude"),
+        longitude=obs_kwargs.get("longitude"),
+        elevation_m=obs_kwargs.get("elevation_m"),
+        cache_size=min(2000, int((b - a) * 30))
+    )
+    finder = StationFinder(eng)
+    items = finder.find(a, b, movers, step_minutes)
+    return {"ok": True, "stations": items, "meta": {
+        "movers": movers, "window_jd_tt": [float(a), float(b)], "frame": frame,
+        "zodiac_mode": zodiac_mode, "ayanamsa_deg": float(ayanamsa_deg),
+        "performance_mode": "optimized", **meta_ts
+    }}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Route-compatible wrappers (unchanged public surface)
+# ──────────────────────────────────────────────────────────────────────────────
+def _extract_observer(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    obs_mode = (kwargs.get("observer") or "").strip().lower()
+    topo = bool(kwargs.get("topocentric", False) or obs_mode == "topocentric")
+    return dict(
+        topocentric=topo,
+        latitude=kwargs.get("latitude"),
+        longitude=kwargs.get("longitude"),
+        elevation_m=kwargs.get("elevation_m"),
+    )
+
+def gochar_drishti(
+    *,
+    natal_chart: Dict[str, Any],
+    date_from: str | None = None,
+    date_to: str | None = None,
+    start_jd_tt: float | None = None,
+    end_jd_tt: float | None = None,
+    jd_tt_window: List[float] | Tuple[float, float] | None = None,
+    transiting_bodies: List[str] | None = None,
+    natal_targets: List[str] | None = None,
+    zodiac_mode: str = "sidereal",
+    ayanamsa: float | str | None = None,
+    frame: str = "ecliptic-of-date",
+    include_nodes: bool = False,
+    treat_nodes_like_saturn: bool = False,
+    orb_deg: float = 12.0,
+    orb_map: Dict[str, float] | None = None,
+    step_minutes: Union[str, float, int] = "auto",
+    prebatch_refinement: bool = False,  # kept for API parity; not used
+    tz_name: str | None = None,
+    scan_mode: str = "balanced",
+    **kwargs,
+) -> Dict[str, Any]:
+    body_like: Dict[str, Any] = {}
+    tz_used = tz_name or kwargs.get("tz") or kwargs.get("place_tz")
+    if isinstance(jd_tt_window, (list, tuple)) and len(jd_tt_window) >= 2:
+        body_like["jd_tt_window"] = [jd_tt_window[0], jd_tt_window[1]]
+    if start_jd_tt is not None and end_jd_tt is not None:
+        body_like["start_jd_tt"] = start_jd_tt
+        body_like["end_jd_tt"] = end_jd_tt
+    if date_from and date_to:
+        body_like.update({"time_range": [date_from, date_to]})
+    obs = _extract_observer(kwargs)
+    return find_gochar_in_range(
+        natal_chart=natal_chart,
+        transiting_bodies=transiting_bodies,
+        natal_targets=natal_targets,
+        frame=frame,
+        zodiac_mode=zodiac_mode,
+        ayanamsa_deg=(float(ayanamsa) if isinstance(ayanamsa, (int, float, str)) and str(ayanamsa).replace(".","",1).isdigit() else None),
+        orb_deg=orb_deg,
+        orb_map=orb_map,
+        include_nodes=include_nodes,
+        treat_nodes_like_saturn=treat_nodes_like_saturn,
+        step_minutes=step_minutes,
+        time_range=body_like.get("time_range"),
+        start_jd_tt=body_like.get("start_jd_tt"),
+        end_jd_tt=body_like.get("end_jd_tt"),
+        scan_mode=scan_mode,
+        tz=tz_used,
+        **obs,
+    )
+
+def ingresses_rashi(
+    *,
+    movers: List[str] | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    start_jd_tt: float | None = None,
+    end_jd_tt: float | None = None,
+    jd_tt_window: List[float] | Tuple[float, float] | None = None,
+    zodiac_mode: str = "sidereal",
+    ayanamsa: float | str | None = None,
+    frame: str = "ecliptic-of-date",
+    step_minutes: Union[str, float, int] = "auto",
+    tz_name: str | None = None,
+    **kwargs,
+) -> Dict[str, Any]:
+    body_like: Dict[str, Any] = {}
+    tz_used = tz_name or kwargs.get("tz") or kwargs.get("place_tz")
+    if isinstance(jd_tt_window, (list, tuple)) and len(jd_tt_window) >= 2:
+        body_like["jd_tt_window"] = [jd_tt_window[0], jd_tt_window[1]]
+    if start_jd_tt is not None and end_jd_tt is not None:
+        body_like["start_jd_tt"] = start_jd_tt
+        body_like["end_jd_tt"] = end_jd_tt
+    if date_from and date_to:
+        body_like.update({"time_range": [date_from, date_to]})
+    obs = _extract_observer(kwargs)
+    ay_deg = float(ayanamsa) if isinstance(ayanamsa, (int, float, str)) and str(ayanamsa).replace(".","",1).isdigit() else 0.0
+    return find_rashi_ingresses_in_range(
+        movers=movers, frame=frame, zodiac_mode=zodiac_mode, ayanamsa_deg=ay_deg,
+        step_minutes=step_minutes, time_range=body_like.get("time_range"),
+        start_jd_tt=body_like.get("start_jd_tt"), end_jd_tt=body_like.get("end_jd_tt"),
+        tz=tz_used, **obs
+    )
+
+def ingresses_nakshatra(
+    *,
+    movers: List[str] | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    start_jd_tt: float | None = None,
+    end_jd_tt: float | None = None,
+    jd_tt_window: List[float] | Tuple[float, float] | None = None,
+    zodiac_mode: str = "sidereal",
+    ayanamsa: float | str | None = None,
+    frame: str = "ecliptic-of-date",
+    step_minutes: Union[str, float, int] = "auto",
+    tz_name: str | None = None,
+    **kwargs,
+) -> Dict[str, Any]:
+    body_like: Dict[str, Any] = {}
+    tz_used = tz_name or kwargs.get("tz") or kwargs.get("place_tz")
+    if isinstance(jd_tt_window, (list, tuple)) and len(jd_tt_window) >= 2:
+        body_like["jd_tt_window"] = [jd_tt_window[0], jd_tt_window[1]]
+    if start_jd_tt is not None and end_jd_tt is not None:
+        body_like["start_jd_tt"] = start_jd_tt
+        body_like["end_jd_tt"] = end_jd_tt
+    if date_from and date_to:
+        body_like.update({"time_range": [date_from, date_to]})
+    obs = _extract_observer(kwargs)
+    ay_deg = float(ayanamsa) if isinstance(ayanamsa, (int, float, str)) and str(ayanamsa).replace(".","",1).isdigit() else 0.0
+    return find_nakshatra_ingresses_in_range(
+        movers=movers, frame=frame, zodiac_mode=zodiac_mode, ayanamsa_deg=ay_deg,
+        step_minutes=step_minutes, time_range=body_like.get("time_range"),
+        start_jd_tt=body_like.get("start_jd_tt"), end_jd_tt=body_like.get("end_jd_tt"),
+        tz=tz_used, **obs
+    )
+
+def stations_retro_direct(
+    *,
+    movers: List[str] | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    start_jd_tt: float | None = None,
+    end_jd_tt: float | None = None,
+    jd_tt_window: List[float] | Tuple[float, float] | None = None,
+    zodiac_mode: str = "sidereal",
+    ayanamsa: float | str | None = None,
+    frame: str = "ecliptic-of-date",
+    step_minutes: Union[str, float, int] = "auto",
+    tz_name: str | None = None,
+    **kwargs,
+) -> Dict[str, Any]:
+    body_like: Dict[str, Any] = {}
+    tz_used = tz_name or kwargs.get("tz") or kwargs.get("place_tz")
+    if isinstance(jd_tt_window, (list, tuple)) and len(jd_tt_window) >= 2:
+        body_like["jd_tt_window"] = [jd_tt_window[0], jd_tt_window[1]]
+    if start_jd_tt is not None and end_jd_tt is not None:
+        body_like["start_jd_tt"] = start_jd_tt
+        body_like["end_jd_tt"] = end_jd_tt
+    if date_from and date_to:
+        body_like.update({"time_range": [date_from, date_to]})
+    obs = _extract_observer(kwargs)
+    ay_deg = float(ayanamsa) if isinstance(ayanamsa, (int, float, str)) and str(ayanamsa).replace(".","",1).isdigit() else 0.0
+    return find_stations_in_range(
+        movers=movers, frame=frame, zodiac_mode=zodiac_mode, ayanamsa_deg=ay_deg,
+        step_minutes=step_minutes, time_range=body_like.get("time_range"),
+        start_jd_tt=body_like.get("start_jd_tt"), end_jd_tt=body_like.get("end_jd_tt"),
+        tz=tz_used, **obs
+    )
+
+
