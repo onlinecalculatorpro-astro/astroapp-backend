@@ -227,7 +227,7 @@ def _window_from_body_to_jd_tt(body: Dict[str, Any]) -> Tuple[Optional[float], O
     # Civil path
     tz = _tz_from_body(body)
     d0, d1 = _parse_dates_from_body(body)
-    if not (isinstance(d0, str) and isinstance(d1, str) and d0.strip() and d1.strip())):
+    if not (isinstance(d0, str) and isinstance(d1, str) and d0.strip() and d1.strip()):
         return None, None, {"error": "time_range_required"}
 
     try:
