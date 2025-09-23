@@ -527,25 +527,34 @@ class VedicTransitEngine(VedicTransitEngine):  # extend with scans
         orb_map: Optional[Dict[str, float]] = None,
         step_minutes: Union[str, float, int] = "auto",
         include_nodes: bool = False,
-        scan_mode: str = "balanced",
+        scan_mode: str = "fast",          # "ultra" | "fast" | "balanced" | "fine"
+        snap_policy: str = "near",        # "never" | "near" | "always"
     ) -> List[GocharEvent]:
         if jd_end_tt <= jd_start_tt or not movers or not targets:
             return []
 
-        # window-aware AUTO
+        # window-aware AUTO (favor larger steps in faster modes)
         if isinstance(step_minutes, str) and step_minutes.lower() == "auto":
-            step_minutes = _auto_step_minutes(
-                "drishti", movers, jd_start_tt, jd_end_tt, min_floor=4, fallback=20, scan_mode=scan_mode
-            )
+            base = _auto_step_minutes("drishti", movers, jd_start_tt, jd_end_tt, min_floor=6, fallback=30)
+            if str(scan_mode).lower().startswith("ultra"):   base *= 1.75
+            elif str(scan_mode).lower().startswith("fast"):  base *= 1.3
+            step_minutes = float(base)
         try:
             dt = float(step_minutes) / (60.0 * 24.0)
         except Exception:
-            dt = 20.0 / (60.0 * 24.0)
+            dt = 30.0 / (60.0 * 24.0)
 
-        fast = str(scan_mode).lower().startswith(("fast","ultra"))
-        fine = str(scan_mode).lower().startswith("fine")
-        max_refinements_per_step = 6 if fast else (18 if fine else 12)
-        # If you want even more speed, bump this down to 3–4.
+        mode = str(scan_mode).lower()
+        ultra = mode.startswith("ultra")
+        fast  = ultra or mode.startswith("fast")
+        fine  = mode.startswith("fine")
+
+        # tighter cap → fewer ephemeris reads for snap checks
+        max_refine_per_step = 2 if ultra else (3 if fast else (6 if fine else 4))
+        # only snap when close
+        snap = str(snap_policy).lower()
+        snap_near = (snap == "near")
+        snap_never = (snap == "never")
 
         events: List[GocharEvent] = []
         dedupe: set[Tuple[str, str, str, int]] = set()
@@ -563,24 +572,23 @@ class VedicTransitEngine(VedicTransitEngine):  # extend with scans
             for m, v in l1.items():
                 _ = self._lon_cache.get_put((_node_canon(m), t1), lambda vv=v: float(vv))
 
-            refinements_left = max_refinements_per_step
+            refinements_left = max_refine_per_step
 
             for body in movers:
                 bcanon = _node_canon(body)
-                if bcanon in ("Rahu","Ketu") and not (include_nodes or self.treat_nodes_like_saturn):
+                if bcanon in ("Rahu", "Ketu") and not (include_nodes or self.treat_nodes_like_saturn):
                     continue
 
                 lon0 = l0.get(body); lon1 = l1.get(body)
                 if lon0 is None or lon1 is None:
                     continue
 
-                # Approx angular speed (deg/day) across the step
                 dlon = wrap180(lon1 - lon0)
                 dt_days = max(1e-9, t1 - t0)
-                dsep_dt = dlon / dt_days  # used as derivative for all axes to this target
+                dsep_dt = dlon / dt_days  # deg/day (linearized)
 
-                # Upper bound for how much the planet can move inside this step
-                max_change_possible = abs(dsep_dt) * dt_days + 0.5  # +guard against curvature
+                # broad guard: how far can separation move this step
+                max_change_possible = abs(dsep_dt) * dt_days + 0.3
 
                 schema = _schema_for(body, include_nodes=include_nodes, treat_nodes_like_saturn=self.treat_nodes_like_saturn)
                 if not schema:
@@ -595,52 +603,58 @@ class VedicTransitEngine(VedicTransitEngine):  # extend with scans
                         s0 = wrap180(angdiff(lon0, tgt_lon) - axis)
                         s1 = wrap180(angdiff(lon1, tgt_lon) - axis)
 
-                        # Cheap far-prune: this step cannot approach the orb
                         _orb = float(orb_map.get(body, orb_deg)) if isinstance(orb_map, dict) else float(orb_deg)
+
+                        # hard far-prune by orb reachability
                         if min(abs(s0), abs(s1)) > (_orb + max_change_possible):
                             continue
 
-                        # In fast mode, only consider sign-crossings (true hits)
                         sign_change = (s0 == 0.0) or (s1 == 0.0) or ((s0 * s1) < 0.0)
-                        if fast and not sign_change:
+                        if ultra and not sign_change:
                             continue
 
-                        # Linear predictor: solve s(t) ≈ s0 + dsep_dt*(t-t0) = 0
+                        # linear solve for zero (or nearest point in step)
                         if abs(dsep_dt) < 1e-9:
                             if not sign_change:
                                 continue
-                            # fallback: mid
                             te_lin = 0.5 * (t0 + t1)
                         else:
                             te_lin = t0 - (s0 / dsep_dt)
                             if te_lin < t0 or te_lin > t1:
-                                # Clamp to the interval; if no crossing and fast → skip
                                 if fast and not sign_change:
                                     continue
                                 te_lin = max(t0, min(t1, te_lin))
 
-                        # One *single* ephemeris read to snap
-                        refinements_left -= 1
-                        lon_now = self._lon_cached(body, te_lin)  # 1 call max per candidate
-                        sep_now = wrap180(angdiff(lon_now, tgt_lon) - axis)
+                        # estimate separation at te_lin without a read
+                        # sep_lin ≈ s0 + dsep_dt*(te_lin - t0)
+                        sep_lin = s0 + dsep_dt * (te_lin - t0)
 
-                        # One Newton correction using the same derivative estimate
-                        if abs(dsep_dt) > 1e-9 and abs(sep_now) > 0.02:  # ~1.2 arcmin threshold
-                            te_corr = te_lin - (sep_now / dsep_dt)
-                            if t0 <= te_corr <= t1:
-                                # one more read only if the correction stayed inside
-                                lon_now = self._lon_cached(body, te_corr)
-                                sep_now = wrap180(angdiff(lon_now, tgt_lon) - axis)
-                                te_lin = te_corr  # accept correction
+                        # decide whether to do an actual ephemeris read ("snap")
+                        do_snap = (snap == "always")
+                        if snap_near and abs(sep_lin) <= min(_orb, 0.5):  # only snap when promising
+                            do_snap = True
 
-                        # If still far outside orb, discard
-                        if abs(sep_now) > _orb:
-                            # accept exact crossings even if slightly > orb due to linearization?
-                            if not sign_change:
-                                continue
+                        if do_snap and refinements_left > 0 and not snap_never:
+                            refinements_left -= 1
+                            lon_now = self._lon_cached(body, te_lin)
+                            sep_now = wrap180(angdiff(lon_now, tgt_lon) - axis)
+
+                            # single Newton correction if still not close
+                            if abs(dsep_dt) > 1e-9 and abs(sep_now) > 0.03:
+                                te_corr = te_lin - (sep_now / dsep_dt)
+                                if t0 <= te_corr <= t1:
+                                    lon_now = self._lon_cached(body, te_corr)
+                                    sep_now = wrap180(angdiff(lon_now, tgt_lon) - axis)
+                                    te_lin = te_corr
+                        else:
+                            # trust linear prediction (zero extra ephemeris calls)
+                            sep_now = sep_lin
+
+                        if abs(sep_now) > _orb and not sign_change:
+                            continue
 
                         applying = (abs(s1) < abs(s0))
-                        bucket = int(math.floor(te_lin * 86400.0 + 0.5))
+                        bucket = int(math.floor(te_lin * 86400.0 + 0.5))  # 1s bucket
                         key = (bcanon, _node_canon(tgt_name), f"{k}th", bucket)
                         if key in dedupe:
                             continue
