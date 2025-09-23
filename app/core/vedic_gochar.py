@@ -393,7 +393,10 @@ class VedicTransitEngine:
         return 0.1
 
     @staticmethod
-    def _refine_zero_brent(f: Callable[[float], float], a: float, b: float, fa: float, fb: float, *, max_iter: int = 32, tol_days: float = 1e-6) -> float:
+    def _refine_zero_brent(
+        f: Callable[[float], float], a: float, b: float, fa: float, fb: float, *,
+        max_iter: int = 32, tol_days: float = 1e-6
+    ) -> float:
         if fa == 0.0: return a
         if fb == 0.0: return b
         if fa * fb > 0.0:
@@ -456,6 +459,12 @@ def _baseline_step_by_window(days: float) -> int:
     if days <= 14.0: return 180
     return 720
 
+def _baseline_step_by_window_fast(days: float) -> int:
+    """Faster baseline for long spans (≤3d → 120m, 4–14d → 360m, >14d → 1440m)."""
+    if days <= 3.0: return 120
+    if days <= 14.0: return 360
+    return 1440
+
 def _min_cap_by_body(kind: str, name: str) -> int:
     """Planet caps per scan kind (minutes)."""
     n = (name or "").strip().lower()
@@ -480,14 +489,17 @@ def _min_cap_by_body(kind: str, name: str) -> int:
         return 180  # jupiter/saturn/others
     return 60
 
-def _auto_step_minutes(kind: str, movers: List[str], a: float, b: float, *, min_floor: int, fallback: int) -> float:
-    base = _baseline_step_by_window(_window_days(a, b))
-    caps: List[int] = []
-    for m in movers or []:
-        caps.append(_min_cap_by_body(kind, m))
-    if not caps:
-        caps = [fallback]
+def _auto_step_minutes(
+    kind: str, movers: List[str], a: float, b: float, *,
+    min_floor: int, fallback: int, scan_mode: str = "balanced"
+) -> float:
+    days = _window_days(a, b)
+    base = _baseline_step_by_window_fast(days) if str(scan_mode).lower().startswith("fast") \
+           else _baseline_step_by_window(days)
+    caps: List[int] = [ _min_cap_by_body(kind, m) for m in (movers or []) ] or [fallback]
     step = max(base, min(caps))
+    if str(scan_mode).lower().startswith("fine"):
+        step = max(min_floor, int(step * 0.6))  # tighten in fine mode
     return float(max(min_floor, step))
 
 
@@ -515,17 +527,23 @@ class VedicTransitEngine(VedicTransitEngine):  # extend with scans
         orb_map: Optional[Dict[str, float]] = None,
         step_minutes: Union[str, float, int] = "auto",
         include_nodes: bool = False,
+        scan_mode: str = "balanced",
     ) -> List[GocharEvent]:
         if jd_end_tt <= jd_start_tt or not movers or not targets:
             return []
 
         # window-aware AUTO
         if isinstance(step_minutes, str) and step_minutes.lower() == "auto":
-            step_minutes = _auto_step_minutes("drishti", movers, jd_start_tt, jd_end_tt, min_floor=4, fallback=20)
+            step_minutes = _auto_step_minutes(
+                "drishti", movers, jd_start_tt, jd_end_tt, min_floor=4, fallback=20, scan_mode=scan_mode
+            )
         try:
             dt = float(step_minutes) / (60.0 * 24.0)
         except Exception:
             dt = 20.0 / (60.0 * 24.0)
+
+        fast = str(scan_mode).lower().startswith("fast")
+        max_refinements_per_step = 8 if fast else 24
 
         events: List[GocharEvent] = []
         dedupe: set[Tuple[str, str, str, int]] = set()
@@ -541,6 +559,8 @@ class VedicTransitEngine(VedicTransitEngine):  # extend with scans
             l1 = self._lon_map(t1, movers)
             for m, v in l1.items():
                 _ = self._lon_cache.get_put((_node_canon(m), t1), lambda vv=v: float(vv))
+
+            refinements_left = max_refinements_per_step
 
             for body in movers:
                 if _node_canon(body) in ("Rahu","Ketu") and not (include_nodes or self.treat_nodes_like_saturn):
@@ -563,25 +583,46 @@ class VedicTransitEngine(VedicTransitEngine):  # extend with scans
                             continue
                         if abs(s0) > 120.0 and abs(s1) > 120.0:
                             continue
-                        sign_change = (s0 == 0.0) or (s1 == 0.0) or ((s0 * s1) < 0.0)
+
                         _orb = float(orb_map.get(body, orb_deg)) if isinstance(orb_map, dict) else float(orb_deg)
-                        guard = max(0.12, min(_orb * 0.33, max_change_possible * 1.4))
-                        near = (min(abs(s0), abs(s1)) <= (_orb + guard))
-                        if not (sign_change or near):
+
+                        # quick prune: can't possibly reach orb in this step
+                        if min(abs(s0), abs(s1)) > (_orb + max_change_possible * 0.8):
                             continue
-                        if min(abs(s0), abs(s1)) > (_orb + max_change_possible):
+
+                        sign_change = (s0 == 0.0) or (s1 == 0.0) or ((s0 * s1) < 0.0)
+                        if not sign_change:
+                            if fast:
+                                # fast mode ignores non-crossings entirely
+                                continue
+                            guard = max(0.12, min(_orb * 0.25, max_change_possible * 1.0))
+                            near = (min(abs(s0), abs(s1)) <= (_orb + guard))
+                            if not near:
+                                continue
+
+                        if refinements_left <= 0:
                             continue
-                        t_exact = self._refine_zero_brent(fsep, t0, t1, s0, s1, tol_days=1e-6)
-                        lon_now = self._lon_cached(body, t_exact)
+                        refinements_left -= 1
+
+                        # 1) secant / linear interpolation guess (cheap)
+                        te = t0 if s1 == s0 else (t0 + (t1 - t0) * (-s0) / (s1 - s0))
+                        te = max(t0, min(t1, te))
+                        se = fsep(te)
+
+                        # 2) if still far, refine with Brent
+                        if abs(se) > 0.5:
+                            te = self._refine_zero_brent(fsep, t0, t1, s0, s1, tol_days=1e-6)
+
+                        lon_now = self._lon_cached(body, te)
                         sep = wrap180(angdiff(lon_now, tgt_lon) - axis)
                         applying = (abs(s1) < abs(s0))
-                        bucket = int(math.floor(t_exact * 86400.0 + 0.5))
+                        bucket = int(math.floor(te * 86400.0 + 0.5))
                         key = (_node_canon(body), _node_canon(tgt_name), f"{k}th", bucket)
                         if key in dedupe:
                             continue
                         dedupe.add(key)
                         events.append(GocharEvent(
-                            jd_tt=float(t_exact),
+                            jd_tt=float(te),
                             body=_node_canon(body),
                             target=_node_canon(tgt_name),
                             drishti=(f"{k}th" if k != 7 else "7th"),
@@ -682,6 +723,7 @@ def find_gochar_in_range(
     treat_nodes_like_saturn: bool | None = None,
     step_minutes: Union[str, float, int] = "auto",
     target_lon_map: Dict[str, float] | None = None,
+    scan_mode: str | None = None,
     **kwargs,
 ) -> Dict[str, Any]:
     if not _EPH_OK:
@@ -734,6 +776,7 @@ def find_gochar_in_range(
             jd_start_tt=float(a), jd_end_tt=float(b),
             movers=movers, targets=targets, orb_deg=float(orb_deg or 12.0),
             orb_map=orb_map, step_minutes=step_minutes, include_nodes=use_nodes,
+            scan_mode=(scan_mode or "balanced"),
         )
     except Exception as e:
         return {"ok": False, "error": f"gochar_scan_failed:{e}", "gochar": [], "meta": {"window_jd_tt": [a, b]}}
@@ -762,7 +805,8 @@ def find_gochar_in_range(
         **meta_ts,
         "frame": frame,
         "zodiac_mode": zodiac_mode,
-        "ayanamsa_deg": ay
+        "ayanamsa_deg": ay,
+        "scan_mode": (scan_mode or "balanced"),
     }
 
     return {"ok": True, "technique": "gochar_drishti", "gochar": hits, "meta": meta_out}
@@ -1083,6 +1127,7 @@ def gochar_drishti(
     step_minutes: Union[str, float, int] = "auto",
     prebatch_refinement: bool = False,
     tz_name: str | None = None,
+    scan_mode: str = "balanced",
     **kwargs,
 ) -> Dict[str, Any]:
     if not _EPH_OK:
@@ -1115,6 +1160,7 @@ def gochar_drishti(
         time_range=[date_from, date_to] if (date_from and date_to) else None,
         start_jd_tt=body_like.get("start_jd_tt"),
         end_jd_tt=body_like.get("end_jd_tt"),
+        scan_mode=scan_mode,
         **obs,
         **body_like,
         prebatch_refinement=prebatch_refinement,
