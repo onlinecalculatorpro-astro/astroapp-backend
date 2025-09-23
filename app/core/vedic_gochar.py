@@ -58,7 +58,6 @@ except Exception:
     def drishti_strength_factor(_: str, __: int) -> float:  # type: ignore
         return 1.0
     def nakshatra_index(lon: float) -> int:  # type: ignore
-        # 27 equal arcs across 360°
         w = 360.0 / 27.0
         return int(math.floor((lon % 360.0) / w)) + 1
     NAKSHATRAS_27 = tuple(f"Nakshatra {i+1}" for i in range(27))  # type: ignore
@@ -84,13 +83,6 @@ except Exception:
 # Adapter factory (backward-compatible; never passes timescale into Config)
 # ──────────────────────────────────────────────────────────────────────
 def _make_ephem(frame: str = "ecliptic-of-date") -> EphemerisAdapter:
-    """
-    Robust construction across adapter versions:
-      1) cfg = EphemConfig(frame=..., planets=PLANETS?)      (NO 'timescale' here)
-      2) EphemerisAdapter(cfg, timescale=TS)
-      3) EphemerisAdapter(cfg, TS)
-      4) EphemerisAdapter(cfg)
-    """
     # Build Config without 'timescale'
     try:
         if PLANETS is not None:
@@ -98,7 +90,6 @@ def _make_ephem(frame: str = "ecliptic-of-date") -> EphemerisAdapter:
         else:
             cfg = EphemConfig(frame=frame)  # type: ignore
     except TypeError:
-        # Very old Config without 'planets'
         cfg = EphemConfig(frame=frame)  # type: ignore
 
     # Build Adapter with best available signature
@@ -162,11 +153,9 @@ def _jd_tt_from_utc_jd(ju: float, y: int, m: int) -> float:
     if _ts and hasattr(_ts, "jd_tt_from_utc_jd"):
         try: return float(_ts.jd_tt_from_utc_jd(float(ju), int(y), int(m)))
         except Exception: pass
-    # astronomy.py fallback: ΔT ≈ 69 s
     return float(ju) + (69.0 / 86400.0)
 
 def _jd_utc_via_stdlib(d: str, t: str, tz: str) -> float:
-    # Normalize time to HH:MM:SS
     parts = (t or "").split(":")
     timestr = t if len(parts) >= 3 else ((t + ":00") if len(parts) == 2 else (t + ":00:00"))
     dt_local = datetime.fromisoformat(f"{d}T{timestr}").replace(tzinfo=ZoneInfo(tz))
@@ -180,7 +169,6 @@ def _jd_utc_via_stdlib(d: str, t: str, tz: str) -> float:
     return JD0 + h/24.0
 
 def _civil_to_jd_utc(date: str, time: str, tz: str) -> float:
-    # Preferred: time_kernel with flexible signatures
     if _tk:
         for fname in ("timescales_from_civil","compute_timescales","build_timescales","to_timescales","from_civil"):
             fn = getattr(_tk, fname, None)
@@ -195,11 +183,9 @@ def _civil_to_jd_utc(date: str, time: str, tz: str) -> float:
                 if isinstance(ju, (int, float)): return float(ju)
             if isinstance(out, (list, tuple)) and out and isinstance(out[0], (int,float)):
                 return float(out[0])
-    # Next: timescales helper
     if _ts and hasattr(_ts, "julian_day_utc"):
         try: return float(_ts.julian_day_utc(date, time, tz))
         except Exception: pass
-    # Fallback: stdlib
     return _jd_utc_via_stdlib(date, time, tz)
 
 def _first_of_day_jd_utc(date: str, tz: str) -> float:
@@ -208,36 +194,26 @@ def _first_of_day_jd_utc(date: str, tz: str) -> float:
 def _last_of_day_jd_utc(date: str, tz: str) -> float:
     return _civil_to_jd_utc(date, "23:59:59", tz)
 
-# Make date parsing tolerant of full ISO datetimes
 def _parse_dates_from_body(body: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
     if isinstance(body.get("time_range"), (list, tuple)) and len(body["time_range"]) >= 2:
         return str(body["time_range"][0]), str(body["time_range"][1])
-
     d0 = (body.get("date_from") or body.get("from") or None)
     d1 = (body.get("date_to")   or body.get("to")   or None)
     if not d0 or not d1:
         return None, None
-
     s0, s1 = str(d0), str(d1)
-
     def _just_date(s: str) -> str:
         if "T" in s:   return s.split("T", 1)[0]
         if " " in s:   return s.split(" ", 1)[0]
         return s
-
     return _just_date(s0), _just_date(s1)
 
 def _tz_from_body(body: Dict[str, Any]) -> str:
-    # accept tz_name, tz, or place_tz (in that priority)
     tz = body.get("tz_name") or body.get("tz") or body.get("place_tz") or "UTC"
     tzs = str(tz).strip()
     return tzs if tzs else "UTC"
 
 def _window_from_body_to_jd_tt(body: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Dict[str, Any]]:
-    """
-    Convert any accepted window shape into (start_jd_tt, end_jd_tt).
-    Meta also includes jd_utc window, jd_ut1 window, tz, and dut1_seconds.
-    """
     # Numeric fast-paths
     if isinstance(body.get("jd_tt_window"), (list, tuple)) and len(body["jd_tt_window"]) == 2:
         try:
@@ -251,7 +227,7 @@ def _window_from_body_to_jd_tt(body: Dict[str, Any]) -> Tuple[Optional[float], O
     # Civil path
     tz = _tz_from_body(body)
     d0, d1 = _parse_dates_from_body(body)
-    if not (isinstance(d0, str) and isinstance(d1, str) and d0.strip() and d1.strip()):
+    if not (isinstance(d0, str) and isinstance(d1, str) and d0.strip() and d1.strip())):
         return None, None, {"error": "time_range_required"}
 
     try:
@@ -260,7 +236,6 @@ def _window_from_body_to_jd_tt(body: Dict[str, Any]) -> Tuple[Optional[float], O
     except Exception as e:
         return None, None, {"error": f"jd_utc_failed:{e}"}
 
-    # TT via helper (+69s fallback baked in _jd_tt_from_utc_jd)
     try: Y0, M0 = map(int, d0.split("-")[:2])
     except Exception: Y0, M0 = 2000, 1
     try: Y1, M1 = map(int, d1.split("-")[:2])
@@ -269,7 +244,6 @@ def _window_from_body_to_jd_tt(body: Dict[str, Any]) -> Tuple[Optional[float], O
     jt0 = _jd_tt_from_utc_jd(ju0, Y0, M0)
     jt1 = _jd_tt_from_utc_jd(ju1, Y1, M1)
 
-    # Deterministic UT1 (meta)
     dut1 = body.get("dut1") if isinstance(body.get("dut1"), (int,float)) else body.get("dut1_seconds")
     if isinstance(dut1, (int, float, str)) and str(dut1).strip() != "":
         try: dut1_used = _clamp_dut1(float(dut1))
@@ -294,8 +268,6 @@ def _window_from_body_to_jd_tt(body: Dict[str, Any]) -> Tuple[Optional[float], O
 # Angles helper (Asc/MC) — uses astronomy.py if available
 # ──────────────────────────────────────────────────────────────────────
 def _angles_sidereal_deg(*, jd_tt: float, lat: float, lon: float, eng: "VedicTransitEngine") -> Dict[str, float]:
-    """Return {'Asc': deg, 'MC': deg} in engine's zodiac (sidereal-adjusted if needed)."""
-    # Preferred: astronomy.py
     if _astro:
         cand = (
             getattr(_astro, "compute_houses", None),
@@ -322,8 +294,6 @@ def _angles_sidereal_deg(*, jd_tt: float, lat: float, lon: float, eng: "VedicTra
                         return {"Asc": norm360(asc), "MC": norm360(mc)}
                 except Exception:
                     pass
-
-    # Optional: ephemeris adapter method (if present)
     try:
         if hasattr(eng.ephem, "angles_ecliptic"):
             res = eng.ephem.angles_ecliptic(jd_tt, latitude=lat, longitude=lon, **eng.obs)  # type: ignore[misc]
@@ -334,8 +304,7 @@ def _angles_sidereal_deg(*, jd_tt: float, lat: float, lon: float, eng: "VedicTra
             return {"Asc": norm360(asc), "MC": norm360(mc)}
     except Exception:
         pass
-
-    return {}  # fallback
+    return {}
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -357,7 +326,6 @@ class GocharEvent:
     meta: Dict[str, Any]
 
 class _LRUCache(OrderedDict):
-    """Tiny LRU for (name, jd_tt) → longitude degrees."""
     def __init__(self, maxsize: int = 2000):
         super().__init__()
         self.maxsize = int(max(256, maxsize))
@@ -475,7 +443,67 @@ class VedicTransitEngine:
                 fa, fb = fb, fa
         return b
 
-    # Graha dṛṣṭi scan
+
+# ──────────────────────────────────────────────────────────────────────
+# Window-aware AUTO step helpers (shared by all scanners)
+# ──────────────────────────────────────────────────────────────────────
+def _window_days(a: float, b: float) -> float:
+    return max(0.0, float(b) - float(a))
+
+def _baseline_step_by_window(days: float) -> int:
+    """Return baseline minutes from window length (≤3d → 60m, 4–14d → 180m, >14d → 720m)."""
+    if days <= 3.0: return 60
+    if days <= 14.0: return 180
+    return 720
+
+def _min_cap_by_body(kind: str, name: str) -> int:
+    """Planet caps per scan kind (minutes)."""
+    n = (name or "").strip().lower()
+    if kind == "drishti":
+        if n == "moon": return 8
+        if n in ("mercury","venus","mars"): return 20
+        if n in ("sun","jupiter","saturn"): return 60
+        if n in ("rahu","ketu","north node","south node"): return 90
+        return 120
+    if kind == "signs":
+        if n == "moon": return 10
+        if n in ("mercury","venus","mars"): return 30
+        if n in ("sun","jupiter","saturn"): return 90
+        return 180
+    if kind == "nak":
+        if n == "moon": return 5
+        if n in ("mercury","venus","mars"): return 20
+        return 60
+    if kind == "stations":
+        if n in ("mercury","venus"): return 60
+        if n == "mars": return 120
+        return 180  # jupiter/saturn/others
+    return 60
+
+def _auto_step_minutes(kind: str, movers: List[str], a: float, b: float, *, min_floor: int, fallback: int) -> float:
+    base = _baseline_step_by_window(_window_days(a, b))
+    caps: List[int] = []
+    for m in movers or []:
+        caps.append(_min_cap_by_body(kind, m))
+    if not caps:
+        caps = [fallback]
+    step = max(base, min(caps))
+    return float(max(min_floor, step))
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Graha dṛṣṭi scan
+# ──────────────────────────────────────────────────────────────────────
+def _schema_for(planet: str, *, include_nodes: bool, treat_nodes_like_saturn: bool) -> Dict[int, float]:
+    p = _node_canon(planet)
+    if p in ("Rahu", "Ketu") and treat_nodes_like_saturn:
+        p = "Saturn"
+    sch = graha_drishti_schema(p)
+    if _node_canon(planet) in ("Rahu", "Ketu") and not (treat_nodes_like_saturn or include_nodes):
+        sch = ({7: 1.0} if include_nodes else {})
+    return sch
+
+class VedicTransitEngine(VedicTransitEngine):  # extend with scans
     def scan_drishti(
         self,
         *,
@@ -491,25 +519,9 @@ class VedicTransitEngine:
         if jd_end_tt <= jd_start_tt or not movers or not targets:
             return []
 
-        def _schema_for(planet: str) -> Dict[int, float]:
-            p = _node_canon(planet)
-            if p in ("Rahu", "Ketu") and self.treat_nodes_like_saturn:
-                p = "Saturn"
-            sch = graha_drishti_schema(p)
-            if _node_canon(planet) in ("Rahu", "Ketu") and not (self.treat_nodes_like_saturn or include_nodes):
-                sch = ({7: 1.0} if include_nodes else {})
-            return sch
-
-        auto = isinstance(step_minutes, str) and step_minutes.lower() == "auto"
-        if auto:
-            caps_min: List[int] = []
-            for m in movers:
-                n = (m or "").lower()
-                if n == "moon": caps_min.append(8)
-                elif n in ("mercury","venus","mars"): caps_min.append(20)
-                elif n in ("sun","jupiter","saturn"): caps_min.append(60)
-                else: caps_min.append(120)
-            step_minutes = max(4, min(caps_min) if caps_min else 20)
+        # window-aware AUTO
+        if isinstance(step_minutes, str) and step_minutes.lower() == "auto":
+            step_minutes = _auto_step_minutes("drishti", movers, jd_start_tt, jd_end_tt, min_floor=4, fallback=20)
         try:
             dt = float(step_minutes) / (60.0 * 24.0)
         except Exception:
@@ -537,7 +549,7 @@ class VedicTransitEngine:
                 if lon0 is None or lon1 is None:
                     continue
                 max_change_possible = self._speed_est(body) * dt
-                schema = _schema_for(body)
+                schema = _schema_for(body, include_nodes=include_nodes, treat_nodes_like_saturn=self.treat_nodes_like_saturn)
                 if not schema:
                     continue
                 for tgt_name, tgt_lon in targets.items():
@@ -600,7 +612,7 @@ def _pick_natal_targets_map(
     *, ep: EphemerisAdapter, eng: VedicTransitEngine, natal_chart: Dict[str, Any],
     tgts: List[str], ay: float
 ) -> Dict[str, float]:
-    # 1) If explicit longitudes were provided, honor them (and add angles if requested)
+    # 1) explicit longitudes?
     for key in ("longitudes", "ecliptic_longitudes"):
         m = natal_chart.get(key)
         if isinstance(m, dict) and m:
@@ -614,7 +626,7 @@ def _pick_natal_targets_map(
                     out.update(_angles_sidereal_deg(jd_tt=float(jd_tt), lat=float(lat), lon=float(lon), eng=eng))
             return out
 
-    # 2) natal_jd_tt → planets & angles at natal epoch (if site present)
+    # 2) natal_jd_tt path
     natal_jd_tt = None
     for k in ("natal_jd_tt","jd_tt","jd_utc"):
         if isinstance(natal_chart.get(k), (int, float)):
@@ -634,7 +646,7 @@ def _pick_natal_targets_map(
                 out.update(_angles_sidereal_deg(jd_tt=float(natal_jd_tt), lat=float(lat), lon=float(lon), eng=eng))
         return out
 
-    # 3) No natal_jd_tt: try civil + site to get jd_tt and angles now; planets can be sampled later
+    # 3) civil + site (angles only; planets sampled at window-left if needed)
     date = natal_chart.get("date") or natal_chart.get("birth_date")
     time = natal_chart.get("time") or natal_chart.get("birth_time") or "12:00:00"
     tz   = natal_chart.get("tz") or natal_chart.get("place_tz")
@@ -651,7 +663,7 @@ def _pick_natal_targets_map(
         except Exception:
             pass
 
-    return out  # may be angles only; planets sampled at window-left edge as fallback
+    return out
 
 def find_gochar_in_range(
     *,
@@ -675,7 +687,6 @@ def find_gochar_in_range(
     if not _EPH_OK:
         return {"ok": False, "error": "ephemeris_unavailable", "gochar": [], "meta": {}}
 
-    # Allow function-style inputs OR route-body-style payload
     body_like: Dict[str, Any] = dict(natal_chart or {})
     if time_range and len(time_range) >= 2:
         body_like["time_range"] = [time_range[0], time_range[1]]
@@ -697,7 +708,6 @@ def find_gochar_in_range(
         if "Rahu" not in movers: movers.append("Rahu")
         if "Ketu" not in movers: movers.append("Ketu")
 
-    # Default targets include angles so DOB/TOB/POB works out of the box
     tgts = list(natal_targets or ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn","Asc","MC"])
 
     ep = _make_ephem(frame)
@@ -715,7 +725,6 @@ def find_gochar_in_range(
     else:
         targets = _pick_natal_targets_map(ep=ep, eng=eng, natal_chart=natal_chart or {}, tgts=tgts, ay=ay)
         if not targets:
-            # last-ditch: compute planets at left edge; angles may be absent if site was missing
             rows = ep.ecliptic_longitudes(float(a), _batch_map_nodes([x for x in tgts if x not in ("Asc","MC")])).get("results", [])
             nat_map = {_node_canon(str(r["name"])): float(r["longitude"]) for r in rows or []}
             targets = {k: (norm360(v - ay) if eng.sidereal_mode else norm360(v)) for k, v in nat_map.items()}
@@ -758,25 +767,10 @@ def find_gochar_in_range(
 
     return {"ok": True, "technique": "gochar_drishti", "gochar": hits, "meta": meta_out}
 
-def _auto_step_minutes_for_signs(movers: List[str]) -> float:
-    caps: List[int] = []
-    for m in movers:
-        n = (m or "").lower()
-        if n == "moon": caps.append(10)
-        elif n in ("mercury","venus","mars"): caps.append(30)
-        elif n in ("sun","jupiter","saturn"): caps.append(90)
-        else: caps.append(180)
-    return float(max(5, min(caps) if caps else 60))
 
-def _auto_step_minutes_for_nak(movers: List[str]) -> float:
-    caps: List[int] = []
-    for m in movers:
-        n = (m or "").lower()
-        if n == "moon": caps.append(5)
-        elif n in ("mercury","venus","mars"): caps.append(20)
-        else: caps.append(60)
-    return float(max(2, min(caps) if caps else 20))
-
+# ──────────────────────────────────────────────────────────────────────
+# Ingress: signs (rāśi)
+# ──────────────────────────────────────────────────────────────────────
 def _sign_index(lon: float) -> int:
     return int(math.floor(norm360(lon) / 30.0)) % 12
 
@@ -798,7 +792,6 @@ def find_rashi_ingresses_in_range(
     if not _EPH_OK:
         return {"ok": False, "error": "ephemeris_unavailable", "ingresses": [], "meta": {}}
 
-    # Allow civil via body_like (date_from/date_to/time_range/tz)
     if start_jd_tt is None or end_jd_tt is None:
         a, b, meta_ts = _resolve_window_or_error(body_like)
         if not (isinstance(a, float) and isinstance(b, float)):
@@ -820,7 +813,7 @@ def find_rashi_ingresses_in_range(
     eng.ayanamsa_deg = float(ayanamsa_deg)
 
     if isinstance(step_minutes, str) and step_minutes.lower() == "auto":
-        step_minutes = _auto_step_minutes_for_signs(movers)
+        step_minutes = _auto_step_minutes("signs", movers, a, b, min_floor=5, fallback=60)
     try:
         dt = float(step_minutes) / (60.0 * 24.0)
     except Exception:
@@ -858,6 +851,10 @@ def find_rashi_ingresses_in_range(
             "meta": {"movers": movers, "window_jd_tt": [float(a), float(b)],
                      "frame": frame, "zodiac_mode": zodiac_mode, "ayanamsa_deg": float(ayanamsa_deg), **meta_ts}}
 
+
+# ──────────────────────────────────────────────────────────────────────
+# Ingress: nakshatra (27)
+# ──────────────────────────────────────────────────────────────────────
 def find_nakshatra_ingresses_in_range(
     *m,
     start_jd_tt: float | None = None,
@@ -899,7 +896,7 @@ def find_nakshatra_ingresses_in_range(
     width = 360.0 / 27.0
 
     if isinstance(step_minutes, str) and step_minutes.lower() == "auto":
-        step_minutes = _auto_step_minutes_for_nak(movers)
+        step_minutes = _auto_step_minutes("nak", movers, a, b, min_floor=2, fallback=20)
     try:
         dt = float(step_minutes) / (60.0 * 24.0)
     except Exception:
@@ -942,6 +939,10 @@ def find_nakshatra_ingresses_in_range(
             "meta": {"movers": movers, "window_jd_tt": [float(a), float(b)],
                      "frame": frame, "zodiac_mode": zodiac_mode, "ayanamsa_deg": float(ayanamsa_deg), **meta_ts}}
 
+
+# ──────────────────────────────────────────────────────────────────────
+# Stations (retro/direct)
+# ──────────────────────────────────────────────────────────────────────
 def find_stations_in_range(
     *,
     start_jd_tt: float | None = None,
@@ -981,13 +982,7 @@ def find_stations_in_range(
     eng.ayanamsa_deg = float(ayanamsa_deg)
 
     if isinstance(step_minutes, str) and step_minutes.lower() == "auto":
-        caps: List[int] = []
-        for m in movers:
-            n = (m or "").lower()
-            if n in ("mercury","venus"): caps.append(60)
-            elif n in ("mars",):         caps.append(120)
-            else:                        caps.append(180)
-        step_minutes = max(15, min(caps) if caps else 120)
+        step_minutes = _auto_step_minutes("stations", movers, a, b, min_floor=15, fallback=120)
     try:
         dt = float(step_minutes) / (60.0 * 24.0)
     except Exception:
@@ -1056,10 +1051,9 @@ def feature_drishti_proximity(*, hits: List[Dict[str, Any]], cap_deg: float = 12
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Thin wrappers named exactly like what routes import
+# Thin wrappers imported by routes
 # ──────────────────────────────────────────────────────────────────────
 def _extract_observer(kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize geocentric/topocentric args from routes."""
     obs_mode = (kwargs.get("observer") or "").strip().lower()
     topo = bool(kwargs.get("topocentric", False) or obs_mode == "topocentric")
     return dict(
@@ -1103,7 +1097,6 @@ def gochar_drishti(
     if date_from and date_to:
         body_like.update({"date_from": date_from, "date_to": date_to, "tz": tz_name or kwargs.get("tz") or kwargs.get("place_tz")})
 
-    # numeric ayanamsa value only (deg); strings handled sidereal elsewhere
     ay_deg = float(ayanamsa) if isinstance(ayanamsa, (int, float, str)) and str(ayanamsa).replace(".","",1).isdigit() else 0.0
     obs = _extract_observer(kwargs)
 
