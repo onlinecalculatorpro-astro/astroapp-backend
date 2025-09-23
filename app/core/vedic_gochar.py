@@ -542,13 +542,15 @@ class VedicTransitEngine(VedicTransitEngine):  # extend with scans
         except Exception:
             dt = 20.0 / (60.0 * 24.0)
 
-        fast = str(scan_mode).lower().startswith("fast")
-        max_refinements_per_step = 8 if fast else 24
+        fast = str(scan_mode).lower().startswith(("fast","ultra"))
+        fine = str(scan_mode).lower().startswith("fine")
+        max_refinements_per_step = 6 if fast else (18 if fine else 12)
+        # If you want even more speed, bump this down to 3–4.
 
         events: List[GocharEvent] = []
         dedupe: set[Tuple[str, str, str, int]] = set()
 
-        # preload
+        # preload t0
         t0 = float(jd_start_tt)
         l0 = self._lon_map(t0, movers)
         for m, v in l0.items():
@@ -556,6 +558,7 @@ class VedicTransitEngine(VedicTransitEngine):  # extend with scans
 
         while t0 < jd_end_tt - 1e-12:
             t1 = float(min(t0 + dt, jd_end_tt))
+            # preload t1
             l1 = self._lon_map(t1, movers)
             for m, v in l1.items():
                 _ = self._lon_cache.get_put((_node_canon(m), t1), lambda vv=v: float(vv))
@@ -563,76 +566,99 @@ class VedicTransitEngine(VedicTransitEngine):  # extend with scans
             refinements_left = max_refinements_per_step
 
             for body in movers:
-                if _node_canon(body) in ("Rahu","Ketu") and not (include_nodes or self.treat_nodes_like_saturn):
+                bcanon = _node_canon(body)
+                if bcanon in ("Rahu","Ketu") and not (include_nodes or self.treat_nodes_like_saturn):
                     continue
+
                 lon0 = l0.get(body); lon1 = l1.get(body)
                 if lon0 is None or lon1 is None:
                     continue
-                max_change_possible = self._speed_est(body) * dt
+
+                # Approx angular speed (deg/day) across the step
+                dlon = wrap180(lon1 - lon0)
+                dt_days = max(1e-9, t1 - t0)
+                dsep_dt = dlon / dt_days  # used as derivative for all axes to this target
+
+                # Upper bound for how much the planet can move inside this step
+                max_change_possible = abs(dsep_dt) * dt_days + 0.5  # +guard against curvature
+
                 schema = _schema_for(body, include_nodes=include_nodes, treat_nodes_like_saturn=self.treat_nodes_like_saturn)
                 if not schema:
                     continue
+
                 for tgt_name, tgt_lon in targets.items():
                     for k, weight in schema.items():
+                        if refinements_left <= 0:
+                            break
+
                         axis = (k * 30.0) % 360.0
-                        def fsep(t: float) -> float:
-                            return wrap180(angdiff(self._lon_cached(body, t), tgt_lon) - axis)
                         s0 = wrap180(angdiff(lon0, tgt_lon) - axis)
                         s1 = wrap180(angdiff(lon1, tgt_lon) - axis)
-                        if not (math.isfinite(s0) and math.isfinite(s1)):
-                            continue
-                        if abs(s0) > 120.0 and abs(s1) > 120.0:
-                            continue
 
+                        # Cheap far-prune: this step cannot approach the orb
                         _orb = float(orb_map.get(body, orb_deg)) if isinstance(orb_map, dict) else float(orb_deg)
-
-                        # quick prune: can't possibly reach orb in this step
-                        if min(abs(s0), abs(s1)) > (_orb + max_change_possible * 0.8):
+                        if min(abs(s0), abs(s1)) > (_orb + max_change_possible):
                             continue
 
+                        # In fast mode, only consider sign-crossings (true hits)
                         sign_change = (s0 == 0.0) or (s1 == 0.0) or ((s0 * s1) < 0.0)
-                        if not sign_change:
-                            if fast:
-                                # fast mode ignores non-crossings entirely
-                                continue
-                            guard = max(0.12, min(_orb * 0.25, max_change_possible * 1.0))
-                            near = (min(abs(s0), abs(s1)) <= (_orb + guard))
-                            if not near:
-                                continue
-
-                        if refinements_left <= 0:
+                        if fast and not sign_change:
                             continue
+
+                        # Linear predictor: solve s(t) ≈ s0 + dsep_dt*(t-t0) = 0
+                        if abs(dsep_dt) < 1e-9:
+                            if not sign_change:
+                                continue
+                            # fallback: mid
+                            te_lin = 0.5 * (t0 + t1)
+                        else:
+                            te_lin = t0 - (s0 / dsep_dt)
+                            if te_lin < t0 or te_lin > t1:
+                                # Clamp to the interval; if no crossing and fast → skip
+                                if fast and not sign_change:
+                                    continue
+                                te_lin = max(t0, min(t1, te_lin))
+
+                        # One *single* ephemeris read to snap
                         refinements_left -= 1
+                        lon_now = self._lon_cached(body, te_lin)  # 1 call max per candidate
+                        sep_now = wrap180(angdiff(lon_now, tgt_lon) - axis)
 
-                        # 1) secant / linear interpolation guess (cheap)
-                        te = t0 if s1 == s0 else (t0 + (t1 - t0) * (-s0) / (s1 - s0))
-                        te = max(t0, min(t1, te))
-                        se = fsep(te)
+                        # One Newton correction using the same derivative estimate
+                        if abs(dsep_dt) > 1e-9 and abs(sep_now) > 0.02:  # ~1.2 arcmin threshold
+                            te_corr = te_lin - (sep_now / dsep_dt)
+                            if t0 <= te_corr <= t1:
+                                # one more read only if the correction stayed inside
+                                lon_now = self._lon_cached(body, te_corr)
+                                sep_now = wrap180(angdiff(lon_now, tgt_lon) - axis)
+                                te_lin = te_corr  # accept correction
 
-                        # 2) if still far, refine with Brent
-                        if abs(se) > 0.5:
-                            te = self._refine_zero_brent(fsep, t0, t1, s0, s1, tol_days=1e-6)
+                        # If still far outside orb, discard
+                        if abs(sep_now) > _orb:
+                            # accept exact crossings even if slightly > orb due to linearization?
+                            if not sign_change:
+                                continue
 
-                        lon_now = self._lon_cached(body, te)
-                        sep = wrap180(angdiff(lon_now, tgt_lon) - axis)
                         applying = (abs(s1) < abs(s0))
-                        bucket = int(math.floor(te * 86400.0 + 0.5))
-                        key = (_node_canon(body), _node_canon(tgt_name), f"{k}th", bucket)
+                        bucket = int(math.floor(te_lin * 86400.0 + 0.5))
+                        key = (bcanon, _node_canon(tgt_name), f"{k}th", bucket)
                         if key in dedupe:
                             continue
                         dedupe.add(key)
+
                         events.append(GocharEvent(
-                            jd_tt=float(te),
-                            body=_node_canon(body),
+                            jd_tt=float(te_lin),
+                            body=bcanon,
                             target=_node_canon(tgt_name),
                             drishti=(f"{k}th" if k != 7 else "7th"),
                             axis_deg=float(axis),
-                            separation_deg=float(sep),
+                            separation_deg=float(sep_now),
                             applying=bool(applying),
-                            exact=abs(sep) <= 1e-6,
+                            exact=abs(sep_now) <= 1e-6,
                             weight=float(weight),
                             meta={"orb_deg": _orb, "k_house": int(k)},
                         ))
+
             t0 = t1
             l0 = l1
 
