@@ -165,25 +165,67 @@ def _dut1_from_env() -> float:
 def _ts_from_civil(date: str, time: str, tz: str) -> Dict[str, Any]:
     """
     Call your timescales/time_kernel to obtain jd_utc/jd_tt and optionally datetime.
-    Raises RuntimeError if not available.
+
+    Robustly tries both 4-arg (with dut1) and 3-arg signatures, with keyword and
+    positional calling, across `time_kernel` and `timescales`. Returns a dict
+    (or converts an object with .jd_tt/.jd_utc attributes into a dict).
     """
-    if _tk is not None:
-        for fname in ("timescales_from_civil", "build_timescales", "compute_timescales", "from_civil", "to_timescales"):
-            fn = getattr(_tk, fname, None)
-            if callable(fn):
+    def _normalize(out: Any) -> Dict[str, Any]:
+        if isinstance(out, dict):
+            return out
+        # object-style return with attributes
+        got: Dict[str, Any] = {}
+        for k in ("jd_tt", "jd_utc", "jd_ut1"):
+            if hasattr(out, k):
                 try:
-                    out = fn(date=date, time=time, tz=tz)  # prefer kwargs
+                    got[k] = float(getattr(out, k))
                 except Exception:
-                    out = fn(date, time, tz)
-                if isinstance(out, dict): return out
+                    pass
+        if got:
+            return got
+        raise RuntimeError("timescales_bad_return")
+
+    def _try_calls(fn):
+        D = _dut1_from_env()
+        attempts = [
+            ((), {"date": date, "time": time, "tz": tz, "dut1_seconds": D}),
+            ((date, time, tz, D), {}),
+            ((), {"date": date, "time": time, "tz": tz}),
+            ((date, time, tz), {}),
+        ]
+        last = None
+        for args, kwargs in attempts:
+            try:
+                return _normalize(fn(*args, **kwargs))
+            except TypeError as e:
+                last = e
+                continue
+            except Exception as e:
+                last = e
+                continue
+        raise last or RuntimeError("timescales_no_match")
+
+    candidates: list[Any] = []
+    if _tk is not None:
+        for name in ("timescales_from_civil", "build_timescales",
+                     "compute_timescales", "from_civil", "to_timescales"):
+            fn = getattr(_tk, name, None)
+            if callable(fn):
+                candidates.append(fn)
     if _ts is not None:
         fn = getattr(_ts, "build_timescales", None)
         if callable(fn):
-            try:
-                return fn(date, time, tz, _dut1_from_env())  # type: ignore
-            except TypeError:
-                return fn(date, time, tz)  # type: ignore
-    raise RuntimeError("timescales_unavailable")
+            candidates.append(fn)
+
+    last_err: Optional[Exception] = None
+    for fn in candidates:
+        try:
+            return _try_calls(fn)
+        except Exception as e:
+            last_err = e
+            continue
+
+    raise RuntimeError(f"timescales_unavailable:{last_err!s}")
 
 def _civil_window_to_jd_tt(*, date_from: str, date_to: str, tz: str) -> Tuple[float, float, Dict[str, Any]]:
     if not (_TS_OK or _tk is not None):
