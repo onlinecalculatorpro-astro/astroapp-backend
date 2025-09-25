@@ -1485,14 +1485,25 @@ def _sep_deg(a: float, b: float) -> float:
 
 def sun_moon_elongation_deg(chart_like: Dict[str, Any]) -> float:
     """Exact Moon–Sun elongation from the chart payload you already computed.
-    Expects `chart_like["bodies"]` rows with 'name' and 'longitude'/'lon'."""
+    Accepts 'longitude', 'lon', or 'longitude_deg'."""
+    def _lon(row: Dict[str, Any]) -> Optional[float]:
+        for k in ("longitude", "lon", "longitude_deg"):
+            v = row.get(k)
+            if v is not None:
+                try:
+                    return float(v)
+                except Exception:
+                    pass
+        return None
+
     sun = moon = None
     for row in (chart_like.get("bodies") or []):
         nm = str(row.get("name") or "")
         if nm == "Sun":
-            sun = float(row.get("longitude", row.get("lon")))
+            sun = _lon(row)
         elif nm == "Moon":
-            moon = float(row.get("longitude", row.get("lon")))
+            moon = _lon(row)
+
     if sun is None or moon is None:
         raise EphemerisError("elongation", "chart missing Sun/Moon longitudes")
     return _sep_deg(sun, moon)
