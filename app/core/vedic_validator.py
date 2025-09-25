@@ -6,13 +6,17 @@ Vedic API — Payload normalization & validation (strict geocoding)
 
 Public API
 ----------
-    normalize_vim_payload(payload)      -> (norm, warns, tz_norm)
-    normalize_yoga_payload(payload)     -> (norm, warns, tz_norm)
+    normalize_vim_payload(payload)          -> (norm, warns, tz_norm)
+    normalize_yoga_payload(payload)         -> (norm, warns, tz_norm)
 
     # Gochar / Ingress / Stations:
-    normalize_gochar_payload(payload)   -> (norm, warns, tz_norm)
-    normalize_ingress_payload(payload)  -> (norm, warns, tz_norm)
-    normalize_stations_payload(payload) -> (norm, warns, tz_norm)
+    normalize_gochar_payload(payload)       -> (norm, warns, tz_norm)
+    normalize_ingress_payload(payload)      -> (norm, warns, tz_norm)
+    normalize_stations_payload(payload)     -> (norm, warns, tz_norm)
+
+    # NEW: Engines backed by core chart
+    normalize_shadbala_payload(payload)     -> (norm, warns, tz_norm)
+    normalize_ashtakavarga_payload(payload) -> (norm, warns, tz_norm)
 
 Highlights
 ----------
@@ -865,4 +869,174 @@ def normalize_stations_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any],
     if not (date_from and date_to):
         warns.append("stations_missing_window")
 
+    return norm, warns, tz_norm or "UTC"
+
+
+# ───────────────────────────── Śaḍbala (NEW) ─────────────────────────
+def normalize_shadbala_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str], str]:
+    """
+    Normalize inputs for Śaḍbala computation.
+    - Sidereal-first defaults (zodiac_mode="sidereal", ayanamsa="lahiri")
+    - Houses recommended for Kāla/Dig Bala (prefer_houses_advanced=True)
+    - Allows topocentric; falls back to geocentric if coords missing
+    """
+    warns: List[str] = []
+
+    zodiac_mode = _norm_method(payload.get("zodiac_mode", payload.get("method", "sidereal")), default="sidereal")
+    ayanamsa = _norm_ayanamsa(payload.get("ayanamsa") or payload.get("ayanamsa_key"))
+    house_system = _coerce_str(payload.get("house_system") or "placidus").strip() or "placidus"
+
+    # DOB/TOB accepted
+    date = _coerce_str(payload.get("DOB") or payload.get("date") or payload.get("birth_date") or "")
+    time_str = _pad_hms(_coerce_str(payload.get("TOB") or payload.get("time") or payload.get("birth_time") or "12:00"))
+
+    # Coordinates & TZ (explicit accepted), but force geocoding if place/POB provided
+    lat = _as_float(payload.get("latitude") or payload.get("lat"))
+    lon = _as_float(payload.get("longitude") or payload.get("lon"))
+    elevation_m = _as_float(payload.get("elevation_m") or payload.get("elevation"))
+    tz_norm = _coerce_str(payload.get("tz") or payload.get("place_tz")).strip() or None
+
+    # Accept POB alias
+    if not any([payload.get("place"), payload.get("birth_place"), payload.get("place_city"),
+                payload.get("place_state"), payload.get("place_country")]) and payload.get("POB"):
+        payload = dict(payload)
+        payload["place"] = payload.get("POB")
+
+    lat_r, lon_r, elev_r, tz_r, fatal = _must_resolve_place_if_provided(payload, warns=warns)
+    if fatal:
+        norm = {
+            "system": "shadbala",
+            "zodiac_mode": zodiac_mode, "ayanamsa": ayanamsa, "house_system": house_system,
+            "date": date or None, "time": time_str if date else None, "tz": tz_norm,
+            "latitude": None, "longitude": None, "elevation_m": None,
+            "coordinate_mode": "geocentric", "topocentric": False,
+            "prefer_houses_advanced": bool(payload.get("prefer_houses_advanced", True)),
+            "include_velocity": bool(payload.get("include_velocity", True)),
+            "fatal": fatal, "raw": payload,
+            "place_tz": tz_norm, "tz_name": tz_norm,
+            "place_name": _coerce_str(payload.get("place") or payload.get("birth_place") or payload.get("POB") or "").strip() or None,
+        }
+        return norm, warns + ["fatal"], tz_norm or "UTC"
+
+    # adopt resolved when present
+    if lat_r is not None and lon_r is not None:
+        lat, lon = lat_r, lon_r
+    if elevation_m is None and elev_r is not None:
+        elevation_m = elev_r
+    if tz_r:
+        tz_norm = tz_r
+
+    coordinate_mode = _norm_observer(payload.get("observer"), "geocentric")
+    topocentric = (coordinate_mode == "topocentric")
+    if topocentric and (lat is None or lon is None):
+        coordinate_mode = "geocentric"
+        topocentric = False
+        warns.append("topocentric_requires_coordinates:fallback_geocentric")
+
+    prefer_houses_advanced = bool(payload.get("prefer_houses_advanced", True))
+    if prefer_houses_advanced and (lat is None or lon is None or not date or not tz_norm):
+        warns.append("shadbala_kala_dig_degraded:missing_time_or_coordinates")
+
+    norm: Dict[str, Any] = {
+        "system": "shadbala",
+        "zodiac_mode": zodiac_mode, "ayanamsa": ayanamsa, "house_system": house_system,
+        "date": date or None, "time": time_str if date else None, "tz": tz_norm,
+        "latitude": lat, "longitude": lon, "elevation_m": elevation_m,
+        "coordinate_mode": coordinate_mode, "topocentric": bool(topocentric),
+        # hint for ephemeris velocity (Chesta Bala): downstream module may use this
+        "include_velocity": bool(payload.get("include_velocity", True)),
+        # houses advanced preference (downstream may call houses_advanced)
+        "prefer_houses_advanced": prefer_houses_advanced,
+        "place_tz": tz_norm, "tz_name": tz_norm,
+        "place_name": _coerce_str(payload.get("place") or payload.get("birth_place") or payload.get("POB") or "").strip() or None,
+        "raw": payload,
+    }
+
+    if not date:
+        warns.append("missing_date")
+    if not time_str:
+        warns.append("missing_time")
+    return norm, warns, tz_norm or "UTC"
+
+
+# ─────────────────────────── Aṣṭakavarga (NEW) ─────────────────────────
+def normalize_ashtakavarga_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str], str]:
+    """
+    Normalize inputs for Aṣṭakavarga computation.
+    Requirements:
+      • Sidereal placements + Lagna → need time, tz, and coordinates (or a resolvable place).
+    Behavior:
+      • Sidereal-first defaults; ayanāṁśa "lahiri" unless provided (float or key).
+      • Enforces geocoding when a place/POB is provided.
+      • If coordinates are entirely missing (and no place), caller may fail to bind Lagna;
+        we surface a warning.
+    """
+    warns: List[str] = []
+
+    zodiac_mode = _norm_method(payload.get("zodiac_mode", payload.get("method", "sidereal")), default="sidereal")
+    ayanamsa = _norm_ayanamsa(payload.get("ayanamsa") or payload.get("ayanamsa_key"))
+    house_system = _coerce_str(payload.get("house_system") or "placidus").strip() or "placidus"
+
+    # DOB/TOB accepted
+    date = _coerce_str(payload.get("DOB") or payload.get("date") or payload.get("birth_date") or "")
+    time_str = _pad_hms(_coerce_str(payload.get("TOB") or payload.get("time") or payload.get("birth_time") or "12:00"))
+
+    # Coordinates & TZ (explicit accepted); enforce geocoding if any place/POB fields
+    lat = _as_float(payload.get("latitude") or payload.get("lat"))
+    lon = _as_float(payload.get("longitude") or payload.get("lon"))
+    elevation_m = _as_float(payload.get("elevation_m") or payload.get("elevation"))
+    tz_norm = _coerce_str(payload.get("tz") or payload.get("place_tz")).strip() or None
+
+    # accept POB alias
+    if not any([payload.get("place"), payload.get("birth_place"), payload.get("place_city"),
+                payload.get("place_state"), payload.get("place_country")]) and payload.get("POB"):
+        payload = dict(payload)
+        payload["place"] = payload.get("POB")
+
+    lat_r, lon_r, elev_r, tz_r, fatal = _must_resolve_place_if_provided(payload, warns=warns)
+    if fatal:
+        norm = {
+            "system": "ashtakavarga",
+            "zodiac_mode": zodiac_mode, "ayanamsa": ayanamsa, "house_system": house_system,
+            "date": date or None, "time": time_str if date else None, "tz": tz_norm,
+            "latitude": None, "longitude": None, "elevation_m": None,
+            "coordinate_mode": "geocentric", "topocentric": False,
+            "fatal": fatal, "raw": payload,
+            "place_tz": tz_norm, "tz_name": tz_norm,
+            "place_name": _coerce_str(payload.get("place") or payload.get("birth_place") or payload.get("POB") or "").strip() or None,
+            # rules spec path can be taken from env by the engine; we just echo if present
+            "spec_path": _coerce_str(payload.get("spec") or payload.get("spec_path") or ""),
+        }
+        return norm, warns + ["fatal"], tz_norm or "UTC"
+
+    # adopt resolved when present
+    if lat_r is not None and lon_r is not None:
+        lat, lon = lat_r, lon_r
+    if elevation_m is None and elev_r is not None:
+        elevation_m = elev_r
+    if tz_r:
+        tz_norm = tz_r
+
+    # Ashtakavarga needs Lagna → warn if coords absent
+    if lat is None or lon is None:
+        warns.append("ashtakavarga_requires_coordinates_for_lagna")
+
+    norm: Dict[str, Any] = {
+        "system": "ashtakavarga",
+        "zodiac_mode": zodiac_mode, "ayanamsa": ayanamsa, "house_system": house_system,
+        "date": date or None, "time": time_str if date else None, "tz": tz_norm,
+        "latitude": lat, "longitude": lon, "elevation_m": elevation_m,
+        "coordinate_mode": "geocentric", "topocentric": False,
+        "place_tz": tz_norm, "tz_name": tz_norm,
+        "place_name": _coerce_str(payload.get("place") or payload.get("birth_place") or payload.get("POB") or "").strip() or None,
+        "spec_path": _coerce_str(payload.get("spec") or payload.get("spec_path") or ""),
+        "raw": payload,
+    }
+
+    if not date:
+        warns.append("missing_date")
+    if not time_str:
+        warns.append("missing_time")
+    if not tz_norm:
+        warns.append("missing_timezone")
     return norm, warns, tz_norm or "UTC"
