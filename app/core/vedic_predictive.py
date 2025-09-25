@@ -20,11 +20,9 @@ What’s here
     • rāśi & nakṣatra ingresses
     • retrograde/direct stations
     • feature_drishti_proximity re-export
-
-Conventions
------------
-- Never introduce jd_utc in API surfaces; use jd_tt / jd_ut1 or civil+tz.
-- Pass through zodiac_mode/method, ayanamsa, observer exactly as requested by callers.
+- (NEW) Śaḍbala and Aṣṭakavarga:
+    • Thin, defensive wrappers delegating to app.core.shadbala / app.core.ashtakavarga
+      with civil+tz+coords, sidereal-first defaults.
 """
 
 from dataclasses import dataclass
@@ -139,6 +137,25 @@ except Exception:
         _yoga_enable = None  # type: ignore
         _yoga_disable = None  # type: ignore
 
+# ───────────────────────── NEW: Śaḍbala / Aṣṭakavarga engines ────────────────
+_SHADBALA_OK = False
+try:
+    # expected API: compute_shadbala(payload: dict, **opts) -> dict
+    from app.core.shadbala import compute_shadbala as _compute_shadbala  # type: ignore
+    _SHADBALA_OK = True
+except Exception:
+    _SHADBALA_OK = False
+    _compute_shadbala = None  # type: ignore
+
+_ASHTAKAVARGA_OK = False
+try:
+    # expected API: compute_ashtakavarga(payload: dict, **opts) -> dict
+    from app.core.ashtakavarga import compute_ashtakavarga as _compute_ashtakavarga  # type: ignore
+    _ASHTAKAVARGA_OK = True
+except Exception:
+    _ASHTAKAVARGA_OK = False
+    _compute_ashtakavarga = None  # type: ignore
+
 
 __all__ = [
     # Dasha
@@ -159,6 +176,8 @@ __all__ = [
     # NEW — Gochar/Ingress/Stations wrappers + feature
     "gochar_drishti", "ingresses_rashi", "ingresses_nakshatra",
     "stations_retro_direct", "feature_drishti_proximity",
+    # NEW — Śaḍbala & Aṣṭakavarga
+    "shadbala", "ashtakavarga",
 ]
 
 # =============================================================================
@@ -807,6 +826,120 @@ def feature_drishti_proximity(*, hits: List[Dict[str, Any]], cap_deg: float = 12
     if not _GOCHAR_OK:
         return []
     return _feature_drishti_proximity(hits=hits, cap_deg=cap_deg)
+
+# =============================================================================
+# (NEW) ŚAḌBALA — thin wrapper over app.core.shadbala
+# =============================================================================
+
+def shadbala(
+    *,
+    natal_chart: Dict[str, Any],
+    zodiac_mode: Literal["tropical","sidereal"] = "sidereal",
+    ayanamsa: Union[str, float] = "lahiri",
+    house_system: str = "placidus",
+    include_velocity: bool = True,
+    prefer_houses_advanced: bool = True,
+    observer: Literal["geocentric","topocentric"] = "geocentric",
+) -> Dict[str, Any]:
+    """
+    Compute Śaḍbala. Delegates to app.core.shadbala.compute_shadbala if available.
+
+    Inputs: expects civil date/time/tz and coordinates present in natal_chart.
+    Returns: engine result dict; if engine absent, returns {"ok": False, "error": "..."}.
+    """
+    if not _SHADBALA_OK or _compute_shadbala is None:
+        return {"ok": False, "error": "shadbala_engine_unavailable"}
+
+    # Build a concise payload (sidereal-first defaults)
+    payload: Dict[str, Any] = {
+        "date": natal_chart.get("date"),
+        "time": natal_chart.get("time") or "12:00:00",
+        "tz": natal_chart.get("place_tz") or natal_chart.get("tz") or "UTC",
+        "latitude": natal_chart.get("latitude"),
+        "longitude": natal_chart.get("longitude"),
+        "elevation_m": natal_chart.get("elevation_m"),
+        "ayanamsa": ayanamsa,
+        "zodiac_mode": zodiac_mode,
+        "house_system": house_system,
+        "observer": observer,
+        "include_velocity": bool(include_velocity),
+        "prefer_houses_advanced": bool(prefer_houses_advanced),
+    }
+
+    # Be permissive with engine signature (payload-only vs payload+kwargs)
+    try:
+        try:
+            res = _compute_shadbala(payload,
+                                    ayanamsa=ayanamsa,
+                                    zodiac_mode=zodiac_mode,
+                                    house_system=house_system,
+                                    include_velocity=include_velocity,
+                                    prefer_houses_advanced=prefer_houses_advanced)
+        except TypeError:
+            res = _compute_shadbala(payload)
+    except Exception as e:
+        return {"ok": False, "error": f"shadbala_engine_error:{e}"}
+
+    if isinstance(res, dict):
+        res.setdefault("ok", True)
+        return res
+    return {"ok": True, "result": res}
+
+# =============================================================================
+# (NEW) AṢṬAKAVARGA — thin wrapper over app.core.ashtakavarga
+# =============================================================================
+
+def ashtakavarga(
+    *,
+    natal_chart: Dict[str, Any],
+    zodiac_mode: Literal["tropical","sidereal"] = "sidereal",
+    ayanamsa: Union[str, float] = "lahiri",
+    house_system: str = "placidus",
+    include_sav: bool = True,
+    include_bav: bool = True,
+    spec_path: Optional[str] = None,   # Optional override for rules/spec
+) -> Dict[str, Any]:
+    """
+    Compute Aṣṭakavarga (BAV per planet and/or SAV).
+    Delegates to app.core.ashtakavarga.compute_ashtakavarga if available.
+    """
+    if not _ASHTAKAVARGA_OK or _compute_ashtakavarga is None:
+        return {"ok": False, "error": "ashtakavarga_engine_unavailable"}
+
+    payload: Dict[str, Any] = {
+        "date": natal_chart.get("date"),
+        "time": natal_chart.get("time") or "12:00:00",
+        "tz": natal_chart.get("place_tz") or natal_chart.get("tz") or "UTC",
+        "latitude": natal_chart.get("latitude"),
+        "longitude": natal_chart.get("longitude"),
+        "elevation_m": natal_chart.get("elevation_m"),
+        "ayanamsa": ayanamsa,
+        "zodiac_mode": zodiac_mode,
+        "house_system": house_system,
+    }
+    if spec_path:
+        payload["spec_path"] = spec_path
+
+    try:
+        try:
+            res = _compute_ashtakavarga(
+                payload,
+                ayanamsa=ayanamsa,
+                zodiac_mode=zodiac_mode,
+                house_system=house_system,
+                include_sav=include_sav,
+                include_bav=include_bav,
+                spec_path=spec_path,
+            )
+        except TypeError:
+            res = _compute_ashtakavarga(payload)
+    except Exception as e:
+        return {"ok": False, "error": f"ashtakavarga_engine_error:{e}"}
+
+    if isinstance(res, dict):
+        res.setdefault("ok", True)
+        return res
+    return {"ok": True, "result": res}
 
 # =============================================================================
 # VARGAS (DIVISIONAL CHARTS) — thin wrappers over app.core.varga_charts
