@@ -1301,35 +1301,21 @@ def _strength_call(fn, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _run_shadbala(body: Dict[str, Any]) -> Dict[str, Any]:
     if _compute_shadbala is None:
-        return {
-            "ok": False,
-            "error": "shadbala_engine_unavailable",
-            "meta": {"route": "strength/shadbala", "branch": _SHADBALA_BRANCH},
-        }
+        return {"ok": False, "error": "shadbala_engine_unavailable",
+                "meta": {"route": "strength/shadbala", "branch": _SHADBALA_BRANCH}}
 
-    # Prefer dedicated validator; fallback to generic
     if callable(normalize_shadbala_payload):
         norm, warns, tz_norm = normalize_shadbala_payload(body)  # type: ignore[misc]
     else:
         norm, warns, tz_norm = _normalize_strength_payload_generic(body)
 
-    # Guardrails: need civil + site
     if not norm.get("date") or not norm.get("time"):
-        return {
-            "ok": False,
-            "error": "missing_date_or_time",
-            "warnings": warns,
-            "meta": {"route": "strength/shadbala", "branch": _SHADBALA_BRANCH, "tz_normalized": tz_norm},
-        }
+        return {"ok": False, "error": "missing_date_or_time", "warnings": warns,
+                "meta": {"route": "strength/shadbala", "branch": _SHADBALA_BRANCH, "tz_normalized": tz_norm}}
     if norm.get("latitude") is None or norm.get("longitude") is None:
-        return {
-            "ok": False,
-            "error": "missing_coordinates",
-            "warnings": warns,
-            "meta": {"route": "strength/shadbala", "branch": _SHADBALA_BRANCH, "tz_normalized": tz_norm},
-        }
+        return {"ok": False, "error": "missing_coordinates", "warnings": warns,
+                "meta": {"route": "strength/shadbala", "branch": _SHADBALA_BRANCH, "tz_normalized": tz_norm}}
 
-    # Build single payload for the engine (keep houses/angles if present)
     payload = {
         "date": norm["date"],
         "time": norm["time"],
@@ -1340,29 +1326,24 @@ def _run_shadbala(body: Dict[str, Any]) -> Dict[str, Any]:
         "zodiac_mode": norm.get("zodiac_mode", "sidereal"),
         "ayanamsa": norm.get("ayanamsa", "lahiri"),
 
-        # pass-throughs for houses/angles (so engine avoids whole-sign fallback)
-        "house_system": norm.get("house_system"),
-        "house_cusps_deg": norm.get("house_cusps_deg"),
-        "houses": norm.get("houses"),
-        "angles": norm.get("angles"),
-
-        # optional engine knobs
-        "include_components": norm.get("include_components"),
-        "vargas": norm.get("vargas"),
+        # ⬇ NEW: pass-throughs so the engine won’t fall back
+        "house_system": body.get("house_system"),
+        "house_cusps_deg": body.get("house_cusps_deg")
+                           or (body.get("houses") or {}).get("cusps_deg")
+                           or (body.get("houses") or {}).get("cusps"),
+        "angles": body.get("angles"),  # asc/mc optional
+        "include_components": body.get("include_components"),
+        "vargas": body.get("vargas"),
     }
 
     try:
         res = _strength_call(_compute_shadbala, payload)
     except Exception as e:
-        return {
-            "ok": False,
-            "error": "shadbala_failed",
-            "detail": str(e),
-            "meta": {"route": "strength/shadbala", "branch": _SHADBALA_BRANCH, "tz_normalized": tz_norm},
-        }
+        return {"ok": False, "error": "shadbala_failed", "detail": str(e),
+                "meta": {"route": "strength/shadbala", "branch": _SHADBALA_BRANCH, "tz_normalized": tz_norm}}
 
-    res.setdefault("meta", {})
-    res["meta"].update({"route": "strength/shadbala", "tz_normalized": tz_norm, "branch": _SHADBALA_BRANCH})
+    res.setdefault("meta", {}).update({"route": "strength/shadbala",
+                                       "tz_normalized": tz_norm, "branch": _SHADBALA_BRANCH})
     if warns:
         res.setdefault("warnings", []).extend(warns)
     return res
