@@ -17,6 +17,29 @@ Notes
   to whole-sign safely.
 - Optionally uses app.core.varga_charts for a tiny Saptavargaja-like bonus.
 - Scores are in Śaṣṭiāṁśa (0..60). Totals sum only computed parts.
+
+Payload (minimal)
+-----------------
+{
+  "date": "YYYY-MM-DD",
+  "time": "HH:MM[:SS]",
+  "tz": "IANA/Zone",
+  "latitude": <float>,
+  "longitude": <float>,
+
+  # Optional
+  "zodiac_mode": "sidereal" | "tropical",
+  "ayanamsa": "lahiri" | "krishnamurti" | <float>,
+  "elevation_m": <float>,
+  "house_system": "placidus" | "koch" | "sripati" | "whole_sign" | ...,
+  "angles": {"asc": <deg>, "mc": <deg>}            # overrides for dig/houses
+  "house_cusps_deg": [12 floats]                    # precomputed cusps
+  # or { "houses": { "cusps_deg" | "cusps": [12 floats] } }
+  "include_components": [
+      "naisargika","uchcha","dig","kendradi","cheshta","kala","drik","varga_bonus"
+  ],
+  "vargas": ["D1","D9","D30", ...]                 # for tiny varga bonus
+}
 """
 
 from dataclasses import dataclass
@@ -224,7 +247,7 @@ def _pick_angles(payload: Dict[str, Any], chart: Dict[str, Any]) -> Dict[str, Op
         mc = None
     return {"asc": asc, "mc": mc}
 
-def _pick_cusps(payload: Dict[str, Any]) -> List[float]:
+def _pick_cusps_from_payload(payload: Dict[str, Any]) -> List[float]:
     # Direct pass-throughs first
     direct = payload.get("house_cusps_deg")
     if isinstance(direct, (list, tuple)) and len(direct) == 12:
@@ -240,23 +263,20 @@ def _pick_cusps(payload: Dict[str, Any]) -> List[float]:
                 return [float(_wrap360(x)) for x in arr]
             except Exception:
                 pass
+    # sometimes callers place it top-level as "cusps_deg" / "cusps"
+    for key in ("cusps_deg", "cusps"):
+        arr = payload.get(key)
+        if isinstance(arr, (list, tuple)) and len(arr) == 12:
+            try:
+                return [float(_wrap360(x)) for x in arr]
+            except Exception:
+                pass
     return []
 
 # ───────────────────────────── Public API ────────────────────────────────────
 def compute_shadbala(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Compute Śaḍbala-like strengths.
-
-    Required civil/site inputs (passed through to astronomy.compute_chart):
-      - date, time, tz, latitude, longitude
-    Optional:
-      - house_system: str (e.g. "placidus", "koch", "whole_sign")
-      - house_cusps_deg: [12 floats] or houses.cusps_deg / houses.cusps
-      - angles: {asc|asc_deg, mc|mc_deg} (used for dig/kendrādi and houses)
-      - include_components: list[str] (subset of:
-            "naisargika","uchcha","dig","kendradi","cheshta","kala","drik","varga_bonus")
-      - vargas: list[str] for tiny varga bonus
-      - ayanamsa / ayanamsa_deg: forwarded to astronomy (mode set there)
+    Compute Śaḍbala-like strengths (safe, extensible subset).
     """
     warnings: List[str] = []
 
@@ -266,8 +286,8 @@ def compute_shadbala(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     # 1) Core chart (all correctness derives from here)
     chart = _compute_chart(payload)
-    mode = str(chart.get("mode", payload.get("mode","tropical"))).strip().lower()
-    meta = dict(chart.get("meta", {}))
+    mode = str(chart.get("mode", payload.get("mode", payload.get("zodiac_mode", "tropical")))).strip().lower()
+    meta = dict(chart.get("meta", {}))  # may include center/frame/ayanamsa_deg etc.
 
     # Angles (from payload or chart)
     ang = _pick_angles(payload, chart)
@@ -282,7 +302,7 @@ def compute_shadbala(payload: Dict[str, Any]) -> Dict[str, Any]:
             lon = float(row.get("longitude_deg", row.get("lon")))
             longs[nm] = _wrap360(lon)
             spd = row.get("speed_deg_per_day", row.get("speed"))
-            speeds[nm] = (float(spd) if isinstance(spd, (int,float)) and math.isfinite(float(spd)) else None)
+            speeds[nm] = (float(spd) if isinstance(spd, (int, float)) and math.isfinite(float(spd)) else None)
         except Exception:
             continue
     for row in (chart.get("points") or []):
@@ -293,37 +313,36 @@ def compute_shadbala(payload: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             continue
 
-    # 2) Houses: prefer provided cusps; else advanced; else fallback whole-sign
-    cusps: List[float] = _pick_cusps(payload)
+    # 2) Houses (preferred via houses_advanced; payload cusps allowed; fallback = whole-sign)
     house_system = payload.get("house_system")
+    cusps: List[float] = []
+    precomputed_source = False
 
-    if not cusps and _compute_houses is not None:
+    # Accept precomputed cusps (e.g., from /ops/calculate)
+    cusps_from_payload = _pick_cusps_from_payload(payload)
+    if len(cusps_from_payload) == 12:
+        cusps = cusps_from_payload
+        precomputed_source = True
+
+    # Else try advanced house engine
+    if (not cusps) and _compute_houses is not None:
         try:
-            hv = _compute_houses(
-                {"angles": {"asc": asc, "mc": mc}, **meta},
-                system=house_system,
-                payload=payload,  # pass full payload if your engine uses it
-            )  # -> dict with 'cusps': [12 floats]
-            if isinstance(hv, dict):
-                raw = hv.get("cusps") or hv.get("cusps_deg")
-                if isinstance(raw, (list, tuple)) and len(raw) == 12:
-                    cusps = [float(_wrap360(x)) for x in raw]
+            hv = _compute_houses({"angles": {"asc": asc, "mc": mc}, **meta},
+                                 system=house_system, payload=payload)  # type: ignore
+            cusps = list(hv.get("cusps", [])) if isinstance(hv, dict) else []
         except Exception as e:
             warnings.append(f"houses_advanced_failed:{type(e).__name__}")
 
-    if not cusps:
-        if isinstance(asc, (int, float)):
-            cusps = _whole_sign_cusps(float(asc))
-            warnings.append("houses_fallback_whole_sign")
-        else:
-            # no angles; whole-sign is undefined → leave Kendrādi as missing
-            warnings.append("houses_missing_angles")
+    # Else whole-sign from ASC
+    if (not cusps) and isinstance(asc, (int, float)):
+        cusps = _whole_sign_cusps(float(asc))
+        warnings.append("houses_fallback_whole_sign")
 
     # 3) Optional varga-based bonus
     varga_bonus: Dict[str, float] = {}
     if "varga_bonus" in include:
         try:
-            varga_list = payload.get("vargas") or ["D1","D9","D30"]
+            varga_list = payload.get("vargas") or ["D1", "D9", "D30"]
             varga_bonus = _varga_bonus(longs, mode=mode, ayanamsa=payload.get("ayanamsa"), vargas=varga_list)
         except Exception as e:
             warnings.append(f"varga_bonus_failed:{type(e).__name__}")
@@ -368,8 +387,10 @@ def compute_shadbala(payload: Dict[str, Any]) -> Dict[str, Any]:
 
         if "varga_bonus" in include:
             vb = varga_bonus.get(nm)
-            comps["varga_bonus"] = _Comp(vb if vb is not None else None,
-                                         None if vb is not None else ("disabled" if not _compute_many_vargas else "not_available"))
+            comps["varga_bonus"] = _Comp(
+                vb if vb is not None else None,
+                None if vb is not None else ("disabled" if not _compute_many_vargas else "not_available"),
+            )
 
         total, maxsum, details = _sum_components(comps)
         pct = (total / maxsum) if maxsum > 0 else None
@@ -381,12 +402,22 @@ def compute_shadbala(payload: Dict[str, Any]) -> Dict[str, Any]:
             "pct": pct,
         }
 
-    # 5) Meta + warnings
+    # 5) Meta + warnings (after building all planets)
+    house_src = (
+        "payload"
+        if (len(cusps) == 12 and precomputed_source)
+        else (
+            "houses_advanced"
+            if (len(cusps) == 12 and _compute_houses is not None)
+            else ("whole_sign_fallback" if len(cusps) == 12 else "none")
+        )
+    )
+
     out_meta: Dict[str, Any] = {
         "module": "shadbala(core)",
         "mode": mode,
         "angles": {"asc": asc, "mc": mc},
-        "houses_source": ("houses_advanced" if len(cusps) == 12 and _compute_houses else ("whole_sign_fallback" if len(cusps) == 12 else "none")),
+        "houses_source": house_src,
         "varga_bonus": {"enabled": bool(_compute_many_vargas and "varga_bonus" in include)},
         "source_chart": {
             "center": chart.get("meta", {}).get("center", chart.get("center")),
@@ -395,14 +426,18 @@ def compute_shadbala(payload: Dict[str, Any]) -> Dict[str, Any]:
         },
         "version": 1,
     }
+
     if len(cusps) == 12:
-        out_meta["house_cusps_deg"] = cusps
+        # ensure wrapped/float cusps in meta for debugging/routing
+        out_meta["house_cusps_deg"] = [float(_wrap360(x)) for x in cusps]
+
+    warnings_out = list(set(warnings + list(chart.get("warnings") or [])))
 
     return {
         "ok": True,
         "bala": results,
         "meta": out_meta,
-        "warnings": list(set(warnings + list(chart.get("warnings") or []))),
+        "warnings": warnings_out,
     }
 
 
