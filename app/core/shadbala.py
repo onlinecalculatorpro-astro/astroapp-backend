@@ -280,13 +280,18 @@ def compute_shadbala(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     warnings: List[str] = []
 
-    include_default = ["naisargika","uchcha","dig","kendradi","cheshta","kala","drik","varga_bonus"]
+    include_default = ["naisargika", "uchcha", "dig", "kendradi", "cheshta", "kala", "drik", "varga_bonus"]
     include = payload.get("include_components") or include_default
     include = [str(x).strip().lower() for x in include]
 
     # 1) Core chart (all correctness derives from here)
     chart = _compute_chart(payload)
-    mode = str(chart.get("mode", payload.get("mode", payload.get("zodiac_mode", "tropical")))).strip().lower()
+    mode = str(
+        chart.get("mode")
+        or payload.get("zodiac_mode")
+        or payload.get("mode")
+        or "tropical"
+    ).strip().lower()
     meta = dict(chart.get("meta", {}))  # may include center/frame/ayanamsa_deg etc.
 
     # Angles (from payload or chart)
@@ -319,7 +324,7 @@ def compute_shadbala(payload: Dict[str, Any]) -> Dict[str, Any]:
     precomputed_source = False
 
     # Accept precomputed cusps (e.g., from /ops/calculate)
-    cusps_from_payload = _pick_cusps_from_payload(payload)
+    cusps_from_payload = _pick_cusps(payload)
     if len(cusps_from_payload) == 12:
         cusps = cusps_from_payload
         precomputed_source = True
