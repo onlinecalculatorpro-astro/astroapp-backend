@@ -638,8 +638,15 @@ def compute_shadbala(payload: Dict[str, Any]) -> Dict[str, Any]:
         comps["dig"] = _Comp(_dig_bala(nm, lon, asc, mc), None if (asc is not None and mc is not None) else "angles_missing")
 
         # KĀLA
-        merged_for_sun = {"meta": dict(chart.get("meta") or {}), **payload}
-        k_val2, k_sub = _kala_bala(nm, chart=merged_for_sun, longs=longs, cusps=cusps, warnings=warnings)
+        merged_for_kala = {**chart, **payload}
+        merged_for_kala["meta"] = {**(chart.get("meta") or {}), **(payload.get("meta") or {})}
+        k_val2, k_sub = _kala_bala(
+            nm,
+            chart=merged_for_kala,   # contains bodies + meta + payload hints
+            longs=longs,
+            cusps=cusps,
+            warnings=warnings
+        )
         comps["kaala"] = _Comp(k_val2, None if k_val2 is not None else "not_computed", k_sub)
 
         # CHEṢṬĀ
