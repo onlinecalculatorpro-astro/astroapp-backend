@@ -23,16 +23,16 @@ def fixed_key(*_a, **_k) -> str:
 # Validators
 # ──────────────────────────────────────────────────────────────────────────────
 try:
-    from app.core.vedic_validator import (
+    from app.core.vedic_validator import (  # type: ignore
         normalize_vim_payload,         # dasha & common tz/site hints
         normalize_yoga_payload,        # yoga (mode-C)
         normalize_gochar_payload,      # gochar/drishti
         normalize_ingress_payload,     # ingress (rashi/nakshatra)
         normalize_stations_payload,    # stations
         # (NEW) strength helpers
-        normalize_shadbala_payload,    # shadbala (if provided in validator)
-        normalize_ashtakavarga_payload # ashtakavarga (if provided in validator)
-    )  # type: ignore
+        normalize_shadbala_payload,    # shadbala (if present)
+        normalize_ashtakavarga_payload # ashtakavarga (if present)
+    )
     _VALIDATOR_IMPORT_ERR = None
 except Exception as _e:
     normalize_vim_payload = None            # type: ignore
@@ -88,7 +88,7 @@ except Exception:
 # Varga engine (varga_charts)
 # ──────────────────────────────────────────────────────────────────────────────
 try:
-    from app.core.varga_charts import (
+    from app.core.varga_charts import (  # type: ignore
         varga_position as _varga_position,
         compute_varga_chart as _compute_varga_chart,
         compute_many_vargas as _compute_many_vargas,
@@ -180,10 +180,10 @@ _compute_shadbala = None        # type: ignore
 _compute_ashtakavarga = None    # type: ignore
 
 try:
-    # Prefer a single entry point if you exposed wrappers here
+    # Prefer unified wrappers if you added them to vedic_predictive
     from app.core.vedic_predictive import (            # type: ignore
-        compute_shadbala as _compute_shadbala,         # wrapper
-        compute_ashtakavarga as _compute_ashtakavarga, # wrapper
+        compute_shadbala as _compute_shadbala,
+        compute_ashtakavarga as _compute_ashtakavarga,
     )
     _SHADBALA_BRANCH = "vedic_predictive"
     _ASHTAKAVARGA_BRANCH = "vedic_predictive"
@@ -216,6 +216,7 @@ def _env_dut1_seconds() -> float:
 
 
 def _wrap_ok(out: Dict[str, Any], warns: List[str], tz_norm: str, branch: str, *, route_name: str) -> Dict[str, Any]:
+    out = dict(out or {})
     out.setdefault("ok", True)
     out.setdefault("meta", {})
     out["meta"].update({"route": route_name, "tz_normalized": tz_norm, "branch": branch})
@@ -282,9 +283,7 @@ def _pick_times(norm: Dict[str, Any], original: Dict[str, Any]) -> Dict[str, Any
 
 
 def _build_civic_payload_vim(original: Dict[str, Any], norm: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Flexible flags for Vimśottarī (method/observer/ayanamsa/place/etc.)."
-    """
+    """Flexible flags for Vimśottarī (method/observer/ayanamsa/place/etc.)."""
     civ: Dict[str, Any] = {}
 
     # Birth time: prefer explicit birth_jd_tt → else jd_tt → else (date,time,tz)
@@ -404,8 +403,12 @@ def _build_civic_payload_kcd(original: Dict[str, Any], norm: Dict[str, Any]) -> 
     return civ
 
 
-# ---- tiny module-call shim (dasha) -------------------------------------------
+# ---- tiny module-call shim (generic) -----------------------------------------
 def _call_single_param_or_kwargs(fn, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Calls a function that may accept either a single 'payload' positional arg
+    or a set of keyword args. Returns the dict result or raises.
+    """
     try:
         sig = inspect.signature(fn)  # type: ignore[arg-type]
         params = list(sig.parameters.values())
@@ -1268,6 +1271,14 @@ def _normalize_strength_payload_generic(body: Dict[str, Any]) -> tuple[Dict[str,
     return norm, warns, tz
 
 
+def _strength_call(fn, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Strength engines may want payload or kwargs; unify the call & enforce dict return."""
+    out = _call_single_param_or_kwargs(fn, payload)
+    if not isinstance(out, dict):
+        raise TypeError(f"invalid_return:{type(out).__name__}")
+    return out
+
+
 def _run_shadbala(body: Dict[str, Any]) -> Dict[str, Any]:
     if _compute_shadbala is None:
         return {"ok": False, "error": "shadbala_engine_unavailable", "meta": {"route": "strength/shadbala", "branch": _SHADBALA_BRANCH}}
@@ -1294,28 +1305,32 @@ def _run_shadbala(body: Dict[str, Any]) -> Dict[str, Any]:
             "meta": {"route": "strength/shadbala", "branch": _SHADBALA_BRANCH, "tz_normalized": tz_norm},
         }
 
-    # Call engine
-    try:
-        res = _compute_shadbala(
-            date=norm["date"],
-            time=norm["time"],
-            tz=norm["tz"],
-            latitude=float(norm["latitude"]),
-            longitude=float(norm["longitude"]),
-            elevation_m=norm.get("elevation_m"),
-            zodiac_mode=norm.get("zodiac_mode", "sidereal"),
-            ayanamsa=norm.get("ayanamsa", "lahiri"),
-        )
-    except Exception as e:
-        return {"ok": False, "error": "shadbala_failed", "detail": str(e), "meta": {"route": "strength/shadbala", "branch": _SHADBALA_BRANCH}},  # type: ignore[return-value]
+    payload = {
+        "date": norm["date"],
+        "time": norm["time"],
+        "tz": norm["tz"],
+        "latitude": float(norm["latitude"]),
+        "longitude": float(norm["longitude"]),
+        "elevation_m": norm.get("elevation_m"),
+        "zodiac_mode": norm.get("zodiac_mode", "sidereal"),
+        "ayanamsa": norm.get("ayanamsa", "lahiri"),
+    }
 
-    if isinstance(res, dict):
-        res.setdefault("meta", {})
-        res["meta"].update({"route": "strength/shadbala", "tz_normalized": tz_norm, "branch": _SHADBALA_BRANCH})
-        if warns:
-            res.setdefault("warnings", []).extend(warns)
-        return res
-    return {"ok": False, "error": "shadbala_invalid_return", "meta": {"route": "strength/shadbala", "branch": _SHADBALA_BRANCH}}
+    try:
+        res = _strength_call(_compute_shadbala, payload)
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "shadbala_failed",
+            "detail": str(e),
+            "meta": {"route": "strength/shadbala", "branch": _SHADBALA_BRANCH, "tz_normalized": tz_norm},
+        }
+
+    res.setdefault("meta", {})
+    res["meta"].update({"route": "strength/shadbala", "tz_normalized": tz_norm, "branch": _SHADBALA_BRANCH})
+    if warns:
+        res.setdefault("warnings", []).extend(warns)
+    return res
 
 
 def _run_ashtakavarga(body: Dict[str, Any]) -> Dict[str, Any]:
@@ -1344,30 +1359,35 @@ def _run_ashtakavarga(body: Dict[str, Any]) -> Dict[str, Any]:
             "meta": {"route": "ashtakavarga", "branch": _ASHTAKAVARGA_BRANCH, "tz_normalized": tz_norm},
         }
 
-    # Engine knobs passthrough (optional)
-    include = body.get("include") or body.get("include_keys")  # e.g., ["SAV","BAV","bhinnashtakavarga","sarvashtakavarga"]
-    try:
-        res = _compute_ashtakavarga(
-            date=norm["date"],
-            time=norm["time"],
-            tz=norm["tz"],
-            latitude=float(norm["latitude"]),
-            longitude=float(norm["longitude"]),
-            elevation_m=norm.get("elevation_m"),
-            zodiac_mode=norm.get("zodiac_mode", "sidereal"),
-            ayanamsa=norm.get("ayanamsa", "lahiri"),
-            include=include,
-        )
-    except Exception as e:
-        return {"ok": False, "error": "ashtakavarga_failed", "detail": str(e), "meta": {"route": "ashtakavarga", "branch": _ASHTAKAVARGA_BRANCH}},  # type: ignore[return-value]
+    include = body.get("include") or body.get("include_keys")  # optional list, e.g., ["SAV","BAV"]
 
-    if isinstance(res, dict):
-        res.setdefault("meta", {})
-        res["meta"].update({"route": "ashtakavarga", "tz_normalized": tz_norm, "branch": _ASHTAKAVARGA_BRANCH})
-        if warns:
-            res.setdefault("warnings", []).extend(warns)
-        return res
-    return {"ok": False, "error": "ashtakavarga_invalid_return", "meta": {"route": "ashtakavarga", "branch": _ASHTAKAVARGA_BRANCH}}
+    payload = {
+        "date": norm["date"],
+        "time": norm["time"],
+        "tz": norm["tz"],
+        "latitude": float(norm["latitude"]),
+        "longitude": float(norm["longitude"]),
+        "elevation_m": norm.get("elevation_m"),
+        "zodiac_mode": norm.get("zodiac_mode", "sidereal"),
+        "ayanamsa": norm.get("ayanamsa", "lahiri"),
+        "include": include,
+    }
+
+    try:
+        res = _strength_call(_compute_ashtakavarga, payload)
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "ashtakavarga_failed",
+            "detail": str(e),
+            "meta": {"route": "ashtakavarga", "branch": _ASHTAKAVARGA_BRANCH, "tz_normalized": tz_norm},
+        }
+
+    res.setdefault("meta", {})
+    res["meta"].update({"route": "ashtakavarga", "tz_normalized": tz_norm, "branch": _ASHTAKAVARGA_BRANCH})
+    if warns:
+        res.setdefault("warnings", []).extend(warns)
+    return res
 
 
 @vedic_api.post("/strength/shadbala")
@@ -1375,7 +1395,7 @@ def _run_ashtakavarga(body: Dict[str, Any]) -> Dict[str, Any]:
 def route_shadbala():
     body = request.get_json(silent=True) or {}
     res = _run_shadbala(body)
-    status = 200 if res.get("ok") else (503 if str(res.get("error","")).endswith("unavailable") else 400)
+    status = 200 if (isinstance(res, dict) and res.get("ok")) else (503 if str(res.get("error","")).endswith("unavailable") else 400)
     return jsonify(res), status
 
 
@@ -1384,5 +1404,5 @@ def route_shadbala():
 def route_ashtakavarga():
     body = request.get_json(silent=True) or {}
     res = _run_ashtakavarga(body)
-    status = 200 if res.get("ok") else (503 if str(res.get("error","")).endswith("unavailable") else 400)
+    status = 200 if (isinstance(res, dict) and res.get("ok")) else (503 if str(res.get("error","")).endswith("unavailable") else 400)
     return jsonify(res), status
