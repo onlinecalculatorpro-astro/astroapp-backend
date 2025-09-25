@@ -1498,31 +1498,112 @@ def sun_moon_elongation_deg(chart_like: Dict[str, Any]) -> float:
     return _sep_deg(sun, moon)
 
 def _extract_datetime_payload(chart_or_payload: Dict[str, Any]) -> Tuple[float, float, float, Dict[str, Any]]:
-    """Return (jd_tt_now, lat, lon, meta) from chart or payload."""
-    meta = dict(chart_or_payload.get("meta", {}))
-    # 1) Prefer explicit JD_TT in meta, if present
-    jd_tt = meta.get("jd_tt") or meta.get("julian_day_tt") or meta.get("jd")
-    lat = (meta.get("latitude") or chart_or_payload.get("latitude"))
-    lon = (meta.get("longitude") or chart_or_payload.get("longitude"))
-    elev = (meta.get("elevation_m") or chart_or_payload.get("elevation_m"))
+    """Return (jd_tt_now, lat, lon, meta) from chart or payload.
 
-    if jd_tt and lat is not None and lon is not None:
+    Accepted shapes for lat/lon/elev:
+      • payload["meta"]["latitude"/"longitude"/"elevation_m"]
+      • payload["latitude"/"longitude"/"elevation_m"]
+      • payload["place"]["lat"/"lon"|"lng"/"elevation_m"]
+      • payload["observer"]["lat"/"lon"|"lng"/"elevation_m"]
+      • payload["chart"]["meta"] or payload["chart"]["place"]
+
+    Accepted time hints:
+      • meta.jd_tt | meta.julian_day_tt | payload.jd_tt | payload.jd | payload.julian_day_tt
+      • OR civil date/time + tz or utc offset:
+          - payload["date"], payload["time"], payload["tz"]
+          - payload["datetime"] ISO string (YYYY-MM-DDTHH:MM:SS)
+          - payload["utc_offset_min"] / ["utc_offset_minutes"] or ["utc_offset_hours"]
+    """
+    def pick(*paths, default=None):
+        cur = chart_or_payload
+        for p in paths:
+            if cur is None: return default
+            if isinstance(cur, dict) and p in cur:
+                cur = cur[p]
+            else:
+                return default
+        return cur
+
+    # ---- latitude / longitude / elevation
+    lat = (
+        pick("meta", "latitude") or pick("latitude") or
+        pick("place", "lat") or pick("observer", "lat") or
+        pick("chart", "meta", "latitude") or pick("chart", "place", "lat")
+    )
+    lon = (
+        pick("meta", "longitude") or pick("longitude") or
+        pick("place", "lon") or pick("place", "lng") or pick("observer", "lon") or pick("observer", "lng") or
+        pick("chart", "meta", "longitude") or pick("chart", "place", "lon") or pick("chart", "place", "lng")
+    )
+    elev = (
+        pick("meta", "elevation_m") or pick("elevation_m") or
+        pick("place", "elevation_m") or pick("observer", "elevation_m") or
+        pick("chart", "meta", "elevation_m") or pick("chart", "place", "elevation_m")
+    )
+
+    # ---- direct jd_tt if present
+    jd_tt = (
+        pick("meta", "jd_tt") or pick("meta", "julian_day_tt") or
+        pick("jd_tt") or pick("julian_day_tt") or pick("jd")
+    )
+    if jd_tt is not None and lat is not None and lon is not None:
         return float(jd_tt), float(lat), float(lon), {"elevation_m": elev}
 
-    # 2) Else build from civil date/time/tz
-    from datetime import datetime
-    import zoneinfo  # Python 3.9+
-    date = chart_or_payload.get("date")
-    time = chart_or_payload.get("time") or "12:00:00"
-    tz   = chart_or_payload.get("tz") or chart_or_payload.get("place_tz") or "UTC"
+    # ---- else: build from civil time + tz/offset
     if lat is None or lon is None:
         raise EphemerisError("sun_events", "latitude/longitude required")
-    dt_local = datetime.fromisoformat(f"{date}T{time}")
-    try:
-        z = zoneinfo.ZoneInfo(str(tz))
-    except Exception:
-        z = zoneinfo.ZoneInfo("UTC")
-    dt_utc = dt_local.replace(tzinfo=z).astimezone(zoneinfo.ZoneInfo("UTC"))
+
+    # Possible sources for datetime / tz
+    dt_iso = pick("datetime")
+    date = pick("date")
+    time = pick("time") or "12:00:00"
+    tz  = pick("tz") or pick("place_tz") or pick("meta", "tz")
+
+    # Numeric offsets (minutes or hours) as last resort
+    utc_off_min = pick("utc_offset_min") or pick("utc_offset_minutes")
+    utc_off_hrs = pick("utc_offset_hours")
+    if utc_off_min is None and utc_off_hrs is not None:
+        try:
+            utc_off_min = float(utc_off_hrs) * 60.0
+        except Exception:
+            utc_off_min = None
+
+    from datetime import datetime, timezone, timedelta
+    import zoneinfo
+
+    if dt_iso:
+        # Try to parse full ISO datetime; if no tz info, apply tz/offset below
+        dt_local = datetime.fromisoformat(str(dt_iso))
+        if dt_local.tzinfo is None:
+            # Attach TZ if provided
+            if isinstance(tz, str):
+                try:
+                    dt_local = dt_local.replace(tzinfo=zoneinfo.ZoneInfo(tz))
+                except Exception:
+                    if utc_off_min is not None:
+                        dt_local = dt_local.replace(tzinfo=timezone(timedelta(minutes=float(utc_off_min))))
+                    else:
+                        dt_local = dt_local.replace(tzinfo=timezone.utc)
+        dt_utc = dt_local.astimezone(timezone.utc)
+    else:
+        if not date:
+            raise EphemerisError("sun_events", "date required when jd_tt is absent")
+        # Build local time first, then assign tz
+        dt_local = datetime.fromisoformat(f"{date}T{time}")
+        if isinstance(tz, str):
+            try:
+                dt_local = dt_local.replace(tzinfo=zoneinfo.ZoneInfo(tz))
+            except Exception:
+                if utc_off_min is not None:
+                    dt_local = dt_local.replace(tzinfo=timezone(timedelta(minutes=float(utc_off_min))))
+                else:
+                    dt_local = dt_local.replace(tzinfo=timezone.utc)
+        else:
+            if utc_off_min is not None:
+                dt_local = dt_local.replace(tzinfo=timezone(timedelta(minutes=float(utc_off_min))))
+            else:
+                dt_local = dt_local.replace(tzinfo=timezone.utc)
+        dt_utc = dt_local.astimezone(timezone.utc)
 
     ts = _get_timescale()
     t = ts.utc(dt_utc.year, dt_utc.month, dt_utc.day, dt_utc.hour, dt_utc.minute, dt_utc.second)
