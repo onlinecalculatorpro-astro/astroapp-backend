@@ -178,6 +178,8 @@ __all__ = [
     "stations_retro_direct", "feature_drishti_proximity",
     # NEW — Śaḍbala & Aṣṭakavarga
     "shadbala", "ashtakavarga",
+    # NEW — Compatibility shim explicitly exported for routes
+    "compute_ashtakavarga",
 ]
 
 # =============================================================================
@@ -687,7 +689,6 @@ def gochar_drishti(
     tz = str(natal_chart.get("place_tz") or natal_chart.get("tz") or "UTC")
     jd0, jd1 = _civil_window_to_tt(date_from, date_to, tz)
 
-    # Use start/end TT when available; otherwise hand civil window + tz to gochar
     res = _find_gochar_in_range(
         natal_chart=natal_chart,
         start_jd_tt=jd0 if jd0 is not None else None,
@@ -704,7 +705,6 @@ def gochar_drishti(
         treat_nodes_like_saturn=treat_nodes_like_saturn,
         step_minutes=step_minutes,
         prebatch_refinement=prebatch_refinement,
-        # Be explicit for downstream civil parsing:
         place_tz=tz, tz=tz,
     )
     return res
@@ -850,7 +850,6 @@ def shadbala(
     if not _SHADBALA_OK or _compute_shadbala is None:
         return {"ok": False, "error": "shadbala_engine_unavailable"}
 
-    # Build a concise payload (sidereal-first defaults)
     payload: Dict[str, Any] = {
         "date": natal_chart.get("date"),
         "time": natal_chart.get("time") or "12:00:00",
@@ -866,7 +865,6 @@ def shadbala(
         "prefer_houses_advanced": bool(prefer_houses_advanced),
     }
 
-    # Be permissive with engine signature (payload-only vs payload+kwargs)
     try:
         try:
             res = _compute_shadbala(payload,
@@ -933,6 +931,34 @@ def ashtakavarga(
             )
         except TypeError:
             res = _compute_ashtakavarga(payload)
+    except Exception as e:
+        return {"ok": False, "error": f"ashtakavarga_engine_error:{e}"}
+
+    if isinstance(res, dict):
+        res.setdefault("ok", True)
+        return res
+    return {"ok": True, "result": res}
+
+# ── NEW: Compatibility shim for routes expecting `compute_ashtakavarga(payload)` ──
+def compute_ashtakavarga(payload: Dict[str, Any] = None, **opts) -> Dict[str, Any]:
+    """
+    Compatibility wrapper so routes can import:
+        from app.core.vedic_predictive import compute_ashtakavarga
+    Accepts a single payload dict (plus optional kwargs), forwards to
+    app.core.ashtakavarga.compute_ashtakavarga with a permissive signature.
+    """
+    if not _ASHTAKAVARGA_OK or _compute_ashtakavarga is None:
+        return {"ok": False, "error": "ashtakavarga_engine_unavailable"}
+
+    merged: Dict[str, Any] = dict(payload or {})
+    merged.update(opts or {})
+
+    try:
+        try:
+            res = _compute_ashtakavarga(merged)
+        except TypeError:
+            # Some implementations may prefer kwargs
+            res = _compute_ashtakavarga(**merged)  # type: ignore[misc]
     except Exception as e:
         return {"ok": False, "error": f"ashtakavarga_engine_error:{e}"}
 
