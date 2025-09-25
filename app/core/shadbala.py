@@ -32,8 +32,8 @@ Payload (minimal)
   "ayanamsa": "lahiri" | "krishnamurti" | <float>,
   "elevation_m": <float>,
   "house_system": "placidus" | "koch" | "sripati" | "whole_sign" | ...,
-  "angles": {"asc": <deg>, "mc": <deg>}            # overrides for dig/houses
-  "house_cusps_deg": [12 floats]                    # precomputed cusps
+  "angles": {"asc": <deg>, "mc": <deg>},           # overrides for dig/houses
+  "house_cusps_deg": [12 floats],                  # precomputed cusps
   # or { "houses": { "cusps_deg" | "cusps": [12 floats] } }
   "include_components": [
       "naisargika","uchcha","dig","kendradi","cheshta","kala","drik","varga_bonus"
@@ -247,14 +247,23 @@ def _pick_angles(payload: Dict[str, Any], chart: Dict[str, Any]) -> Dict[str, Op
         mc = None
     return {"asc": asc, "mc": mc}
 
-def _pick_cusps_from_payload(payload: Dict[str, Any]) -> List[float]:
-    # Direct pass-throughs first
+def _pick_cusps(payload: Dict[str, Any]) -> List[float]:
+    """
+    Accept precomputed house cusps from payload in any of these keys:
+    - house_cusps_deg (flat list)
+    - houses.cusps_deg or houses.cusps
+    - cusps_deg or cusps (legacy flat)
+    Returns [] if not present/valid.
+    """
+    # direct flat list
     direct = payload.get("house_cusps_deg")
     if isinstance(direct, (list, tuple)) and len(direct) == 12:
         try:
             return [float(_wrap360(x)) for x in direct]
         except Exception:
             pass
+
+    # nested under "houses"
     houses_obj = payload.get("houses") or {}
     for key in ("cusps_deg", "cusps"):
         arr = houses_obj.get(key)
@@ -263,7 +272,8 @@ def _pick_cusps_from_payload(payload: Dict[str, Any]) -> List[float]:
                 return [float(_wrap360(x)) for x in arr]
             except Exception:
                 pass
-    # sometimes callers place it top-level as "cusps_deg" / "cusps"
+
+    # legacy top-level
     for key in ("cusps_deg", "cusps"):
         arr = payload.get(key)
         if isinstance(arr, (list, tuple)) and len(arr) == 12:
@@ -271,6 +281,7 @@ def _pick_cusps_from_payload(payload: Dict[str, Any]) -> List[float]:
                 return [float(_wrap360(x)) for x in arr]
             except Exception:
                 pass
+
     return []
 
 # ───────────────────────────── Public API ────────────────────────────────────
