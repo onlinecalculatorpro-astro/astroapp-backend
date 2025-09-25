@@ -180,7 +180,7 @@ _compute_shadbala = None        # type: ignore
 _compute_ashtakavarga = None    # type: ignore
 
 try:
-    # Prefer unified wrappers if you added them to vedic_predictive
+    # Prefer unified wrappers if added to vedic_predictive
     from app.core.vedic_predictive import (            # type: ignore
         compute_shadbala as _compute_shadbala,
         compute_ashtakavarga as _compute_ashtakavarga,
@@ -932,7 +932,6 @@ def vedic_gochar_drishti():
             orb_deg=float(norm.get("orb_deg", 12.0)),
             orb_map=norm.get("orb_map") or {},
             step_minutes=norm.get("step_minutes", "auto"),
-            prebatch_refinement=bool(body.get("prebatch_refinement", False)),
             tz_name=tz_norm,
         )
     except Exception as e:
@@ -1326,7 +1325,7 @@ def _run_shadbala(body: Dict[str, Any]) -> Dict[str, Any]:
         "zodiac_mode": norm.get("zodiac_mode", "sidereal"),
         "ayanamsa": norm.get("ayanamsa", "lahiri"),
 
-        # ⬇ NEW: pass-throughs so the engine won’t fall back
+        # ⬇ pass-throughs so the engine won’t fall back
         "house_system": body.get("house_system"),
         "house_cusps_deg": body.get("house_cusps_deg")
                            or (body.get("houses") or {}).get("cusps_deg")
@@ -1390,6 +1389,12 @@ def _run_ashtakavarga(body: Dict[str, Any]) -> Dict[str, Any]:
         "elevation_m": norm.get("elevation_m"),
         "zodiac_mode": norm.get("zodiac_mode", "sidereal"),
         "ayanamsa": norm.get("ayanamsa", "lahiri"),
+
+        # ⬇ important pass-throughs for core/ashtakavarga
+        "house_system": body.get("house_system") or norm.get("house_system"),
+        "angles": body.get("angles"),
+        "ruleset": body.get("ruleset"),
+        "ruleset_map": body.get("ruleset_map"),
         "include": include,
     }
 
@@ -1419,9 +1424,19 @@ def route_shadbala():
     return jsonify(res), status
 
 
+@vedic_api.post("/strength/ashtakavarga")
+@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
+def route_strength_ashtakavarga():
+    body = request.get_json(silent=True) or {}
+    res = _run_ashtakavarga(body)
+    status = 200 if (isinstance(res, dict) and res.get("ok")) else (503 if str(res.get("error","")).endswith("unavailable") else 400)
+    return jsonify(res), status
+
+
+# Back-compat alias
 @vedic_api.post("/ashtakavarga")
 @rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
-def route_ashtakavarga():
+def route_ashtakavarga_alias():
     body = request.get_json(silent=True) or {}
     res = _run_ashtakavarga(body)
     status = 200 if (isinstance(res, dict) and res.get("ok")) else (503 if str(res.get("error","")).endswith("unavailable") else 400)
