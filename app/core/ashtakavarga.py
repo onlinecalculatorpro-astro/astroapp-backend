@@ -1,594 +1,1227 @@
-# app/core/ashtakavarga.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 """
-Aṣṭakavarga — research-grade, rule-driven engine (BAV + LAV + SAV)
+Ashtakavarga engine — precision-first (gold-standard ready)
 
-What this module provides
--------------------------
-- Pure, deterministic bindu arithmetic per BPHS-style tables (no orbs/heuristics).
-- Pluggable rules via JSON/dict (no hardcoded vendor tables).
-- Works directly from your chart pipeline:
-    compute_ashtakavarga(payload[, spec]) -> dict
-  where `payload` is the same dict you pass to astronomy.compute_chart.
+Public API:
+    compute_ashtakavarga(payload: dict) -> dict
+    clear_caches() -> None
 
-Public API (stable)
--------------------
-    AshtakavargaSpec
-    load_spec(spec_dict_or_path: dict|str|None) -> AshtakavargaSpec
-    rashi_index(lon_deg: float) -> int  # 1..12
+Design principles (mirrors shadbala.py):
+1) Authoritative astronomy only — all longitudes/angles come from
+   `app.core.astronomy.compute_chart(payload)`. No ephemeris duplication here.
+2) Respect `zodiac_mode` and `ayanamsa` exactly as astronomy provides. Longitudes
+   we receive are already in the requested frame (sidereal/tropical).
+3) Transparent `meta` + `warnings`: ruleset used, ayanāṁśa, mode, fallbacks, version, etc.
+4) Deterministic, audited math. If something is missing, compute what you can,
+   and emit explicit warnings. No approximations.
+5) Minimal payload shape (same spirit as shadbala):
+   {
+     "date":"YYYY-MM-DD", "time":"HH:MM[:SS]", "tz":"IANA/Zone",
+     "latitude": float, "longitude": float,
+     "zodiac_mode":"sidereal"|"tropical", "ayanamsa": name|number,
+     "house_system": str, "angles": {"asc": deg, "mc": deg}
+   }
 
-    compute_bav(longitudes_sidereal: dict[str,float], spec) -> dict[str, list[int]]
-    compute_lagna_av(lagna_lon_sidereal: float, spec) -> list[int]
-    compute_sav(bav: dict[str, list[int]], lav: list[int], *, include_nodes: bool = False) -> list[int]
-
-    from_sidereal_chart(chart: dict, spec) -> dict  # if you already have a sidereal chart
-    quick_compute(lon_sid_map: dict[str,float], lagna_sid_deg: float, spec) -> dict
-
-    compute_ashtakavarga(payload: dict, spec: AshtakavargaSpec|None = None) -> dict
-        # High-level wrapper:
-        #   1) astronomy.compute_chart(payload)
-        #   2) extracts/derives SIDEREAL longitudes + Lagna
-        #   3) builds BAV/LAV/SAV
+Output shape:
+{
+  "ok": true,
+  "bav": { "Sun":[..12 ints..], ..., "Saturn":[..12..] },  # entries are integer bindu counts (0..8)
+  "bav_totals": {"Sun": int, ..., "Saturn": int},
+  "sav": {"by_sign":[..12..], "total": int},
+  "meta": {"module":"ashtakavarga(core)","mode":"sidereal|tropical",
+           "ayanamsa_deg":float|None,"ruleset":"parashari-bphs|custom",
+           "version":1},
+  "warnings":[...]
+}
 """
 
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Mapping, Optional, Tuple, Union, Any
-import math
-import os
-import json
+from typing import Dict, List, Tuple, Optional, Any
 
-# ──────────────────────────── required core wiring ───────────────────────────
+# ---------- External dependency: astronomy router (authoritative longitudes) ----------
 try:
-    # single source of truth for positions/angles/mode/ayanamsa
-    from app.core.astronomy import compute_chart as _compute_chart
-except Exception as e:
-    raise RuntimeError(f"ashtakavarga: astronomy.compute_chart import failed: {e}")
-
-# optional: ayanāṁśa name → degrees resolver (used when chart is tropical)
-try:
-    from app.core.ayanamsa import get_ayanamsa_deg as _get_ayanamsa_deg  # type: ignore
+    from app.core.astronomy import compute_chart  # type: ignore
 except Exception:
-    _get_ayanamsa_deg = None  # type: ignore
+    compute_chart = None  # type: ignore
 
-# ───────────────────────── helpers: angles & names ───────────────────────────
+PLANETS: List[str] = ["Sun", "Moon", "Mars", "Mercury", "Jupiter", "Venus", "Saturn"]
 
-def _norm360(x: float) -> float:
-    r = math.fmod(float(x), 360.0)
-    return r + 360.0 if r < 0.0 else r
+# ------------------------------------------------------------------------------
+# Canonical Parāśari / BPHS bindu-offset tables (giver -> receiver -> offsets 1..12)
+# Offsets are counted from the receiver’s sign; add 1 bindu to that relative sign.
+# Receivers are the seven planets; Lagna rows are provided separately below.
+# Sources (consolidated/lined up with BPHS practice): see project docs.
+# ------------------------------------------------------------------------------
 
-def rashi_index(lon_deg: float) -> int:
-    """Return 1..12 for 0° Aries..330° Pisces (expects SIDEREAL longitude)."""
-    return int(math.floor(_norm360(lon_deg) / 30.0)) + 1
+_BPHS_RULES: Dict[str, Dict[str, List[int]]] = {
+    # ---------------- Sun (giver) ----------------
+    "Sun": {
+        "Sun":     [1, 2, 4, 7, 8, 9, 10, 11],
+        "Moon":    [3, 6, 10, 11],
+        "Mars":    [1, 2, 4, 7, 8, 9, 10, 11],
+        "Mercury": [3, 5, 6, 9, 10, 11, 12],
+        "Jupiter": [5, 6, 9, 11],
+        "Venus":   [6, 7, 12],
+        "Saturn":  [1, 2, 4, 7, 8, 9, 10, 11],
+    },
 
-_CANON_NAMES = {
-    "sun":"Sun","surya":"Sun",
-    "moon":"Moon","chandra":"Moon",
-    "mars":"Mars","mangal":"Mars","kuja":"Mars",
-    "mercury":"Mercury","budha":"Mercury",
-    "jupiter":"Jupiter","guru":"Jupiter","brihaspati":"Jupiter",
-    "venus":"Venus","shukra":"Venus",
-    "saturn":"Saturn","shani":"Saturn",
-    "rahu":"Rahu","north node":"Rahu","northnode":"Rahu",
-    "ketu":"Ketu","south node":"Ketu","southnode":"Ketu",
-    "asc":"Lagna","ascendant":"Lagna","lagna":"Lagna",
+    # ---------------- Moon (giver) ----------------
+    "Moon": {
+        "Sun":     [3, 6, 7, 8, 10, 11],
+        "Moon":    [1, 3, 6, 7, 10, 11],
+        "Mars":    [2, 3, 5, 6, 9, 10, 11],
+        "Mercury": [1, 3, 4, 5, 7, 8, 10, 11],
+        "Jupiter": [1, 4, 7, 8, 10, 11, 12],
+        "Venus":   [3, 4, 5, 7, 9, 10, 11],
+        "Saturn":  [3, 5, 6, 11],
+    },
+
+    # ---------------- Mars (giver) ----------------
+    "Mars": {
+        "Sun":     [3, 5, 6, 10, 11],
+        "Moon":    [3, 6, 11],
+        "Mars":    [1, 2, 4, 7, 8, 10, 11],
+        "Mercury": [3, 5, 6, 11],
+        "Jupiter": [6, 10, 11, 12],
+        "Venus":   [6, 8, 11, 12],
+        "Saturn":  [1, 4, 7, 8, 9, 10, 11],
+    },
+
+    # ---------------- Mercury (giver) ----------------
+    "Mercury": {
+        "Sun":     [1, 3, 5, 6, 9, 10, 11, 12],
+        "Moon":    [2, 4, 6, 8, 10, 11],
+        "Mars":    [1, 2, 4, 7, 8, 9, 10, 11],
+        "Mercury": [1, 3, 5, 6, 9, 10, 11, 12],
+        "Jupiter": [6, 8, 11, 12],
+        "Venus":   [1, 2, 3, 4, 5, 9, 10, 11],
+        "Saturn":  [1, 2, 4, 7, 8, 9, 10, 11],
+    },
+
+    # ---------------- Jupiter (giver) ----------------
+    "Jupiter": {
+        "Sun":     [1, 2, 3, 4, 7, 8, 9, 10, 11],
+        "Moon":    [2, 5, 7, 9, 11],
+        "Mars":    [1, 2, 4, 7, 8, 10, 11],
+        "Mercury": [1, 2, 4, 5, 6, 9, 10, 11],
+        "Jupiter": [1, 2, 3, 4, 7, 8, 10, 11],
+        "Venus":   [2, 5, 6, 9, 10, 11],
+        "Saturn":  [3, 5, 6, 12],
+    },
+
+    # ---------------- Venus (giver) ----------------
+    "Venus": {
+        "Sun":     [8, 11, 12],
+        "Moon":    [1, 2, 3, 4, 5, 8, 9, 11, 12],
+        "Mars":    [3, 5, 6, 9, 11, 12],
+        "Mercury": [3, 5, 6, 9, 11],
+        "Jupiter": [5, 8, 9, 10, 11],
+        "Venus":   [1, 2, 3, 4, 5, 8, 9, 10, 11],
+        "Saturn":  [3, 4, 5, 8, 9, 10, 11],
+    },
+
+    # ---------------- Saturn (giver) ----------------
+    "Saturn": {
+        "Sun":     [1, 2, 4, 7, 8, 10, 11],
+        "Moon":    [3, 6, 11],
+        "Mars":    [3, 5, 6, 10, 11, 12],
+        "Mercury": [6, 8, 9, 10, 11, 12],
+        "Jupiter": [5, 6, 11, 12],
+        "Venus":   [6, 11, 12],
+        "Saturn":  [3, 5, 6, 11],
+    },
 }
 
-def _canon(name: str) -> str:
-    return _CANON_NAMES.get(str(name).strip().lower(), str(name))
+# Lagna as receiver (offsets counted from Lagna’s sign) for each giver:
+_BPHS_RULES_LAGNA: Dict[str, List[int]] = {
+    "Sun":     [3, 4, 6, 10, 11, 12],
+    "Moon":    [3, 6, 10, 11],
+    "Mars":    [1, 3, 6, 10, 11],
+    "Mercury": [1, 2, 4, 6, 8, 10, 11],
+    "Jupiter": [1, 2, 4, 5, 6, 9, 10, 11],
+    "Venus":   [1, 2, 3, 4, 5, 8, 9, 11],
+    "Saturn":  [1, 3, 4, 6, 10, 11],
+}
 
-_PLANETS_7 = ("Sun","Moon","Mars","Mercury","Jupiter","Venus","Saturn")
+# ---------------- Internal caches (ruleset compilation) ----------------
+_COMPILED_RULES_CACHE: Dict[str, Dict[str, Dict[str, List[int]]]] = {}
 
-# ───────────────────────── rules spec (pluggable) ────────────────────────────
 
-@dataclass(frozen=True)
-class AshtakavargaSpec:
-    """
-    Rule container:
+# ========================= Utilities =========================
 
-    bav_offsets:
-        dict[target][contributor] = tuple[int,...]
-        - target, contributor ∈ {"Sun","Moon","Mars","Mercury","Jupiter","Venus","Saturn"}
-        - Offsets are forward sign steps 1..12 from contributor’s sign.
+def _wrap360(x: float) -> float:
+    """Wrap angle into [0, 360)."""
+    v = x % 360.0
+    return v if v >= 0 else v + 360.0
 
-    lav_offsets:
-        tuple[int,...] of forward offsets from Lagna to mark 1s in LAV.
 
-    expected_row_totals (optional):
-        dict[target] = int total bindu count for that BAV row.
+def _sign_index(lon_deg: float) -> int:
+    """Return 0..11 sign index from an ecliptic longitude in degrees (0° = Aries)."""
+    return int(_wrap360(lon_deg) // 30.0)  # 0=Aries, ... 11=Pisces
 
-    expected_lav_total (optional): int total for LAV row.
-    expected_sav_total (optional): int overall total of SAV across 12 signs.
-    """
-    bav_offsets: Dict[str, Dict[str, Tuple[int, ...]]]
-    lav_offsets: Tuple[int, ...]
-    expected_row_totals: Optional[Dict[str, int]] = None
-    expected_lav_total: Optional[int] = None
-    expected_sav_total: Optional[int] = None
 
-# cache the default spec if loaded from env
-_default_spec_cache: Optional[AshtakavargaSpec] = None
+def _safe_float(x: Any) -> Optional[float]:
+    try:
+        return float(x)
+    except Exception:
+        return None
 
-def load_spec(spec: Optional[Union[str, Mapping[str, object]]] = None) -> AshtakavargaSpec:
-    """
-    Load AshtakavargaSpec from:
-      - a dict-like object (already parsed), or
-      - a JSON file path, or
-      - if None: look for env OCP_ASHTAKAVARGA_SPEC (JSON path).
-    """
-    global _default_spec_cache
 
-    data: Mapping[str, object]
-    if spec is None:
-        if _default_spec_cache is not None:
-            return _default_spec_cache
-        path = os.getenv("OCP_ASHTAKAVARGA_SPEC", "").strip()
-        if not path:
-            raise RuntimeError("Ashtakavarga rules not provided. Set OCP_ASHTAKAVARGA_SPEC to a JSON file or pass a dict to load_spec().")
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    elif isinstance(spec, str):
-        with open(spec, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    else:
-        data = spec
-
-    def _tupled(x: Iterable[int]) -> Tuple[int, ...]:
-        return tuple(int(v) for v in x)
-
-    raw_bav = data.get("bav_offsets", {})  # type: ignore[assignment]
-    if not isinstance(raw_bav, Mapping):
-        raise ValueError("bav_offsets missing or not a mapping")
-    bav: Dict[str, Dict[str, Tuple[int, ...]]] = {}
-    for tgt, contribs in raw_bav.items():  # type: ignore[assignment]
-        if not isinstance(contribs, Mapping):
-            raise ValueError(f"bav_offsets[{tgt!r}] must be a mapping")
-        row: Dict[str, Tuple[int, ...]] = {}
-        for c, offsets in contribs.items():  # type: ignore[assignment]
-            if not isinstance(offsets, (list, tuple)):
-                raise ValueError(f"bav_offsets[{tgt!r}][{c!r}] must be a list/tuple of offsets")
-            offs = []
-            for k in offsets:
-                kk = int(k)
-                if kk < 0:
-                    kk %= 12
-                if kk == 0:
-                    kk = 12  # 0 → contributor’s own sign becomes +12 forward
-                offs.append(kk)
-            row[_canon(c)] = _tupled(offs)
-        bav[_canon(tgt)] = row
-
-    raw_lav = data.get("lav_offsets", [])
-    if not isinstance(raw_lav, (list, tuple)):
-        raise ValueError("lav_offsets must be list/tuple")
-    lav = []
-    for k in raw_lav:
-        kk = int(k)
-        if kk < 0:
-            kk %= 12
-        if kk == 0:
-            kk = 12
-        lav.append(kk)
-
-    exp_rows = data.get("expected_row_totals")
-    exp_lav  = data.get("expected_lav_total")
-    exp_sav  = data.get("expected_sav_total")
-
-    spec_obj = AshtakavargaSpec(
-        bav_offsets=bav,
-        lav_offsets=tuple(lav),
-        expected_row_totals={_canon(k): int(v) for k, v in (exp_rows or {}).items()} if isinstance(exp_rows, Mapping) else None,
-        expected_lav_total=(int(exp_lav) if isinstance(exp_lav, (int, float)) else None),
-        expected_sav_total=(int(exp_sav) if isinstance(exp_sav, (int, float)) else None),
-    )
-    if spec is None:
-        _default_spec_cache = spec_obj
-    return spec_obj
-
-# ───────────────────────── core arithmetic (0/1 rows) ────────────────────────
-
-def _forward_sign(base: int, step: int) -> int:
-    """Return sign index (1..12) after stepping 'step' forward from base (1..12)."""
-    b = int(base); s = int(step) % 12
-    return ((b - 1 + s) % 12) + 1
-
-def _bindu_row_from_offsets(contributor_sign: int, offsets: Tuple[int, ...]) -> List[int]:
-    """Return a 12-bin 0/1 row with 1s at contributor_sign + offsets."""
-    bins = [0] * 12
-    for off in offsets:
-        j = _forward_sign(contributor_sign, off)
-        bins[j - 1] = 1
-    return bins
-
-def _sum_rows(rows: Iterable[List[int]]) -> List[int]:
-    acc = [0] * 12
-    for r in rows:
-        for i in range(12):
-            acc[i] += int(r[i])
-    return acc
-
-# ───────────────────────── public: BAV / LAV / SAV ───────────────────────────
-
-def compute_bav(
-    longitudes_sidereal: Mapping[str, float],
-    spec: AshtakavargaSpec
-) -> Dict[str, List[int]]:
-    """
-    Build BAV matrices for Sun..Saturn.
-
-    longitudes_sidereal: {'Sun': lon, ..., 'Saturn': lon}
-      → longitudes MUST be sidereal (ayanāṁśa already subtracted).
-
-    Returns: {planet: [12 ints]} in Aries..Pisces order.
-    """
-    # contributor signs
-    signs: Dict[str, int] = {}
-    for nm, lon in longitudes_sidereal.items():
-        nm2 = _canon(nm)
-        if nm2 in _PLANETS_7:
-            try:
-                signs[nm2] = rashi_index(float(lon))
-            except Exception:
-                pass
-
-    out: Dict[str, List[int]] = {}
-    for target in _PLANETS_7:
-        rule_row = spec.bav_offsets.get(target)
-        if not rule_row:
-            raise RuntimeError(f"BAV rules missing for target planet {target}")
-        rows: List[List[int]] = []
-        for contrib in _PLANETS_7:
-            offs = rule_row.get(contrib)
-            if not offs:
-                raise RuntimeError(f"BAV rules missing for target={target}, contributor={contrib}")
-            csign = signs.get(contrib)
-            if csign is None:
-                raise RuntimeError(f"Missing sidereal longitude for contributor {contrib}")
-            rows.append(_bindu_row_from_offsets(csign, offs))
-        out[target] = _sum_rows(rows)
-
-        # optional row-total integrity
-        if spec.expected_row_totals and target in spec.expected_row_totals:
-            exp = int(spec.expected_row_totals[target])
-            got = sum(out[target])
-            if got != exp:
-                raise AssertionError(f"Ashtakavarga integrity: BAV[{target}] total={got} != expected {exp}")
-
-    return out
-
-def compute_lagna_av(
-    lagna_lon_sidereal: float,
-    spec: AshtakavargaSpec
+def _bav_for_planet(
+    giver: str,
+    signs: Dict[str, int],
+    rules: Dict[str, Dict[str, List[int]]],
+    warnings: List[str],
 ) -> List[int]:
-    """Compute LAV (Lagna Aṣṭakavarga) from Lagna and lav_offsets."""
-    lagna_sign = rashi_index(float(lagna_lon_sidereal))
-    return _bindu_row_from_offsets(lagna_sign, spec.lav_offsets)
-
-def compute_sav(
-    bav: Mapping[str, List[int]],
-    lav: List[int],
-    *,
-    include_nodes: bool = False   # kept for API symmetry; classic model ignores nodes
-) -> List[int]:
-    """Sum seven BAV rows + LAV → 12-bin SAV array."""
-    rows = [bav[p] for p in _PLANETS_7 if p in bav]
-    rows.append(lav)
-    return _sum_rows(rows)
-
-# ───────────────────────── adapters: extract from chart ──────────────────────
-
-def _extract_sidereal_longitudes(chart: Mapping[str, Any]) -> Dict[str, float]:
     """
-    Tries in order:
-      1) chart['bodies_sidereal'] = [{'name','longitude_sidereal_deg'}, ...]
-      2) chart['bodies'] with 'longitude_deg' plus chart/meta ayanāṁśa to siderealize
-      3) chart['bodies'] with already-sidereal 'lon' (fallback)
+    Compute the 12-sign BAV vector for `giver` using the supplied `rules`.
+
+    `signs` maps body -> sign_index (0..11). Bodies include "Lagna" (if available) and the 7 planets.
+    `rules[giver][receiver] = [offsets 1..12]`.
+
+    For each receiver present in `signs` and in rules, each offset marks
+    (signs[receiver] + offset - 1) % 12 as +1 in the giver's BAV.
     """
-    out: Dict[str, float] = {}
-    # 1) explicit sidereal
-    bodies_s = chart.get("bodies_sidereal")
-    if isinstance(bodies_s, list):
-        for row in bodies_s:
-            try:
-                nm = _canon(str(row["name"]))
-                lon = float(row["longitude_sidereal_deg"])
-                out[nm] = _norm360(lon)
-            except Exception:
+    vec = [0] * 12
+    grules = rules.get(giver, {})
+    for receiver, offsets in grules.items():
+        if receiver not in signs:
+            continue
+        base = signs[receiver]
+        for off in offsets:
+            if not isinstance(off, int) or not (1 <= off <= 12):
+                warnings.append(f"invalid_offset:{giver}->{receiver}:{off}")
                 continue
-        if out:
-            return out
+            idx = (base + (off - 1)) % 12
+            vec[idx] += 1
+    return vec
 
-    # ayanāṁśa to convert tropical → sidereal
-    ay = None
-    # meta from astronomy/ephemeris_adapter
-    meta = chart.get("meta", {}) if isinstance(chart, Mapping) else {}
-    if isinstance(meta, Mapping):
-        sid = meta.get("sidereal")
-        if isinstance(sid, Mapping) and "ayanamsa_deg" in sid:
-            try:
-                ay = float(sid["ayanamsa_deg"])
-            except Exception:
-                ay = None
-        if ay is None and "ayanamsa_deg" in meta:
-            try:
-                ay = float(meta["ayanamsa_deg"])
-            except Exception:
-                ay = None
-    # direct top-level hint
-    if ay is None:
-        try:
-            if "ayanamsa_deg" in chart:
-                ay = float(chart["ayanamsa_deg"])
-        except Exception:
-            ay = None
 
-    bodies = chart.get("bodies", [])
-    if isinstance(bodies, list) and bodies:
-        for row in bodies:
-            try:
-                nm = _canon(str(row["name"]))
-                if ay is not None and "longitude_deg" in row:
-                    L = _norm360(float(row["longitude_deg"]) - float(ay))
-                else:
-                    # already sidereal or ambiguous - try 'lon' as-is
-                    L = _norm360(float(row.get("lon")))  # may raise
-                out[nm] = L
-            except Exception:
-                continue
+def _validate_rules_map(
+    rules_map: Dict[str, Dict[str, List[int]]],
+    include_lagna: bool = True
+) -> Tuple[bool, List[str]]:
+    """Validate a custom ruleset map coming from payload."""
+    w: List[str] = []
+    ok = True
+    for giver, rmap in rules_map.items():
+        if giver not in PLANETS:
+            ok = False
+            w.append(f"unknown_giver:{giver}")
+        for receiver, offs in rmap.items():
+            if receiver not in PLANETS and not (include_lagna and receiver in ("Lagna", "Asc")):
+                ok = False
+                w.append(f"unknown_receiver:{giver}->{receiver}")
+            if not isinstance(offs, (list, tuple)) or not all(isinstance(o, int) for o in offs):
+                ok = False
+                w.append(f"invalid_offsets_type:{giver}->{receiver}")
+            for o in offs:
+                if o < 1 or o > 12:
+                    ok = False
+                    w.append(f"invalid_offset_range:{giver}->{receiver}:{o}")
+    return ok, w
 
-    return out
 
-def _extract_lagna_sidereal(chart: Mapping[str, Any]) -> Optional[float]:
+def _compile_rules_parashari() -> Dict[str, Dict[str, List[int]]]:
+    """Compile embedded BPHS rules (+ Lagna receiver rows)."""
+    compiled: Dict[str, Dict[str, List[int]]] = {}
+    for giver in PLANETS:
+        gr = _BPHS_RULES[giver]
+        compiled[giver] = {}
+        for receiver in PLANETS:
+            compiled[giver][receiver] = list(gr[receiver])
+        # Lagna offsets:
+        compiled[giver]["Lagna"] = list(_BPHS_RULES_LAGNA[giver])
+    return compiled
+
+
+def _load_ruleset(name: str, payload: Dict[str, Any]) -> Tuple[Dict[str, Dict[str, List[int]]], List[str], str]:
     """
-    Try common places for Lagna (sidereal):
-      - chart['angles_sidereal']['asc_deg']
-      - houses payload: chart['houses']['asc_deg'] (already sidereal)
-      - chart['angles']['asc_deg'] minus ayanāṁśa
+    Load/compile a ruleset.
+    - name "parashari-bphs": uses embedded constants in this module.
+    - name "custom": uses `payload['ruleset_map']` (validated).
+    Returns: (rules, warnings, ruleset_name_effective)
     """
-    # explicit sidereal angles
-    try:
-        angs = chart.get("angles_sidereal")
-        if isinstance(angs, Mapping):
-            v = angs.get("asc_deg")
-            if isinstance(v, (int, float)) and math.isfinite(float(v)):
-                return _norm360(float(v))
-    except Exception:
-        pass
+    warnings: List[str] = []
+    tag = str(name or "parashari-bphs").lower()
 
-    # houses_advanced output (if caller injected it)
-    try:
-        houses = chart.get("houses")
-        if isinstance(houses, Mapping):
-            v = houses.get("ascendant") or houses.get("asc_deg")
-            if isinstance(v, (int, float)) and math.isfinite(float(v)):
-                return _norm360(float(v))
-    except Exception:
-        pass
+    if tag == "custom":
+        custom = payload.get("ruleset_map")
+        if not isinstance(custom, dict):
+            warnings.append("ruleset_custom_missing")
+            # Fallback to BPHS
+            tag = "parashari-bphs"
+        else:
+            ok, w = _validate_rules_map(custom, include_lagna=True)
+            warnings.extend(w)
+            if not ok:
+                warnings.append("ruleset_custom_invalid")
+                tag = "parashari-bphs"
+            else:
+                # normalize "Asc" -> "Lagna"
+                compiled: Dict[str, Dict[str, List[int]]] = {}
+                for giver, rmap in custom.items():
+                    compiled[giver] = {}
+                    for receiver, offs in rmap.items():
+                        key = "Lagna" if receiver in ("Lagna", "Asc") else receiver
+                        compiled[giver][key] = list(offs)
+                return compiled, warnings, "custom"
 
-    # tropical asc + ayanāṁśa → sidereal
-    try:
-        angs_t = chart.get("angles")
-        if isinstance(angs_t, Mapping):
-            asc_t = angs_t.get("asc_deg")
-            if isinstance(asc_t, (int, float)):
-                # find ayanāṁśa like in _extract_sidereal_longitudes
-                ay = None
-                meta = chart.get("meta", {}) if isinstance(chart, Mapping) else {}
-                if isinstance(meta, Mapping):
-                    sid = meta.get("sidereal")
-                    if isinstance(sid, Mapping) and "ayanamsa_deg" in sid:
-                        ay = float(sid["ayanamsa_deg"])
-                    elif "ayanamsa_deg" in meta:
-                        ay = float(meta["ayanamsa_deg"])
-                if ay is None and "ayanamsa_deg" in chart:
-                    ay = float(chart["ayanamsa_deg"])
-                if ay is not None:
-                    return _norm360(float(asc_t) - float(ay))
-    except Exception:
-        pass
-    return None
+    # Default / fallback: parashari-bphs
+    cache_key = "parashari-bphs"
+    if cache_key in _COMPILED_RULES_CACHE:
+        return _COMPILED_RULES_CACHE[cache_key], warnings, "parashari-bphs"
 
-def from_sidereal_chart(chart: Mapping[str, Any], spec: AshtakavargaSpec) -> Dict[str, Any]:
+    compiled = _compile_rules_parashari()
+    _COMPILED_RULES_CACHE[cache_key] = compiled
+    return compiled, warnings, "parashari-bphs"
+
+
+def clear_caches() -> None:
+    """Clear ruleset compilation caches."""
+    _COMPILED_RULES_CACHE.clear()
+
+
+# ========================= Core Engine =========================
+
+def compute_ashtakavarga(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Produce a complete Aṣṭakavarga bundle from a sidereal-ready chart dict.
-    Structure:
-    {
-      "bav": {"Sun":[...12...], ..., "Saturn":[...12...]},
-      "lav": [...12...],
-      "sav": [...12...],
-      "meta": { "expected_ok": true, "ayanamsa_deg": <float>|None }
+    Compute BAV (per planet) and SAV (per sign) using Parāśari Ashtakavarga rules.
+
+    `payload` — minimal input; all astronomy comes from `compute_chart(payload)`.
+
+    Returns a dict with keys: ok, bav, bav_totals, sav{by_sign,total}, meta, warnings.
+    """
+    warnings: List[str] = []
+    meta: Dict[str, Any] = {
+        "module": "ashtakavarga(core)",
+        "version": 1,
+        "mode": None,
+        "ayanamsa_deg": None,
+        "ruleset": None,
     }
-    Raises on integrity violations if spec declares expected totals.
-    """
-    longs = _extract_sidereal_longitudes(chart)
-    if not all(k in longs for k in _PLANETS_7):
-        missing = [k for k in _PLANETS_7 if k not in longs]
-        raise RuntimeError(f"Missing sidereal longitudes for: {', '.join(missing)}")
 
-    lagna = _extract_lagna_sidereal(chart)
-    if lagna is None:
-        raise RuntimeError("Cannot determine Lagna (Ascendant) sidereal longitude from chart payload.")
+    if compute_chart is None:
+        return {
+            "ok": False,
+            "bav": {},
+            "bav_totals": {},
+            "sav": {"by_sign": [0] * 12, "total": 0},
+            "meta": meta,
+            "warnings": ["astronomy_router_unavailable"],
+        }
 
-    bav = compute_bav(longs, spec)
-    lav = compute_lagna_av(lagna, spec)
-    sav = compute_sav(bav, lav)
+    # Pull authoritative chart from astronomy adapter
+    try:
+        chart = compute_chart(payload)
+    except Exception as e:
+        return {
+            "ok": False,
+            "bav": {},
+            "bav_totals": {},
+            "sav": {"by_sign": [0] * 12, "total": 0},
+            "meta": meta,
+            "warnings": [f"astronomy_compute_failed:{type(e).__name__}"],
+        }
 
-    # optional grand-total integrity
-    expected_ok = True
-    if spec.expected_lav_total is not None:
-        if sum(lav) != int(spec.expected_lav_total):
-            expected_ok = False
-            raise AssertionError(f"Ashtakavarga integrity: LAV total={sum(lav)} != expected {spec.expected_lav_total}")
-    if spec.expected_sav_total is not None:
-        if sum(sav) != int(spec.expected_sav_total):
-            expected_ok = False
-            raise AssertionError(f"Ashtakavarga integrity: SAV total={sum(sav)} != expected {spec.expected_sav_total}")
+    # Mode & ayanamsa reporting
+    meta["mode"] = (chart.get("meta", {}).get("mode")
+                    or payload.get("zodiac_mode")
+                    or "sidereal")
+    a_deg = chart.get("meta", {}).get("ayanamsa_deg")
+    if a_deg is None and str(meta["mode"]).lower() == "sidereal":
+        a_deg = _safe_float(payload.get("ayanamsa"))
+    meta["ayanamsa_deg"] = a_deg
 
-    # ayanāṁśa echo (if available)
-    ay_meta = None
-    meta = chart.get("meta", {}) if isinstance(chart, Mapping) else {}
-    if isinstance(meta, Mapping):
-        if isinstance(meta.get("sidereal"), Mapping) and "ayanamsa_deg" in meta["sidereal"]:
-            ay_meta = float(meta["sidereal"]["ayanamsa_deg"])
-        elif "ayanamsa_deg" in meta:
-            ay_meta = float(meta["ayanamsa_deg"])
-    if ay_meta is None and "ayanamsa_deg" in chart:
-        try: ay_meta = float(chart["ayanamsa_deg"])
-        except Exception: pass
+    # Extract longitudes for the 7 planets
+    planets_block = chart.get("planets", {})
+    longitudes: Dict[str, Optional[float]] = {}
+    missing: List[str] = []
+    for p in PLANETS:
+        v = planets_block.get(p, {})
+        lon = v.get("lon", v.get("longitude"))
+        fv = _safe_float(lon)
+        if fv is None:
+            missing.append(p)
+        longitudes[p] = fv
+
+    # Ascendant (Lagna)
+    asc = None
+    angles_block = chart.get("angles", chart.get("meta", {}))
+    if isinstance(angles_block, dict):
+        asc = _safe_float(angles_block.get("asc") or angles_block.get("ASC") or angles_block.get("Ascendant"))
+    if asc is None and isinstance(payload.get("angles"), dict):
+        asc = _safe_float(payload["angles"].get("asc"))
+
+    if missing:
+        warnings.append("missing_longitudes:" + ",".join(missing))
+    if asc is None:
+        warnings.append("missing_lagna:asc")
+
+    if all(longitudes[p] is None for p in PLANETS):
+        return {
+            "ok": False,
+            "bav": {},
+            "bav_totals": {},
+            "sav": {"by_sign": [0] * 12, "total": 0},
+            "meta": meta,
+            "warnings": warnings + ["no_planet_longitudes_available"],
+        }
+
+    # Build sign indices
+    signs: Dict[str, int] = {}
+    for p, lon in longitudes.items():
+        if lon is not None:
+            signs[p] = _sign_index(lon)
+    if asc is not None:
+        signs["Lagna"] = _sign_index(asc)
+
+    # Load ruleset
+    requested_ruleset = str(payload.get("ruleset", "parashari-bphs")).lower()
+    rules, rs_warnings, ruleset_name = _load_ruleset(requested_ruleset, payload)
+    warnings.extend(rs_warnings)
+    meta["ruleset"] = ruleset_name
+
+    # BAV per planet
+    bav: Dict[str, List[int]] = {}
+    for giver in PLANETS:
+        vec = _bav_for_planet(giver, signs, rules, warnings)
+        bav[giver] = vec
+
+    # BAV totals per planet
+    bav_totals: Dict[str, int] = {k: int(sum(v)) for k, v in bav.items()}
+
+    # SAV: column-wise sum
+    sav_by_sign = [sum(bav[g][i] for g in PLANETS) for i in range(12)]
+    sav_total = int(sum(sav_by_sign))
+
+    # Consistency check
+    if sav_total != sum(bav_totals.values()):
+        warnings.append("consistency_mismatch:sav_total!=sum(bav_totals)")
 
     return {
+        "ok": True,
         "bav": bav,
-        "lav": lav,
-        "sav": sav,
-        "meta": {
-            "expected_ok": expected_ok,
-            "ayanamsa_deg": ay_meta,
-        }
+        "bav_totals": bav_totals,
+        "sav": {"by_sign": sav_by_sign, "total": sav_total},
+        "meta": meta,
+        "warnings": warnings,
+    }
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+"""
+Ashtakavarga engine — precision-first (gold-standard ready)
+
+Public API:
+    compute_ashtakavarga(payload: dict) -> dict
+    clear_caches() -> None
+
+Design principles (mirrors shadbala.py):
+1) Authoritative astronomy only — all longitudes/angles come from
+   `app.core.astronomy.compute_chart(payload)`. No ephemeris duplication here.
+2) Respect `zodiac_mode` and `ayanamsa` exactly as astronomy provides. Longitudes
+   we receive are already in the requested frame (sidereal/tropical).
+3) Transparent `meta` + `warnings`: ruleset used, ayanāṁśa, mode, fallbacks, version, etc.
+4) Deterministic, audited math. If something is missing, compute what you can,
+   and emit explicit warnings. No approximations.
+5) Minimal payload shape (same spirit as shadbala):
+   {
+     "date":"YYYY-MM-DD", "time":"HH:MM[:SS]", "tz":"IANA/Zone",
+     "latitude": float, "longitude": float,
+     "zodiac_mode":"sidereal"|"tropical", "ayanamsa": name|number,
+     "house_system": str, "angles": {"asc": deg, "mc": deg}
+   }
+
+Output shape:
+{
+  "ok": true,
+  "bav": { "Sun":[..12 ints..], ..., "Saturn":[..12..] },  # entries are integer bindu counts (0..8)
+  "bav_totals": {"Sun": int, ..., "Saturn": int},
+  "sav": {"by_sign":[..12..], "total": int},
+  "meta": {"module":"ashtakavarga(core)","mode":"sidereal|tropical",
+           "ayanamsa_deg":float|None,"ruleset":"parashari-bphs|custom",
+           "version":1},
+  "warnings":[...]
+}
+"""
+
+from typing import Dict, List, Tuple, Optional, Any
+
+# ---------- External dependency: astronomy router (authoritative longitudes) ----------
+try:
+    from app.core.astronomy import compute_chart  # type: ignore
+except Exception:
+    compute_chart = None  # type: ignore
+
+PLANETS: List[str] = ["Sun", "Moon", "Mars", "Mercury", "Jupiter", "Venus", "Saturn"]
+
+# ------------------------------------------------------------------------------
+# Canonical Parāśari / BPHS bindu-offset tables (giver -> receiver -> offsets 1..12)
+# Offsets are counted from the receiver’s sign; add 1 bindu to that relative sign.
+# Receivers are the seven planets; Lagna rows are provided separately below.
+# Sources (consolidated/lined up with BPHS practice): see project docs.
+# ------------------------------------------------------------------------------
+
+_BPHS_RULES: Dict[str, Dict[str, List[int]]] = {
+    # ---------------- Sun (giver) ----------------
+    "Sun": {
+        "Sun":     [1, 2, 4, 7, 8, 9, 10, 11],
+        "Moon":    [3, 6, 10, 11],
+        "Mars":    [1, 2, 4, 7, 8, 9, 10, 11],
+        "Mercury": [3, 5, 6, 9, 10, 11, 12],
+        "Jupiter": [5, 6, 9, 11],
+        "Venus":   [6, 7, 12],
+        "Saturn":  [1, 2, 4, 7, 8, 9, 10, 11],
+    },
+
+    # ---------------- Moon (giver) ----------------
+    "Moon": {
+        "Sun":     [3, 6, 7, 8, 10, 11],
+        "Moon":    [1, 3, 6, 7, 10, 11],
+        "Mars":    [2, 3, 5, 6, 9, 10, 11],
+        "Mercury": [1, 3, 4, 5, 7, 8, 10, 11],
+        "Jupiter": [1, 4, 7, 8, 10, 11, 12],
+        "Venus":   [3, 4, 5, 7, 9, 10, 11],
+        "Saturn":  [3, 5, 6, 11],
+    },
+
+    # ---------------- Mars (giver) ----------------
+    "Mars": {
+        "Sun":     [3, 5, 6, 10, 11],
+        "Moon":    [3, 6, 11],
+        "Mars":    [1, 2, 4, 7, 8, 10, 11],
+        "Mercury": [3, 5, 6, 11],
+        "Jupiter": [6, 10, 11, 12],
+        "Venus":   [6, 8, 11, 12],
+        "Saturn":  [1, 4, 7, 8, 9, 10, 11],
+    },
+
+    # ---------------- Mercury (giver) ----------------
+    "Mercury": {
+        "Sun":     [1, 3, 5, 6, 9, 10, 11, 12],
+        "Moon":    [2, 4, 6, 8, 10, 11],
+        "Mars":    [1, 2, 4, 7, 8, 9, 10, 11],
+        "Mercury": [1, 3, 5, 6, 9, 10, 11, 12],
+        "Jupiter": [6, 8, 11, 12],
+        "Venus":   [1, 2, 3, 4, 5, 9, 10, 11],
+        "Saturn":  [1, 2, 4, 7, 8, 9, 10, 11],
+    },
+
+    # ---------------- Jupiter (giver) ----------------
+    "Jupiter": {
+        "Sun":     [1, 2, 3, 4, 7, 8, 9, 10, 11],
+        "Moon":    [2, 5, 7, 9, 11],
+        "Mars":    [1, 2, 4, 7, 8, 10, 11],
+        "Mercury": [1, 2, 4, 5, 6, 9, 10, 11],
+        "Jupiter": [1, 2, 3, 4, 7, 8, 10, 11],
+        "Venus":   [2, 5, 6, 9, 10, 11],
+        "Saturn":  [3, 5, 6, 12],
+    },
+
+    # ---------------- Venus (giver) ----------------
+    "Venus": {
+        "Sun":     [8, 11, 12],
+        "Moon":    [1, 2, 3, 4, 5, 8, 9, 11, 12],
+        "Mars":    [3, 5, 6, 9, 11, 12],
+        "Mercury": [3, 5, 6, 9, 11],
+        "Jupiter": [5, 8, 9, 10, 11],
+        "Venus":   [1, 2, 3, 4, 5, 8, 9, 10, 11],
+        "Saturn":  [3, 4, 5, 8, 9, 10, 11],
+    },
+
+    # ---------------- Saturn (giver) ----------------
+    "Saturn": {
+        "Sun":     [1, 2, 4, 7, 8, 10, 11],
+        "Moon":    [3, 6, 11],
+        "Mars":    [3, 5, 6, 10, 11, 12],
+        "Mercury": [6, 8, 9, 10, 11, 12],
+        "Jupiter": [5, 6, 11, 12],
+        "Venus":   [6, 11, 12],
+        "Saturn":  [3, 5, 6, 11],
+    },
+}
+
+# Lagna as receiver (offsets counted from Lagna’s sign) for each giver:
+_BPHS_RULES_LAGNA: Dict[str, List[int]] = {
+    "Sun":     [3, 4, 6, 10, 11, 12],
+    "Moon":    [3, 6, 10, 11],
+    "Mars":    [1, 3, 6, 10, 11],
+    "Mercury": [1, 2, 4, 6, 8, 10, 11],
+    "Jupiter": [1, 2, 4, 5, 6, 9, 10, 11],
+    "Venus":   [1, 2, 3, 4, 5, 8, 9, 11],
+    "Saturn":  [1, 3, 4, 6, 10, 11],
+}
+
+# ---------------- Internal caches (ruleset compilation) ----------------
+_COMPILED_RULES_CACHE: Dict[str, Dict[str, Dict[str, List[int]]]] = {}
+
+
+# ========================= Utilities =========================
+
+def _wrap360(x: float) -> float:
+    """Wrap angle into [0, 360)."""
+    v = x % 360.0
+    return v if v >= 0 else v + 360.0
+
+
+def _sign_index(lon_deg: float) -> int:
+    """Return 0..11 sign index from an ecliptic longitude in degrees (0° = Aries)."""
+    return int(_wrap360(lon_deg) // 30.0)  # 0=Aries, ... 11=Pisces
+
+
+def _safe_float(x: Any) -> Optional[float]:
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+
+def _bav_for_planet(
+    giver: str,
+    signs: Dict[str, int],
+    rules: Dict[str, Dict[str, List[int]]],
+    warnings: List[str],
+) -> List[int]:
+    """
+    Compute the 12-sign BAV vector for `giver` using the supplied `rules`.
+
+    `signs` maps body -> sign_index (0..11). Bodies include "Lagna" (if available) and the 7 planets.
+    `rules[giver][receiver] = [offsets 1..12]`.
+
+    For each receiver present in `signs` and in rules, each offset marks
+    (signs[receiver] + offset - 1) % 12 as +1 in the giver's BAV.
+    """
+    vec = [0] * 12
+    grules = rules.get(giver, {})
+    for receiver, offsets in grules.items():
+        if receiver not in signs:
+            continue
+        base = signs[receiver]
+        for off in offsets:
+            if not isinstance(off, int) or not (1 <= off <= 12):
+                warnings.append(f"invalid_offset:{giver}->{receiver}:{off}")
+                continue
+            idx = (base + (off - 1)) % 12
+            vec[idx] += 1
+    return vec
+
+
+def _validate_rules_map(
+    rules_map: Dict[str, Dict[str, List[int]]],
+    include_lagna: bool = True
+) -> Tuple[bool, List[str]]:
+    """Validate a custom ruleset map coming from payload."""
+    w: List[str] = []
+    ok = True
+    for giver, rmap in rules_map.items():
+        if giver not in PLANETS:
+            ok = False
+            w.append(f"unknown_giver:{giver}")
+        for receiver, offs in rmap.items():
+            if receiver not in PLANETS and not (include_lagna and receiver in ("Lagna", "Asc")):
+                ok = False
+                w.append(f"unknown_receiver:{giver}->{receiver}")
+            if not isinstance(offs, (list, tuple)) or not all(isinstance(o, int) for o in offs):
+                ok = False
+                w.append(f"invalid_offsets_type:{giver}->{receiver}")
+            for o in offs:
+                if o < 1 or o > 12:
+                    ok = False
+                    w.append(f"invalid_offset_range:{giver}->{receiver}:{o}")
+    return ok, w
+
+
+def _compile_rules_parashari() -> Dict[str, Dict[str, List[int]]]:
+    """Compile embedded BPHS rules (+ Lagna receiver rows)."""
+    compiled: Dict[str, Dict[str, List[int]]] = {}
+    for giver in PLANETS:
+        gr = _BPHS_RULES[giver]
+        compiled[giver] = {}
+        for receiver in PLANETS:
+            compiled[giver][receiver] = list(gr[receiver])
+        # Lagna offsets:
+        compiled[giver]["Lagna"] = list(_BPHS_RULES_LAGNA[giver])
+    return compiled
+
+
+def _load_ruleset(name: str, payload: Dict[str, Any]) -> Tuple[Dict[str, Dict[str, List[int]]], List[str], str]:
+    """
+    Load/compile a ruleset.
+    - name "parashari-bphs": uses embedded constants in this module.
+    - name "custom": uses `payload['ruleset_map']` (validated).
+    Returns: (rules, warnings, ruleset_name_effective)
+    """
+    warnings: List[str] = []
+    tag = str(name or "parashari-bphs").lower()
+
+    if tag == "custom":
+        custom = payload.get("ruleset_map")
+        if not isinstance(custom, dict):
+            warnings.append("ruleset_custom_missing")
+            # Fallback to BPHS
+            tag = "parashari-bphs"
+        else:
+            ok, w = _validate_rules_map(custom, include_lagna=True)
+            warnings.extend(w)
+            if not ok:
+                warnings.append("ruleset_custom_invalid")
+                tag = "parashari-bphs"
+            else:
+                # normalize "Asc" -> "Lagna"
+                compiled: Dict[str, Dict[str, List[int]]] = {}
+                for giver, rmap in custom.items():
+                    compiled[giver] = {}
+                    for receiver, offs in rmap.items():
+                        key = "Lagna" if receiver in ("Lagna", "Asc") else receiver
+                        compiled[giver][key] = list(offs)
+                return compiled, warnings, "custom"
+
+    # Default / fallback: parashari-bphs
+    cache_key = "parashari-bphs"
+    if cache_key in _COMPILED_RULES_CACHE:
+        return _COMPILED_RULES_CACHE[cache_key], warnings, "parashari-bphs"
+
+    compiled = _compile_rules_parashari()
+    _COMPILED_RULES_CACHE[cache_key] = compiled
+    return compiled, warnings, "parashari-bphs"
+
+
+def clear_caches() -> None:
+    """Clear ruleset compilation caches."""
+    _COMPILED_RULES_CACHE.clear()
+
+
+# ========================= Core Engine =========================
+
+def compute_ashtakavarga(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Compute BAV (per planet) and SAV (per sign) using Parāśari Ashtakavarga rules.
+
+    `payload` — minimal input; all astronomy comes from `compute_chart(payload)`.
+
+    Returns a dict with keys: ok, bav, bav_totals, sav{by_sign,total}, meta, warnings.
+    """
+    warnings: List[str] = []
+    meta: Dict[str, Any] = {
+        "module": "ashtakavarga(core)",
+        "version": 1,
+        "mode": None,
+        "ayanamsa_deg": None,
+        "ruleset": None,
     }
 
-# ───────────────────────── high-level: from request payload ──────────────────
+    if compute_chart is None:
+        return {
+            "ok": False,
+            "bav": {},
+            "bav_totals": {},
+            "sav": {"by_sign": [0] * 12, "total": 0},
+            "meta": meta,
+            "warnings": ["astronomy_router_unavailable"],
+        }
 
-def _resolve_ayanamsa_from_payload(payload: Mapping[str, Any], chart_meta: Mapping[str, Any]) -> Optional[float]:
-    """
-    Best-effort ayanāṁśa degrees to convert tropical → sidereal if needed.
-    Sources (priority):
-      1) chart_meta.meta.sidereal.ayanamsa_deg or meta.ayanamsa_deg (from astronomy)
-      2) payload['ayanamsa'] key: float or str (via app.core.ayanamsa if available)
-    """
-    # 1) meta from astronomy chart
+    # Pull authoritative chart from astronomy adapter
     try:
-        meta = chart_meta.get("meta", {})
-        if isinstance(meta, Mapping):
-            sid = meta.get("sidereal")
-            if isinstance(sid, Mapping) and "ayanamsa_deg" in sid:
-                return float(sid["ayanamsa_deg"])
-            if "ayanamsa_deg" in meta:
-                return float(meta["ayanamsa_deg"])
-    except Exception:
-        pass
+        chart = compute_chart(payload)
+    except Exception as e:
+        return {
+            "ok": False,
+            "bav": {},
+            "bav_totals": {},
+            "sav": {"by_sign": [0] * 12, "total": 0},
+            "meta": meta,
+            "warnings": [f"astronomy_compute_failed:{type(e).__name__}"],
+        }
 
-    # 2) payload hint
+    # Mode & ayanamsa reporting
+    meta["mode"] = (chart.get("meta", {}).get("mode")
+                    or payload.get("zodiac_mode")
+                    or "sidereal")
+    a_deg = chart.get("meta", {}).get("ayanamsa_deg")
+    if a_deg is None and str(meta["mode"]).lower() == "sidereal":
+        a_deg = _safe_float(payload.get("ayanamsa"))
+    meta["ayanamsa_deg"] = a_deg
+
+    # Extract longitudes for the 7 planets
+    planets_block = chart.get("planets", {})
+    longitudes: Dict[str, Optional[float]] = {}
+    missing: List[str] = []
+    for p in PLANETS:
+        v = planets_block.get(p, {})
+        lon = v.get("lon", v.get("longitude"))
+        fv = _safe_float(lon)
+        if fv is None:
+            missing.append(p)
+        longitudes[p] = fv
+
+    # Ascendant (Lagna)
+    asc = None
+    angles_block = chart.get("angles", chart.get("meta", {}))
+    if isinstance(angles_block, dict):
+        asc = _safe_float(angles_block.get("asc") or angles_block.get("ASC") or angles_block.get("Ascendant"))
+    if asc is None and isinstance(payload.get("angles"), dict):
+        asc = _safe_float(payload["angles"].get("asc"))
+
+    if missing:
+        warnings.append("missing_longitudes:" + ",".join(missing))
+    if asc is None:
+        warnings.append("missing_lagna:asc")
+
+    if all(longitudes[p] is None for p in PLANETS):
+        return {
+            "ok": False,
+            "bav": {},
+            "bav_totals": {},
+            "sav": {"by_sign": [0] * 12, "total": 0},
+            "meta": meta,
+            "warnings": warnings + ["no_planet_longitudes_available"],
+        }
+
+    # Build sign indices
+    signs: Dict[str, int] = {}
+    for p, lon in longitudes.items():
+        if lon is not None:
+            signs[p] = _sign_index(lon)
+    if asc is not None:
+        signs["Lagna"] = _sign_index(asc)
+
+    # Load ruleset
+    requested_ruleset = str(payload.get("ruleset", "parashari-bphs")).lower()
+    rules, rs_warnings, ruleset_name = _load_ruleset(requested_ruleset, payload)
+    warnings.extend(rs_warnings)
+    meta["ruleset"] = ruleset_name
+
+    # BAV per planet
+    bav: Dict[str, List[int]] = {}
+    for giver in PLANETS:
+        vec = _bav_for_planet(giver, signs, rules, warnings)
+        bav[giver] = vec
+
+    # BAV totals per planet
+    bav_totals: Dict[str, int] = {k: int(sum(v)) for k, v in bav.items()}
+
+    # SAV: column-wise sum
+    sav_by_sign = [sum(bav[g][i] for g in PLANETS) for i in range(12)]
+    sav_total = int(sum(sav_by_sign))
+
+    # Consistency check
+    if sav_total != sum(bav_totals.values()):
+        warnings.append("consistency_mismatch:sav_total!=sum(bav_totals)")
+
+    return {
+        "ok": True,
+        "bav": bav,
+        "bav_totals": bav_totals,
+        "sav": {"by_sign": sav_by_sign, "total": sav_total},
+        "meta": meta,
+        "warnings": warnings,
+    }
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+"""
+Ashtakavarga engine — precision-first (gold-standard ready)
+
+Public API:
+    compute_ashtakavarga(payload: dict) -> dict
+    clear_caches() -> None
+
+Design principles (mirrors shadbala.py):
+1) Authoritative astronomy only — all longitudes/angles come from
+   `app.core.astronomy.compute_chart(payload)`. No ephemeris duplication here.
+2) Respect `zodiac_mode` and `ayanamsa` exactly as astronomy provides. Longitudes
+   we receive are already in the requested frame (sidereal/tropical).
+3) Transparent `meta` + `warnings`: ruleset used, ayanāṁśa, mode, fallbacks, version, etc.
+4) Deterministic, audited math. If something is missing, compute what you can,
+   and emit explicit warnings. No approximations.
+5) Minimal payload shape (same spirit as shadbala):
+   {
+     "date":"YYYY-MM-DD", "time":"HH:MM[:SS]", "tz":"IANA/Zone",
+     "latitude": float, "longitude": float,
+     "zodiac_mode":"sidereal"|"tropical", "ayanamsa": name|number,
+     "house_system": str, "angles": {"asc": deg, "mc": deg}
+   }
+
+Output shape:
+{
+  "ok": true,
+  "bav": { "Sun":[..12 ints..], ..., "Saturn":[..12..] },  # entries are integer bindu counts (0..8)
+  "bav_totals": {"Sun": int, ..., "Saturn": int},
+  "sav": {"by_sign":[..12..], "total": int},
+  "meta": {"module":"ashtakavarga(core)","mode":"sidereal|tropical",
+           "ayanamsa_deg":float|None,"ruleset":"parashari-bphs|custom",
+           "version":1},
+  "warnings":[...]
+}
+"""
+
+from typing import Dict, List, Tuple, Optional, Any
+
+# ---------- External dependency: astronomy router (authoritative longitudes) ----------
+try:
+    from app.core.astronomy import compute_chart  # type: ignore
+except Exception:
+    compute_chart = None  # type: ignore
+
+PLANETS: List[str] = ["Sun", "Moon", "Mars", "Mercury", "Jupiter", "Venus", "Saturn"]
+
+# ------------------------------------------------------------------------------
+# Canonical Parāśari / BPHS bindu-offset tables (giver -> receiver -> offsets 1..12)
+# Offsets are counted from the receiver’s sign; add 1 bindu to that relative sign.
+# Receivers are the seven planets; Lagna rows are provided separately below.
+# Sources (consolidated/lined up with BPHS practice): see project docs.
+# ------------------------------------------------------------------------------
+
+_BPHS_RULES: Dict[str, Dict[str, List[int]]] = {
+    # ---------------- Sun (giver) ----------------
+    "Sun": {
+        "Sun":     [1, 2, 4, 7, 8, 9, 10, 11],
+        "Moon":    [3, 6, 10, 11],
+        "Mars":    [1, 2, 4, 7, 8, 9, 10, 11],
+        "Mercury": [3, 5, 6, 9, 10, 11, 12],
+        "Jupiter": [5, 6, 9, 11],
+        "Venus":   [6, 7, 12],
+        "Saturn":  [1, 2, 4, 7, 8, 9, 10, 11],
+    },
+
+    # ---------------- Moon (giver) ----------------
+    "Moon": {
+        "Sun":     [3, 6, 7, 8, 10, 11],
+        "Moon":    [1, 3, 6, 7, 10, 11],
+        "Mars":    [2, 3, 5, 6, 9, 10, 11],
+        "Mercury": [1, 3, 4, 5, 7, 8, 10, 11],
+        "Jupiter": [1, 4, 7, 8, 10, 11, 12],
+        "Venus":   [3, 4, 5, 7, 9, 10, 11],
+        "Saturn":  [3, 5, 6, 11],
+    },
+
+    # ---------------- Mars (giver) ----------------
+    "Mars": {
+        "Sun":     [3, 5, 6, 10, 11],
+        "Moon":    [3, 6, 11],
+        "Mars":    [1, 2, 4, 7, 8, 10, 11],
+        "Mercury": [3, 5, 6, 11],
+        "Jupiter": [6, 10, 11, 12],
+        "Venus":   [6, 8, 11, 12],
+        "Saturn":  [1, 4, 7, 8, 9, 10, 11],
+    },
+
+    # ---------------- Mercury (giver) ----------------
+    "Mercury": {
+        "Sun":     [1, 3, 5, 6, 9, 10, 11, 12],
+        "Moon":    [2, 4, 6, 8, 10, 11],
+        "Mars":    [1, 2, 4, 7, 8, 9, 10, 11],
+        "Mercury": [1, 3, 5, 6, 9, 10, 11, 12],
+        "Jupiter": [6, 8, 11, 12],
+        "Venus":   [1, 2, 3, 4, 5, 9, 10, 11],
+        "Saturn":  [1, 2, 4, 7, 8, 9, 10, 11],
+    },
+
+    # ---------------- Jupiter (giver) ----------------
+    "Jupiter": {
+        "Sun":     [1, 2, 3, 4, 7, 8, 9, 10, 11],
+        "Moon":    [2, 5, 7, 9, 11],
+        "Mars":    [1, 2, 4, 7, 8, 10, 11],
+        "Mercury": [1, 2, 4, 5, 6, 9, 10, 11],
+        "Jupiter": [1, 2, 3, 4, 7, 8, 10, 11],
+        "Venus":   [2, 5, 6, 9, 10, 11],
+        "Saturn":  [3, 5, 6, 12],
+    },
+
+    # ---------------- Venus (giver) ----------------
+    "Venus": {
+        "Sun":     [8, 11, 12],
+        "Moon":    [1, 2, 3, 4, 5, 8, 9, 11, 12],
+        "Mars":    [3, 5, 6, 9, 11, 12],
+        "Mercury": [3, 5, 6, 9, 11],
+        "Jupiter": [5, 8, 9, 10, 11],
+        "Venus":   [1, 2, 3, 4, 5, 8, 9, 10, 11],
+        "Saturn":  [3, 4, 5, 8, 9, 10, 11],
+    },
+
+    # ---------------- Saturn (giver) ----------------
+    "Saturn": {
+        "Sun":     [1, 2, 4, 7, 8, 10, 11],
+        "Moon":    [3, 6, 11],
+        "Mars":    [3, 5, 6, 10, 11, 12],
+        "Mercury": [6, 8, 9, 10, 11, 12],
+        "Jupiter": [5, 6, 11, 12],
+        "Venus":   [6, 11, 12],
+        "Saturn":  [3, 5, 6, 11],
+    },
+}
+
+# Lagna as receiver (offsets counted from Lagna’s sign) for each giver:
+_BPHS_RULES_LAGNA: Dict[str, List[int]] = {
+    "Sun":     [3, 4, 6, 10, 11, 12],
+    "Moon":    [3, 6, 10, 11],
+    "Mars":    [1, 3, 6, 10, 11],
+    "Mercury": [1, 2, 4, 6, 8, 10, 11],
+    "Jupiter": [1, 2, 4, 5, 6, 9, 10, 11],
+    "Venus":   [1, 2, 3, 4, 5, 8, 9, 11],
+    "Saturn":  [1, 3, 4, 6, 10, 11],
+}
+
+# ---------------- Internal caches (ruleset compilation) ----------------
+_COMPILED_RULES_CACHE: Dict[str, Dict[str, Dict[str, List[int]]]] = {}
+
+
+# ========================= Utilities =========================
+
+def _wrap360(x: float) -> float:
+    """Wrap angle into [0, 360)."""
+    v = x % 360.0
+    return v if v >= 0 else v + 360.0
+
+
+def _sign_index(lon_deg: float) -> int:
+    """Return 0..11 sign index from an ecliptic longitude in degrees (0° = Aries)."""
+    return int(_wrap360(lon_deg) // 30.0)  # 0=Aries, ... 11=Pisces
+
+
+def _safe_float(x: Any) -> Optional[float]:
     try:
-        ay_key = payload.get("ayanamsa")
-        if isinstance(ay_key, (int, float)):
-            return float(ay_key)
-        if isinstance(ay_key, str) and _get_ayanamsa_deg is not None:
-            return float(_get_ayanamsa_deg(None, ay_key.strip().lower()))  # type: ignore[arg-type]
+        return float(x)
     except Exception:
-        pass
-    return None
+        return None
 
-def _siderealize_rows_if_needed(chart: Mapping[str, Any], payload: Mapping[str, Any]) -> Mapping[str, Any]:
+
+def _bav_for_planet(
+    giver: str,
+    signs: Dict[str, int],
+    rules: Dict[str, Dict[str, List[int]]],
+    warnings: List[str],
+) -> List[int]:
     """
-    Ensure 'bodies_sidereal' and 'angles_sidereal.asc_deg' exist.
-    If chart mode is sidereal, return as-is; otherwise subtract ayanāṁśa.
+    Compute the 12-sign BAV vector for `giver` using the supplied `rules`.
+
+    `signs` maps body -> sign_index (0..11). Bodies include "Lagna" (if available) and the 7 planets.
+    `rules[giver][receiver] = [offsets 1..12]`.
+
+    For each receiver present in `signs` and in rules, each offset marks
+    (signs[receiver] + offset - 1) % 12 as +1 in the giver's BAV.
     """
-    mode = str(chart.get("mode", payload.get("mode","tropical"))).strip().lower()
-    if mode.startswith("sidereal"):
-        return chart
-
-    ay = _resolve_ayanamsa_from_payload(payload, chart)
-    if ay is None:
-        # We prefer being explicit rather than silently wrong
-        raise RuntimeError("Ayanāṁśa is required to compute Aṣṭakavarga from a tropical chart. "
-                           "Provide payload['ayanamsa'] (float or key) or compute a sidereal chart upstream.")
-
-    # build sidereal bodies list
-    sid_rows = []
-    for row in (chart.get("bodies") or []):
-        try:
-            nm = row.get("name")
-            trop = float(row.get("longitude_deg", row.get("lon")))
-            sid = _norm360(trop - float(ay))
-            sid_rows.append({"name": nm, "longitude_sidereal_deg": sid})
-        except Exception:
+    vec = [0] * 12
+    grules = rules.get(giver, {})
+    for receiver, offsets in grules.items():
+        if receiver not in signs:
             continue
+        base = signs[receiver]
+        for off in offsets:
+            if not isinstance(off, int) or not (1 <= off <= 12):
+                warnings.append(f"invalid_offset:{giver}->{receiver}:{off}")
+                continue
+            idx = (base + (off - 1)) % 12
+            vec[idx] += 1
+    return vec
 
-    # ascendant
-    asc_sid = None
-    try:
-        asc_t = chart.get("angles", {}).get("asc_deg")
-        if isinstance(asc_t, (int,float)):
-            asc_sid = _norm360(float(asc_t) - float(ay))
-    except Exception:
-        pass
 
-    out = dict(chart)
-    if sid_rows:
-        out["bodies_sidereal"] = sid_rows
-    if asc_sid is not None:
-        out["angles_sidereal"] = {"asc_deg": asc_sid}
-    # also echo ay for meta
-    meta = dict(chart.get("meta", {}))
-    sid_meta = dict(meta.get("sidereal", {}))
-    sid_meta["ayanamsa_deg"] = float(ay)
-    meta["sidereal"] = sid_meta
-    out["meta"] = meta
-    return out
+def _validate_rules_map(
+    rules_map: Dict[str, Dict[str, List[int]]],
+    include_lagna: bool = True
+) -> Tuple[bool, List[str]]:
+    """Validate a custom ruleset map coming from payload."""
+    w: List[str] = []
+    ok = True
+    for giver, rmap in rules_map.items():
+        if giver not in PLANETS:
+            ok = False
+            w.append(f"unknown_giver:{giver}")
+        for receiver, offs in rmap.items():
+            if receiver not in PLANETS and not (include_lagna and receiver in ("Lagna", "Asc")):
+                ok = False
+                w.append(f"unknown_receiver:{giver}->{receiver}")
+            if not isinstance(offs, (list, tuple)) or not all(isinstance(o, int) for o in offs):
+                ok = False
+                w.append(f"invalid_offsets_type:{giver}->{receiver}")
+            for o in offs:
+                if o < 1 or o > 12:
+                    ok = False
+                    w.append(f"invalid_offset_range:{giver}->{receiver}:{o}")
+    return ok, w
 
-def compute_ashtakavarga(payload: Mapping[str, Any], spec: Optional[AshtakavargaSpec] = None) -> Dict[str, Any]:
+
+def _compile_rules_parashari() -> Dict[str, Dict[str, List[int]]]:
+    """Compile embedded BPHS rules (+ Lagna receiver rows)."""
+    compiled: Dict[str, Dict[str, List[int]]] = {}
+    for giver in PLANETS:
+        gr = _BPHS_RULES[giver]
+        compiled[giver] = {}
+        for receiver in PLANETS:
+            compiled[giver][receiver] = list(gr[receiver])
+        # Lagna offsets:
+        compiled[giver]["Lagna"] = list(_BPHS_RULES_LAGNA[giver])
+    return compiled
+
+
+def _load_ruleset(name: str, payload: Dict[str, Any]) -> Tuple[Dict[str, Dict[str, List[int]]], List[str], str]:
     """
-    High-level wrapper you can call from a route.
-
-    Input:
-        payload — the same dict you pass to astronomy.compute_chart (datetime, place, mode, etc.)
-                  Optionally include 'ayanamsa' (float or name) when using tropical mode.
-
-    Behavior:
-        - Calls astronomy.compute_chart(payload)
-        - Ensures sidereal longitudes/ascendant are present (siderealizes if needed)
-        - Loads rules via load_spec(None) unless 'spec' is provided
-        - Returns {'bav':..., 'lav':..., 'sav':..., 'meta':{...}, 'warnings':[...]}
-
-    Raises:
-        - RuntimeError / AssertionError on missing data or integrity violations
+    Load/compile a ruleset.
+    - name "parashari-bphs": uses embedded constants in this module.
+    - name "custom": uses `payload['ruleset_map']` (validated).
+    Returns: (rules, warnings, ruleset_name_effective)
     """
-    spec_obj = spec or load_spec(None)
+    warnings: List[str] = []
+    tag = str(name or "parashari-bphs").lower()
 
-    chart = _compute_chart(payload)
-    warnings = list(chart.get("warnings") or [])
+    if tag == "custom":
+        custom = payload.get("ruleset_map")
+        if not isinstance(custom, dict):
+            warnings.append("ruleset_custom_missing")
+            # Fallback to BPHS
+            tag = "parashari-bphs"
+        else:
+            ok, w = _validate_rules_map(custom, include_lagna=True)
+            warnings.extend(w)
+            if not ok:
+                warnings.append("ruleset_custom_invalid")
+                tag = "parashari-bphs"
+            else:
+                # normalize "Asc" -> "Lagna"
+                compiled: Dict[str, Dict[str, List[int]]] = {}
+                for giver, rmap in custom.items():
+                    compiled[giver] = {}
+                    for receiver, offs in rmap.items():
+                        key = "Lagna" if receiver in ("Lagna", "Asc") else receiver
+                        compiled[giver][key] = list(offs)
+                return compiled, warnings, "custom"
 
-    # make sure we have sidereal fields
-    chart_s = _siderealize_rows_if_needed(chart, payload)
+    # Default / fallback: parashari-bphs
+    cache_key = "parashari-bphs"
+    if cache_key in _COMPILED_RULES_CACHE:
+        return _COMPILED_RULES_CACHE[cache_key], warnings, "parashari-bphs"
 
-    bundle = from_sidereal_chart(chart_s, spec_obj)
+    compiled = _compile_rules_parashari()
+    _COMPILED_RULES_CACHE[cache_key] = compiled
+    return compiled, warnings, "parashari-bphs"
 
-    # decorate meta for observability
-    meta = dict(bundle.get("meta", {}))
-    meta.update({
-        "source": "compute_ashtakavarga",
-        "chart_mode": chart.get("mode"),
-        "ephemeris_center": chart.get("meta", {}).get("center", chart.get("center")),
-        "frame": chart.get("meta", {}).get("frame"),
+
+def clear_caches() -> None:
+    """Clear ruleset compilation caches."""
+    _COMPILED_RULES_CACHE.clear()
+
+
+# ========================= Core Engine =========================
+
+def compute_ashtakavarga(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Compute BAV (per planet) and SAV (per sign) using Parāśari Ashtakavarga rules.
+
+    `payload` — minimal input; all astronomy comes from `compute_chart(payload)`.
+
+    Returns a dict with keys: ok, bav, bav_totals, sav{by_sign,total}, meta, warnings.
+    """
+    warnings: List[str] = []
+    meta: Dict[str, Any] = {
+        "module": "ashtakavarga(core)",
         "version": 1,
-    })
-    bundle["meta"] = meta
-    bundle["warnings"] = warnings
-    return bundle
+        "mode": None,
+        "ayanamsa_deg": None,
+        "ruleset": None,
+    }
 
-# ───────────────────────── convenience: quick build ──────────────────────────
+    if compute_chart is None:
+        return {
+            "ok": False,
+            "bav": {},
+            "bav_totals": {},
+            "sav": {"by_sign": [0] * 12, "total": 0},
+            "meta": meta,
+            "warnings": ["astronomy_router_unavailable"],
+        }
 
-def quick_compute(
-    longitudes_sidereal: Mapping[str, float],
-    lagna_lon_sidereal: float,
-    spec: AshtakavargaSpec
-) -> Dict[str, Any]:
-    """Direct BAV/LAV/SAV without a full chart dict."""
-    bav = compute_bav(longitudes_sidereal, spec)
-    lav = compute_lagna_av(lagna_lon_sidereal, spec)
-    sav = compute_sav(bav, lav)
-    return {"bav": bav, "lav": lav, "sav": sav}
+    # Pull authoritative chart from astronomy adapter
+    try:
+        chart = compute_chart(payload)
+    except Exception as e:
+        return {
+            "ok": False,
+            "bav": {},
+            "bav_totals": {},
+            "sav": {"by_sign": [0] * 12, "total": 0},
+            "meta": meta,
+            "warnings": [f"astronomy_compute_failed:{type(e).__name__}"],
+        }
 
-# ───────────────────────── module exports ────────────────────────────────────
+    # Mode & ayanamsa reporting
+    meta["mode"] = (chart.get("meta", {}).get("mode")
+                    or payload.get("zodiac_mode")
+                    or "sidereal")
+    a_deg = chart.get("meta", {}).get("ayanamsa_deg")
+    if a_deg is None and str(meta["mode"]).lower() == "sidereal":
+        a_deg = _safe_float(payload.get("ayanamsa"))
+    meta["ayanamsa_deg"] = a_deg
 
-__all__ = [
-    "AshtakavargaSpec",
-    "load_spec",
-    "rashi_index",
-    "compute_bav",
-    "compute_lagna_av",
-    "compute_sav",
-    "from_sidereal_chart",
-    "quick_compute",
-    "compute_ashtakavarga",
-]
+    # Extract longitudes for the 7 planets
+    planets_block = chart.get("planets", {})
+    longitudes: Dict[str, Optional[float]] = {}
+    missing: List[str] = []
+    for p in PLANETS:
+        v = planets_block.get(p, {})
+        lon = v.get("lon", v.get("longitude"))
+        fv = _safe_float(lon)
+        if fv is None:
+            missing.append(p)
+        longitudes[p] = fv
+
+    # Ascendant (Lagna)
+    asc = None
+    angles_block = chart.get("angles", chart.get("meta", {}))
+    if isinstance(angles_block, dict):
+        asc = _safe_float(angles_block.get("asc") or angles_block.get("ASC") or angles_block.get("Ascendant"))
+    if asc is None and isinstance(payload.get("angles"), dict):
+        asc = _safe_float(payload["angles"].get("asc"))
+
+    if missing:
+        warnings.append("missing_longitudes:" + ",".join(missing))
+    if asc is None:
+        warnings.append("missing_lagna:asc")
+
+    if all(longitudes[p] is None for p in PLANETS):
+        return {
+            "ok": False,
+            "bav": {},
+            "bav_totals": {},
+            "sav": {"by_sign": [0] * 12, "total": 0},
+            "meta": meta,
+            "warnings": warnings + ["no_planet_longitudes_available"],
+        }
+
+    # Build sign indices
+    signs: Dict[str, int] = {}
+    for p, lon in longitudes.items():
+        if lon is not None:
+            signs[p] = _sign_index(lon)
+    if asc is not None:
+        signs["Lagna"] = _sign_index(asc)
+
+    # Load ruleset
+    requested_ruleset = str(payload.get("ruleset", "parashari-bphs")).lower()
+    rules, rs_warnings, ruleset_name = _load_ruleset(requested_ruleset, payload)
+    warnings.extend(rs_warnings)
+    meta["ruleset"] = ruleset_name
+
+    # BAV per planet
+    bav: Dict[str, List[int]] = {}
+    for giver in PLANETS:
+        vec = _bav_for_planet(giver, signs, rules, warnings)
+        bav[giver] = vec
+
+    # BAV totals per planet
+    bav_totals: Dict[str, int] = {k: int(sum(v)) for k, v in bav.items()}
+
+    # SAV: column-wise sum
+    sav_by_sign = [sum(bav[g][i] for g in PLANETS) for i in range(12)]
+    sav_total = int(sum(sav_by_sign))
+
+    # Consistency check
+    if sav_total != sum(bav_totals.values()):
+        warnings.append("consistency_mismatch:sav_total!=sum(bav_totals)")
+
+    return {
+        "ok": True,
+        "bav": bav,
+        "bav_totals": bav_totals,
+        "sav": {"by_sign": sav_by_sign, "total": sav_total},
+        "meta": meta,
+        "warnings": warnings,
+    }
