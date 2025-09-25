@@ -9,96 +9,195 @@ Public API:
 """
 
 from typing import Dict, List, Tuple, Optional, Any
+import os
+import json
 
-# ---------- External dependency: astronomy router (authoritative longitudes) ----------
+# ---------- Astronomy acquisition (primary & fallbacks) ----------
+# Primary import (if your build exposes a pure function)
 try:
     from app.core.astronomy import compute_chart  # type: ignore
 except Exception:
     compute_chart = None  # type: ignore
 
+def _safe_float(x: Any) -> Optional[float]:
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+def _maybe_chart_shape(obj: Any) -> Optional[Dict[str, Any]]:
+    """Try to coerce various 'ops/calculate' result shapes into a chart dict."""
+    if not isinstance(obj, dict):
+        return None
+    # Already a chart?
+    if "planets" in obj and (isinstance(obj["planets"], dict) or obj["planets"] is None):
+        return obj
+
+    # Common wrappers: {"chart": {...}} or {"result": {"chart": {...}}}
+    for key in ("chart", "vedic_chart", "sidereal_chart", "tropical_chart"):
+        c = obj.get(key)
+        if isinstance(c, dict) and "planets" in c:
+            return c
+
+    res = obj.get("result")
+    if isinstance(res, dict):
+        for key in ("chart", "vedic_chart", "sidereal_chart", "tropical_chart"):
+            c = res.get(key)
+            if isinstance(c, dict) and "planets" in c:
+                return c
+
+    # Bundle: {"charts": {"vedic": {...}}}
+    charts = obj.get("charts")
+    if isinstance(charts, dict):
+        for k in ("vedic", "primary", "sidereal", "tropical"):
+            c = charts.get(k)
+            if isinstance(c, dict) and "planets" in c:
+                return c
+
+    # Flat top-level planets/angles
+    if {"Sun", "Moon"} & set(obj.keys()):
+        # normalize to {planets:{...}, angles:{...}}
+        planets = {k: v for k, v in obj.items() if k in ("Sun","Moon","Mars","Mercury","Jupiter","Venus","Saturn")}
+        angles = {k: v for k, v in obj.items() if k.lower() in ("asc","mc","ascendant")}
+        meta = obj.get("meta") if isinstance(obj.get("meta"), dict) else {}
+        return {"planets": planets, "angles": angles, "meta": meta}
+
+    return None
+
+def _try_import_fallback_compute() -> Optional[Any]:
+    """
+    Try a few alternate import paths some codebases use for the same idea.
+    Returns a callable(payload) -> chart | result | None, or None if not found.
+    """
+    candidates = (
+        # (module, attribute)
+        ("app.ops.astronomy", "compute_chart"),
+        ("app.api.astronomy", "compute_chart"),
+        ("app.core.ops_calculate", "compute"),         # sometimes export compute(payload)
+        ("app.api.ops_calculate", "compute"),
+        ("ops_api", "compute_chart"),
+    )
+    for mod, attr in candidates:
+        try:
+            m = __import__(mod, fromlist=[attr])
+            fn = getattr(m, attr, None)
+            if callable(fn):
+                return fn
+        except Exception:
+            continue
+    return None
+
+def _call_ops_calculate_http(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    POST to /ops/calculate on the same service.
+    Uses OPS_BASE_URL or http://127.0.0.1:{PORT} as a base.
+    Returns a normalized chart dict or None.
+    """
+    try:
+        import requests  # type: ignore
+    except Exception:
+        return None
+
+    base = os.environ.get("OPS_BASE_URL")
+    if not base:
+        port = os.environ.get("PORT", "5000")
+        base = f"http://127.0.0.1:{port}"
+    url = base.rstrip("/") + "/ops/calculate"
+
+    try:
+        resp = requests.post(url, json=payload, timeout=15)
+    except Exception:
+        return None
+    if resp.status_code >= 400:
+        return None
+
+    try:
+        data = resp.json()
+    except Exception:
+        try:
+            data = json.loads(resp.text or "{}")
+        except Exception:
+            return None
+
+    chart = _maybe_chart_shape(data)
+    return chart
+
+def _obtain_chart(payload: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], List[str]]:
+    """
+    Try multiple ways to obtain an astronomy chart in the canonical shape.
+    Returns (chart_dict_or_None, warnings)
+    """
+    warnings: List[str] = []
+
+    # 1) Primary
+    if compute_chart is not None:
+        try:
+            raw = compute_chart(payload)
+            chart = _maybe_chart_shape(raw) or _maybe_chart_shape(raw.get("chart") if isinstance(raw, dict) else None)
+            if chart:
+                return chart, warnings
+        except Exception as e:
+            warnings.append(f"astronomy_compute_failed:{type(e).__name__}")
+
+    # 2) Importable fallbacks
+    fallback = _try_import_fallback_compute()
+    if callable(fallback):
+        try:
+            raw = fallback(payload)
+            chart = _maybe_chart_shape(raw) or (isinstance(raw, dict) and _maybe_chart_shape(raw.get("chart")))
+            if chart:
+                return chart, warnings
+        except Exception as e:
+            warnings.append(f"astronomy_fallback_failed:{type(e).__name__}")
+
+    # 3) HTTP to /ops/calculate
+    chart = _call_ops_calculate_http(payload)
+    if chart:
+        return chart, warnings
+
+    warnings.append("astronomy_router_unavailable")
+    return None, warnings
+
+
+# ---------- Engine constants ----------
 PLANETS: List[str] = ["Sun", "Moon", "Mars", "Mercury", "Jupiter", "Venus", "Saturn"]
 
-# ----------------------------------------------------------------------
 # Canonical Parāśari / BPHS bindu-offset tables (giver -> receiver)
-# ----------------------------------------------------------------------
 _BPHS_RULES: Dict[str, Dict[str, List[int]]] = {
-    "Sun": {
-        "Sun":     [1, 2, 4, 7, 8, 9, 10, 11],
-        "Moon":    [3, 6, 10, 11],
-        "Mars":    [1, 2, 4, 7, 8, 9, 10, 11],
-        "Mercury": [3, 5, 6, 9, 10, 11, 12],
-        "Jupiter": [5, 6, 9, 11],
-        "Venus":   [6, 7, 12],
-        "Saturn":  [1, 2, 4, 7, 8, 9, 10, 11],
-    },
-    "Moon": {
-        "Sun":     [3, 6, 7, 8, 10, 11],
-        "Moon":    [1, 3, 6, 7, 10, 11],
-        "Mars":    [2, 3, 5, 6, 9, 10, 11],
-        "Mercury": [1, 3, 4, 5, 7, 8, 10, 11],
-        "Jupiter": [1, 4, 7, 8, 10, 11, 12],
-        "Venus":   [3, 4, 5, 7, 9, 10, 11],
-        "Saturn":  [3, 5, 6, 11],
-    },
-    "Mars": {
-        "Sun":     [3, 5, 6, 10, 11],
-        "Moon":    [3, 6, 11],
-        "Mars":    [1, 2, 4, 7, 8, 10, 11],
-        "Mercury": [3, 5, 6, 11],
-        "Jupiter": [6, 10, 11, 12],
-        "Venus":   [6, 8, 11, 12],
-        "Saturn":  [1, 4, 7, 8, 9, 10, 11],
-    },
-    "Mercury": {
-        "Sun":     [1, 3, 5, 6, 9, 10, 11, 12],
-        "Moon":    [2, 4, 6, 8, 10, 11],
-        "Mars":    [1, 2, 4, 7, 8, 9, 10, 11],
-        "Mercury": [1, 3, 5, 6, 9, 10, 11, 12],
-        "Jupiter": [6, 8, 11, 12],
-        "Venus":   [1, 2, 3, 4, 5, 9, 10, 11],
-        "Saturn":  [1, 2, 4, 7, 8, 9, 10, 11],
-    },
-    "Jupiter": {
-        "Sun":     [1, 2, 3, 4, 7, 8, 9, 10, 11],
-        "Moon":    [2, 5, 7, 9, 11],
-        "Mars":    [1, 2, 4, 7, 8, 10, 11],
-        "Mercury": [1, 2, 4, 5, 6, 9, 10, 11],
-        "Jupiter": [1, 2, 3, 4, 7, 8, 10, 11],
-        "Venus":   [2, 5, 6, 9, 10, 11],
-        "Saturn":  [3, 5, 6, 12],
-    },
-    "Venus": {
-        "Sun":     [8, 11, 12],
-        "Moon":    [1, 2, 3, 4, 5, 8, 9, 11, 12],
-        "Mars":    [3, 5, 6, 9, 11, 12],
-        "Mercury": [3, 5, 6, 9, 11],
-        "Jupiter": [5, 8, 9, 10, 11],
-        "Venus":   [1, 2, 3, 4, 5, 8, 9, 10, 11],
-        "Saturn":  [3, 4, 5, 8, 9, 10, 11],
-    },
-    "Saturn": {
-        "Sun":     [1, 2, 4, 7, 8, 10, 11],
-        "Moon":    [3, 6, 11],
-        "Mars":    [3, 5, 6, 10, 11, 12],
-        "Mercury": [6, 8, 9, 10, 11, 12],
-        "Jupiter": [5, 6, 11, 12],
-        "Venus":   [6, 11, 12],
-        "Saturn":  [3, 5, 6, 11],
-    },
+    "Sun":     {"Sun":[1,2,4,7,8,9,10,11],"Moon":[3,6,10,11],"Mars":[1,2,4,7,8,9,10,11],
+                "Mercury":[3,5,6,9,10,11,12],"Jupiter":[5,6,9,11],"Venus":[6,7,12],
+                "Saturn":[1,2,4,7,8,9,10,11]},
+    "Moon":    {"Sun":[3,6,7,8,10,11],"Moon":[1,3,6,7,10,11],"Mars":[2,3,5,6,9,10,11],
+                "Mercury":[1,3,4,5,7,8,10,11],"Jupiter":[1,4,7,8,10,11,12],
+                "Venus":[3,4,5,7,9,10,11],"Saturn":[3,5,6,11]},
+    "Mars":    {"Sun":[3,5,6,10,11],"Moon":[3,6,11],"Mars":[1,2,4,7,8,10,11],
+                "Mercury":[3,5,6,11],"Jupiter":[6,10,11,12],"Venus":[6,8,11,12],
+                "Saturn":[1,4,7,8,9,10,11]},
+    "Mercury": {"Sun":[1,3,5,6,9,10,11,12],"Moon":[2,4,6,8,10,11],
+                "Mars":[1,2,4,7,8,9,10,11],"Mercury":[1,3,5,6,9,10,11,12],
+                "Jupiter":[6,8,11,12],"Venus":[1,2,3,4,5,9,10,11],
+                "Saturn":[1,2,4,7,8,9,10,11]},
+    "Jupiter": {"Sun":[1,2,3,4,7,8,9,10,11],"Moon":[2,5,7,9,11],
+                "Mars":[1,2,4,7,8,10,11],"Mercury":[1,2,4,5,6,9,10,11],
+                "Jupiter":[1,2,3,4,7,8,10,11],"Venus":[2,5,6,9,10,11],
+                "Saturn":[3,5,6,12]},
+    "Venus":   {"Sun":[8,11,12],"Moon":[1,2,3,4,5,8,9,11,12],
+                "Mars":[3,5,6,9,11,12],"Mercury":[3,5,6,9,11],
+                "Jupiter":[5,8,9,10,11],"Venus":[1,2,3,4,5,8,9,10,11],
+                "Saturn":[3,4,5,8,9,10,11]},
+    "Saturn":  {"Sun":[1,2,4,7,8,10,11],"Moon":[3,6,11],
+                "Mars":[3,5,6,10,11,12],"Mercury":[6,8,9,10,11,12],
+                "Jupiter":[5,6,11,12],"Venus":[6,11,12],"Saturn":[3,5,6,11]},
 }
 
-# Lagna as receiver (offsets counted from Lagna’s sign) for each giver:
+# Lagna as receiver
 _BPHS_RULES_LAGNA: Dict[str, List[int]] = {
-    "Sun":     [3, 4, 6, 10, 11, 12],
-    "Moon":    [3, 6, 10, 11],
-    "Mars":    [1, 3, 6, 10, 11],
-    "Mercury": [1, 2, 4, 6, 8, 10, 11],
-    "Jupiter": [1, 2, 4, 5, 6, 9, 10, 11],
-    "Venus":   [1, 2, 3, 4, 5, 8, 9, 11],
-    "Saturn":  [1, 3, 4, 6, 10, 11],
+    "Sun":[3,4,6,10,11,12], "Moon":[3,6,10,11], "Mars":[1,3,6,10,11],
+    "Mercury":[1,2,4,6,8,10,11], "Jupiter":[1,2,4,5,6,9,10,11],
+    "Venus":[1,2,3,4,5,8,9,11], "Saturn":[1,3,4,6,10,11],
 }
 
-# ---------------- Internal caches (ruleset compilation) ----------------
+# Cache of compiled rules
 _COMPILED_RULES_CACHE: Dict[str, Dict[str, Dict[str, List[int]]]] = {}
 
 # ========================= Utilities =========================
@@ -108,12 +207,6 @@ def _wrap360(x: float) -> float:
 
 def _sign_index(lon_deg: float) -> int:
     return int(_wrap360(lon_deg) // 30.0)  # 0=Aries … 11=Pisces
-
-def _safe_float(x: Any) -> Optional[float]:
-    try:
-        return float(x)
-    except Exception:
-        return None
 
 def _bav_for_planet(
     giver: str,
@@ -145,9 +238,9 @@ def _validate_rules_map(
         if giver not in PLANETS:
             ok = False; w.append(f"unknown_giver:{giver}")
         for receiver, offs in rmap.items():
-            if receiver not in PLANETS and not (include_lagna and receiver in ("Lagna", "Asc")):
+            if receiver not in PLANETS and not (include_lagna and receiver in ("Lagna","Asc")):
                 ok = False; w.append(f"unknown_receiver:{giver}->{receiver}")
-            if not isinstance(offs, (list, tuple)) or not all(isinstance(o, int) for o in offs):
+            if not isinstance(offs, (list,tuple)) or not all(isinstance(o,int) for o in offs):
                 ok = False; w.append(f"invalid_offsets_type:{giver}->{receiver}")
             for o in offs:
                 if o < 1 or o > 12:
@@ -183,7 +276,7 @@ def _load_ruleset(name: str, payload: Dict[str, Any]) -> Tuple[Dict[str, Dict[st
                 for giver, rmap in custom.items():
                     compiled[giver] = {}
                     for receiver, offs in rmap.items():
-                        key = "Lagna" if receiver in ("Lagna", "Asc") else receiver
+                        key = "Lagna" if receiver in ("Lagna","Asc") else receiver
                         compiled[giver][key] = list(offs)
                 return compiled, warnings, "custom"
     cache_key = "parashari-bphs"
@@ -198,6 +291,13 @@ def clear_caches() -> None:
 
 # ========================= Core Engine =========================
 def compute_ashtakavarga(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Compute BAV (per planet) and SAV (per sign) using Parāśari Ashtakavarga rules.
+    Astronomy is obtained from:
+        1) app.core.astronomy.compute_chart
+        2) importable fallbacks
+        3) POST /ops/calculate
+    """
     warnings: List[str] = []
     meta: Dict[str, Any] = {
         "module": "ashtakavarga(core)",
@@ -207,42 +307,42 @@ def compute_ashtakavarga(payload: Dict[str, Any]) -> Dict[str, Any]:
         "ruleset": None,
     }
 
-    if compute_chart is None:
+    # Acquire authoritative chart (sidereal/tropical already honored upstream)
+    chart, w0 = _obtain_chart(payload)
+    warnings.extend(w0)
+    if chart is None:
         return {
             "ok": False, "bav": {}, "bav_totals": {},
             "sav": {"by_sign": [0]*12, "total": 0},
             "meta": meta,
-            "warnings": ["astronomy_router_unavailable"],
+            "warnings": warnings,
         }
 
-    try:
-        chart = compute_chart(payload)
-    except Exception as e:
-        return {
-            "ok": False, "bav": {}, "bav_totals": {},
-            "sav": {"by_sign": [0]*12, "total": 0},
-            "meta": meta,
-            "warnings": [f"astronomy_compute_failed:{type(e).__name__}"],
-        }
-
+    # Mode & ayanamsa reporting
     meta["mode"] = (chart.get("meta", {}).get("mode")
                     or payload.get("zodiac_mode") or "sidereal")
-    a_deg = chart.get("meta", {}).get("ayanamsa_deg")
+    a_deg = chart.get("meta", {}).get("ayanamsa_deg") if isinstance(chart.get("meta"), dict) else None
     if a_deg is None and str(meta["mode"]).lower() == "sidereal":
         a_deg = _safe_float(payload.get("ayanamsa"))
     meta["ayanamsa_deg"] = a_deg
 
-    planets_block = chart.get("planets", {})
+    # Extract longitudes for the 7 planets
+    planets_block = chart.get("planets", {}) if isinstance(chart.get("planets"), dict) else {}
     longitudes: Dict[str, Optional[float]] = {}
     missing: List[str] = []
+
     for p in PLANETS:
         v = planets_block.get(p, {})
-        lon = v.get("lon", v.get("longitude"))
+        if isinstance(v, dict):
+            lon = v.get("lon", v.get("longitude"))
+        else:
+            lon = v  # sometimes flattened number
         fv = _safe_float(lon)
         if fv is None:
             missing.append(p)
         longitudes[p] = fv
 
+    # Ascendant (Lagna)
     asc = None
     angles_block = chart.get("angles", chart.get("meta", {}))
     if isinstance(angles_block, dict):
@@ -263,6 +363,14 @@ def compute_ashtakavarga(payload: Dict[str, Any]) -> Dict[str, Any]:
             "warnings": warnings + ["no_planet_longitudes_available"],
         }
 
+    # Build sign indices
+    def _wrap360(x: float) -> float:
+        v = x % 360.0
+        return v if v >= 0 else v + 360.0
+
+    def _sign_index(lon_deg: float) -> int:
+        return int(_wrap360(lon_deg) // 30.0)
+
     signs: Dict[str, int] = {}
     for p, lon in longitudes.items():
         if lon is not None:
@@ -270,19 +378,34 @@ def compute_ashtakavarga(payload: Dict[str, Any]) -> Dict[str, Any]:
     if asc is not None:
         signs["Lagna"] = _sign_index(asc)
 
+    # Load ruleset
     requested_ruleset = str(payload.get("ruleset", "parashari-bphs")).lower()
     rules, rs_warnings, ruleset_name = _load_ruleset(requested_ruleset, payload)
     warnings.extend(rs_warnings)
     meta["ruleset"] = ruleset_name
 
-    bav: Dict[str, List[int]] = {}
-    for giver in PLANETS:
-        bav[giver] = _bav_for_planet(giver, signs, rules, warnings)
+    # BAV per planet
+    def _bav_for_planet(giver: str, signs: Dict[str, int], rules: Dict[str, Dict[str, List[int]]], warnings: List[str]) -> List[int]:
+        vec = [0] * 12
+        grules = rules.get(giver, {})
+        for receiver, offsets in grules.items():
+            if receiver not in signs:
+                continue
+            base = signs[receiver]
+            for off in offsets:
+                if not isinstance(off, int) or not (1 <= off <= 12):
+                    warnings.append(f"invalid_offset:{giver}->{receiver}:{off}")
+                    continue
+                idx = (base + (off - 1)) % 12
+                vec[idx] += 1
+        return vec
 
+    bav: Dict[str, List[int]] = {giver: _bav_for_planet(giver, signs, rules, warnings) for giver in PLANETS}
     bav_totals: Dict[str, int] = {k: int(sum(v)) for k, v in bav.items()}
     sav_by_sign = [sum(bav[g][i] for g in PLANETS) for i in range(12)]
     sav_total = int(sum(sav_by_sign))
-    if sav_total != sum(bav_totals.values()):
+
+    if sav_total != sum(bav_totals.values()):  # integrity check
         warnings.append("consistency_mismatch:sav_total!=sum(bav_totals)")
 
     return {
