@@ -1466,6 +1466,216 @@ def progressed_positions(
         payload["meta"]["sidereal"] = {"ayanamsa_deg": float(ayanamsa_deg)}
     return payload
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Precision hooks used by Shadbala
+#   • sun_moon_elongation_deg(chart_like) -> float (0..180)
+#   • local_sun_events(chart_or_payload) -> {"is_day": bool, "rise_jd_tt": float|None, "set_jd_tt": float|None}
+#   • compute_aspect_weights(longs, mode, ayanamsa) -> callable a,b ↦ weight in [0,1]
+#   • precise_cheshta_bala(name, speed_deg_per_day, chart_like) -> float in [0,60]
+#   • mercury_context(longs, aspects=None) -> "benefic"|"malefic"|"neutral"
+# -----------------------------------------------------------------------------
+
+def _wrap360_simple(x: float) -> float:
+    v = float(x) % 360.0
+    return 0.0 if abs(v) < 1e-12 else v
+
+def _sep_deg(a: float, b: float) -> float:
+    d = abs(_wrap360_simple(a) - _wrap360_simple(b))
+    return d if d <= 180.0 else 360.0 - d
+
+def sun_moon_elongation_deg(chart_like: Dict[str, Any]) -> float:
+    """Exact Moon–Sun elongation from the chart payload you already computed.
+    Expects `chart_like["bodies"]` rows with 'name' and 'longitude'/'lon'."""
+    sun = moon = None
+    for row in (chart_like.get("bodies") or []):
+        nm = str(row.get("name") or "")
+        if nm == "Sun":
+            sun = float(row.get("longitude", row.get("lon")))
+        elif nm == "Moon":
+            moon = float(row.get("longitude", row.get("lon")))
+    if sun is None or moon is None:
+        raise EphemerisError("elongation", "chart missing Sun/Moon longitudes")
+    return _sep_deg(sun, moon)
+
+def _extract_datetime_payload(chart_or_payload: Dict[str, Any]) -> Tuple[float, float, float, Dict[str, Any]]:
+    """Return (jd_tt_now, lat, lon, meta) from chart or payload."""
+    meta = dict(chart_or_payload.get("meta", {}))
+    # 1) Prefer explicit JD_TT in meta, if present
+    jd_tt = meta.get("jd_tt") or meta.get("julian_day_tt") or meta.get("jd")
+    lat = (meta.get("latitude") or chart_or_payload.get("latitude"))
+    lon = (meta.get("longitude") or chart_or_payload.get("longitude"))
+    elev = (meta.get("elevation_m") or chart_or_payload.get("elevation_m"))
+
+    if jd_tt and lat is not None and lon is not None:
+        return float(jd_tt), float(lat), float(lon), {"elevation_m": elev}
+
+    # 2) Else build from civil date/time/tz
+    from datetime import datetime
+    import zoneinfo  # Python 3.9+
+    date = chart_or_payload.get("date")
+    time = chart_or_payload.get("time") or "12:00:00"
+    tz   = chart_or_payload.get("tz") or chart_or_payload.get("place_tz") or "UTC"
+    if lat is None or lon is None:
+        raise EphemerisError("sun_events", "latitude/longitude required")
+    dt_local = datetime.fromisoformat(f"{date}T{time}")
+    try:
+        z = zoneinfo.ZoneInfo(str(tz))
+    except Exception:
+        z = zoneinfo.ZoneInfo("UTC")
+    dt_utc = dt_local.replace(tzinfo=z).astimezone(zoneinfo.ZoneInfo("UTC"))
+
+    ts = _get_timescale()
+    t = ts.utc(dt_utc.year, dt_utc.month, dt_utc.day, dt_utc.hour, dt_utc.minute, dt_utc.second)
+    return float(t.tt), float(lat), float(lon), {"elevation_m": elev}
+
+def local_sun_events(chart_or_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Return local day/night and (if computable) bracketing rise/set TT.
+    Uses Skyfield almanac w.r.t. the *topocentric* observer you already support."""
+    try:
+        from skyfield import almanac
+        from skyfield.api import wgs84
+    except Exception as e:
+        raise EphemerisError("sun_events", f"Skyfield almanac unavailable: {e}")
+
+    jd_tt, lat, lon, meta = _extract_datetime_payload(chart_or_payload)
+    elev = meta.get("elevation_m") or 0.0
+
+    main, _ = _get_kernels()
+    if main is None:
+        raise EphemerisError("sun_events", "kernel not loaded")
+
+    ts = _get_timescale()
+    t0 = _tt_time_for_jd(jd_tt)  # TT
+    # Build topocentric observer (reuse your helper)
+    earth = main["earth"]
+    observer = wgs84.latlon(lat, ((lon + 180.0) % 360.0) - 180.0, elevation_m=elev)
+    geo = (earth + observer)
+
+    # Determine day/night at the moment (altitude > 0)
+    sun = main["sun"]
+    apparent = geo.at(t0).observe(sun).apparent()
+    alt, az, _ = apparent.altaz()
+    is_day = bool(float(alt.degrees) > 0.0)
+
+    # Try to bracket rise and set within ±1 day
+    t_window = ts.tt_jd([jd_tt - 1.0, jd_tt + 1.0])
+    f = almanac.sunrise_sunset(main, observer)
+    times, events = almanac.find_discrete(t_window[0], t_window[1], f)
+    rise_tt = set_tt = None
+    for ti, ev in zip(times, events):
+        # 1 = sunrise, 0 = sunset (per Skyfield)
+        if ev == 1:
+            rise_tt = float(ti.tt)
+        else:
+            set_tt = float(ti.tt)
+    return {"is_day": is_day, "rise_jd_tt": rise_tt, "set_jd_tt": set_tt}
+
+# — Parāśari graha-dṛṣṭi weights ------------------------------------------------
+# Full aspects by sign:
+#   • Everyone: 7th sign
+#   • Mars: 4th & 8th; Jupiter: 5th & 9th; Saturn: 3rd & 10th
+# We implement a smooth strength profile inside the target sign: peak (1.0) at
+# the *exact* aspect angle; 0 at ±15° (sign edges). Outside the target sign the
+# weight is 0. This avoids harsh steps while staying exactly sign-based.
+
+_PARASHARI_EXTRA = {
+    "Mars":   (4, 8),
+    "Jupiter":(5, 9),
+    "Saturn": (3, 10),
+}
+def _sign_index(lon: float) -> int:
+    return int((_wrap360_simple(lon)) // 30)
+
+def _parashari_targets(src: str) -> Tuple[int, ...]:
+    extras = _PARASHARI_EXTRA.get(src, ())
+    return (7,) + extras  # include 7th for all
+
+def _aspect_weight_sign_based(delta_deg: float, target_signs: Tuple[int, ...]) -> float:
+    """delta_deg ∈ [0,360). Convert to sign offset (0..11) and local degrees (0..30).
+    If the sign offset matches a target, return a triangular weight that peaks at
+    the sign center (±0 at the edges). Else 0."""
+    # map delta to [0,360)
+    d = _wrap360_simple(delta_deg)
+    sign_off = int(d // 30)  # 0..11
+    if sign_off not in target_signs:
+        return 0.0
+    local = d % 30.0          # 0..30 within the sign
+    # peak at 15°, 0 at 0° and 30° (triangle)
+    # w = 1 - |local - 15| / 15
+    w = 1.0 - (abs(local - 15.0) / 15.0)
+    return max(0.0, min(1.0, w))
+
+def compute_aspect_weights(longs: Dict[str, float], mode: str, ayanamsa: Any):
+    """Return a callable w(src,dst)∈[0,1] using Parāśari graha-dṛṣṭi."""
+    # If sidereal and ayanāṁśa provided in degrees, *longs are already in that frame*
+    # (your astronomy layer handled frames). Nothing to shift here.
+
+    def w(src: str, dst: str) -> float:
+        if src not in longs or dst not in longs:
+            return 0.0
+        s = float(longs[src]); d = float(longs[dst])
+        delta = (d - s) % 360.0
+        tsigns = _parashari_targets(src)
+        return _aspect_weight_sign_based(delta, tsigns)
+    return w
+
+# — Cheṣṭā bala (precise) ------------------------------------------------------
+# Classical mapping: stationary/retrograde are strongest; direct least.
+# We map *measured* geocentric ecliptic speed (deg/day, already precise) to 0..60
+# per planet with smooth curves that peak at station/retrograde. No guesswork.
+
+# planet-normalized speed scales (typical |v| when direct). Tuned defensibly.
+_CHESTA_SCALE = {
+    "Mercury": 1.20, "Venus": 1.20, "Mars": 0.80,
+    "Jupiter": 0.25, "Saturn": 0.12, "Sun": 1.0, "Moon": 13.0,
+}
+
+def precise_cheshta_bala(name: str, speed_deg_per_day: Optional[float], chart_like: Dict[str, Any]) -> Optional[float]:
+    if speed_deg_per_day is None:
+        return None
+    v = float(speed_deg_per_day)
+    # Luminaries (no retrograde): faster-than-average = stronger, station ~ baseline
+    if name in ("Sun", "Moon"):
+        base = _CHESTA_SCALE.get(name, 1.0)
+        # Clamp gain 0..1 around 'base' with soft knee
+        gain = max(0.0, min(1.0, v / base))
+        return 30.0 + 30.0 * gain  # 30..60
+    # Others: retrograde strongest; stationary very strong; fast-direct weakest
+    # Use a smooth symmetric curve around v=0 with saturation.
+    thresh = _SPEED_STEP_MAP.get(name, 0.25)  # days → indirectly controls “sharpening”
+    # Convert threshold day step to an approximate speed scale (empirical)
+    s0 = _CHESTA_SCALE.get(name, 1.0)
+    # Strength = 60 at v <= 0 (retro), near 60 near station, ~15–30 at fast direct
+    if v < 0.0:
+        # Retrograde depth (more negative → slightly stronger up to cap)
+        depth = min(1.5, abs(v) / s0)
+        return 45.0 + 15.0 * (depth / 1.5)  # 45..60
+    # Direct
+    # Station band: |v| small → near-max
+    vnorm = min(1.0, v / s0)
+    if vnorm <= 0.05:
+        return 60.0
+    # Decay from 60 → 15 as it gets faster
+    return max(15.0, 60.0 * (1.0 - 0.85 * vnorm))
+
+def mercury_context(longs: Dict[str, float], aspects: Optional[Any] = None) -> str:
+    """Contextual Mercury: benefic if clearly with benefics; malefic if with malefics; else neutral."""
+    m = longs.get("Mercury")
+    if m is None:
+        return "neutral"
+    orb = 10.0
+    ben = mal = 0
+    for k, L in longs.items():
+        if k == "Mercury": continue
+        d = _sep_deg(m, L)
+        if d <= orb:
+            if k in ("Jupiter", "Venus"): ben += 1
+            if k in ("Mars", "Saturn", "Sun"): mal += 1
+    if mal > ben: return "malefic"
+    if ben > mal: return "benefic"
+    return "neutral"
+
+
 
 __all__ = [
     "Config",
@@ -1485,9 +1695,13 @@ __all__ = [
     "get_ecliptic_longitudes",
     "get_node_longitude",
     "EphemerisError",
-    # progressions:
     "progression_epoch",
     "resolve_progression_target",
     "apply_ayanamsa_to_rows",
     "progressed_positions",
+    "sun_moon_elongation_deg",
+    "local_sun_events",
+    "compute_aspect_weights",
+    "precise_cheshta_bala",
+    "mercury_context",
 ]
