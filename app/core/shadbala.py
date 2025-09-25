@@ -342,7 +342,8 @@ def _kala_bala(name: str,
                 is_day = bool(ev["is_day"])  # type: ignore[arg-type]
                 sub["source_daynight"] = "adapter"
         except Exception as e:
-            warnings.append(f"kala_daynight_failed:{type(e).__name__}")
+           msg = getattr(e, "message", str(e))
+           warnings.append(f"kala_daynight_failed:{type(e).__name__}:{msg}")
 
     if is_day is None and len(cusps) == 12 and "Sun" in longs:
         try:
@@ -637,7 +638,8 @@ def compute_shadbala(payload: Dict[str, Any]) -> Dict[str, Any]:
         comps["dig"] = _Comp(_dig_bala(nm, lon, asc, mc), None if (asc is not None and mc is not None) else "angles_missing")
 
         # KĀLA
-        k_val2, k_sub = _kala_bala(nm, chart=chart, longs=longs, cusps=cusps, warnings=warnings)
+        merged_for_sun = {"meta": dict(chart.get("meta") or {}), **payload}
+        k_val2, k_sub = _kala_bala(nm, chart=merged_for_sun, longs=longs, cusps=cusps, warnings=warnings)
         comps["kaala"] = _Comp(k_val2, None if k_val2 is not None else "not_computed", k_sub)
 
         # CHEṢṬĀ
