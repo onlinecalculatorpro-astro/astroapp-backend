@@ -29,6 +29,9 @@ try:
         normalize_gochar_payload,      # gochar/drishti
         normalize_ingress_payload,     # ingress (rashi/nakshatra)
         normalize_stations_payload,    # stations
+        # (NEW) strength helpers
+        normalize_shadbala_payload,    # shadbala (if provided in validator)
+        normalize_ashtakavarga_payload # ashtakavarga (if provided in validator)
     )  # type: ignore
     _VALIDATOR_IMPORT_ERR = None
 except Exception as _e:
@@ -37,6 +40,8 @@ except Exception as _e:
     normalize_gochar_payload = None         # type: ignore
     normalize_ingress_payload = None        # type: ignore
     normalize_stations_payload = None       # type: ignore
+    normalize_shadbala_payload = None       # type: ignore
+    normalize_ashtakavarga_payload = None   # type: ignore
     _VALIDATOR_IMPORT_ERR = repr(_e)
 
 
@@ -163,6 +168,40 @@ except Exception:
     _ingresses_nakshatra = None          # type: ignore
     _stations_retro_direct = None        # type: ignore
     _feature_drishti_proximity = None    # type: ignore
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# (NEW) Śaḍbala & Aṣṭakavarga — prefer vedic_predictive wrappers, fallback to modules
+# ──────────────────────────────────────────────────────────────────────────────
+_SHADBALA_BRANCH = "none"
+_ASHTAKAVARGA_BRANCH = "none"
+
+_compute_shadbala = None        # type: ignore
+_compute_ashtakavarga = None    # type: ignore
+
+try:
+    # Prefer a single entry point if you exposed wrappers here
+    from app.core.vedic_predictive import (            # type: ignore
+        compute_shadbala as _compute_shadbala,         # wrapper
+        compute_ashtakavarga as _compute_ashtakavarga, # wrapper
+    )
+    _SHADBALA_BRANCH = "vedic_predictive"
+    _ASHTAKAVARGA_BRANCH = "vedic_predictive"
+except Exception:
+    # Fallback to direct modules
+    try:
+        from app.core.shadbala import compute_shadbala as _compute_shadbala  # type: ignore
+        _SHADBALA_BRANCH = "shadbala_module"
+    except Exception:
+        _compute_shadbala = None  # type: ignore
+        _SHADBALA_BRANCH = "none"
+
+    try:
+        from app.core.ashtakavarga import compute_ashtakavarga as _compute_ashtakavarga  # type: ignore
+        _ASHTAKAVARGA_BRANCH = "ashtakavarga_module"
+    except Exception:
+        _compute_ashtakavarga = None  # type: ignore
+        _ASHTAKAVARGA_BRANCH = "none"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -684,6 +723,11 @@ def vedic_diag():
         # Gochar diagnostics
         "gochar_present": _GOCHAR_OK,
         "gochar_branch": _GOCHAR_BRANCH,
+        # Strength diagnostics
+        "shadbala_present": bool(_compute_shadbala),
+        "shadbala_branch": _SHADBALA_BRANCH,
+        "ashtakavarga_present": bool(_compute_ashtakavarga),
+        "ashtakavarga_branch": _ASHTAKAVARGA_BRANCH,
         "rl_cap_per_min": RL_VEDIC_PREDICTIVE,
         "rl_bucket_key": "20",
         "dut1_seconds_env": _env_dut1_seconds(),
@@ -1194,3 +1238,151 @@ def _resolve_ayanamsa_for_engine(body: Dict[str, Any], method: str, jd_tt: Optio
         "ayanamsa_resolve": "default_key_passthrough",
     })
     return key, meta
+
+
+# =============================================================================
+# (NEW) Śaḍbala & Aṣṭakavarga routes
+# =============================================================================
+
+def _normalize_strength_payload_generic(body: Dict[str, Any]) -> tuple[Dict[str, Any], List[str], str]:
+    """
+    Fallback normalizer for strength endpoints when dedicated normalizers
+    are not available in vedic_validator. Uses yoga normalizer semantics.
+    """
+    if callable(normalize_yoga_payload):
+        return normalize_yoga_payload(body)  # type: ignore[misc]
+    # Last-resort: minimal pass-through
+    warns: List[str] = ["validator_unavailable_minimal_fallback"]
+    tz = str(body.get("tz") or body.get("place_tz") or "UTC")
+    norm = {
+        "date": body.get("date") or body.get("birth_date"),
+        "time": body.get("time") or body.get("birth_time") or "12:00:00",
+        "tz": tz,
+        "latitude": _coerce_float(body.get("latitude") or body.get("lat")),
+        "longitude": _coerce_float(body.get("longitude") or body.get("lon")),
+        "elevation_m": _coerce_float(body.get("elevation_m") or body.get("elevation")),
+        "zodiac_mode": _norm_method(body.get("zodiac_mode") or body.get("method") or "sidereal"),
+        "ayanamsa": _norm_ayanamsa(body.get("ayanamsa")),
+        "place_tz": tz,
+    }
+    return norm, warns, tz
+
+
+def _run_shadbala(body: Dict[str, Any]) -> Dict[str, Any]:
+    if _compute_shadbala is None:
+        return {"ok": False, "error": "shadbala_engine_unavailable", "meta": {"route": "strength/shadbala", "branch": _SHADBALA_BRANCH}}
+
+    # Prefer dedicated validator; fallback to yoga-style normalization
+    if callable(normalize_shadbala_payload):
+        norm, warns, tz_norm = normalize_shadbala_payload(body)  # type: ignore[misc]
+    else:
+        norm, warns, tz_norm = _normalize_strength_payload_generic(body)
+
+    # Guardrails: need civil+site
+    if not norm.get("date") or not norm.get("time"):
+        return {
+            "ok": False,
+            "error": "missing_date_or_time",
+            "warnings": warns,
+            "meta": {"route": "strength/shadbala", "branch": _SHADBALA_BRANCH, "tz_normalized": tz_norm},
+        }
+    if norm.get("latitude") is None or norm.get("longitude") is None:
+        return {
+            "ok": False,
+            "error": "missing_coordinates",
+            "warnings": warns,
+            "meta": {"route": "strength/shadbala", "branch": _SHADBALA_BRANCH, "tz_normalized": tz_norm},
+        }
+
+    # Call engine
+    try:
+        res = _compute_shadbala(
+            date=norm["date"],
+            time=norm["time"],
+            tz=norm["tz"],
+            latitude=float(norm["latitude"]),
+            longitude=float(norm["longitude"]),
+            elevation_m=norm.get("elevation_m"),
+            zodiac_mode=norm.get("zodiac_mode", "sidereal"),
+            ayanamsa=norm.get("ayanamsa", "lahiri"),
+        )
+    except Exception as e:
+        return {"ok": False, "error": "shadbala_failed", "detail": str(e), "meta": {"route": "strength/shadbala", "branch": _SHADBALA_BRANCH}},  # type: ignore[return-value]
+
+    if isinstance(res, dict):
+        res.setdefault("meta", {})
+        res["meta"].update({"route": "strength/shadbala", "tz_normalized": tz_norm, "branch": _SHADBALA_BRANCH})
+        if warns:
+            res.setdefault("warnings", []).extend(warns)
+        return res
+    return {"ok": False, "error": "shadbala_invalid_return", "meta": {"route": "strength/shadbala", "branch": _SHADBALA_BRANCH}}
+
+
+def _run_ashtakavarga(body: Dict[str, Any]) -> Dict[str, Any]:
+    if _compute_ashtakavarga is None:
+        return {"ok": False, "error": "ashtakavarga_engine_unavailable", "meta": {"route": "ashtakavarga", "branch": _ASHTAKAVARGA_BRANCH}}
+
+    # Prefer dedicated validator; fallback to yoga-style normalization
+    if callable(normalize_ashtakavarga_payload):
+        norm, warns, tz_norm = normalize_ashtakavarga_payload(body)  # type: ignore[misc]
+    else:
+        norm, warns, tz_norm = _normalize_strength_payload_generic(body)
+
+    # Guardrails: need civil+site
+    if not norm.get("date") or not norm.get("time"):
+        return {
+            "ok": False,
+            "error": "missing_date_or_time",
+            "warnings": warns,
+            "meta": {"route": "ashtakavarga", "branch": _ASHTAKAVARGA_BRANCH, "tz_normalized": tz_norm},
+        }
+    if norm.get("latitude") is None or norm.get("longitude") is None:
+        return {
+            "ok": False,
+            "error": "missing_coordinates",
+            "warnings": warns,
+            "meta": {"route": "ashtakavarga", "branch": _ASHTAKAVARGA_BRANCH, "tz_normalized": tz_norm},
+        }
+
+    # Engine knobs passthrough (optional)
+    include = body.get("include") or body.get("include_keys")  # e.g., ["SAV","BAV","bhinnashtakavarga","sarvashtakavarga"]
+    try:
+        res = _compute_ashtakavarga(
+            date=norm["date"],
+            time=norm["time"],
+            tz=norm["tz"],
+            latitude=float(norm["latitude"]),
+            longitude=float(norm["longitude"]),
+            elevation_m=norm.get("elevation_m"),
+            zodiac_mode=norm.get("zodiac_mode", "sidereal"),
+            ayanamsa=norm.get("ayanamsa", "lahiri"),
+            include=include,
+        )
+    except Exception as e:
+        return {"ok": False, "error": "ashtakavarga_failed", "detail": str(e), "meta": {"route": "ashtakavarga", "branch": _ASHTAKAVARGA_BRANCH}},  # type: ignore[return-value]
+
+    if isinstance(res, dict):
+        res.setdefault("meta", {})
+        res["meta"].update({"route": "ashtakavarga", "tz_normalized": tz_norm, "branch": _ASHTAKAVARGA_BRANCH})
+        if warns:
+            res.setdefault("warnings", []).extend(warns)
+        return res
+    return {"ok": False, "error": "ashtakavarga_invalid_return", "meta": {"route": "ashtakavarga", "branch": _ASHTAKAVARGA_BRANCH}}
+
+
+@vedic_api.post("/strength/shadbala")
+@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
+def route_shadbala():
+    body = request.get_json(silent=True) or {}
+    res = _run_shadbala(body)
+    status = 200 if res.get("ok") else (503 if str(res.get("error","")).endswith("unavailable") else 400)
+    return jsonify(res), status
+
+
+@vedic_api.post("/ashtakavarga")
+@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
+def route_ashtakavarga():
+    body = request.get_json(silent=True) or {}
+    res = _run_ashtakavarga(body)
+    status = 200 if res.get("ok") else (503 if str(res.get("error","")).endswith("unavailable") else 400)
+    return jsonify(res), status
