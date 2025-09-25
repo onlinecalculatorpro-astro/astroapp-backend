@@ -1244,30 +1244,50 @@ def _resolve_ayanamsa_for_engine(body: Dict[str, Any], method: str, jd_tt: Optio
 
 
 # =============================================================================
-# (NEW) Śaḍbala & Aṣṭakavarga routes
+# Śaḍbala & Aṣṭakavarga routes
 # =============================================================================
 
 def _normalize_strength_payload_generic(body: Dict[str, Any]) -> tuple[Dict[str, Any], List[str], str]:
     """
-    Fallback normalizer for strength endpoints when dedicated normalizers
-    are not available in vedic_validator. Uses yoga normalizer semantics.
+    Fallback normalizer for strength endpoints when a dedicated validator
+    is not available in vedic_validator. Mirrors 'yoga' normalizer semantics
+    and, importantly, *preserves* house/angles fields so engines can use them.
     """
     if callable(normalize_yoga_payload):
-        return normalize_yoga_payload(body)  # type: ignore[misc]
-    # Last-resort: minimal pass-through
-    warns: List[str] = ["validator_unavailable_minimal_fallback"]
-    tz = str(body.get("tz") or body.get("place_tz") or "UTC")
-    norm = {
-        "date": body.get("date") or body.get("birth_date"),
-        "time": body.get("time") or body.get("birth_time") or "12:00:00",
-        "tz": tz,
-        "latitude": _coerce_float(body.get("latitude") or body.get("lat")),
-        "longitude": _coerce_float(body.get("longitude") or body.get("lon")),
-        "elevation_m": _coerce_float(body.get("elevation_m") or body.get("elevation")),
-        "zodiac_mode": _norm_method(body.get("zodiac_mode") or body.get("method") or "sidereal"),
-        "ayanamsa": _norm_ayanamsa(body.get("ayanamsa")),
-        "place_tz": tz,
-    }
+        norm, warns, tz = normalize_yoga_payload(body)  # type: ignore[misc]
+    else:
+        # Last-resort: minimal pass-through
+        warns: List[str] = ["validator_unavailable_minimal_fallback"]
+        tz = str(body.get("tz") or body.get("place_tz") or "UTC")
+        norm = {
+            "date": body.get("date") or body.get("birth_date"),
+            "time": body.get("time") or body.get("birth_time") or "12:00:00",
+            "tz": tz,
+            "latitude": _coerce_float(body.get("latitude") or body.get("lat")),
+            "longitude": _coerce_float(body.get("longitude") or body.get("lon")),
+            "elevation_m": _coerce_float(body.get("elevation_m") or body.get("elevation")),
+            "zodiac_mode": _norm_method(body.get("zodiac_mode") or body.get("mode") or body.get("method") or "sidereal"),
+            "ayanamsa": _norm_ayanamsa(body.get("ayanamsa")),
+            "place_tz": tz,
+        }
+
+    # ── Do NOT drop helpful extras (engines may rely on these) ──────────────
+    # Houses / angles
+    if body.get("house_system") is not None:
+        norm["house_system"] = body["house_system"]
+    if body.get("house_cusps_deg") is not None:
+        norm["house_cusps_deg"] = body["house_cusps_deg"]
+    if isinstance(body.get("houses"), dict):
+        norm["houses"] = body["houses"]
+    if isinstance(body.get("angles"), dict):
+        norm["angles"] = body["angles"]
+
+    # Engine-specific optional knobs
+    if body.get("include_components") is not None:
+        norm["include_components"] = body["include_components"]
+    if body.get("vargas") is not None:
+        norm["vargas"] = body["vargas"]
+
     return norm, warns, tz
 
 
@@ -1281,15 +1301,19 @@ def _strength_call(fn, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _run_shadbala(body: Dict[str, Any]) -> Dict[str, Any]:
     if _compute_shadbala is None:
-        return {"ok": False, "error": "shadbala_engine_unavailable", "meta": {"route": "strength/shadbala", "branch": _SHADBALA_BRANCH}}
+        return {
+            "ok": False,
+            "error": "shadbala_engine_unavailable",
+            "meta": {"route": "strength/shadbala", "branch": _SHADBALA_BRANCH},
+        }
 
-    # Prefer dedicated validator; fallback to yoga-style normalization
+    # Prefer dedicated validator; fallback to generic
     if callable(normalize_shadbala_payload):
         norm, warns, tz_norm = normalize_shadbala_payload(body)  # type: ignore[misc]
     else:
         norm, warns, tz_norm = _normalize_strength_payload_generic(body)
 
-    # Guardrails: need civil+site
+    # Guardrails: need civil + site
     if not norm.get("date") or not norm.get("time"):
         return {
             "ok": False,
@@ -1305,6 +1329,7 @@ def _run_shadbala(body: Dict[str, Any]) -> Dict[str, Any]:
             "meta": {"route": "strength/shadbala", "branch": _SHADBALA_BRANCH, "tz_normalized": tz_norm},
         }
 
+    # Build single payload for the engine (keep houses/angles if present)
     payload = {
         "date": norm["date"],
         "time": norm["time"],
@@ -1314,6 +1339,16 @@ def _run_shadbala(body: Dict[str, Any]) -> Dict[str, Any]:
         "elevation_m": norm.get("elevation_m"),
         "zodiac_mode": norm.get("zodiac_mode", "sidereal"),
         "ayanamsa": norm.get("ayanamsa", "lahiri"),
+
+        # pass-throughs for houses/angles (so engine avoids whole-sign fallback)
+        "house_system": norm.get("house_system"),
+        "house_cusps_deg": norm.get("house_cusps_deg"),
+        "houses": norm.get("houses"),
+        "angles": norm.get("angles"),
+
+        # optional engine knobs
+        "include_components": norm.get("include_components"),
+        "vargas": norm.get("vargas"),
     }
 
     try:
@@ -1335,15 +1370,19 @@ def _run_shadbala(body: Dict[str, Any]) -> Dict[str, Any]:
 
 def _run_ashtakavarga(body: Dict[str, Any]) -> Dict[str, Any]:
     if _compute_ashtakavarga is None:
-        return {"ok": False, "error": "ashtakavarga_engine_unavailable", "meta": {"route": "ashtakavarga", "branch": _ASHTAKAVARGA_BRANCH}}
+        return {
+            "ok": False,
+            "error": "ashtakavarga_engine_unavailable",
+            "meta": {"route": "ashtakavarga", "branch": _ASHTAKAVARGA_BRANCH},
+        }
 
-    # Prefer dedicated validator; fallback to yoga-style normalization
+    # Prefer dedicated validator; fallback to generic
     if callable(normalize_ashtakavarga_payload):
         norm, warns, tz_norm = normalize_ashtakavarga_payload(body)  # type: ignore[misc]
     else:
         norm, warns, tz_norm = _normalize_strength_payload_generic(body)
 
-    # Guardrails: need civil+site
+    # Guardrails
     if not norm.get("date") or not norm.get("time"):
         return {
             "ok": False,
@@ -1359,7 +1398,7 @@ def _run_ashtakavarga(body: Dict[str, Any]) -> Dict[str, Any]:
             "meta": {"route": "ashtakavarga", "branch": _ASHTAKAVARGA_BRANCH, "tz_normalized": tz_norm},
         }
 
-    include = body.get("include") or body.get("include_keys")  # optional list, e.g., ["SAV","BAV"]
+    include = body.get("include") or body.get("include_keys")  # optional list, e.g. ["SAV","BAV"]
 
     payload = {
         "date": norm["date"],
