@@ -296,14 +296,20 @@ def compute_shadbala(payload: Dict[str, Any]) -> Dict[str, Any]:
     include = [str(x).strip().lower() for x in include]
 
     # 1) Core chart (all correctness derives from here)
+    # Prefer the caller's intent for zodiac mode; fall back to chart default.
+    payload_mode = (str(payload.get("zodiac_mode") or payload.get("mode") or "")
+                    .strip().lower() or None)
+    if payload_mode:
+        # Nudge astronomy layer to honor requested mode
+        payload = {**payload, "mode": payload_mode}
+
     chart = _compute_chart(payload)
-    mode = str(
-        chart.get("mode")
-        or payload.get("zodiac_mode")
-        or payload.get("mode")
-        or "tropical"
-    ).strip().lower()
-    meta = dict(chart.get("meta", {}))  # may include center/frame/ayanamsa_deg etc.
+
+    # Final mode: payload (if given) else whatever astronomy reported else tropical  
+    mode = (payload_mode or str(chart.get("mode") or "tropical")).strip().lower()
+
+    # Meta may include center/frame/ayanamsa_deg, etc.
+    meta = dict(chart.get("meta") or {})
 
     # Angles (from payload or chart)
     ang = _pick_angles(payload, chart)
