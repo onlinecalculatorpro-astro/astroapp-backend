@@ -161,6 +161,19 @@ def _split_csv_or_list(v: Any) -> List[str]:
             out.append(p.strip())
     return out
 
+def _coerce_step_minutes(x: Any, default: Union[str, float, int] = "auto") -> Union[str, float, int]:
+    if isinstance(x, (int, float)):
+        return x
+    if isinstance(x, str):
+        s = x.strip()
+        if s.isdigit():
+            try:
+                return float(s)
+            except Exception:
+                return default
+        return s or default
+    return default
+
 
 # ============================ Geocoding (strict) ============================
 
@@ -324,7 +337,6 @@ def _norm_ruleset_name(v: Any) -> str:
     s = _coerce_str(v).strip().lower()
     if s in ("custom", "user", "override"):
         return "custom"
-    # default to canonical core rules (embedded in ashtakavarga.py)
     return "parashari-bphs"
 
 def _validate_ruleset_map(m: Any) -> Tuple[Optional[Dict[str, Dict[str, List[int]]]], List[str]]:
@@ -353,8 +365,13 @@ def _validate_ruleset_map(m: Any) -> Tuple[Optional[Dict[str, Dict[str, List[int
                 continue
             offs_ok: List[int] = []
             for o in offs:
-                if 1 <= int(o) <= 12:
-                    offs_ok.append(int(o))
+                try:
+                    oi = int(o)
+                except Exception:
+                    warns.append(f"ruleset_map_invalid:offset_type:{giver}->{receiver}:{o}")
+                    continue
+                if 1 <= oi <= 12:
+                    offs_ok.append(oi)
                 else:
                     warns.append(f"ruleset_map_invalid:offset_range:{giver}->{receiver}:{o}")
             if offs_ok:
@@ -608,7 +625,7 @@ def normalize_gochar_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], L
     ayanamsa = _norm_ayanamsa(payload.get("ayanamsa") or payload.get("ayanamsa_key"))
     include_nodes = _norm_bool(payload.get("include_nodes"), False)
     treat_nodes_like_saturn = _norm_bool(payload.get("treat_nodes_like_saturn"), False)
-    step_minutes: Union[str, float, int] = payload.get("step_minutes", "auto")
+    step_minutes: Union[str, float, int] = _coerce_step_minutes(payload.get("step_minutes", "auto"))
 
     movers = _collect_bodies(payload, key_order=("movers", "bodies", "transiting_bodies"), default=_DEFAULT_MOVERS)
     if include_nodes:
@@ -637,6 +654,7 @@ def normalize_gochar_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], L
             "frame": frame, "zodiac_mode": zodiac_mode, "ayanamsa": ayanamsa,
             "include_nodes": bool(include_nodes), "treat_nodes_like_saturn": bool(treat_nodes_like_saturn),
             "step_minutes": step_minutes,
+            "observer": "geocentric", "topocentric": False,
             "movers": movers, "natal_targets": natal_targets,
             "orb_deg": float(orb_deg), "orb_map": orb_map or {},
             "natal_chart": {
@@ -671,6 +689,14 @@ def normalize_gochar_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], L
     natal_jd_tt = _as_float(natal_in.get("natal_jd_tt") or natal_in.get("jd_tt"))
     natal_jd_utc = _as_float(natal_in.get("jd_utc"))
 
+    # Observer handling (consistent with other normalizers)
+    observer = _norm_observer(payload.get("observer"), "geocentric")
+    topocentric = (observer == "topocentric")
+    if topocentric and (lat is None or lon is None):
+        observer = "geocentric"
+        topocentric = False
+        warns.append("topocentric_requires_coordinates:fallback_geocentric")
+
     # angle targets auto-prune if we cannot bind angles
     if any(t in ("Ascendant", "Descendant", "MC", "IC") for t in natal_targets):
         have_angles_map = isinstance(longitudes, dict) and any(k in longitudes for k in ("Ascendant", "Descendant", "MC", "IC"))
@@ -683,6 +709,8 @@ def normalize_gochar_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], L
         "frame": frame,
         "zodiac_mode": zodiac_mode,
         "ayanamsa": ayanamsa,
+        "observer": observer,
+        "topocentric": bool(topocentric),
         "include_nodes": bool(include_nodes),
         "treat_nodes_like_saturn": bool(treat_nodes_like_saturn),
         "step_minutes": step_minutes,
@@ -737,9 +765,9 @@ def normalize_ingress_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], 
     if fatal:
         norm = {
             "frame": frame, "zodiac_mode": zodiac_mode, "ayanamsa": ayanamsa,
-            "movers": [], "time_range": None, "step_minutes": payload.get("step_minutes", "auto"),
+            "movers": [], "time_range": None, "step_minutes": _coerce_step_minutes(payload.get("step_minutes", "auto")),
             "topocentric": False, "latitude": None, "longitude": None, "elevation_m": None,
-            "tz_name": tz_norm, "fatal": fatal, "raw": payload,
+            "tz": tz_norm, "tz_name": tz_norm, "fatal": fatal, "raw": payload,
         }
         d0, d1, _ = _collect_time_window(payload)
         if d0 and d1: norm["time_range"] = [d0, d1]
@@ -769,11 +797,12 @@ def normalize_ingress_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], 
         "ayanamsa": ayanamsa,
         "movers": movers,
         "time_range": [date_from, date_to] if (date_from and date_to) else None,
-        "step_minutes": payload.get("step_minutes", "auto"),
+        "step_minutes": _coerce_step_minutes(payload.get("step_minutes", "auto")),
         "topocentric": bool(topocentric),
         "latitude": lat,
         "longitude": lon,
         "elevation_m": elevation_m,
+        "tz": tz_norm,
         "tz_name": tz_norm,
         "raw": payload,
     }
@@ -800,9 +829,9 @@ def normalize_stations_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any],
     if fatal:
         norm = {
             "frame": frame, "zodiac_mode": zodiac_mode, "ayanamsa": ayanamsa,
-            "movers": [], "time_range": None, "step_minutes": payload.get("step_minutes", "auto"),
+            "movers": [], "time_range": None, "step_minutes": _coerce_step_minutes(payload.get("step_minutes", "auto")),
             "topocentric": False, "latitude": None, "longitude": None, "elevation_m": None,
-            "tz_name": tz_norm, "fatal": fatal, "raw": payload,
+            "tz": tz_norm, "tz_name": tz_norm, "fatal": fatal, "raw": payload,
         }
         d0, d1, _ = _collect_time_window(payload)
         if d0 and d1: norm["time_range"] = [d0, d1]
@@ -829,11 +858,12 @@ def normalize_stations_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any],
         "ayanamsa": ayanamsa,
         "movers": movers,
         "time_range": [date_from, date_to] if (date_from and date_to) else None,
-        "step_minutes": payload.get("step_minutes", "auto"),
+        "step_minutes": _coerce_step_minutes(payload.get("step_minutes", "auto")),
         "topocentric": bool(topocentric),
         "latitude": lat,
         "longitude": lon,
         "elevation_m": elevation_m,
+        "tz": tz_norm,
         "tz_name": tz_norm,
         "raw": payload,
     }
@@ -1014,3 +1044,14 @@ def normalize_ashtakavarga_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, A
     if not time_str: warns.append("missing_time")
     if not tz_norm: warns.append("missing_timezone")
     return norm, warns, tz_norm or "UTC"
+
+
+__all__ = [
+    "normalize_vim_payload",
+    "normalize_yoga_payload",
+    "normalize_gochar_payload",
+    "normalize_ingress_payload",
+    "normalize_stations_payload",
+    "normalize_shadbala_payload",
+    "normalize_ashtakavarga_payload",
+]
