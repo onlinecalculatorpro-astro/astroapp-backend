@@ -890,19 +890,64 @@ def shadbala(
 def ashtakavarga(
     *,
     natal_chart: Dict[str, Any],
-    zodiac_mode: Literal["tropical","sidereal"] = "sidereal",
+    zodiac_mode: Literal["tropical", "sidereal"] = "sidereal",
     ayanamsa: Union[str, float] = "lahiri",
     house_system: str = "placidus",
     include_sav: bool = True,
     include_bav: bool = True,
-    spec_path: Optional[str] = None,   # Optional override for rules/spec
+    spec_path: Optional[str] = None,             # Optional override for rules/spec
+    # NEW: expose custom rules so callers can bypass the validator if needed
+    ruleset: Optional[str] = None,               # e.g. "parashari-bphs" | "custom"
+    ruleset_map: Optional[Dict[str, Dict[str, List[int]]]] = None,  # when ruleset="custom"
 ) -> Dict[str, Any]:
     """
     Compute Aṣṭakavarga (BAV per planet and/or SAV).
     Delegates to app.core.ashtakavarga.compute_ashtakavarga if available.
+
+    Notes:
+    - Forwards civil date/time/tz and coordinates from `natal_chart`.
+    - Passes through `angles` (asc/mc) if present to help bind Lagna without recomputation.
+    - Supports optional custom rules via `ruleset` and `ruleset_map`.
     """
     if not _ASHTAKAVARGA_OK or _compute_ashtakavarga is None:
         return {"ok": False, "error": "ashtakavarga_engine_unavailable"}
+
+    # Optional angles pass-through
+    angles: Optional[Dict[str, float]] = None
+    if isinstance(natal_chart.get("angles"), dict):
+        ang_in = natal_chart["angles"]
+        tmp: Dict[str, float] = {}
+        try:
+            if ang_in.get("asc") is not None:
+                tmp["asc"] = float(ang_in.get("asc"))
+        except Exception:
+            pass
+        try:
+            if ang_in.get("ASC") is not None:
+                tmp["asc"] = float(ang_in.get("ASC"))
+        except Exception:
+            pass
+        try:
+            if ang_in.get("Ascendant") is not None:
+                tmp["asc"] = float(ang_in.get("Ascendant"))
+        except Exception:
+            pass
+        try:
+            if ang_in.get("mc") is not None:
+                tmp["mc"] = float(ang_in.get("mc"))
+        except Exception:
+            pass
+        try:
+            if ang_in.get("MC") is not None:
+                tmp["mc"] = float(ang_in.get("MC"))
+        except Exception:
+            pass
+        try:
+            if ang_in.get("Midheaven") is not None:
+                tmp["mc"] = float(ang_in.get("Midheaven"))
+        except Exception:
+            pass
+        angles = tmp or None
 
     payload: Dict[str, Any] = {
         "date": natal_chart.get("date"),
@@ -915,11 +960,18 @@ def ashtakavarga(
         "zodiac_mode": zodiac_mode,
         "house_system": house_system,
     }
+    if angles:
+        payload["angles"] = angles
     if spec_path:
         payload["spec_path"] = spec_path
+    if ruleset:
+        payload["ruleset"] = ruleset
+    if ruleset_map:
+        payload["ruleset_map"] = ruleset_map
 
     try:
         try:
+            # Many implementations accept extra kwargs and ignore unknowns.
             res = _compute_ashtakavarga(
                 payload,
                 ayanamsa=ayanamsa,
@@ -928,8 +980,11 @@ def ashtakavarga(
                 include_sav=include_sav,
                 include_bav=include_bav,
                 spec_path=spec_path,
+                ruleset=ruleset,
+                ruleset_map=ruleset_map,
             )
         except TypeError:
+            # Fallback to the strict single-arg signature.
             res = _compute_ashtakavarga(payload)
     except Exception as e:
         return {"ok": False, "error": f"ashtakavarga_engine_error:{e}"}
@@ -938,6 +993,7 @@ def ashtakavarga(
         res.setdefault("ok", True)
         return res
     return {"ok": True, "result": res}
+
 
 # ── NEW: Compatibility shim for routes expecting `compute_ashtakavarga(payload)` ──
 def compute_ashtakavarga(payload: Dict[str, Any] = None, **opts) -> Dict[str, Any]:
@@ -955,9 +1011,9 @@ def compute_ashtakavarga(payload: Dict[str, Any] = None, **opts) -> Dict[str, An
 
     try:
         try:
+            # Some cores accept a single dict; others prefer kwargs.
             res = _compute_ashtakavarga(merged)
         except TypeError:
-            # Some implementations may prefer kwargs
             res = _compute_ashtakavarga(**merged)  # type: ignore[misc]
     except Exception as e:
         return {"ok": False, "error": f"ashtakavarga_engine_error:{e}"}
