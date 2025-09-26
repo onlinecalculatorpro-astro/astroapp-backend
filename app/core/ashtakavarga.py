@@ -7,19 +7,22 @@ Ashtakavarga engine — precision-first (gold-standard ready)
 Public API:
     compute_ashtakavarga(payload: dict) -> dict
     clear_caches() -> None
+
+Design notes
+------------
+• Single source of truth for astronomy, same pattern as shadbala.py:
+    from app.core.astronomy import compute_chart as _compute_chart
+• No HTTP fallbacks here. If astronomy is unavailable, we fail fast with a clear error.
+• We normalize the astronomy chart into the AV-specific minimal shape locally.
 """
 
 from typing import Dict, List, Tuple, Optional, Any
-import os
-import json
 
-# ---------- Astronomy acquisition (primary & fallbacks) ----------
-# Primary import (if your build exposes a pure function)
+# ────────────────────────────── Required core (single source of truth) ───────
 try:
-    from app.core.astronomy import compute_chart  # type: ignore
-except Exception:
-    compute_chart = None  # type: ignore
-
+    from app.core.astronomy import compute_chart as _compute_chart
+except Exception as e:
+    raise RuntimeError(f"ashtakavarga: astronomy.compute_chart import failed: {e}")
 
 # ========================= Small Utilities =========================
 def _safe_float(x: Any) -> Optional[float]:
@@ -40,146 +43,84 @@ def _sign_index(lon_deg: float) -> int:
     return int(_wrap360(lon_deg) // 30.0)  # 0=Aries … 11=Pisces
 
 
-def _maybe_chart_shape(obj: Any) -> Optional[Dict[str, Any]]:
-    """Coerce various 'ops/calculate' result shapes into a canonical chart dict."""
-    if not isinstance(obj, dict):
-        return None
-
-    # Already a chart?
-    if "planets" in obj and (isinstance(obj["planets"], dict) or obj["planets"] is None):
-        return obj
-
-    # Common wrappers: {"chart": {...}} or {"result": {"chart": {...}}}
-    for key in ("chart", "vedic_chart", "sidereal_chart", "tropical_chart"):
-        c = obj.get(key)
-        if isinstance(c, dict) and "planets" in c:
-            return c
-
-    res = obj.get("result")
-    if isinstance(res, dict):
-        for key in ("chart", "vedic_chart", "sidereal_chart", "tropical_chart"):
-            c = res.get(key)
-            if isinstance(c, dict) and "planets" in c:
-                return c
-
-    # Bundle: {"charts": {"vedic": {...}}}
-    charts = obj.get("charts")
-    if isinstance(charts, dict):
-        for k in ("vedic", "primary", "sidereal", "tropical"):
-            c = charts.get(k)
-            if isinstance(c, dict) and "planets" in c:
-                return c
-
-    # Flat top-level planets/angles
-    if {"Sun", "Moon"} & set(obj.keys()):
-        planets = {k: v for k, v in obj.items()
-                   if k in ("Sun", "Moon", "Mars", "Mercury", "Jupiter", "Venus", "Saturn")}
-        angles = {k: v for k, v in obj.items() if str(k).lower() in ("asc", "mc", "ascendant")}
-        meta = obj.get("meta") if isinstance(obj.get("meta"), dict) else {}
-        return {"planets": planets, "angles": angles, "meta": meta}
-
-    return None
-
-
-def _try_import_fallback_compute() -> Optional[Any]:
+# ========================= Chart Normalization ======================
+def _chart_to_av_shape(chart: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Try a few alternate import paths some codebases use for the same idea.
-    Returns a callable(payload) -> chart | result | None, or None if not found.
+    Convert astronomy.compute_chart() output into Ashtakavarga's canonical minimal shape:
+      {
+        "planets": { "Sun": {"lon": deg}, ..., "Saturn": {"lon": deg} },
+        "angles":  { "asc": deg }   # optional but preferred (for Lagna rules)
+        "meta":    { "mode": "sidereal|tropical", "ayanamsa_deg": float|None }
+      }
+
+    Accepts the chart format used by shadbala.py (bodies/points/meta/angles).
     """
-    candidates = (
-        # (module, attribute)
-        ("app.ops.astronomy", "compute_chart"),
-        ("app.api.astronomy", "compute_chart"),
-        ("app.core.ops_calculate", "compute"),  # sometimes export compute(payload)
-        ("app.api.ops_calculate", "compute"),
-        ("ops_api", "compute_chart"),
-    )
-    for mod, attr in candidates:
+    planets_out: Dict[str, Dict[str, float]] = {}
+
+    # Bodies block: prefer longitude_deg; fallback to lon
+    for row in (chart.get("bodies") or []):
         try:
-            m = __import__(mod, fromlist=[attr])
-            fn = getattr(m, attr, None)
-            if callable(fn):
-                return fn
+            name = str(row.get("name"))
+            if name in ("Sun", "Moon", "Mars", "Mercury", "Jupiter", "Venus", "Saturn"):
+                lon = float(row.get("longitude_deg", row.get("lon")))
+                planets_out[name] = {"lon": lon}
         except Exception:
             continue
+
+    # Fallback: some adapters may expose classic "planets" dict already
+    if not planets_out and isinstance(chart.get("planets"), dict):
+        for k, v in (chart["planets"] or {}).items():
+            if k in ("Sun", "Moon", "Mars", "Mercury", "Jupiter", "Venus", "Saturn"):
+                if isinstance(v, dict):
+                    lon = v.get("lon", v.get("longitude"))
+                else:
+                    lon = v
+                f = _safe_float(lon)
+                if f is not None:
+                    planets_out[k] = {"lon": f}
+
+    # Angles: prefer chart.angles.asc / asc_deg; fallback to meta.asc_deg
+    angles_out: Dict[str, float] = {}
+    angles_in = chart.get("angles") or {}
+    asc = angles_in.get("asc") or angles_in.get("asc_deg")
+    if asc is None:
+        asc = (chart.get("meta") or {}).get("asc_deg")
+    f_asc = _safe_float(asc)
+    if f_asc is not None:
+        angles_out["asc"] = f_asc
+
+    # Meta: mode and ayanamsa_deg if available
+    meta_in = chart.get("meta") or {}
+    meta_out = {
+        "mode": meta_in.get("mode") or chart.get("mode"),
+        "ayanamsa_deg": meta_in.get("ayanamsa_deg"),
+    }
+
+    return {"planets": planets_out, "angles": angles_out, "meta": meta_out}
+
+
+def _extract_asc_deg(chart_like: Dict[str, Any]) -> Optional[float]:
+    """ASC in angles or meta, tolerant to a few common keys."""
+    angles = chart_like.get("angles")
+    if isinstance(angles, dict):
+        for k in ("asc", "ASC", "Ascendant", "ascendant", "asc_deg"):
+            v = angles.get(k)
+            f = _safe_float(v)
+            if f is not None:
+                return f
+        v = angles.get("asc")
+        if isinstance(v, dict):
+            f = _safe_float(v.get("deg"))
+            if f is not None:
+                return f
+
+    meta = chart_like.get("meta", {})
+    if isinstance(meta, dict):
+        f = _safe_float(meta.get("asc_deg"))
+        if f is not None:
+            return f
+
     return None
-
-
-def _call_ops_calculate_http(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    POST to /ops/calculate on the same service.
-    Uses OPS_BASE_URL or http://127.0.0.1:{PORT} as a base.
-    Returns a normalized chart dict or None.
-    """
-    try:
-        import requests  # type: ignore
-    except Exception:
-        return None
-
-    base = os.environ.get("OPS_BASE_URL")
-    if not base:
-        port = os.environ.get("PORT", "5000")
-        base = f"http://127.0.0.1:{port}"
-    url = base.rstrip("/") + "/ops/calculate"
-
-    try:
-        resp = requests.post(url, json=payload, timeout=15)
-    except Exception:
-        return None
-    if resp.status_code >= 400:
-        return None
-
-    try:
-        data = resp.json()
-    except Exception:
-        try:
-            data = json.loads(resp.text or "{}")
-        except Exception:
-            return None
-
-    chart = _maybe_chart_shape(data)
-    return chart
-
-
-def _obtain_chart(payload: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], List[str]]:
-    """
-    Try multiple ways to obtain an astronomy chart in the canonical shape.
-    Returns (chart_dict_or_None, warnings)
-    """
-    warnings: List[str] = []
-
-    # 1) Primary
-    if compute_chart is not None:
-        try:
-            raw = compute_chart(payload)
-            chart = _maybe_chart_shape(raw) or (
-                isinstance(raw, dict) and _maybe_chart_shape(raw.get("chart"))
-            )
-            if chart:
-                return chart, warnings
-        except Exception as e:
-            warnings.append(f"astronomy_compute_failed:{type(e).__name__}")
-
-    # 2) Importable fallbacks
-    fallback = _try_import_fallback_compute()
-    if callable(fallback):
-        try:
-            raw = fallback(payload)
-            chart = _maybe_chart_shape(raw) or (
-                isinstance(raw, dict) and _maybe_chart_shape(raw.get("chart"))
-            )
-            if chart:
-                return chart, warnings
-        except Exception as e:
-            warnings.append(f"astronomy_fallback_failed:{type(e).__name__}")
-
-    # 3) HTTP to /ops/calculate
-    chart = _call_ops_calculate_http(payload)
-    if chart:
-        return chart, warnings
-
-    warnings.append("astronomy_router_unavailable")
-    return None, warnings
 
 
 # ========================= Engine constants =========================
@@ -314,100 +255,41 @@ def _bav_for_planet(
     return vec
 
 
-def _extract_asc_deg(chart: Dict[str, Any]) -> Optional[float]:
-    """
-    Try common shapes for ASC in chart["angles"] or chart["meta"].
-    Accepts:
-      angles: { "asc": 321.23 } or { "Ascendant": 321.23 } or { "asc_deg": 321.23 }
-      angles: { "asc": {"deg": 321.23} }   (rare)
-      meta:   { "asc_deg": 321.23 }        (compat)
-    """
-    angles = chart.get("angles")
-    if isinstance(angles, dict):
-        # direct float
-        for k in ("asc", "ASC", "Ascendant", "ascendant", "asc_deg"):
-            v = angles.get(k)
-            f = _safe_float(v)
-            if f is not None:
-                return f
-        # nested
-        v = angles.get("asc")
-        if isinstance(v, dict):
-            f = _safe_float(v.get("deg"))
-            if f is not None:
-                return f
-
-    meta = chart.get("meta", {})
-    if isinstance(meta, dict):
-        f = _safe_float(meta.get("asc_deg"))
-        if f is not None:
-            return f
-
-    return None
-
-
 def compute_ashtakavarga(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Compute BAV (per planet) and SAV (per sign) using Parāśari Ashtakavarga rules.
-    Astronomy is obtained via a router (primary import, fallbacks, HTTP).
+    Astronomy is obtained from app.core.astronomy.compute_chart (single source of truth).
     """
     warnings: List[str] = []
     meta: Dict[str, Any] = {
         "module": "ashtakavarga(core)",
-        "version": 1,
+        "version": 2,
         "mode": None,
         "ayanamsa_deg": None,
         "ruleset": None,
     }
 
-    # ---- Normalize payload for astronomy/OPS (compat shim) ----
-    ap = dict(payload or {})
-    # OPS expects "mode" not "zodiac_mode"
-    if "mode" not in ap and ap.get("zodiac_mode"):
-        ap["mode"] = ap["zodiac_mode"]
+    # Respect caller's requested zodiac mode (forward it to astronomy as "mode")
+    req_mode = (str(payload.get("zodiac_mode") or payload.get("mode") or "").strip().lower() or None)
+    if req_mode:
+        payload = {**payload, "mode": req_mode}
+    if "tz" not in payload:
+        tz_guess = payload.get("place_tz") or payload.get("tz_name") or "UTC"
+        payload = {**payload, "tz": tz_guess}
 
-    # tz fallbacks
-    if "tz" not in ap:
-        ap["tz"] = ap.get("place_tz") or ap.get("tz_name") or "UTC"
-
-    # coordinate coercion (avoid strings)
-    for k in ("latitude", "longitude", "elevation_m"):
-        if k in ap:
-            coerced = _safe_float(ap.get(k))
-            if coerced is not None:
-                ap[k] = coerced
-
-    # keep house system explicitly if provided
-    if ap.get("house_system") is None and payload.get("house_system"):
-        ap["house_system"] = payload["house_system"]
-
-    # ---- Pull authoritative chart via router (primary + fallbacks) ----
-    chart, router_warnings = _obtain_chart(ap)
-    warnings.extend(router_warnings)
-    if chart is None:
-        return {
-            "ok": False,
-            "bav": {},
-            "bav_totals": {},
-            "sav": {"by_sign": [0] * 12, "total": 0},
-            "meta": meta,
-            "warnings": warnings,
-        }
+    # 1) Authoritative chart
+    chart = _compute_chart(payload)  # may raise; propagate clear error upstream
+    avc = _chart_to_av_shape(chart)
 
     # Mode & ayanamsa reporting
-    meta["mode"] = (
-        chart.get("meta", {}).get("mode")
-        or ap.get("mode")
-        or ap.get("zodiac_mode")
-        or "sidereal"
-    )
-    a_deg = chart.get("meta", {}).get("ayanamsa_deg")
+    meta["mode"] = (avc.get("meta") or {}).get("mode") or req_mode or "sidereal"
+    a_deg = (avc.get("meta") or {}).get("ayanamsa_deg")
     if a_deg is None and str(meta["mode"]).lower() == "sidereal":
-        a_deg = _safe_float(ap.get("ayanamsa"))
+        a_deg = _safe_float(payload.get("ayanamsa"))
     meta["ayanamsa_deg"] = a_deg
 
     # Extract longitudes (7 planets)
-    planets_block = chart.get("planets", {}) if isinstance(chart, dict) else {}
+    planets_block = avc.get("planets", {}) if isinstance(avc, dict) else {}
     longitudes: Dict[str, Optional[float]] = {}
     missing: List[str] = []
     for p in PLANETS:
@@ -419,7 +301,7 @@ def compute_ashtakavarga(payload: Dict[str, Any]) -> Dict[str, Any]:
         longitudes[p] = fv
 
     # Ascendant (Lagna)
-    asc = _extract_asc_deg(chart)
+    asc = _extract_asc_deg(avc)
     if asc is None and isinstance(payload.get("angles"), dict):
         asc = _safe_float(payload["angles"].get("asc"))
 
