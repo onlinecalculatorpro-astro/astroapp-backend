@@ -293,10 +293,7 @@ def clear_caches() -> None:
 def compute_ashtakavarga(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Compute BAV (per planet) and SAV (per sign) using Parāśari Ashtakavarga rules.
-    Astronomy is obtained from:
-        1) app.core.astronomy.compute_chart
-        2) importable fallbacks
-        3) POST /ops/calculate
+    Astronomy comes from app.core.astronomy.compute_chart(payload).
     """
     warnings: List[str] = []
     meta: Dict[str, Any] = {
@@ -307,48 +304,88 @@ def compute_ashtakavarga(payload: Dict[str, Any]) -> Dict[str, Any]:
         "ruleset": None,
     }
 
-    # Acquire authoritative chart (sidereal/tropical already honored upstream)
-    chart, w0 = _obtain_chart(payload)
-    warnings.extend(w0)
-    if chart is None:
+    # ---- Normalize payload for astronomy/OPS (compat shim) ----
+    ap = dict(payload or {})
+    # OPS expects "mode" not "zodiac_mode"
+    if "mode" not in ap and ap.get("zodiac_mode"):
+        ap["mode"] = ap["zodiac_mode"]
+    # tz fallbacks
+    if "tz" not in ap:
+        ap["tz"] = ap.get("place_tz") or ap.get("tz_name") or "UTC"
+    # coordinate coercion (avoid strings)
+    for k in ("latitude", "longitude", "elevation_m"):
+        if k in ap:
+            try:
+                ap[k] = float(ap[k])
+            except Exception:
+                pass
+    # keep house system explicitly if provided
+    if ap.get("house_system") is None and payload.get("house_system"):
+        ap["house_system"] = payload["house_system"]
+
+    if compute_chart is None:
         return {
             "ok": False, "bav": {}, "bav_totals": {},
             "sav": {"by_sign": [0]*12, "total": 0},
             "meta": meta,
-            "warnings": warnings,
+            "warnings": ["astronomy_router_unavailable"],
+        }
+
+    # ---- Pull authoritative chart ----
+    try:
+        chart = compute_chart(ap)
+    except Exception as e:
+        return {
+            "ok": False, "bav": {}, "bav_totals": {},
+            "sav": {"by_sign": [0]*12, "total": 0},
+            "meta": meta,
+            "warnings": [f"astronomy_compute_failed:{type(e).__name__}"],
         }
 
     # Mode & ayanamsa reporting
     meta["mode"] = (chart.get("meta", {}).get("mode")
-                    or payload.get("zodiac_mode") or "sidereal")
-    a_deg = chart.get("meta", {}).get("ayanamsa_deg") if isinstance(chart.get("meta"), dict) else None
+                    or ap.get("mode")
+                    or ap.get("zodiac_mode")
+                    or "sidereal")
+    a_deg = chart.get("meta", {}).get("ayanamsa_deg")
     if a_deg is None and str(meta["mode"]).lower() == "sidereal":
-        a_deg = _safe_float(payload.get("ayanamsa"))
+        try:
+            a_deg = float(ap.get("ayanamsa")) if ap.get("ayanamsa") is not None else None
+        except Exception:
+            a_deg = None
     meta["ayanamsa_deg"] = a_deg
 
-    # Extract longitudes for the 7 planets
-    planets_block = chart.get("planets", {}) if isinstance(chart.get("planets"), dict) else {}
+    # Extract longitudes (7 planets)
+    planets_block = chart.get("planets", {}) if isinstance(chart, dict) else {}
     longitudes: Dict[str, Optional[float]] = {}
     missing: List[str] = []
-
     for p in PLANETS:
-        v = planets_block.get(p, {})
-        if isinstance(v, dict):
-            lon = v.get("lon", v.get("longitude"))
-        else:
-            lon = v  # sometimes flattened number
-        fv = _safe_float(lon)
+        v = planets_block.get(p, {}) or {}
+        lon = v.get("lon", v.get("longitude"))
+        try:
+            fv = float(lon) if lon is not None else None
+        except Exception:
+            fv = None
         if fv is None:
             missing.append(p)
         longitudes[p] = fv
 
     # Ascendant (Lagna)
     asc = None
-    angles_block = chart.get("angles", chart.get("meta", {}))
+    angles_block = chart.get("angles", chart.get("meta", {})) if isinstance(chart, dict) else {}
     if isinstance(angles_block, dict):
-        asc = _safe_float(angles_block.get("asc") or angles_block.get("ASC") or angles_block.get("Ascendant"))
+        for key in ("asc", "ASC", "Ascendant", "asc_deg"):
+            if key in angles_block:
+                try:
+                    asc = float(angles_block[key])
+                    break
+                except Exception:
+                    pass
     if asc is None and isinstance(payload.get("angles"), dict):
-        asc = _safe_float(payload["angles"].get("asc"))
+        try:
+            asc = float(payload["angles"].get("asc"))
+        except Exception:
+            asc = None
 
     if missing:
         warnings.append("missing_longitudes:" + ",".join(missing))
@@ -363,11 +400,10 @@ def compute_ashtakavarga(payload: Dict[str, Any]) -> Dict[str, Any]:
             "warnings": warnings + ["no_planet_longitudes_available"],
         }
 
-    # Build sign indices
+    # Sign indices
     def _wrap360(x: float) -> float:
         v = x % 360.0
         return v if v >= 0 else v + 360.0
-
     def _sign_index(lon_deg: float) -> int:
         return int(_wrap360(lon_deg) // 30.0)
 
@@ -378,17 +414,19 @@ def compute_ashtakavarga(payload: Dict[str, Any]) -> Dict[str, Any]:
     if asc is not None:
         signs["Lagna"] = _sign_index(asc)
 
-    # Load ruleset
+    # Ruleset
     requested_ruleset = str(payload.get("ruleset", "parashari-bphs")).lower()
     rules, rs_warnings, ruleset_name = _load_ruleset(requested_ruleset, payload)
     warnings.extend(rs_warnings)
     meta["ruleset"] = ruleset_name
 
     # BAV per planet
-    def _bav_for_planet(giver: str, signs: Dict[str, int], rules: Dict[str, Dict[str, List[int]]], warnings: List[str]) -> List[int]:
-        vec = [0] * 12
-        grules = rules.get(giver, {})
-        for receiver, offsets in grules.items():
+    def _bav_for_planet(giver: str,
+                        signs: Dict[str, int],
+                        rules: Dict[str, Dict[str, List[int]]],
+                        warnings: List[str]) -> List[int]:
+        vec = [0]*12
+        for receiver, offsets in rules.get(giver, {}).items():
             if receiver not in signs:
                 continue
             base = signs[receiver]
@@ -400,12 +438,11 @@ def compute_ashtakavarga(payload: Dict[str, Any]) -> Dict[str, Any]:
                 vec[idx] += 1
         return vec
 
-    bav: Dict[str, List[int]] = {giver: _bav_for_planet(giver, signs, rules, warnings) for giver in PLANETS}
+    bav: Dict[str, List[int]] = {g: _bav_for_planet(g, signs, rules, warnings) for g in PLANETS}
     bav_totals: Dict[str, int] = {k: int(sum(v)) for k, v in bav.items()}
     sav_by_sign = [sum(bav[g][i] for g in PLANETS) for i in range(12)]
     sav_total = int(sum(sav_by_sign))
-
-    if sav_total != sum(bav_totals.values()):  # integrity check
+    if sav_total != sum(bav_totals.values()):
         warnings.append("consistency_mismatch:sav_total!=sum(bav_totals)")
 
     return {
