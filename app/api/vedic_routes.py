@@ -1266,7 +1266,8 @@ def _normalize_strength_payload_generic(body: Dict[str, Any]) -> tuple[Dict[str,
             "longitude": _coerce_float(body.get("longitude") or body.get("lon")),
             "elevation_m": _coerce_float(body.get("elevation_m") or body.get("elevation")),
             "zodiac_mode": _norm_method(body.get("zodiac_mode") or body.get("mode") or body.get("method") or "sidereal"),
-            "ayanamsa": _norm_ayanamsa(body.get("ayanamsa")),
+            # ⬇ improvement: accept ayanamsa_key alias too
+            "ayanamsa": _norm_ayanamsa(body.get("ayanamsa") or body.get("ayanamsa_key")),
             "place_tz": tz,
         }
 
@@ -1333,6 +1334,9 @@ def _run_shadbala(body: Dict[str, Any]) -> Dict[str, Any]:
         "angles": body.get("angles"),  # asc/mc optional
         "include_components": body.get("include_components"),
         "vargas": body.get("vargas"),
+
+        # ⬇ improvement: allow explicit observer override if provided
+        "observer": body.get("observer"),
     }
 
     try:
@@ -1396,6 +1400,9 @@ def _run_ashtakavarga(body: Dict[str, Any]) -> Dict[str, Any]:
         "ruleset": body.get("ruleset"),
         "ruleset_map": body.get("ruleset_map"),
         "include": include,
+
+        # ⬇ improvement: pass spec/spec_path through to engine if present
+        "spec_path": body.get("spec_path") or body.get("spec") or norm.get("spec_path"),
     }
 
     try:
