@@ -16,7 +16,7 @@ vedic_api = Blueprint("vedic_api", __name__)
 RL_VEDIC_PREDICTIVE = int(os.getenv("ASTRO_RL_VEDIC_PREDICTIVE_PER_MIN", "20"))
 
 def fixed_key(*_a, **_k) -> str:
-    """Shared bucket key ('20') used by all predictive/varga/yoga calls."""
+    """Shared bucket key ('20') used by all predictive/varga/yoga/horary calls."""
     return "20"
 
 
@@ -190,6 +190,26 @@ try:
     _PRED_BRANCH = "vedic_predictive"
 except Exception:
     _PRED_BRANCH = "none"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Horary (Prasna) core
+# ──────────────────────────────────────────────────────────────────────────────
+_HORARY_OK = False
+_horary_err = None
+try:
+    from app.core.horary import (  # type: ignore
+        analyze_prasna_enhanced as _analyze_prasna_enhanced,
+        HoraryInput as _HoraryInput,
+        QuestionType as _QuestionType,
+    )
+    _HORARY_OK = True
+except Exception as _he:
+    _HORARY_OK = False
+    _horary_err = repr(_he)
+    _analyze_prasna_enhanced = None  # type: ignore
+    _HoraryInput = None               # type: ignore
+    _QuestionType = None              # type: ignore
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -792,6 +812,9 @@ def vedic_diag():
         "shadbala_branch": "vedic_predictive" if _shadbala_wrapper else "none",
         "ashtakavarga_present": bool(_ashtakavarga_wrapper),
         "ashtakavarga_branch": "vedic_predictive" if _ashtakavarga_wrapper else "none",
+        # Horary diagnostics
+        "horary_present": _HORARY_OK,
+        "horary_error": _horary_err,
         "rl_cap_per_min": RL_VEDIC_PREDICTIVE,
         "rl_bucket_key": "20",
         "dut1_seconds_env": _env_dut1_seconds(),
@@ -1468,3 +1491,200 @@ def route_ashtakavarga_alias():
     res = _run_ashtakavarga(body)
     status = 200 if (isinstance(res, dict) and res.get("ok")) else (503 if str(res.get("error","")).endswith("unavailable") else 400)
     return jsonify(res), status
+
+
+# =============================================================================
+# Horary (Prasna) routes
+# =============================================================================
+
+def _parse_question_type(val: Any) -> Optional[Any]:
+    """
+    Accepts enum name/value like 'job', 'JOB', 'QuestionType.JOB', or int not used.
+    Returns a _QuestionType or None.
+    """
+    if not _HORARY_OK or _QuestionType is None:
+        return None
+    if val is None:
+        return None
+    if isinstance(val, _QuestionType):  # type: ignore
+        return val
+    s = str(val).strip()
+    if not s:
+        return None
+    s = s.replace("QuestionType.", "").strip().lower()
+    for qt in _QuestionType:  # type: ignore
+        if qt.value == s or qt.name.lower() == s:
+            return qt
+    return None
+
+
+def _normalize_horary_payload(body: Dict[str, Any]) -> tuple[Dict[str, Any], List[str], str]:
+    """
+    Use yoga normalizer when available to align date/time/tz/place/coords.
+    Return a dict of HoraryInput kwargs + warns + tz_norm.
+    """
+    warns: List[str] = []
+    tz_norm = str(body.get("tz") or body.get("place_tz") or "UTC")
+    norm: Dict[str, Any] = {}
+
+    # Prefer yoga validator for the civil + site fields
+    if callable(normalize_yoga_payload):
+        norm, warns, tz_norm = normalize_yoga_payload(body)  # type: ignore[misc]
+    else:
+        # minimal fallback
+        warns.append("validator_unavailable_minimal_fallback")
+        norm = {
+            "date": body.get("date") or body.get("birth_date"),
+            "time": body.get("time") or body.get("birth_time") or "12:00:00",
+            "tz": tz_norm,
+            "latitude": _coerce_float(body.get("latitude") or body.get("lat")),
+            "longitude": _coerce_float(body.get("longitude") or body.get("lon")),
+            "elevation_m": _coerce_float(body.get("elevation_m") or body.get("elevation")),
+            "zodiac_mode": _norm_method(body.get("zodiac_mode") or body.get("mode") or "sidereal"),
+            "ayanamsa": _norm_ayanamsa(body.get("ayanamsa")),
+            "place": body.get("place"),
+        }
+
+    # Build horary kwargs
+    out = {
+        "date": norm.get("date"),
+        "time": norm.get("time"),
+        "tz_name": norm.get("tz") or tz_norm,
+        "place": body.get("place") or norm.get("place"),
+        "latitude": norm.get("latitude"),
+        "longitude": norm.get("longitude"),
+        "zodiac_mode": norm.get("zodiac_mode", "sidereal"),
+        "ayanamsa": norm.get("ayanamsa", "lahiri"),
+        "ayanamsa_deg": _coerce_float(body.get("ayanamsa_deg")),
+        "house_system": body.get("house_system") or "sripati",
+        # KP options
+        "kp_house_system": body.get("kp_house_system") or "placidus",
+        "kp_ayanamsa": body.get("kp_ayanamsa") or "krishnamurti",
+        "kp_number": _coerce_int(body.get("kp_number"), None) if body.get("kp_number") is not None else None,  # type: ignore
+        "kp_number_mode": str(body.get("kp_number_mode") or "anchor_asc"),
+        # Question
+        "question_type": _parse_question_type(body.get("question_type")),
+        "question_text": body.get("question_text"),
+        "querent_house": _coerce_int(body.get("querent_house"), 1),
+        "quesited_house": _coerce_int(body.get("quesited_house"), None) if body.get("quesited_house") is not None else None,  # type: ignore
+    }
+
+    return out, warns, tz_norm
+
+
+@vedic_api.post("/horary/parashari")
+@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
+def horary_parashari():
+    if not _HORARY_OK or not callable(_analyze_prasna_enhanced):
+        return jsonify({"ok": False, "error": "horary_engine_unavailable"}), 503
+    body = request.get_json(silent=True) or {}
+    hw, warns, tz_norm = _normalize_horary_payload(body)
+
+    # Basic guardrails
+    if not hw.get("date") or not hw.get("time"):
+        return jsonify({
+            "ok": False,
+            "error": "missing_date_or_time",
+            "warnings": warns,
+            "meta": {"route": "horary/parashari", "branch": "horary_core", "tz_normalized": tz_norm},
+        }), 400
+    if hw.get("latitude") is None or hw.get("longitude") is None:
+        return jsonify({
+            "ok": False,
+            "error": "missing_coordinates",
+            "warnings": warns,
+            "meta": {"route": "horary/parashari", "branch": "horary_core", "tz_normalized": tz_norm},
+        }), 400
+
+    try:
+        inp = _HoraryInput(**hw)  # type: ignore
+        res = _analyze_prasna_enhanced(inp, method="parashari")  # type: ignore
+    except Exception as e:
+        return jsonify({"ok": False, "error": "horary_parashari_failed", "detail": str(e)}), 400
+
+    if isinstance(res, dict):
+        res.setdefault("meta", {})
+        res["meta"].update({"route": "horary/parashari", "tz_normalized": tz_norm, "branch": "horary_core"})
+        if warns:
+            res.setdefault("warnings", []).extend(warns)
+    return jsonify(res), (200 if res.get("ok") else 400)
+
+
+@vedic_api.post("/horary/kp")
+@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
+def horary_kp():
+    if not _HORARY_OK or not callable(_analyze_prasna_enhanced):
+        return jsonify({"ok": False, "error": "horary_engine_unavailable"}), 503
+    body = request.get_json(silent=True) or {}
+    hw, warns, tz_norm = _normalize_horary_payload(body)
+
+    if not hw.get("date") or not hw.get("time"):
+        return jsonify({
+            "ok": False,
+            "error": "missing_date_or_time",
+            "warnings": warns,
+            "meta": {"route": "horary/kp", "branch": "horary_core", "tz_normalized": tz_norm},
+        }), 400
+    if hw.get("latitude") is None or hw.get("longitude") is None:
+        return jsonify({
+            "ok": False,
+            "error": "missing_coordinates",
+            "warnings": warns,
+            "meta": {"route": "horary/kp", "branch": "horary_core", "tz_normalized": tz_norm},
+        }), 400
+
+    try:
+        inp = _HoraryInput(**hw)  # type: ignore
+        res = _analyze_prasna_enhanced(inp, method="kp")  # type: ignore
+    except Exception as e:
+        return jsonify({"ok": False, "error": "horary_kp_failed", "detail": str(e)}), 400
+
+    if isinstance(res, dict):
+        res.setdefault("meta", {})
+        res["meta"].update({"route": "horary/kp", "tz_normalized": tz_norm, "branch": "horary_core"})
+        if warns:
+            res.setdefault("warnings", []).extend(warns)
+    return jsonify(res), (200 if res.get("ok") else 400)
+
+
+@vedic_api.post("/horary")
+@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
+def horary_generic():
+    """
+    Generic horary endpoint with 'method' in body: 'parashari' (default) or 'kp'.
+    """
+    if not _HORARY_OK or not callable(_analyze_prasna_enhanced):
+        return jsonify({"ok": False, "error": "horary_engine_unavailable"}), 503
+    body = request.get_json(silent=True) or {}
+    method = str(body.get("method") or "parashari").lower()
+    if method not in ("parashari", "kp"):
+        method = "parashari"
+    hw, warns, tz_norm = _normalize_horary_payload(body)
+
+    if not hw.get("date") or not hw.get("time"):
+        return jsonify({
+            "ok": False,
+            "error": "missing_date_or_time",
+            "warnings": warns,
+            "meta": {"route": "horary", "branch": "horary_core", "tz_normalized": tz_norm, "method": method},
+        }), 400
+    if hw.get("latitude") is None or hw.get("longitude") is None:
+        return jsonify({
+            "ok": False,
+            "error": "missing_coordinates",
+            "warnings": warns,
+            "meta": {"route": "horary", "branch": "horary_core", "tz_normalized": tz_norm, "method": method},
+        }), 400
+
+    try:
+        inp = _HoraryInput(**hw)  # type: ignore
+        res = _analyze_prasna_enhanced(inp, method=method)  # type: ignore
+    except Exception as e:
+        return jsonify({"ok": False, "error": "horary_failed", "detail": str(e)}), 400
+
+    if isinstance(res, dict):
+        res.setdefault("meta", {})
+        res["meta"].update({"route": "horary", "tz_normalized": tz_norm, "branch": "horary_core", "method": method})
+        if warns:
+            res.setdefault("warnings", []).extend(warns)
+    return jsonify(res), (200 if res.get("ok") else 400)
