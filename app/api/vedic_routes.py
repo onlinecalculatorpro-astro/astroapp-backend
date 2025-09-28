@@ -1,9 +1,10 @@
 # app/api/vedic_routes.py
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import inspect
 import os
+from datetime import datetime, timezone
 
 from flask import Blueprint, jsonify, request
 from app.utils.ratelimit import rate_limit  # fixed shared bucket
@@ -120,7 +121,7 @@ except Exception:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Yoga core (Mode-C only)
+# Yoga core (diag visibility); route uses vedic_predictive.yoga_detect
 # ──────────────────────────────────────────────────────────────────────────────
 _YOGA_OK = False
 _compute_yogas = None  # type: ignore
@@ -171,37 +172,24 @@ except Exception:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# (NEW) Śaḍbala & Aṣṭakavarga — prefer vedic_predictive wrappers, fallback to modules
+# Predictive helpers from vedic_predictive
 # ──────────────────────────────────────────────────────────────────────────────
-_SHADBALA_BRANCH = "none"
-_ASHTAKAVARGA_BRANCH = "none"
-
-_compute_shadbala = None        # type: ignore
-_compute_ashtakavarga = None    # type: ignore
+_PRED_BRANCH = "none"
+_predict_dasha_periods = None   # type: ignore
+_yoga_detect = None             # type: ignore
+_shadbala_wrapper = None        # type: ignore
+_ashtakavarga_wrapper = None    # type: ignore
 
 try:
-    # Prefer unified wrappers if added to vedic_predictive
-    from app.core.vedic_predictive import (            # type: ignore
-        compute_shadbala as _compute_shadbala,
-        compute_ashtakavarga as _compute_ashtakavarga,
+    from app.core.vedic_predictive import (  # type: ignore
+        predict_dasha_periods as _predict_dasha_periods,
+        yoga_detect as _yoga_detect,
+        shadbala as _shadbala_wrapper,
+        compute_ashtakavarga as _ashtakavarga_wrapper,  # shim exists in predictive
     )
-    _SHADBALA_BRANCH = "vedic_predictive"
-    _ASHTAKAVARGA_BRANCH = "vedic_predictive"
+    _PRED_BRANCH = "vedic_predictive"
 except Exception:
-    # Fallback to direct modules
-    try:
-        from app.core.shadbala import compute_shadbala as _compute_shadbala  # type: ignore
-        _SHADBALA_BRANCH = "shadbala_module"
-    except Exception:
-        _compute_shadbala = None  # type: ignore
-        _SHADBALA_BRANCH = "none"
-
-    try:
-        from app.core.ashtakavarga import compute_ashtakavarga as _compute_ashtakavarga  # type: ignore
-        _ASHTAKAVARGA_BRANCH = "ashtakavarga_module"
-    except Exception:
-        _compute_ashtakavarga = None  # type: ignore
-        _ASHTAKAVARGA_BRANCH = "none"
+    _PRED_BRANCH = "none"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -478,8 +466,45 @@ def _ensure_tree_envelope(res: Dict[str, Any], *, scheme: str) -> Dict[str, Any]
     return res
 
 
+# ---- dasha window helpers ----------------------------------------------------
+def _iso_to_utc_dt(s: str, default_time: str = "00:00:00") -> Optional[datetime]:
+    if not s:
+        return None
+    t = s.strip()
+    try:
+        if "T" not in t:
+            t = f"{t}T{default_time}"
+        # Allow "Z"
+        t = t.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(t)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _pick_window(body: Dict[str, Any]) -> Tuple[Optional[datetime], Optional[datetime]]:
+    """
+    Accepts:
+      - window/time_window/range: {"from": "YYYY-MM-DD", "to": "YYYY-MM-DD"}
+      - date_from/date_to
+      - from/to
+    Returns UTC datetimes spanning the civil days.
+    """
+    win = body.get("window") or body.get("time_window") or body.get("range") or {}
+    d0 = (win or {}).get("from") or (win or {}).get("start")
+    d1 = (win or {}).get("to") or (win or {}).get("end")
+    d0 = d0 or body.get("date_from") or body.get("from")
+    d1 = d1 or body.get("date_to") or body.get("to")
+
+    dt0 = _iso_to_utc_dt(str(d0 or ""), "00:00:00")
+    dt1 = _iso_to_utc_dt(str(d1 or ""), "23:59:59")
+    return dt0, dt1
+
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Core runners (dasha): validator → registry (preferred) → module fallback
+# Core runners (dasha): validator → registry (preferred) → module/predictive
 # ──────────────────────────────────────────────────────────────────────────────
 def _run_with_registry_first(
     *,
@@ -497,6 +522,38 @@ def _run_with_registry_first(
         }
 
     norm, warns, tz_norm = normalize_vim_payload(body)  # type: ignore[misc]
+
+    # If a civil window is provided and predictive helper exists, prefer it.
+    # (Keeps old behavior when no window provided.)
+    if callable(_predict_dasha_periods):
+        dt0, dt1 = _pick_window(body)
+        if dt0 and dt1:
+            natal_chart = {
+                "date": norm.get("date"),
+                "time": norm.get("time"),
+                "tz": norm.get("tz") or tz_norm,
+                "place_tz": norm.get("tz") or tz_norm,
+                "latitude": norm.get("latitude"),
+                "longitude": norm.get("longitude"),
+                "elevation_m": norm.get("elevation_m"),
+                "ayanamsa": norm.get("ayanamsa"),
+                "jd_tt": norm.get("jd_tt"),
+                "jd_ut1": norm.get("jd_ut1"),
+            }
+            try:
+                res = _predict_dasha_periods(
+                    natal_chart=natal_chart,
+                    start_date=dt0,
+                    end_date=dt1,
+                    dasha_system=scheme_key,
+                    include_antardasha=_levels_from(norm) >= 2,
+                    levels=_levels_from(norm),
+                )
+                if isinstance(res, dict) and res.get("ok"):
+                    return _wrap_ok(res, warns, tz_norm, branch=f"predictive.{scheme_key}", route_name=route_name)
+            except Exception:
+                # fall back silently if predictive path fails
+                pass
 
     # Attempt central registry (preferred)
     if _compute_dasha_registry is not None:
@@ -726,11 +783,15 @@ def vedic_diag():
         # Gochar diagnostics
         "gochar_present": _GOCHAR_OK,
         "gochar_branch": _GOCHAR_BRANCH,
+        # Predictive helpers
+        "predictive_branch": _PRED_BRANCH,
+        "predictive_dasha_present": bool(_predict_dasha_periods),
+        "yoga_detect_present": bool(_yoga_detect),
         # Strength diagnostics
-        "shadbala_present": bool(_compute_shadbala),
-        "shadbala_branch": _SHADBALA_BRANCH,
-        "ashtakavarga_present": bool(_compute_ashtakavarga),
-        "ashtakavarga_branch": _ASHTAKAVARGA_BRANCH,
+        "shadbala_present": bool(_shadbala_wrapper),
+        "shadbala_branch": "vedic_predictive" if _shadbala_wrapper else "none",
+        "ashtakavarga_present": bool(_ashtakavarga_wrapper),
+        "ashtakavarga_branch": "vedic_predictive" if _ashtakavarga_wrapper else "none",
         "rl_cap_per_min": RL_VEDIC_PREDICTIVE,
         "rl_bucket_key": "20",
         "dut1_seconds_env": _env_dut1_seconds(),
@@ -786,7 +847,7 @@ def vedic_kalachakra():
     return jsonify(res), status
 
 
-# ──────────────── Yoga routes (Mode-C only) ────────────────
+# ──────────────── Yoga routes (wired via vedic_predictive.yoga_detect) ─────────
 @vedic_api.get("/yoga/catalog")
 @rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
 def vedic_yoga_catalog():
@@ -805,82 +866,39 @@ def vedic_yoga_catalog():
 def vedic_yoga_detect():
     """
     Yoga detection (civil/time + site only).
-    Requires: date, time, tz, latitude, longitude (place is optional; if provided and a resolver is available, it can fill missing tz/coords).
-    No precomputed points/cusps accepted here.
+    Uses vedic_predictive.yoga_detect which prefers core yoga engine and
+    falls back to legacy-basic detectors when needed.
     """
     if normalize_yoga_payload is None:
         return jsonify({"ok": False, "error": "validator_unavailable"}), 503
-    if not (_YOGA_OK and callable(_compute_yogas)):
-        return jsonify({"ok": False, "error": "yoga_core_unavailable"}), 503
+    if not callable(_yoga_detect):
+        return jsonify({"ok": False, "error": "yoga_engine_unavailable"}), 503
 
     body = request.get_json(silent=True) or {}
     norm, warns, tz_norm = normalize_yoga_payload(body)  # type: ignore[misc]
 
-    # Basic input guardrails
+    # Guardrails similar to the old route
     if not norm.get("date") or not norm.get("time"):
         return jsonify({
             "ok": False,
             "error": "missing_date_or_time",
             "warnings": (warns or []),
-            "meta": {"route": "yoga/detect", "branch": "needs_civil", "tz_normalized": tz_norm},
-        }), 400
-    if norm.get("latitude") is None or norm.get("longitude") is None:
-        return jsonify({
-            "ok": False,
-            "error": "missing_coordinates",
-            "warnings": (warns or []),
-            "meta": {"route": "yoga/detect", "branch": "needs_coordinates", "tz_normalized": tz_norm},
-            "hints": [
-                "Provide 'latitude' and 'longitude' (in degrees).",
-                "Optionally send a 'place' string (city/state/country) if a resolver is enabled.",
-            ],
+            "meta": {"route": "yoga/detect", "branch": _PRED_BRANCH, "tz_normalized": tz_norm},
         }), 400
 
-    # Call the core yoga engine
+    # Call predictive wrapper (handles core + fallback)
     try:
-        res = _compute_yogas(
-            {
-                "date": norm["date"],
-                "time": norm["time"],
-                "tz": norm["tz"],
-                "latitude": norm["latitude"],
-                "longitude": norm["longitude"],
-                "elevation_m": norm.get("elevation_m"),
-                # passthrough for any future core-side needs
-                "include": norm.get("include") or [],
-            },
-            ayanamsa=norm.get("ayanamsa", "lahiri"),
-            house_system=norm.get("house_system", "placidus"),
-            # defaults below mirror core defaults; override if you expose UI toggles
-            sign_lord_variant="classical",
-            chandra_mangala_by_sign=True,
-            conj_orb_deg=6.0,
-            gajakesari_include_same_house=True,
-            include_mooltrikona_in_mahapurusha=True,
-            use_vargas_for_scoring=bool(norm.get("use_vargas_for_scoring", True)),
-            varga_keys_for_boost=tuple(norm.get("varga_keys_for_boost") or ("D9", "D10")),
-            include_arudha_notes=False,
-            enable_catalog_tags=tuple(norm.get("enable_catalog_tags") or ()),
-            disable_catalog_tags=tuple(norm.get("disable_catalog_tags") or ()),
-        )
+        res = _yoga_detect(norm)
     except Exception as e:
         return jsonify({"ok": False, "error": "yoga_detect_failed", "detail": str(e)}), 400
 
-    ok = bool(res.get("ok"))
-    yogas = res.get("yogas", []) if isinstance(res, dict) else []
-    present = [y.get("name") for y in yogas if isinstance(y, dict) and y.get("present")]
-    out = {
-        "ok": ok,
-        "yogas": yogas,
-        "present": present,
-        "context": res.get("context"),
-        "warnings": (warns or []) + (res.get("warnings", []) if isinstance(res, dict) else []),
-        "meta": {"route": "yoga/detect", "branch": "yoga_core", "tz_normalized": tz_norm},
-    }
-    if not ok:
-        out["error"] = res.get("error", "yoga_detect_failed")
-        return jsonify(out), (503 if str(out["error"]).endswith("unavailable") else 400)
-    return jsonify(out), 200
+    if isinstance(res, dict):
+        res.setdefault("meta", {})
+        res["meta"].update({"route": "yoga/detect", "tz_normalized": tz_norm, "branch": _PRED_BRANCH})
+        if warns:
+            res.setdefault("warnings", []).extend(warns)
+
+    return jsonify(res), (200 if res.get("ok") else 400)
 
 
 # ──────────────── Gochar / Ingress / Stations routes ────────────────
@@ -1243,7 +1261,7 @@ def _resolve_ayanamsa_for_engine(body: Dict[str, Any], method: str, jd_tt: Optio
 
 
 # =============================================================================
-# Śaḍbala & Aṣṭakavarga routes
+# Śaḍbala & Aṣṭakavarga routes (via vedic_predictive wrappers when available)
 # =============================================================================
 
 def _normalize_strength_payload_generic(body: Dict[str, Any]) -> tuple[Dict[str, Any], List[str], str]:
@@ -1300,9 +1318,9 @@ def _strength_call(fn, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _run_shadbala(body: Dict[str, Any]) -> Dict[str, Any]:
-    if _compute_shadbala is None:
+    if _shadbala_wrapper is None:
         return {"ok": False, "error": "shadbala_engine_unavailable",
-                "meta": {"route": "strength/shadbala", "branch": _SHADBALA_BRANCH}}
+                "meta": {"route": "strength/shadbala", "branch": "none"}}
 
     if callable(normalize_shadbala_payload):
         norm, warns, tz_norm = normalize_shadbala_payload(body)  # type: ignore[misc]
@@ -1311,53 +1329,48 @@ def _run_shadbala(body: Dict[str, Any]) -> Dict[str, Any]:
 
     if not norm.get("date") or not norm.get("time"):
         return {"ok": False, "error": "missing_date_or_time", "warnings": warns,
-                "meta": {"route": "strength/shadbala", "branch": _SHADBALA_BRANCH, "tz_normalized": tz_norm}}
+                "meta": {"route": "strength/shadbala", "branch": "vedic_predictive", "tz_normalized": tz_norm}}
     if norm.get("latitude") is None or norm.get("longitude") is None:
         return {"ok": False, "error": "missing_coordinates", "warnings": warns,
-                "meta": {"route": "strength/shadbala", "branch": _SHADBALA_BRANCH, "tz_normalized": tz_norm}}
+                "meta": {"route": "strength/shadbala", "branch": "vedic_predictive", "tz_normalized": tz_norm}}
 
-    payload = {
+    natal_chart = {
         "date": norm["date"],
         "time": norm["time"],
-        "tz": norm["tz"],
+        "place_tz": norm.get("tz") or tz_norm,
+        "tz": norm.get("tz") or tz_norm,
         "latitude": float(norm["latitude"]),
         "longitude": float(norm["longitude"]),
         "elevation_m": norm.get("elevation_m"),
-        "zodiac_mode": norm.get("zodiac_mode", "sidereal"),
-        "ayanamsa": norm.get("ayanamsa", "lahiri"),
-
-        # ⬇ pass-throughs so the engine won’t fall back
-        "house_system": body.get("house_system"),
-        "house_cusps_deg": body.get("house_cusps_deg")
-                           or (body.get("houses") or {}).get("cusps_deg")
-                           or (body.get("houses") or {}).get("cusps"),
-        "angles": body.get("angles"),  # asc/mc optional
-        "include_components": body.get("include_components"),
-        "vargas": body.get("vargas"),
-
-        # ⬇ improvement: allow explicit observer override if provided
-        "observer": body.get("observer"),
     }
 
     try:
-        res = _strength_call(_compute_shadbala, payload)
+        res = _shadbala_wrapper(
+            natal_chart=natal_chart,
+            zodiac_mode=norm.get("zodiac_mode", "sidereal"),
+            ayanamsa=norm.get("ayanamsa", "lahiri"),
+            house_system=norm.get("house_system", "placidus"),
+            include_velocity=bool(body.get("include_velocity", True)),
+            prefer_houses_advanced=bool(body.get("prefer_houses_advanced", True)),
+            observer=str(body.get("observer") or "geocentric"),
+        )
     except Exception as e:
         return {"ok": False, "error": "shadbala_failed", "detail": str(e),
-                "meta": {"route": "strength/shadbala", "branch": _SHADBALA_BRANCH, "tz_normalized": tz_norm}}
+                "meta": {"route": "strength/shadbala", "branch": "vedic_predictive", "tz_normalized": tz_norm}}
 
     res.setdefault("meta", {}).update({"route": "strength/shadbala",
-                                       "tz_normalized": tz_norm, "branch": _SHADBALA_BRANCH})
+                                       "tz_normalized": tz_norm, "branch": "vedic_predictive"})
     if warns:
         res.setdefault("warnings", []).extend(warns)
     return res
 
 
 def _run_ashtakavarga(body: Dict[str, Any]) -> Dict[str, Any]:
-    if _compute_ashtakavarga is None:
+    if _ashtakavarga_wrapper is None:
         return {
             "ok": False,
             "error": "ashtakavarga_engine_unavailable",
-            "meta": {"route": "ashtakavarga", "branch": _ASHTAKAVARGA_BRANCH},
+            "meta": {"route": "ashtakavarga", "branch": "none"},
         }
 
     # Prefer dedicated validator; fallback to generic
@@ -1372,51 +1385,58 @@ def _run_ashtakavarga(body: Dict[str, Any]) -> Dict[str, Any]:
             "ok": False,
             "error": "missing_date_or_time",
             "warnings": warns,
-            "meta": {"route": "ashtakavarga", "branch": _ASHTAKAVARGA_BRANCH, "tz_normalized": tz_norm},
+            "meta": {"route": "ashtakavarga", "branch": "vedic_predictive", "tz_normalized": tz_norm},
         }
     if norm.get("latitude") is None or norm.get("longitude") is None:
         return {
             "ok": False,
             "error": "missing_coordinates",
             "warnings": warns,
-            "meta": {"route": "ashtakavarga", "branch": _ASHTAKAVARGA_BRANCH, "tz_normalized": tz_norm},
+            "meta": {"route": "ashtakavarga", "branch": "vedic_predictive", "tz_normalized": tz_norm},
         }
 
-    include = body.get("include") or body.get("include_keys")  # optional list, e.g. ["SAV","BAV"]
-
-    payload = {
+    natal_chart = {
         "date": norm["date"],
         "time": norm["time"],
-        "tz": norm["tz"],
+        "place_tz": norm.get("tz") or tz_norm,
+        "tz": norm.get("tz") or tz_norm,
         "latitude": float(norm["latitude"]),
         "longitude": float(norm["longitude"]),
         "elevation_m": norm.get("elevation_m"),
-        "zodiac_mode": norm.get("zodiac_mode", "sidereal"),
-        "ayanamsa": norm.get("ayanamsa", "lahiri"),
-
-        # ⬇ important pass-throughs for core/ashtakavarga
-        "house_system": body.get("house_system") or norm.get("house_system"),
+        # Optional: pass angles if present
         "angles": body.get("angles"),
-        "ruleset": body.get("ruleset"),
-        "ruleset_map": body.get("ruleset_map"),
-        "include": include,
-
-        # ⬇ improvement: pass spec/spec_path through to engine if present
-        "spec_path": body.get("spec_path") or body.get("spec") or norm.get("spec_path"),
     }
 
     try:
-        res = _strength_call(_compute_ashtakavarga, payload)
+        # Use predictive shim (accepts payload-like kwargs)
+        res = _ashtakavarga_wrapper(
+            {
+                "date": natal_chart["date"],
+                "time": natal_chart["time"],
+                "tz": natal_chart["tz"],
+                "latitude": natal_chart["latitude"],
+                "longitude": natal_chart["longitude"],
+                "elevation_m": natal_chart["elevation_m"],
+                "zodiac_mode": norm.get("zodiac_mode", "sidereal"),
+                "ayanamsa": norm.get("ayanamsa", "lahiri"),
+                "house_system": norm.get("house_system", "placidus"),
+                "angles": body.get("angles"),
+                "ruleset": body.get("ruleset"),
+                "ruleset_map": body.get("ruleset_map"),
+                "include": body.get("include") or body.get("include_keys"),
+                "spec_path": body.get("spec_path") or body.get("spec") or norm.get("spec_path"),
+            }
+        )
     except Exception as e:
         return {
             "ok": False,
             "error": "ashtakavarga_failed",
             "detail": str(e),
-            "meta": {"route": "ashtakavarga", "branch": _ASHTAKAVARGA_BRANCH, "tz_normalized": tz_norm},
+            "meta": {"route": "ashtakavarga", "branch": "vedic_predictive", "tz_normalized": tz_norm},
         }
 
     res.setdefault("meta", {})
-    res["meta"].update({"route": "ashtakavarga", "tz_normalized": tz_norm, "branch": _ASHTAKAVARGA_BRANCH})
+    res["meta"].update({"route": "ashtakavarga", "tz_normalized": tz_norm, "branch": "vedic_predictive"})
     if warns:
         res.setdefault("warnings", []).extend(warns)
     return res
