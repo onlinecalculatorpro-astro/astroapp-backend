@@ -290,11 +290,11 @@ def _houses_from_chart(
     longitude: float,
     house_system: str,
     zodiac_mode: str,
-    ayanamsa_deg: Optional[float]
+    ayanamsa_deg: Optional[float],
 ) -> Dict[str, Any]:
     """
-    Use compute_house_system with strict timescales coming from chart.meta.timescales,
-    then optionally shift cusps by ayanamsa for sidereal mode.
+    Try advanced house engine with multiple signatures; if it fails,
+    fall back to Equal Houses from ASC (so analysis still works).
     """
     def _pick_ts(ts: Dict[str, Any], *keys: str) -> Optional[float]:
         for k in keys:
@@ -307,37 +307,93 @@ def _houses_from_chart(
                 pass
         return None
 
-    ts = chart.get("meta", {}).get("timescales", {}) or {}
+    ts = (chart.get("meta", {}) or {}).get("timescales", {}) or {}
+    jd_ut  = _pick_ts(ts, "jd_ut", "jd_utc")
+    jd_tt  = _pick_ts(ts, "jd_tt", "tt_jd", "jd_tdb")
+    jd_ut1 = _pick_ts(ts, "jd_ut1", "ut1_jd")
 
-    # Be tolerant to different field names from the astronomy layer
-    jd_ut  = _pick_ts(ts, "jd_ut", "jd_utc")         # UT (some builds call it jd_ut)
-    jd_tt  = _pick_ts(ts, "jd_tt", "tt_jd", "jd_tdb")# TT (some builds expose tt_jd/jd_tdb)
-    jd_ut1 = _pick_ts(ts, "jd_ut1", "ut1_jd")        # UT1
+    # Helper: try calling the engine with different kw layouts
+    def _try_engine() -> Optional[Dict[str, Any]]:
+        from inspect import signature
+        sig = None
+        try:
+            sig = signature(compute_house_system)
+        except Exception:
+            pass
 
-    if jd_ut is None or jd_tt is None or jd_ut1 is None:
-        have = { "jd_ut": jd_ut, "jd_tt": jd_tt, "jd_ut1": jd_ut1, "raw_keys": list(ts.keys()) }
-        raise ValueError(f"Timescales incomplete for houses: {have}")
+        trials = [
+            dict(latitude=latitude, longitude=longitude, house_system=house_system,
+                 jd_ut=jd_ut, jd_tt=jd_tt, jd_ut1=jd_ut1),
+            dict(latitude=latitude, longitude=longitude, house_system=house_system,
+                 jd_tt=jd_tt, jd_ut1=jd_ut1),
+            dict(latitude=latitude, longitude=longitude, house_system=house_system,
+                 jd_ut=jd_ut, jd_ut1=jd_ut1),
+            dict(latitude=latitude, longitude=longitude, house_system=house_system,
+                 jd_tt=jd_tt),
+        ]
 
-    payload = compute_house_system(
-        latitude=latitude,
-        longitude=longitude,
-        house_system=house_system,
-        jd_ut=jd_ut,
-        jd_tt=jd_tt,
-        jd_ut1=jd_ut1,
-    )
+        for kwargs in trials:
+            # Skip trials missing required values
+            if "jd_tt" in kwargs and kwargs["jd_tt"] is None: 
+                continue
+            if "jd_ut1" in kwargs and kwargs["jd_ut1"] is None:
+                continue
+            if "jd_ut" in kwargs and kwargs["jd_ut"] is None:
+                continue
+            try:
+                return compute_house_system(**kwargs)  # type: ignore[arg-type]
+            except TypeError:
+                # Signature mismatch → try next
+                continue
+            except Exception:
+                # Engine raised runtime error → try next
+                continue
+        return None
 
+    payload = _try_engine()
+
+    # Fallback: Equal Houses from ASC (never crash analysis)
+    if not payload:
+        asc_deg = None
+        ang = chart.get("angles") or {}
+        asc_deg = ang.get("asc_deg", chart.get("asc_deg"))
+        if asc_deg is None:
+            raise ValueError("houses_fallback_failed:no_asc_in_chart")
+
+        asc_deg = float(asc_deg)
+        cusps = [deg_wrap(asc_deg + i * 30.0) for i in range(12)]
+        mc_guess = (ang.get("mc_deg") if ang.get("mc_deg") is not None else deg_wrap(asc_deg + 90.0))
+
+        if zodiac_mode.lower() == "sidereal" and isinstance(ayanamsa_deg, (int, float)):
+            cusps = shift_sidereal(cusps, float(ayanamsa_deg))
+            asc_out = deg_wrap(asc_deg - float(ayanamsa_deg))
+            mc_out  = deg_wrap(float(mc_guess) - float(ayanamsa_deg))
+        else:
+            asc_out = asc_deg
+            mc_out  = float(mc_guess)
+
+        return {
+            "house_system": f"{house_system} (fallback=Equal from ASC)",
+            "cusps_deg": cusps,
+            "asc_deg": asc_out,
+            "mc_deg": mc_out,
+            "vertex": None,
+            "eastpoint": None,
+            "warnings": ["houses_engine_unavailable_fallback_equal"],
+        }
+
+    # Advanced payload OK — apply sidereal shift if needed
     cusps = list(payload["cusps_deg"])
     asc_deg_h = float(payload["asc_deg"])
     mc_deg_h  = float(payload["mc_deg"])
 
     if zodiac_mode.lower() == "sidereal" and isinstance(ayanamsa_deg, (int, float)):
-        cusps = shift_sidereal(cusps, float(ayanamsa_deg))
+        cusps    = shift_sidereal(cusps, float(ayanamsa_deg))
         asc_deg_h = deg_wrap(asc_deg_h - float(ayanamsa_deg))
         mc_deg_h  = deg_wrap(mc_deg_h  - float(ayanamsa_deg))
 
     return {
-        "house_system": payload["house_system"],
+        "house_system": payload.get("house_system", house_system),
         "cusps_deg": cusps,
         "asc_deg": asc_deg_h,
         "mc_deg": mc_deg_h,
