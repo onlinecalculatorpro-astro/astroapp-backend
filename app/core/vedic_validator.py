@@ -18,15 +18,15 @@ Public API
     normalize_shadbala_payload(payload)     -> (norm, warns, tz_norm)
     normalize_ashtakavarga_payload(payload) -> (norm, warns, tz_norm)
 
-    # Horary / Prasna (Parāśari + KP):
+    # Horary / Prasna (Parāśari + KP + Hybrid):
     normalize_horary_payload(payload)       -> (norm, warns, tz_norm)
 
 Key policies
 ------------
 • Sidereal-first defaults (zodiac_mode="sidereal", ayanamsa="lahiri").
-• If ANY place/POB string/parts are present, we MUST resolve via
-  app.core.geocoding.resolve_place — even if lat/lon/tz were also provided.
-  On failure, we return a fatal reason.
+• If ANY place/POB string/parts are present, we MUST resolve via a resolver
+  (preferred: app.core.geocoding.resolve_place; fallback: app.core.astronomy.resolve_place)
+  — even if lat/lon/tz were also provided. On failure, we return a fatal reason.
 • Timescales helper used where appropriate (no jd leak to other systems).
 • Ashtakavarga: passes through `ruleset` and validated `ruleset_map` to core;
   accepts optional `angles` {asc, mc}.
@@ -41,17 +41,22 @@ import inspect
 
 # ── (Optional) link to horary primitives for enums (no heavy imports at import time) ──
 try:
-    from app.core.horary import QuestionType as _QuestionType  # for Enum value mapping only
+    from app.core.horary import QuestionType as _QuestionType  # for Enum mapping if available
     _HORARY_ENUM_OK = True
 except Exception:
     _QuestionType = None  # type: ignore
     _HORARY_ENUM_OK = False
 
-# ── Required geocoder when any place/POB is present ──
+# ── Required geocoder when any place/POB is present (prefer dedicated module) ──
+_RESOLVE_PLACE = None
 try:
     from app.core.geocoding import resolve_place as _RESOLVE_PLACE  # type: ignore
 except Exception:
-    _RESOLVE_PLACE = None  # type: ignore
+    try:
+        # Fallback to astronomy.resolve_place (exported in your astronomy core)
+        from app.core.astronomy import resolve_place as _RESOLVE_PLACE  # type: ignore
+    except Exception:
+        _RESOLVE_PLACE = None  # type: ignore
 
 # ── Optional timescales where used ──
 try:
@@ -1122,33 +1127,65 @@ def _norm_question_type(v: Any) -> str:
             return qt.value
     return _LocalQuestionType.JOB.value
 
+def _as_core_qtype(value_str: str):
+    """
+    Try to convert normalized question-type string into the real Enum
+    app.core.horary.QuestionType if available; otherwise return None.
+    """
+    if not _HORARY_ENUM_OK:
+        return None
+    try:
+        # Enum members are defined with .value matching our normalized string
+        for m in _QuestionType:  # type: ignore
+            if str(m.value).lower() == value_str:
+                return m
+    except Exception:
+        pass
+    return None
+
 def _norm_horary_method(v: Any) -> str:
     s = _coerce_str(v).strip().lower()
     if s in ("kp", "krishnamurti", "kp_horary", "kph"):
         return "kp"
     if s in ("parashari", "parasari", "parāśari", "parashari_prasna", "prasna", "prashna"):
         return "parashari"
+    if s in ("hybrid", "mix", "blended", "combined", "prasna_hybrid", "horary_hybrid"):
+        return "hybrid"
     # default: parashari (classical)
     return "parashari"
 
 def normalize_horary_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str], str]:
     """
     Normalize inputs for Horary / Prasna endpoints.
-    Returns a dict that maps directly to app.core.horary.HoraryInput fields + method selector.
+    Returns a dict that maps directly to:
+      - app.core.horary.HoraryInput fields when method="parashari" | "kp"
+      - app.core.horary.HybridPrasnaInput fields when method="hybrid"
 
-    Accepted keys:
-      - method|mode: "parashari" | "kp"
-      - date, time, tz
-      - place / (place_city, place_state, place_country) / POB (strict geocoding if present)
-      - latitude, longitude (if place not provided)
-      - zodiac_mode (default sidereal), ayanamsa (default lahiri), house_system (default sripati)
-      - kp_house_system (default placidus), kp_ayanamsa (default krishnamurti)
-      - kp_number (1..249), kp_number_mode ("anchor_asc" | "advisory")
-      - question | question_type | topic
+    Accepted keys (superset):
+      method|mode: "parashari" | "kp" | "hybrid"
+
+      # Question moment (parashari/kp use date/time/tz + place/lat/lon; hybrid uses question_*):
+      date, time, tz, place / (place_city/state/country) / POB, latitude, longitude
+      question_date, question_time, question_tz, question_place / *_city/state/country,
+      question_latitude, question_longitude
+
+      # Birth data (only used for hybrid; aliases DOB/TOB/POB):
+      birth_date|DOB, birth_time|TOB, birth_tz|tz_name, birth_place|POB,
+      birth_latitude|latitude, birth_longitude|longitude,
+      birth_zodiac_mode, birth_ayanamsa
+
+      # Shared astro settings:
+      zodiac_mode (default sidereal), ayanamsa (default lahiri), house_system (default sripati)
+
+      # KP options (for method="kp"):
+      kp_house_system (default placidus), kp_ayanamsa (default krishnamurti),
+      kp_number (1..249), kp_number_mode ("anchor_asc" | "advisory")
+
+      # Question typing:
+      question | question_type | topic (free text & type)
     """
     warns: List[str] = []
 
-    # Method (parashari | kp)
     method = _norm_horary_method(payload.get("method") or payload.get("mode") or "parashari")
 
     # Common chart basics
@@ -1156,6 +1193,165 @@ def normalize_horary_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], L
     ayanamsa = _norm_ayanamsa(payload.get("ayanamsa") or payload.get("ayanamsa_key") or "lahiri")
     house_system = _coerce_str(payload.get("house_system") or "sripati").strip() or "sripati"
 
+    # Question type / text
+    qtype_val = _norm_question_type(payload.get("question_type") or payload.get("question") or payload.get("topic"))
+    qtype_enum = _as_core_qtype(qtype_val)
+    qtext = _coerce_str(payload.get("question_text") or payload.get("query") or payload.get("topic") or "").strip() or None
+
+    # ---------- HYBRID BRANCH ----------
+    if method == "hybrid":
+        # Question moment
+        q_date = _coerce_str(payload.get("question_date") or payload.get("date") or "").strip()
+        q_time = _pad_hms(_coerce_str(payload.get("question_time") or payload.get("time") or "").strip())
+        q_tz   = _coerce_str(payload.get("question_tz") or payload.get("tz") or payload.get("place_tz")).strip() or None
+
+        # Question location (strict geocoding if any place string present)
+        # Allow: question_place / place / question_place_city|state|country
+        if not any([payload.get("question_place"), payload.get("question_place_city"),
+                    payload.get("question_place_state"), payload.get("question_place_country")]) and payload.get("place"):
+            payload = dict(payload)
+            payload["question_place"] = payload.get("place")
+
+        q_lat = _as_float(payload.get("question_latitude") or payload.get("latitude") or payload.get("lat"))
+        q_lon = _as_float(payload.get("question_longitude") or payload.get("longitude") or payload.get("lon"))
+
+        q_lat_r, q_lon_r, _q_elev_r, q_tz_r, q_fatal = _must_resolve_place_if_provided(payload, place_prefix="question_", warns=warns)
+        if q_fatal:
+            norm = {
+                "system": "horary",
+                "method": "hybrid",
+                "question_date": q_date or None,
+                "question_time": q_time or None,
+                "question_tz": q_tz,
+                "zodiac_mode": zodiac_mode,
+                "ayanamsa": ayanamsa,
+                "house_system": house_system,
+                "question_type": qtype_val,
+                "question_type_enum": qtype_enum,
+                "question_text": qtext,
+                "question_latitude": None, "question_longitude": None,
+                "fatal": q_fatal,
+                "raw": payload,
+            }
+            return norm, warns + ["fatal"], q_tz or "UTC"
+
+        if q_lat_r is not None and q_lon_r is not None:
+            q_lat, q_lon = q_lat_r, q_lon_r
+        if q_tz_r:
+            q_tz = q_tz_r
+
+        if q_lat is None or q_lon is None:
+            warns.append("missing_question_coordinates")
+            norm = {
+                "system": "horary",
+                "method": "hybrid",
+                "question_date": q_date or None,
+                "question_time": q_time or None,
+                "question_tz": q_tz,
+                "zodiac_mode": zodiac_mode,
+                "ayanamsa": ayanamsa,
+                "house_system": house_system,
+                "question_type": qtype_val,
+                "question_type_enum": qtype_enum,
+                "question_text": qtext,
+                "question_latitude": None, "question_longitude": None,
+                "fatal": "missing_location",
+                "raw": payload,
+            }
+            return norm, warns + ["fatal"], q_tz or "UTC"
+
+        # Querent birth data (with common aliases)
+        b_date = _coerce_str(payload.get("birth_date") or payload.get("DOB") or "").strip()
+        b_time = _pad_hms(_coerce_str(payload.get("birth_time") or payload.get("TOB") or "").strip())
+        b_tz   = _coerce_str(payload.get("birth_tz") or payload.get("tz_name") or payload.get("birth_place_tz")).strip() or None
+
+        # Use separate birth_* coords/place if provided; else allow aliases
+        if not any([payload.get("birth_place"), payload.get("birth_place_city"),
+                    payload.get("birth_place_state"), payload.get("birth_place_country")]) and payload.get("POB"):
+            payload = dict(payload)
+            payload["birth_place"] = payload.get("POB")
+
+        b_place_to_resolve = any([
+            payload.get("birth_place"), payload.get("birth_place_city"),
+            payload.get("birth_place_state"), payload.get("birth_place_country"), payload.get("POB")
+        ])
+
+        b_lat = _as_float(payload.get("birth_latitude"))
+        b_lon = _as_float(payload.get("birth_longitude"))
+
+        if b_place_to_resolve:
+            b_lat_r, b_lon_r, _b_elev_r, b_tz_r, b_fatal = _must_resolve_place_if_provided(payload, place_prefix="birth_", warns=warns)
+            if b_fatal:
+                # Hybrid can still continue if birth cannot be resolved, but mark fatal to prevent core call
+                norm = {
+                    "system": "horary",
+                    "method": "hybrid",
+                    "question_date": q_date or None,
+                    "question_time": q_time or None,
+                    "question_tz": q_tz,
+                    "zodiac_mode": zodiac_mode,
+                    "ayanamsa": ayanamsa,
+                    "house_system": house_system,
+                    "question_type": qtype_val,
+                    "question_type_enum": qtype_enum,
+                    "question_text": qtext,
+                    "question_latitude": q_lat, "question_longitude": q_lon,
+                    "fatal": b_fatal,
+                    "raw": payload,
+                }
+                return norm, warns + ["fatal"], q_tz or "UTC"
+            if b_lat_r is not None and b_lon_r is not None:
+                b_lat, b_lon = b_lat_r, b_lon_r
+            if b_tz_r:
+                b_tz = b_tz_r
+
+        # Birth zodiac/ayana (allow specific overrides)
+        b_zodiac = _norm_method(payload.get("birth_zodiac_mode", payload.get("zodiac_mode")), default="sidereal")
+        b_ayan   = _norm_ayanamsa(payload.get("birth_ayanamsa", payload.get("ayanamsa")) or "lahiri")
+
+        norm = {
+            "system": "horary",
+            "method": "hybrid",
+            # question moment as HybridPrasnaInput expects:
+            "question_date": q_date or None,
+            "question_time": q_time or None,
+            "question_tz": q_tz,
+            "question_place": _coerce_str(payload.get("question_place") or payload.get("place") or "").strip() or None,
+            "question_latitude": q_lat,
+            "question_longitude": q_lon,
+            # shared settings:
+            "zodiac_mode": zodiac_mode,
+            "ayanamsa": ayanamsa,
+            "house_system": house_system,
+            # question typing:
+            "question_type": qtype_val,
+            "question_type_enum": qtype_enum,
+            "question_text": qtext,
+            # nested querent birth object (as Horary.HybridPrasnaInput expects):
+            "querent_birth": {
+                "date": b_date or None,
+                "time": b_time or None,
+                "tz_name": b_tz,
+                "place": _coerce_str(payload.get("birth_place") or payload.get("POB") or "").strip() or None,
+                "latitude": b_lat,
+                "longitude": b_lon,
+                "zodiac_mode": b_zodiac,
+                "ayanamsa": b_ayan,
+            },
+            "raw": payload,
+        }
+
+        if not q_date: warns.append("missing_question_date")
+        if not q_time: warns.append("missing_question_time")
+        if not q_tz: warns.append("missing_question_timezone")
+        # Birth data is optional but recommended
+        if not b_date: warns.append("missing_birth_date")
+        if not b_time: warns.append("missing_birth_time")
+        if not b_tz: warns.append("missing_birth_timezone")
+
+        return norm, warns, q_tz or "UTC"
+
+    # ---------- PARASHARI / KP BRANCH ----------
     # KP options
     kp_house_system = _coerce_str(payload.get("kp_house_system") or "placidus").strip() or "placidus"
     kp_ayanamsa = _coerce_str(payload.get("kp_ayanamsa") or "krishnamurti").strip() or "krishnamurti"
@@ -1173,21 +1369,21 @@ def normalize_horary_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], L
     if kp_number_mode not in ("anchor_asc", "advisory"):
         kp_number_mode = "anchor_asc"
 
-    # Time & TZ
+    # Time & TZ (question moment)
     date = _coerce_str(payload.get("date")).strip() or _coerce_str(payload.get("DOB")).strip()
     time_str = _pad_hms(_coerce_str(payload.get("time") or payload.get("TOB") or ""))
     tz_norm = _coerce_str(payload.get("tz") or payload.get("place_tz")).strip() or None
 
-    # Coordinates / place resolution
+    # Coordinates / place resolution for question moment
     lat = _as_float(payload.get("latitude") or payload.get("lat"))
     lon = _as_float(payload.get("longitude") or payload.get("lon"))
 
-    # POB alias
+    # POB alias for question place
     if not any([payload.get("place"), payload.get("birth_place"), payload.get("place_city"),
                 payload.get("place_state"), payload.get("place_country")]) and payload.get("POB"):
         payload = dict(payload); payload["place"] = payload.get("POB")
 
-    lat_r, lon_r, elev_r, tz_r, fatal = _must_resolve_place_if_provided(payload, warns=warns)
+    lat_r, lon_r, _elev_r, tz_r, fatal = _must_resolve_place_if_provided(payload, warns=warns)
     if fatal:
         # For horary, missing location is fatal — need tz & coordinates for houses.
         norm = {
@@ -1203,7 +1399,9 @@ def normalize_horary_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], L
             "kp_ayanamsa": kp_ayanamsa,
             "kp_number": kp_number,
             "kp_number_mode": kp_number_mode,
-            "question_type": _norm_question_type(payload.get("question_type") or payload.get("question") or payload.get("topic")),
+            "question_type": qtype_val,
+            "question_type_enum": qtype_enum,
+            "question_text": qtext,
             "latitude": None, "longitude": None,
             "fatal": fatal,
             "raw": payload,
@@ -1218,7 +1416,6 @@ def normalize_horary_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], L
     # Without any place/coords at all, flag fatal — chart/house calc won't be reliable.
     if lat is None or lon is None:
         warns.append("missing_coordinates")
-        # We still return a normalized shape, but mark fatal to prevent core call
         norm = {
             "system": "horary",
             "method": method,
@@ -1232,15 +1429,14 @@ def normalize_horary_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], L
             "kp_ayanamsa": kp_ayanamsa,
             "kp_number": kp_number,
             "kp_number_mode": kp_number_mode,
-            "question_type": _norm_question_type(payload.get("question_type") or payload.get("question") or payload.get("topic")),
+            "question_type": qtype_val,
+            "question_type_enum": qtype_enum,
+            "question_text": qtext,
             "latitude": None, "longitude": None,
             "fatal": "missing_location",
             "raw": payload,
         }
         return norm, warns + ["fatal"], tz_norm or "UTC"
-
-    # Question type normalization (string that matches app.core.horary.QuestionType)
-    qtype_val = _norm_question_type(payload.get("question_type") or payload.get("question") or payload.get("topic"))
 
     norm: Dict[str, Any] = {
         "system": "horary",
@@ -1258,8 +1454,9 @@ def normalize_horary_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], L
         "kp_ayanamsa": kp_ayanamsa,
         "kp_number": kp_number,
         "kp_number_mode": kp_number_mode,
-        "question_type": qtype_val,        # string value used by HoraryInput
-        "question_text": _coerce_str(payload.get("question_text") or payload.get("query") or payload.get("topic") or "").strip() or None,
+        "question_type": qtype_val,         # string value (stable for APIs)
+        "question_type_enum": qtype_enum,   # real Enum instance if available
+        "question_text": qtext,
         "querent_house": 1,
         "quesited_house": _as_float(payload.get("quesited_house")) and int(float(payload.get("quesited_house"))) or None,
         "raw": payload,
