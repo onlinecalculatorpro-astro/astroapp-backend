@@ -1705,7 +1705,51 @@ def _merge_horary_results(parashari: Dict[str, Any], kp: Dict[str, Any]) -> Dict
         "agreement_keys": agree,
         "parashari_only_keys": sorted(list(a_keys - k_keys)),
         "kp_only_keys": sorted(list(k_keys - a_keys)),
-    }
+    }# --- strict input validation for horary --------------------------------------
+def _validate_civil_raw(body: Dict[str, Any], tz_fallback: str) -> Optional[str]:
+    """Validate raw date/time/tz from the request body (not the normalized copy)."""
+    date = str(body.get("date") or body.get("birth_date") or "").strip()
+    time = str(body.get("time") or body.get("birth_time") or "").strip()
+    tz   = str(body.get("tz") or body.get("place_tz") or tz_fallback or "UTC").strip()
+
+    if not date or not time:
+        return "missing_date_or_time"
+
+    # Prefer the same timescales helper you already use in varga routes
+    if not _TS_OK or build_timescales is None:
+        # Fallback: quick format sanity (YYYY-MM-DD / HH:MM[:SS])
+        import re
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+            return "invalid_date_or_time"
+        if not re.fullmatch(r"\d{1,2}:\d{2}(:\d{2})?", time):
+            return "invalid_date_or_time"
+        return None
+
+    try:
+        ts = build_timescales(date, time, tz, _env_dut1_seconds())  # type: ignore
+        # Must yield a usable JD
+        jd = ts.get("jd_tt") if isinstance(ts, dict) else getattr(ts, "jd_tt", None)
+        float(jd)  # raises if None/NaN
+    except Exception:
+        return "invalid_date_or_time"
+    return None
+
+
+def _validate_coords_raw(body: Dict[str, Any]) -> Optional[str]:
+    lat = body.get("latitude") or body.get("lat")
+    lon = body.get("longitude") or body.get("lon")
+    if lat is None or lon is None:
+        return "missing_coordinates"
+    try:
+        lat = float(lat); lon = float(lon)
+    except Exception:
+        return "missing_coordinates"  # or "invalid_coordinates"
+    if not (-90.0 <= lat <= 90.0) or not (-180.0 <= lon <= 180.0):
+        return "invalid_coordinates_range"
+    return None
+
+
+
 
 
 
