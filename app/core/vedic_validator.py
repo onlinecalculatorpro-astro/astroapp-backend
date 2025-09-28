@@ -18,21 +18,34 @@ Public API
     normalize_shadbala_payload(payload)     -> (norm, warns, tz_norm)
     normalize_ashtakavarga_payload(payload) -> (norm, warns, tz_norm)
 
+    # Horary / Prasna (Parāśari + KP):
+    normalize_horary_payload(payload)       -> (norm, warns, tz_norm)
+
 Key policies
 ------------
 • Sidereal-first defaults (zodiac_mode="sidereal", ayanamsa="lahiri").
 • If ANY place/POB string/parts are present, we MUST resolve via
   app.core.geocoding.resolve_place — even if lat/lon/tz were also provided.
   On failure, we return a fatal reason.
-• Timescales used only for Vimśottarī (no jd_utc leak).
+• Timescales helper used where appropriate (no jd leak to other systems).
 • Ashtakavarga: passes through `ruleset` and validated `ruleset_map` to core;
   accepts optional `angles` {asc, mc}.
 """
 
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, Set
+from enum import Enum
+from datetime import datetime, timezone
 import os
 import re
 import inspect
+
+# ── (Optional) link to horary primitives for enums (no heavy imports at import time) ──
+try:
+    from app.core.horary import QuestionType as _QuestionType  # for Enum value mapping only
+    _HORARY_ENUM_OK = True
+except Exception:
+    _QuestionType = None  # type: ignore
+    _HORARY_ENUM_OK = False
 
 # ── Required geocoder when any place/POB is present ──
 try:
@@ -40,7 +53,7 @@ try:
 except Exception:
     _RESOLVE_PLACE = None  # type: ignore
 
-# ── Optional timescales for Vimśottarī only ──
+# ── Optional timescales where used ──
 try:
     from app.core.timescales import build_timescales  # type: ignore
     _TIMESCALES_OK = True
@@ -244,7 +257,7 @@ def _must_resolve_place_if_provided(
     return latf, lonf, elevf, tz_norm, None
 
 
-# ============================ Timescales (Vim only) ============================
+# ============================ Timescales helpers ============================
 
 def _env_dut1_seconds() -> float:
     try:
@@ -418,7 +431,7 @@ def _collect_time_window(payload: Dict[str, Any]) -> Tuple[Optional[str], Option
         date_from = _coerce_str(win.get("from") or win.get("start"))
         date_to = _coerce_str(win.get("to") or win.get("end"))
     tr = payload.get("time_range") or payload.get("timerange")
-    if (not date_from or not date_to) and isinstance(tr, (list, tuple)) and len(tr) == 2:
+    if (not date_from and not date_to) and isinstance(tr, (list, tuple)) and len(tr) == 2:
         date_from = date_from or _coerce_str(tr[0])
         date_to = date_to or _coerce_str(tr[1])
     date_from = date_from or _coerce_str(payload.get("date_from") or payload.get("from"))
@@ -428,7 +441,7 @@ def _collect_time_window(payload: Dict[str, Any]) -> Tuple[Optional[str], Option
     return (date_from or None, date_to or None, warns)
 
 
-# ============================ Normalizers ============================
+# ============================ Normalizers: Vimshottari ============================
 
 def normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str], str]:
     warns: List[str] = []
@@ -530,6 +543,8 @@ def normalize_vim_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List
     return norm, warns, tz_norm or "UTC"
 
 
+# ============================ Normalizers: Yoga ============================
+
 def normalize_yoga_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str], str]:
     warns: List[str] = []
 
@@ -612,7 +627,7 @@ def normalize_yoga_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], Lis
     return norm, warns, tz_norm or "UTC"
 
 
-# ---------- Gochar / Ingress / Stations ----------
+# ============================ Normalizers: Gochar / Ingress / Stations ============================
 
 _DEFAULT_MOVERS = ["Sun", "Moon", "Mercury", "Venus", "Mars", "Jupiter", "Saturn"]
 _DEFAULT_TARGETS = ["Sun", "Moon", "Mercury", "Venus", "Mars", "Jupiter", "Saturn", "Ascendant", "Descendant", "MC", "IC"]
@@ -871,7 +886,7 @@ def normalize_stations_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any],
     return norm, warns, tz_norm or "UTC"
 
 
-# ---------- Śaḍbala (core-backed) ----------
+# ============================ Normalizers: Śaḍbala ============================
 
 def normalize_shadbala_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str], str]:
     """
@@ -946,7 +961,7 @@ def normalize_shadbala_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any],
     return norm, warns, tz_norm or "UTC"
 
 
-# ---------- Aṣṭakavarga (core-backed) ----------
+# ============================ Normalizers: Aṣṭakavarga ============================
 
 def normalize_ashtakavarga_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str], str]:
     """
@@ -1046,6 +1061,218 @@ def normalize_ashtakavarga_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, A
     return norm, warns, tz_norm or "UTC"
 
 
+# ============================ Normalizers: Horary / Prasna ============================
+
+class _LocalQuestionType(Enum):
+    JOB = "job"
+    MARRIAGE = "marriage"
+    LITIGATION = "litigation"
+    HEALTH = "health"
+    LOST_ITEM = "lost_item"
+    PROPERTY = "property"
+    FOREIGN = "foreign"
+    EDUCATION = "education"
+    CHILDREN = "children"
+    BUSINESS = "business"
+
+_QSTR_ALIASES: Dict[str, _LocalQuestionType] = {
+    "job": _LocalQuestionType.JOB,
+    "career": _LocalQuestionType.JOB,
+    "offer": _LocalQuestionType.JOB,
+    "promotion": _LocalQuestionType.JOB,
+    "marriage": _LocalQuestionType.MARRIAGE,
+    "relationship": _LocalQuestionType.MARRIAGE,
+    "dating": _LocalQuestionType.MARRIAGE,
+    "litigation": _LocalQuestionType.LITIGATION,
+    "lawsuit": _LocalQuestionType.LITIGATION,
+    "court": _LocalQuestionType.LITIGATION,
+    "health": _LocalQuestionType.HEALTH,
+    "illness": _LocalQuestionType.HEALTH,
+    "lost_item": _LocalQuestionType.LOST_ITEM,
+    "lost": _LocalQuestionType.LOST_ITEM,
+    "missing": _LocalQuestionType.LOST_ITEM,
+    "property": _LocalQuestionType.PROPERTY,
+    "real_estate": _LocalQuestionType.PROPERTY,
+    "foreign": _LocalQuestionType.FOREIGN,
+    "travel": _LocalQuestionType.FOREIGN,
+    "abroad": _LocalQuestionType.FOREIGN,
+    "education": _LocalQuestionType.EDUCATION,
+    "study": _LocalQuestionType.EDUCATION,
+    "children": _LocalQuestionType.CHILDREN,
+    "child": _LocalQuestionType.CHILDREN,
+    "business": _LocalQuestionType.BUSINESS,
+    "partnership": _LocalQuestionType.BUSINESS,
+}
+
+def _norm_question_type(v: Any) -> str:
+    """
+    Normalize question_type string to match app.core.horary.QuestionType value.
+    Returns the lowercase value string.
+    """
+    if isinstance(v, _LocalQuestionType):
+        return v.value
+    s = _coerce_str(v).strip().lower()
+    if not s:
+        return _LocalQuestionType.JOB.value
+    if s in _QSTR_ALIASES:
+        return _QSTR_ALIASES[s].value
+    # Already one of the canonical names?
+    for qt in _LocalQuestionType:
+        if s == qt.value:
+            return qt.value
+    return _LocalQuestionType.JOB.value
+
+def _norm_horary_method(v: Any) -> str:
+    s = _coerce_str(v).strip().lower()
+    if s in ("kp", "krishnamurti", "kp_horary", "kph"):
+        return "kp"
+    if s in ("parashari", "parasari", "parāśari", "parashari_prasna", "prasna", "prashna"):
+        return "parashari"
+    # default: parashari (classical)
+    return "parashari"
+
+def normalize_horary_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str], str]:
+    """
+    Normalize inputs for Horary / Prasna endpoints.
+    Returns a dict that maps directly to app.core.horary.HoraryInput fields + method selector.
+
+    Accepted keys:
+      - method|mode: "parashari" | "kp"
+      - date, time, tz
+      - place / (place_city, place_state, place_country) / POB (strict geocoding if present)
+      - latitude, longitude (if place not provided)
+      - zodiac_mode (default sidereal), ayanamsa (default lahiri), house_system (default sripati)
+      - kp_house_system (default placidus), kp_ayanamsa (default krishnamurti)
+      - kp_number (1..249), kp_number_mode ("anchor_asc" | "advisory")
+      - question | question_type | topic
+    """
+    warns: List[str] = []
+
+    # Method (parashari | kp)
+    method = _norm_horary_method(payload.get("method") or payload.get("mode") or "parashari")
+
+    # Common chart basics
+    zodiac_mode = _norm_method(payload.get("zodiac_mode", "sidereal"), default="sidereal")
+    ayanamsa = _norm_ayanamsa(payload.get("ayanamsa") or payload.get("ayanamsa_key") or "lahiri")
+    house_system = _coerce_str(payload.get("house_system") or "sripati").strip() or "sripati"
+
+    # KP options
+    kp_house_system = _coerce_str(payload.get("kp_house_system") or "placidus").strip() or "placidus"
+    kp_ayanamsa = _coerce_str(payload.get("kp_ayanamsa") or "krishnamurti").strip() or "krishnamurti"
+    kp_number = None
+    if payload.get("kp_number") is not None:
+        try:
+            n = int(payload.get("kp_number"))
+            if 1 <= n <= 249:
+                kp_number = n
+            else:
+                warns.append("kp_number_out_of_range")
+        except Exception:
+            warns.append("kp_number_invalid")
+    kp_number_mode = _coerce_str(payload.get("kp_number_mode") or "anchor_asc").strip().lower()
+    if kp_number_mode not in ("anchor_asc", "advisory"):
+        kp_number_mode = "anchor_asc"
+
+    # Time & TZ
+    date = _coerce_str(payload.get("date")).strip() or _coerce_str(payload.get("DOB")).strip()
+    time_str = _pad_hms(_coerce_str(payload.get("time") or payload.get("TOB") or ""))
+    tz_norm = _coerce_str(payload.get("tz") or payload.get("place_tz")).strip() or None
+
+    # Coordinates / place resolution
+    lat = _as_float(payload.get("latitude") or payload.get("lat"))
+    lon = _as_float(payload.get("longitude") or payload.get("lon"))
+
+    # POB alias
+    if not any([payload.get("place"), payload.get("birth_place"), payload.get("place_city"),
+                payload.get("place_state"), payload.get("place_country")]) and payload.get("POB"):
+        payload = dict(payload); payload["place"] = payload.get("POB")
+
+    lat_r, lon_r, elev_r, tz_r, fatal = _must_resolve_place_if_provided(payload, warns=warns)
+    if fatal:
+        # For horary, missing location is fatal — need tz & coordinates for houses.
+        norm = {
+            "system": "horary",
+            "method": method,
+            "date": date or None,
+            "time": time_str or None,
+            "tz": tz_norm,
+            "zodiac_mode": zodiac_mode,
+            "ayanamsa": ayanamsa,
+            "house_system": house_system,
+            "kp_house_system": kp_house_system,
+            "kp_ayanamsa": kp_ayanamsa,
+            "kp_number": kp_number,
+            "kp_number_mode": kp_number_mode,
+            "question_type": _norm_question_type(payload.get("question_type") or payload.get("question") or payload.get("topic")),
+            "latitude": None, "longitude": None,
+            "fatal": fatal,
+            "raw": payload,
+        }
+        return norm, warns + ["fatal"], tz_norm or "UTC"
+
+    if lat_r is not None and lon_r is not None:
+        lat, lon = lat_r, lon_r
+    if tz_r:
+        tz_norm = tz_r
+
+    # Without any place/coords at all, flag fatal — chart/house calc won't be reliable.
+    if lat is None or lon is None:
+        warns.append("missing_coordinates")
+        # We still return a normalized shape, but mark fatal to prevent core call
+        norm = {
+            "system": "horary",
+            "method": method,
+            "date": date or None,
+            "time": time_str or None,
+            "tz": tz_norm,
+            "zodiac_mode": zodiac_mode,
+            "ayanamsa": ayanamsa,
+            "house_system": house_system,
+            "kp_house_system": kp_house_system,
+            "kp_ayanamsa": kp_ayanamsa,
+            "kp_number": kp_number,
+            "kp_number_mode": kp_number_mode,
+            "question_type": _norm_question_type(payload.get("question_type") or payload.get("question") or payload.get("topic")),
+            "latitude": None, "longitude": None,
+            "fatal": "missing_location",
+            "raw": payload,
+        }
+        return norm, warns + ["fatal"], tz_norm or "UTC"
+
+    # Question type normalization (string that matches app.core.horary.QuestionType)
+    qtype_val = _norm_question_type(payload.get("question_type") or payload.get("question") or payload.get("topic"))
+
+    norm: Dict[str, Any] = {
+        "system": "horary",
+        "method": method,  # "parashari" | "kp"
+        "date": date or None,
+        "time": time_str or None,
+        "tz": tz_norm,
+        "place": _coerce_str(payload.get("place") or payload.get("birth_place") or "").strip() or None,
+        "latitude": lat,
+        "longitude": lon,
+        "zodiac_mode": zodiac_mode,
+        "ayanamsa": ayanamsa,
+        "house_system": house_system,
+        "kp_house_system": kp_house_system,
+        "kp_ayanamsa": kp_ayanamsa,
+        "kp_number": kp_number,
+        "kp_number_mode": kp_number_mode,
+        "question_type": qtype_val,        # string value used by HoraryInput
+        "question_text": _coerce_str(payload.get("question_text") or payload.get("query") or payload.get("topic") or "").strip() or None,
+        "querent_house": 1,
+        "quesited_house": _as_float(payload.get("quesited_house")) and int(float(payload.get("quesited_house"))) or None,
+        "raw": payload,
+    }
+
+    # Warnings for missing time/tz — the core will fallback to now/UTC if absent
+    if not date: warns.append("missing_date")
+    if not time_str: warns.append("missing_time")
+    if not tz_norm: warns.append("missing_timezone")
+
+    return norm, warns, tz_norm or "UTC"
+
+
 __all__ = [
     "normalize_vim_payload",
     "normalize_yoga_payload",
@@ -1054,4 +1281,5 @@ __all__ = [
     "normalize_stations_payload",
     "normalize_shadbala_payload",
     "normalize_ashtakavarga_payload",
+    "normalize_horary_payload",
 ]
