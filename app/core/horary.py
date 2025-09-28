@@ -283,25 +283,53 @@ def _chart(date: Optional[str], time_: Optional[str], tz: Optional[str],
         "topocentric": bool(topocentric)
     })
 
-def _houses_from_chart(chart: Dict[str,Any], *, latitude: float, longitude: float,
-                       house_system: str, zodiac_mode: str, ayanamsa_deg: Optional[float]) -> Dict[str, Any]:
+def _houses_from_chart(
+    chart: Dict[str, Any],
+    *,
+    latitude: float,
+    longitude: float,
+    house_system: str,
+    zodiac_mode: str,
+    ayanamsa_deg: Optional[float]
+) -> Dict[str, Any]:
     """
     Use compute_house_system with strict timescales coming from chart.meta.timescales,
     then optionally shift cusps by ayanamsa for sidereal mode.
     """
-    ts = chart.get("meta", {}).get("timescales", {})
-    jd_ut = float(ts.get("jd_utc")) if ts and ts.get("jd_utc") is not None else None
-    jd_tt = float(ts.get("jd_tt")) if ts and ts.get("jd_tt") is not None else None
-    jd_ut1 = float(ts.get("jd_ut1")) if ts and ts.get("jd_ut1") is not None else None
-    if not (isinstance(jd_tt, float) and isinstance(jd_ut1, float) and isinstance(jd_ut, float)):
-        raise ValueError("Timescales missing from compute_chart.meta; cannot compute houses.")
+    def _pick_ts(ts: Dict[str, Any], *keys: str) -> Optional[float]:
+        for k in keys:
+            v = ts.get(k)
+            if v is None:
+                continue
+            try:
+                return float(v)
+            except Exception:
+                pass
+        return None
+
+    ts = chart.get("meta", {}).get("timescales", {}) or {}
+
+    # Be tolerant to different field names from the astronomy layer
+    jd_ut  = _pick_ts(ts, "jd_ut", "jd_utc")         # UT (some builds call it jd_ut)
+    jd_tt  = _pick_ts(ts, "jd_tt", "tt_jd", "jd_tdb")# TT (some builds expose tt_jd/jd_tdb)
+    jd_ut1 = _pick_ts(ts, "jd_ut1", "ut1_jd")        # UT1
+
+    if jd_ut is None or jd_tt is None or jd_ut1 is None:
+        have = { "jd_ut": jd_ut, "jd_tt": jd_tt, "jd_ut1": jd_ut1, "raw_keys": list(ts.keys()) }
+        raise ValueError(f"Timescales incomplete for houses: {have}")
+
     payload = compute_house_system(
-        latitude=latitude, longitude=longitude,
-        house_system=house_system, jd_ut=jd_ut, jd_tt=jd_tt, jd_ut1=jd_ut1
+        latitude=latitude,
+        longitude=longitude,
+        house_system=house_system,
+        jd_ut=jd_ut,
+        jd_tt=jd_tt,
+        jd_ut1=jd_ut1,
     )
+
     cusps = list(payload["cusps_deg"])
     asc_deg_h = float(payload["asc_deg"])
-    mc_deg_h = float(payload["mc_deg"])
+    mc_deg_h  = float(payload["mc_deg"])
 
     if zodiac_mode.lower() == "sidereal" and isinstance(ayanamsa_deg, (int, float)):
         cusps = shift_sidereal(cusps, float(ayanamsa_deg))
