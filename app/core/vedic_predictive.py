@@ -4,9 +4,9 @@ from __future__ import annotations
 
 """
 Vedic predictive helpers — daśā, varga wrappers, Yoga detection,
-and (NEW) gochar/ingress/station wrappers wired to app.core.vedic_gochar.
+and gochar/ingress/station wrappers wired to app.core.vedic_gochar.
 
-What’s here
+What's here
 -----------
 - Windowed daśā periods across multiple systems:
     vimshottari (preferred engine), ashtottari, yogini, chara (Jaimini), kalachakra
@@ -15,19 +15,27 @@ What’s here
 - Yoga detection:
     • Primary path delegates to `app.core.yoga.compute_yogas` (sidereal-first)
     • Legacy “basic” detectors are kept as a fallback for precomputed points/cusps.
-- (NEW) Vedic Gochar:
-    • graha dṛṣṭi transit hits (degree-true)
-    • rāśi & nakṣatra ingresses
-    • retrograde/direct stations
-    • feature_drishti_proximity re-export
-- (NEW) Śaḍbala and Aṣṭakavarga:
-    • Thin, defensive wrappers delegating to app.core.shadbala / app.core.ashtakavarga
-      with civil+tz+coords, sidereal-first defaults.
+- Vedic Gochar (transit dṛṣṭi hits), rāśi & nakṣatra ingresses, retro/direct stations.
+- Śaḍbala and Aṣṭakavarga: thin, defensive wrappers to `app.core.shadbala` / `app.core.ashtakavarga`.
+
+NEW: Payload-wired wrappers
+---------------------------
+High-level helpers that accept raw request payloads, run your strict
+normalizers from `app.core.vedic_validator`, and then call the engines:
+
+    dasha_from_payload(payload)                 -> dict
+    yoga_from_payload(payload)                  -> dict
+    gochar_from_payload(payload)                -> dict
+    ingresses_rashi_from_payload(payload)       -> dict
+    ingresses_nakshatra_from_payload(payload)   -> dict
+    stations_from_payload(payload)              -> dict
+    shadbala_from_payload(payload)              -> dict
+    ashtakavarga_from_payload(payload)          -> dict
 """
 
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Tuple, Literal, Optional, Set, Union
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import re
 import math
 
@@ -36,7 +44,22 @@ from app.core.common_predictive import (
 )
 from app.core.ephem_singleton import TS, PLANETS  # TS is used for TT<->UTC conversions
 
-# ───────────────────────── Gochar/Ingress/Stations (NEW) ─────────────────────
+# ───────────────────────── Validator wiring (NEW) ────────────────────────────
+try:
+    from app.core.vedic_validator import (
+        normalize_vim_payload,
+        normalize_yoga_payload,
+        normalize_gochar_payload,
+        normalize_ingress_payload,
+        normalize_stations_payload,
+        normalize_shadbala_payload,
+        normalize_ashtakavarga_payload,
+    )
+    _VALIDATOR_OK = True
+except Exception:
+    _VALIDATOR_OK = False
+
+# ───────────────────────── Gochar/Ingress/Stations ──────────────────────────
 _GOCHAR_OK = False
 try:
     from app.core.vedic_gochar import (  # type: ignore
@@ -112,7 +135,6 @@ except Exception:
 # ───────────────────────── Yoga core (primary) ───────────────────────────────
 _YOGA_CORE_OK = False
 try:
-    # prefer singular module name
     from app.core.yoga import (
         compute_yogas as _compute_yogas_core,
         list_registered_yogas as _yoga_list,
@@ -122,7 +144,6 @@ try:
     _YOGA_CORE_OK = True
 except Exception:
     try:
-        # support alternate filename (# app/core/yogas.py)
         from app.core.yogas import (
             compute_yogas as _compute_yogas_core,
             list_registered_yogas as _yoga_list,
@@ -137,10 +158,9 @@ except Exception:
         _yoga_enable = None  # type: ignore
         _yoga_disable = None  # type: ignore
 
-# ───────────────────────── NEW: Śaḍbala / Aṣṭakavarga engines ────────────────
+# ───────────────────────── Śaḍbala / Aṣṭakavarga engines ────────────────────
 _SHADBALA_OK = False
 try:
-    # expected API: compute_shadbala(payload: dict, **opts) -> dict
     from app.core.shadbala import compute_shadbala as _compute_shadbala  # type: ignore
     _SHADBALA_OK = True
 except Exception:
@@ -149,7 +169,6 @@ except Exception:
 
 _ASHTAKAVARGA_OK = False
 try:
-    # expected API: compute_ashtakavarga(payload: dict, **opts) -> dict
     from app.core.ashtakavarga import compute_ashtakavarga as _compute_ashtakavarga  # type: ignore
     _ASHTAKAVARGA_OK = True
 except Exception:
@@ -161,10 +180,10 @@ __all__ = [
     # Dasha
     "DashaPeriod", "vimsottari_dasha", "predict_dasha_periods",
     "feature_dasha_lords_onehot",
-    # Vargas (wrappers and full-detail helpers)
+    # Vargas
     "compute_vargas_for_point", "compute_vargas",
     "compute_varga_for_point_full", "compute_varga_full",
-    # Yogas (new wired API + legacy basic detectors retained)
+    # Yogas
     "yoga_detect", "list_yoga_catalog",
     "house_index_for_longitude",
     "detect_panch_mahapurusha", "detect_gajakesari", "detect_chandra_mangal",
@@ -173,13 +192,18 @@ __all__ = [
     "detect_kemadruma_basic", "detect_yogas",
     # Features
     "feature_yoga_flags",
-    # NEW — Gochar/Ingress/Stations wrappers + feature
+    # Gochar / Ingress / Stations + feature
     "gochar_drishti", "ingresses_rashi", "ingresses_nakshatra",
     "stations_retro_direct", "feature_drishti_proximity",
-    # NEW — Śaḍbala & Aṣṭakavarga
+    # Śaḍbala & Aṣṭakavarga
     "shadbala", "ashtakavarga",
-    # NEW — Compatibility shim explicitly exported for routes
+    # Compatibility shim
     "compute_ashtakavarga",
+    # NEW payload-wired helpers
+    "dasha_from_payload", "yoga_from_payload",
+    "gochar_from_payload", "ingresses_rashi_from_payload",
+    "ingresses_nakshatra_from_payload", "stations_from_payload",
+    "shadbala_from_payload", "ashtakavarga_from_payload",
 ]
 
 # =============================================================================
@@ -343,6 +367,17 @@ def _civil_window_to_tt(date_from: str, date_to: str, tz_name: str) -> Tuple[Opt
     except Exception:
         return None, None
 
+def _civil_day_bounds_to_dt(date_str: str, tz_name: str) -> Tuple[Optional[datetime], Optional[datetime]]:
+    """UTC datetimes covering a civil day in tz_name."""
+    try:
+        ts0 = timescales_from_civil(str(date_str), "00:00:00", str(tz_name))
+        ts1 = timescales_from_civil(str(date_str), "23:59:59", str(tz_name))
+        a = TS.tt_jd(float(ts0["jd_tt"])).utc_datetime().replace(tzinfo=timezone.utc)
+        b = TS.tt_jd(float(ts1["jd_tt"])).utc_datetime().replace(tzinfo=timezone.utc)
+        return a, b
+    except Exception:
+        return None, None
+
 # ───────────────────────────── Helpers for multi-system dasha ──────────────────
 
 def _normalize_system(name: str) -> str:
@@ -446,7 +481,9 @@ def _clip_rows(rows: List[Dict[str, Any]], jd_a: float, jd_b: float) -> List[Dic
     keep.sort(key=lambda d: (d["start_jd_tt"], d["level"]))
     return keep
 
-# ───────────────────────────── Public predictive API ──────────────────────────
+# =============================================================================
+# PUBLIC PREDICTIVE API (chart-based)
+# =============================================================================
 
 def predict_dasha_periods(
     *,
@@ -663,7 +700,7 @@ def predict_dasha_periods(
     return {"ok": False, "error": "unsupported_dasha"}
 
 # =============================================================================
-# (NEW) GOCHAR / INGRESSES / STATIONS — thin wrappers over app.core.vedic_gochar
+# GOCHAR / INGRESSES / STATIONS — thin wrappers over app.core.vedic_gochar
 # =============================================================================
 
 def gochar_drishti(
@@ -828,7 +865,7 @@ def feature_drishti_proximity(*, hits: List[Dict[str, Any]], cap_deg: float = 12
     return _feature_drishti_proximity(hits=hits, cap_deg=cap_deg)
 
 # =============================================================================
-# (NEW) ŚAḌBALA — thin wrapper over app.core.shadbala
+# ŚAḌBALA — thin wrapper over app.core.shadbala
 # =============================================================================
 
 def shadbala(
@@ -884,7 +921,7 @@ def shadbala(
     return {"ok": True, "result": res}
 
 # =============================================================================
-# (NEW) AṢṬAKAVARGA — thin wrapper over app.core.ashtakavarga
+# AṢṬAKAVARGA — thin wrapper over app.core.ashtakavarga
 # =============================================================================
 
 def ashtakavarga(
@@ -895,24 +932,17 @@ def ashtakavarga(
     house_system: str = "placidus",
     include_sav: bool = True,
     include_bav: bool = True,
-    spec_path: Optional[str] = None,             # Optional override for rules/spec
-    # NEW: expose custom rules so callers can bypass the validator if needed
-    ruleset: Optional[str] = None,               # e.g. "parashari-bphs" | "custom"
-    ruleset_map: Optional[Dict[str, Dict[str, List[int]]]] = None,  # when ruleset="custom"
+    spec_path: Optional[str] = None,
+    ruleset: Optional[str] = None,
+    ruleset_map: Optional[Dict[str, Dict[str, List[int]]]] = None,
 ) -> Dict[str, Any]:
     """
     Compute Aṣṭakavarga (BAV per planet and/or SAV).
     Delegates to app.core.ashtakavarga.compute_ashtakavarga if available.
-
-    Notes:
-    - Forwards civil date/time/tz and coordinates from `natal_chart`.
-    - Passes through `angles` (asc/mc) if present to help bind Lagna without recomputation.
-    - Supports optional custom rules via `ruleset` and `ruleset_map`.
     """
     if not _ASHTAKAVARGA_OK or _compute_ashtakavarga is None:
         return {"ok": False, "error": "ashtakavarga_engine_unavailable"}
 
-    # Optional angles pass-through
     angles: Optional[Dict[str, float]] = None
     if isinstance(natal_chart.get("angles"), dict):
         ang_in = natal_chart["angles"]
@@ -971,7 +1001,6 @@ def ashtakavarga(
 
     try:
         try:
-            # Many implementations accept extra kwargs and ignore unknowns.
             res = _compute_ashtakavarga(
                 payload,
                 ayanamsa=ayanamsa,
@@ -984,7 +1013,6 @@ def ashtakavarga(
                 ruleset_map=ruleset_map,
             )
         except TypeError:
-            # Fallback to the strict single-arg signature.
             res = _compute_ashtakavarga(payload)
     except Exception as e:
         return {"ok": False, "error": f"ashtakavarga_engine_error:{e}"}
@@ -994,37 +1022,26 @@ def ashtakavarga(
         return res
     return {"ok": True, "result": res}
 
-
-# ── NEW: Compatibility shim for routes expecting `compute_ashtakavarga(payload)` ──
+# ── Compatibility shim for routes expecting `compute_ashtakavarga(payload)` ──
 def compute_ashtakavarga(payload: Dict[str, Any] = None, **opts) -> Dict[str, Any]:
-    """
-    Compatibility wrapper so routes can import:
-        from app.core.vedic_predictive import compute_ashtakavarga
-    Accepts a single payload dict (plus optional kwargs), forwards to
-    app.core.ashtakavarga.compute_ashtakavarga with a permissive signature.
-    """
     if not _ASHTAKAVARGA_OK or _compute_ashtakavarga is None:
         return {"ok": False, "error": "ashtakavarga_engine_unavailable"}
-
     merged: Dict[str, Any] = dict(payload or {})
     merged.update(opts or {})
-
     try:
         try:
-            # Some cores accept a single dict; others prefer kwargs.
             res = _compute_ashtakavarga(merged)
         except TypeError:
             res = _compute_ashtakavarga(**merged)  # type: ignore[misc]
     except Exception as e:
         return {"ok": False, "error": f"ashtakavarga_engine_error:{e}"}
-
     if isinstance(res, dict):
         res.setdefault("ok", True)
         return res
     return {"ok": True, "result": res}
 
 # =============================================================================
-# VARGAS (DIVISIONAL CHARTS) — thin wrappers over app.core.varga_charts
+# VARGAS (DIVISIONAL CHARTS)
 # =============================================================================
 
 def compute_vargas_for_point(
@@ -1436,3 +1453,230 @@ def feature_yoga_flags(yogas: List[Dict[str, Any]], *, include: Optional[Iterabl
         else:
             flags[name] = 1 if bool(present) else 0
     return flags
+
+# =============================================================================
+# NEW: PAYLOAD-WIRED CONVENIENCE WRAPPERS (validator → engines)
+# =============================================================================
+
+def _parse_window_from_payload(payload: Dict[str, Any], tz_name: str) -> Tuple[Optional[datetime], Optional[datetime]]:
+    """
+    Accepts payload keys:
+      - window|time_window|range: {"from"/"start": "YYYY-MM-DD", "to"/"end": "..."}
+      - time_range: ["YYYY-MM-DD","YYYY-MM-DD"]
+      - date_from/date_to or from/to
+    Returns UTC datetimes spanning those civil days in tz_name.
+    """
+    d0 = None; d1 = None
+    win = payload.get("window") or payload.get("time_window") or payload.get("range") or {}
+    if isinstance(win, dict):
+        d0 = str(win.get("from") or win.get("start") or "").strip() or None
+        d1 = str(win.get("to") or win.get("end") or "").strip() or None
+    tr = payload.get("time_range") or payload.get("timerange")
+    if (not d0 or not d1) and isinstance(tr, (list, tuple)) and len(tr) == 2:
+        d0 = d0 or (str(tr[0]).strip() or None)
+        d1 = d1 or (str(tr[1]).strip() or None)
+    if not (d0 and d1):
+        d0 = d0 or (str(payload.get("date_from") or payload.get("from") or "").strip() or None)
+        d1 = d1 or (str(payload.get("date_to") or payload.get("to") or "").strip() or None)
+    if not (d0 and d1):
+        return None, None
+    a0, _ = _civil_day_bounds_to_dt(d0, tz_name)
+    _, b1 = _civil_day_bounds_to_dt(d1, tz_name)
+    return a0, b1
+
+def dasha_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize with validator, then run dasha prediction within a window.
+    Window is taken from payload (same keys as gochar). If absent, defaults to
+    [birth_date, birth_date + 120y) in the given tz.
+    """
+    if not _VALIDATOR_OK:
+        return {"ok": False, "error": "validator_unavailable"}
+    norm, warns, tz_norm = normalize_vim_payload(payload)
+    if norm.get("fatal"):
+        return {"ok": False, "fatal": norm.get("fatal"), "warnings": warns, "system": "vimshottari"}
+
+    # Determine window
+    start_dt, end_dt = _parse_window_from_payload(payload, tz_norm or "UTC")
+    if start_dt is None or end_dt is None:
+        # default to full 120-year span from birth moment
+        try:
+            ts = timescales_from_civil(str(norm.get("date") or ""), str(norm.get("time") or "12:00:00"), str(tz_norm or "UTC"))
+            birth_dt_utc = TS.tt_jd(float(ts["jd_tt"])).utc_datetime().replace(tzinfo=timezone.utc)
+        except Exception:
+            birth_dt_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+            warns.append("dasha_window_defaulted_now")
+        start_dt = birth_dt_utc
+        end_dt = birth_dt_utc + timedelta(days=int(_TOTAL_YEARS * _MEAN_YEAR_DAYS))
+
+    res = predict_dasha_periods(
+        natal_chart=norm,
+        start_date=start_dt,
+        end_date=end_dt,
+        dasha_system="vimshottari",
+        levels=int(norm.get("levels") or 3),
+        include_antardasha=bool((norm.get("levels") or 3) >= 2),
+    )
+    if warns:
+        res.setdefault("warnings", []).extend(warns)
+    return res
+
+def yoga_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not _VALIDATOR_OK:
+        return {"ok": False, "error": "validator_unavailable"}
+    norm, warns, _tz = normalize_yoga_payload(payload)
+    if norm.get("fatal"):
+        return {"ok": False, "fatal": norm.get("fatal"), "warnings": warns, "system": "yoga"}
+    res = yoga_detect(norm)
+    if warns:
+        res.setdefault("warnings", []).extend(warns)
+    return res
+
+def gochar_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not _VALIDATOR_OK:
+        return {"ok": False, "error": "validator_unavailable"}
+    norm, warns, tz = normalize_gochar_payload(payload)
+    if norm.get("fatal"):
+        return {"ok": False, "fatal": norm.get("fatal"), "warnings": warns, "system": "gochar"}
+    tr = norm.get("time_range") or [None, None]
+    d0, d1 = tr if isinstance(tr, (list, tuple)) and len(tr) == 2 else (None, None)
+    if not (d0 and d1):
+        return {"ok": False, "error": "gochar_missing_window", "warnings": warns}
+    res = gochar_drishti(
+        natal_chart=norm.get("natal_chart") or {},
+        date_from=str(d0), date_to=str(d1),
+        transiting_bodies=norm.get("movers"),
+        natal_targets=norm.get("natal_targets"),
+        zodiac_mode=norm.get("zodiac_mode", "sidereal"),
+        ayanamsa=norm.get("ayanamsa", "lahiri"),
+        frame=norm.get("frame", "ecliptic-of-date"),
+        include_nodes=bool(norm.get("include_nodes")),
+        treat_nodes_like_saturn=bool(norm.get("treat_nodes_like_saturn")),
+        orb_deg=float(norm.get("orb_deg") or 12.0),
+        orb_map=norm.get("orb_map") or {},
+        step_minutes=norm.get("step_minutes", "auto"),
+        prebatch_refinement=bool(payload.get("prebatch_refinement", False)),
+    )
+    if warns:
+        res.setdefault("warnings", []).extend(warns)
+    return res
+
+def ingresses_rashi_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not _VALIDATOR_OK:
+        return {"ok": False, "error": "validator_unavailable"}
+    norm, warns, tz = normalize_ingress_payload(payload)
+    if norm.get("fatal"):
+        return {"ok": False, "fatal": norm.get("fatal"), "warnings": warns, "system": "ingress_rashi"}
+    tr = norm.get("time_range") or [None, None]
+    d0, d1 = tr if isinstance(tr, (list, tuple)) and len(tr) == 2 else (None, None)
+    if not (d0 and d1):
+        return {"ok": False, "error": "ingress_missing_window", "warnings": warns}
+    res = ingresses_rashi(
+        date_from=str(d0), date_to=str(d1),
+        movers=norm.get("movers"),
+        zodiac_mode=norm.get("zodiac_mode", "sidereal"),
+        ayanamsa=norm.get("ayanamsa", "lahiri"),
+        frame=norm.get("frame", "ecliptic-of-date"),
+        observer="topocentric" if norm.get("topocentric") else "geocentric",
+        latitude=norm.get("latitude"),
+        longitude=norm.get("longitude"),
+        elevation_m=norm.get("elevation_m"),
+        tz_name=str(norm.get("tz_name") or tz or "UTC"),
+        step_minutes=norm.get("step_minutes", "auto"),
+    )
+    if warns:
+        res.setdefault("warnings", []).extend(warns)
+    return res
+
+def ingresses_nakshatra_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not _VALIDATOR_OK:
+        return {"ok": False, "error": "validator_unavailable"}
+    norm, warns, tz = normalize_ingress_payload(payload)
+    if norm.get("fatal"):
+        return {"ok": False, "fatal": norm.get("fatal"), "warnings": warns, "system": "ingress_nakshatra"}
+    tr = norm.get("time_range") or [None, None]
+    d0, d1 = tr if isinstance(tr, (list, tuple)) and len(tr) == 2 else (None, None)
+    if not (d0 and d1):
+        return {"ok": False, "error": "ingress_missing_window", "warnings": warns}
+    res = ingresses_nakshatra(
+        date_from=str(d0), date_to=str(d1),
+        movers=norm.get("movers"),
+        zodiac_mode=norm.get("zodiac_mode", "sidereal"),
+        ayanamsa=norm.get("ayanamsa", "lahiri"),
+        frame=norm.get("frame", "ecliptic-of-date"),
+        observer="topocentric" if norm.get("topocentric") else "geocentric",
+        latitude=norm.get("latitude"),
+        longitude=norm.get("longitude"),
+        elevation_m=norm.get("elevation_m"),
+        tz_name=str(norm.get("tz_name") or tz or "UTC"),
+        step_minutes=norm.get("step_minutes", "auto"),
+    )
+    if warns:
+        res.setdefault("warnings", []).extend(warns)
+    return res
+
+def stations_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not _VALIDATOR_OK:
+        return {"ok": False, "error": "validator_unavailable"}
+    norm, warns, tz = normalize_stations_payload(payload)
+    if norm.get("fatal"):
+        return {"ok": False, "fatal": norm.get("fatal"), "warnings": warns, "system": "stations"}
+    tr = norm.get("time_range") or [None, None]
+    d0, d1 = tr if isinstance(tr, (list, tuple)) and len(tr) == 2 else (None, None)
+    if not (d0 and d1):
+        return {"ok": False, "error": "stations_missing_window", "warnings": warns}
+    res = stations_retro_direct(
+        date_from=str(d0), date_to=str(d1),
+        movers=norm.get("movers"),
+        zodiac_mode=norm.get("zodiac_mode", "sidereal"),
+        ayanamsa=norm.get("ayanamsa", "lahiri"),
+        frame=norm.get("frame", "ecliptic-of-date"),
+        observer="topocentric" if norm.get("topocentric") else "geocentric",
+        latitude=norm.get("latitude"),
+        longitude=norm.get("longitude"),
+        elevation_m=norm.get("elevation_m"),
+        tz_name=str(norm.get("tz_name") or tz or "UTC"),
+        step_minutes=norm.get("step_minutes", "auto"),
+    )
+    if warns:
+        res.setdefault("warnings", []).extend(warns)
+    return res
+
+def shadbala_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not _VALIDATOR_OK:
+        return {"ok": False, "error": "validator_unavailable"}
+    norm, warns, _tz = normalize_shadbala_payload(payload)
+    if norm.get("fatal"):
+        return {"ok": False, "fatal": norm.get("fatal"), "warnings": warns, "system": "shadbala"}
+    res = shadbala(
+        natal_chart=norm,
+        zodiac_mode=norm.get("zodiac_mode", "sidereal"),
+        ayanamsa=norm.get("ayanamsa", "lahiri"),
+        house_system=norm.get("house_system", "placidus"),
+        include_velocity=bool(norm.get("include_velocity", True)),
+        prefer_houses_advanced=bool(norm.get("prefer_houses_advanced", True)),
+        observer="topocentric" if norm.get("topocentric") else "geocentric",
+    )
+    if warns:
+        res.setdefault("warnings", []).extend(warns)
+    return res
+
+def ashtakavarga_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not _VALIDATOR_OK:
+        return {"ok": False, "error": "validator_unavailable"}
+    norm, warns, _tz = normalize_ashtakavarga_payload(payload)
+    if norm.get("fatal"):
+        return {"ok": False, "fatal": norm.get("fatal"), "warnings": warns, "system": "ashtakavarga"}
+    res = ashtakavarga(
+        natal_chart=norm,
+        zodiac_mode=norm.get("zodiac_mode", "sidereal"),
+        ayanamsa=norm.get("ayanamsa", "lahiri"),
+        house_system=norm.get("house_system", "placidus"),
+        include_sav=True, include_bav=True,
+        spec_path=norm.get("spec_path"),
+        ruleset=norm.get("ruleset"),
+        ruleset_map=norm.get("ruleset_map"),
+    )
+    if warns:
+        res.setdefault("warnings", []).extend(warns)
+    return res
