@@ -1686,6 +1686,28 @@ def _parse_question_type(val: Any) -> Optional[Any]:
             return qt
     return None
 
+def _merge_horary_results(parashari: Dict[str, Any], kp: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Non-opinionated merge: reports where both engines agree on simple scalar fields
+    (str/int/float/bool), plus keys unique to each result. Keeps full results separate.
+    """
+    if not isinstance(parashari, dict) or not isinstance(kp, dict):
+        return {"agreement_keys": [], "parashari_only_keys": [], "kp_only_keys": []}
+
+    def _is_scalar(v): return isinstance(v, (str, int, float, bool))
+    a_keys = set(parashari.keys())
+    k_keys = set(kp.keys())
+
+    agree = sorted([k for k in (a_keys & k_keys)
+                    if _is_scalar(parashari.get(k)) and parashari.get(k) == kp.get(k)])
+
+    return {
+        "agreement_keys": agree,
+        "parashari_only_keys": sorted(list(a_keys - k_keys)),
+        "kp_only_keys": sorted(list(k_keys - a_keys)),
+    }
+
+
 
 def _normalize_horary_payload(body: Dict[str, Any]) -> tuple[Dict[str, Any], List[str], str]:
     """
@@ -1815,45 +1837,157 @@ def horary_kp():
             res.setdefault("warnings", []).extend(warns)
     return jsonify(res), (200 if res.get("ok") else 400)
 
-
-@vedic_api.post("/horary")
+@vedic_api.post("/horary/hybrid")
 @rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
-def horary_generic():
+def horary_hybrid():
     """
-    Generic horary endpoint with 'method' in body: 'parashari' (default) or 'kp'.
+    Hybrid horary: runs both Parāśarī and KP on the same normalized payload
+    and returns both results plus a light-weight agreement summary.
     """
     if not _HORARY_OK or not callable(_analyze_prasna_enhanced):
         return jsonify({"ok": False, "error": "horary_engine_unavailable"}), 503
+
     body = request.get_json(silent=True) or {}
-    method = str(body.get("method") or "parashari").lower()
-    if method not in ("parashari", "kp"):
-        method = "parashari"
     hw, warns, tz_norm = _normalize_horary_payload(body)
 
+    # Guardrails (same as the other horary routes)
     if not hw.get("date") or not hw.get("time"):
         return jsonify({
             "ok": False,
             "error": "missing_date_or_time",
             "warnings": warns,
-            "meta": {"route": "horary", "branch": "horary_core", "tz_normalized": tz_norm, "method": method},
+            "meta": {"route": "horary/hybrid", "branch": "horary_core", "tz_normalized": tz_norm},
         }), 400
     if hw.get("latitude") is None or hw.get("longitude") is None:
         return jsonify({
             "ok": False,
             "error": "missing_coordinates",
             "warnings": warns,
-            "meta": {"route": "horary", "branch": "horary_core", "tz_normalized": tz_norm, "method": method},
+            "meta": {"route": "horary/hybrid", "branch": "horary_core", "tz_normalized": tz_norm},
         }), 400
 
     try:
+        # Build once; reuse for both methods
         inp = _HoraryInput(**hw)  # type: ignore
-        res = _analyze_prasna_enhanced(inp, method=method)  # type: ignore
+        res_par = _analyze_prasna_enhanced(inp, method="parashari")  # type: ignore
+        res_kp  = _analyze_prasna_enhanced(inp, method="kp")         # type: ignore
     except Exception as e:
-        return jsonify({"ok": False, "error": "horary_failed", "detail": str(e)}), 400
+        return jsonify({"ok": False, "error": "horary_hybrid_failed", "detail": str(e)}), 400
+
+    ok_par = bool(isinstance(res_par, dict) and res_par.get("ok"))
+    ok_kp  = bool(isinstance(res_kp, dict) and res_kp.get("ok"))
+
+    # If both failed, return 400; if one succeeded, still 200 with partial=true.
+    if not (ok_par or ok_kp):
+        return jsonify({
+            "ok": False,
+            "error": "hybrid_both_failed",
+            "meta": {"route": "horary/hybrid", "tz_normalized": tz_norm, "branch": "horary_core"},
+            "warnings": warns,
+            "parashari": res_par, "kp": res_kp
+        }), 400
+
+    merged = _merge_horary_results(res_par if isinstance(res_par, dict) else {},
+                                   res_kp if isinstance(res_kp, dict) else {})
+
+    out = {
+        "ok": ok_par and ok_kp,
+        "method": "hybrid",
+        "partial": not (ok_par and ok_kp),
+        "parashari": res_par,
+        "kp": res_kp,
+        "merged": merged,
+        "meta": {"route": "horary/hybrid", "tz_normalized": tz_norm, "branch": "horary_core"},
+    }
+    if warns:
+        out.setdefault("warnings", []).extend(warns)
+
+    # If only one engine OK, still return 200 so client can use the partial result.
+    status = 200 if (ok_par or ok_kp) else 400
+    return jsonify(out), status
+
+
+
+@vedic_api.post("/horary")
+@rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
+def horary_generic():
+    """
+    DEPRECATED: Generic horary endpoint.
+    Accepts body.method: 'parashari' (default), 'kp', or 'hybrid'.
+    Prefer the explicit routes:
+      - /api/vedic/horary/parashari
+      - /api/vedic/horary/kp
+      - /api/vedic/horary/hybrid
+    """
+    if not _HORARY_OK or not callable(_analyze_prasna_enhanced):
+        return jsonify({"ok": False, "error": "horary_engine_unavailable"}), 503
+
+    body = request.get_json(silent=True) or {}
+    method = str(body.get("method") or "parashari").lower()
+    if method not in ("parashari", "kp", "hybrid"):
+        method = "parashari"
+
+    hw, warns, tz_norm = _normalize_horary_payload(body)
+
+    # Guardrails
+    if not hw.get("date") or not hw.get("time"):
+        res = {
+            "ok": False,
+            "error": "missing_date_or_time",
+            "warnings": warns,
+            "meta": {"route": "horary", "branch": "horary_core", "tz_normalized": tz_norm, "method": method, "deprecated": True,
+                     "preferred_endpoints": ["/api/vedic/horary/parashari", "/api/vedic/horary/kp", "/api/vedic/horary/hybrid"]},
+        }
+        return jsonify(res), 400, {"X-Deprecated-Endpoint": "/api/vedic/horary"}
+
+    if hw.get("latitude") is None or hw.get("longitude") is None:
+        res = {
+            "ok": False,
+            "error": "missing_coordinates",
+            "warnings": warns,
+            "meta": {"route": "horary", "branch": "horary_core", "tz_normalized": tz_norm, "method": method, "deprecated": True,
+                     "preferred_endpoints": ["/api/vedic/horary/parashari", "/api/vedic/horary/kp", "/api/vedic/horary/hybrid"]},
+        }
+        return jsonify(res), 400, {"X-Deprecated-Endpoint": "/api/vedic/horary"}
+
+    try:
+        inp = _HoraryInput(**hw)  # type: ignore
+
+        if method == "hybrid":
+            # run both and merge
+            res_par = _analyze_prasna_enhanced(inp, method="parashari")  # type: ignore
+            res_kp  = _analyze_prasna_enhanced(inp, method="kp")         # type: ignore
+            ok_par = bool(isinstance(res_par, dict) and res_par.get("ok"))
+            ok_kp  = bool(isinstance(res_kp, dict) and res_kp.get("ok"))
+            merged = _merge_horary_results(res_par if isinstance(res_par, dict) else {},
+                                           res_kp  if isinstance(res_kp, dict)  else {})
+            out = {
+                "ok": ok_par and ok_kp,
+                "method": "hybrid",
+                "partial": not (ok_par and ok_kp),
+                "parashari": res_par,
+                "kp": res_kp,
+                "merged": merged,
+                "warnings": warns or [],
+                "meta": {"route": "horary", "tz_normalized": tz_norm, "branch": "horary_core", "method": "hybrid", "deprecated": True,
+                         "preferred_endpoints": ["/api/vedic/horary/parashari", "/api/vedic/horary/kp", "/api/vedic/horary/hybrid"]},
+            }
+            status = 200 if (ok_par or ok_kp) else 400
+            return jsonify(out), status, {"X-Deprecated-Endpoint": "/api/vedic/horary"}
+
+        # parashari or kp
+        res = _analyze_prasna_enhanced(inp, method=method)  # type: ignore
+
+    except Exception as e:
+        return jsonify({"ok": False, "error": "horary_failed", "detail": str(e)}), 400, {"X-Deprecated-Endpoint": "/api/vedic/horary"}
 
     if isinstance(res, dict):
         res.setdefault("meta", {})
-        res["meta"].update({"route": "horary", "tz_normalized": tz_norm, "branch": "horary_core", "method": method})
+        res["meta"].update({"route": "horary", "tz_normalized": tz_norm, "branch": "horary_core", "method": method,
+                            "deprecated": True,
+                            "preferred_endpoints": ["/api/vedic/horary/parashari", "/api/vedic/horary/kp", "/api/vedic/horary/hybrid"]})
         if warns:
             res.setdefault("warnings", []).extend(warns)
-    return jsonify(res), (200 if res.get("ok") else 400)
+
+    status = 200 if res.get("ok") else 400
+    return jsonify(res), status, {"X-Deprecated-Endpoint": "/api/vedic/horary"}
