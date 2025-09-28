@@ -4,18 +4,21 @@ Horary / Prashna systems (Parāśari, KP, Hybrid) — single-file module.
 
 Key points
 ----------
-- No dependency on app.core.houses.compute_houses (which was missing).
+- No dependency on app.core.houses.compute_houses.
   We call app.core.houses_advanced.compute_house_system(...) directly.
-- Timescales come from compute_chart(...).meta.timescales (jd_tt, jd_ut1, jd_utc).
+- Timescales are taken from compute_chart(...).meta.timescales (jd_tt, jd_ut1, jd_utc).
 - If zodiac_mode == "sidereal", house cusps are shifted by ayanamsa so
   house tests (occupancy, sign lords, KP sub-lords) are internally consistent.
-- Public entrypoint: analyze_prasna_enhanced(method=...), with helpers per system.
+- Public entrypoints:
+    - analyze_prasna_enhanced(method=...), for route compatibility
+    - analyze_prasna(method=...)
+    - analyze_parashari / analyze_kp / analyze_hybrid
 
-Exported API
-------------
+Exports
+-------
 - HoraryInput, QuestionType
 - QuerentBirthData, HybridPrasnaInput
-- analyze_prasna_enhanced (for routes), analyze_prasna
+- analyze_prasna_enhanced, analyze_prasna
 - analyze_parashari, analyze_kp, analyze_hybrid
 """
 
@@ -144,7 +147,7 @@ class QuestionType(Enum):
     CHILDREN = "children"
     BUSINESS = "business"
 
-# Richer house mapping for Parāśari & KP decisions
+# Richer house mapping for Parāśarī & KP decisions
 ENHANCED_QUESTION_HOUSES: Dict[QuestionType, Dict[str, List[int]]] = {
     QuestionType.JOB:        {"primary":[10],      "secondary":[6,2],  "supportive":[9,11], "obstructive":[12,8]},
     QuestionType.MARRIAGE:   {"primary":[7],       "secondary":[2,11], "supportive":[1,5,9], "obstructive":[6,8,12]},
@@ -171,6 +174,7 @@ class HoraryInput:
     # astro mode
     zodiac_mode: str = "sidereal"
     ayanamsa: str | float = "lahiri"
+    ayanamsa_deg: Optional[float] = None   # <-- accept explicit ayanamsa degrees if provided
     house_system: str = "sripati"
     # KP options
     kp_house_system: str = "placidus"
@@ -252,8 +256,14 @@ def calculate_aspects(long1: float, long2: float) -> Tuple[float, Optional[str]]
 # Low-level: get charts + houses in a consistent way (with sidereal shift for cusps)
 # =============================================================================
 
-def _ensure_coords_and_tz(date: Optional[str], time_: Optional[str], tz: Optional[str],
-                          place: Optional[str], lat: Optional[float], lon: Optional[float]) -> Tuple[str,str,str,float,float]:
+def _ensure_coords_and_tz(
+    date: Optional[str],
+    time_: Optional[str],
+    tz: Optional[str],
+    place: Optional[str],
+    lat: Optional[float],
+    lon: Optional[float],
+) -> Tuple[str, str, str, float, float]:
     """Fill missing lat/lon/tz from resolve_place; default to now/UTC if needed."""
     if not (date and time_):
         now = datetime.now(timezone.utc)
@@ -272,9 +282,18 @@ def _ensure_coords_and_tz(date: Optional[str], time_: Optional[str], tz: Optiona
         lat, lon = 0.0, 0.0
     return str(date), str(time_), str(tz), float(lat), float(lon)
 
-def _chart(date: Optional[str], time_: Optional[str], tz: Optional[str],
-           place: Optional[str], lat: Optional[float], lon: Optional[float],
-           *, zodiac_mode: str, ayanamsa: str|float, topocentric: bool=True) -> Dict[str, Any]:
+def _chart(
+    date: Optional[str],
+    time_: Optional[str],
+    tz: Optional[str],
+    place: Optional[str],
+    lat: Optional[float],
+    lon: Optional[float],
+    *,
+    zodiac_mode: str,
+    ayanamsa: str | float,
+    topocentric: bool = True
+) -> Dict[str, Any]:
     d, t, tzr, la, lo = _ensure_coords_and_tz(date, time_, tz, place, lat, lon)
     return compute_chart({
         "date": d, "time": t, "tz": tzr,
@@ -314,13 +333,6 @@ def _houses_from_chart(
 
     # Helper: try calling the engine with different kw layouts
     def _try_engine() -> Optional[Dict[str, Any]]:
-        from inspect import signature
-        sig = None
-        try:
-            sig = signature(compute_house_system)
-        except Exception:
-            pass
-
         trials = [
             dict(latitude=latitude, longitude=longitude, house_system=house_system,
                  jd_ut=jd_ut, jd_tt=jd_tt, jd_ut1=jd_ut1),
@@ -331,9 +343,7 @@ def _houses_from_chart(
             dict(latitude=latitude, longitude=longitude, house_system=house_system,
                  jd_tt=jd_tt),
         ]
-
         for kwargs in trials:
-            # Skip trials missing required values
             if "jd_tt" in kwargs and kwargs["jd_tt"] is None: 
                 continue
             if "jd_ut1" in kwargs and kwargs["jd_ut1"] is None:
@@ -343,10 +353,8 @@ def _houses_from_chart(
             try:
                 return compute_house_system(**kwargs)  # type: ignore[arg-type]
             except TypeError:
-                # Signature mismatch → try next
                 continue
             except Exception:
-                # Engine raised runtime error → try next
                 continue
         return None
 
@@ -354,13 +362,12 @@ def _houses_from_chart(
 
     # Fallback: Equal Houses from ASC (never crash analysis)
     if not payload:
-        asc_deg = None
         ang = chart.get("angles") or {}
-        asc_deg = ang.get("asc_deg", chart.get("asc_deg"))
-        if asc_deg is None:
+        asc_any = ang.get("asc_deg", chart.get("asc_deg"))
+        if asc_any is None:
             raise ValueError("houses_fallback_failed:no_asc_in_chart")
 
-        asc_deg = float(asc_deg)
+        asc_deg = float(asc_any)
         cusps = [deg_wrap(asc_deg + i * 30.0) for i in range(12)]
         mc_guess = (ang.get("mc_deg") if ang.get("mc_deg") is not None else deg_wrap(asc_deg + 90.0))
 
@@ -388,7 +395,7 @@ def _houses_from_chart(
     mc_deg_h  = float(payload["mc_deg"])
 
     if zodiac_mode.lower() == "sidereal" and isinstance(ayanamsa_deg, (int, float)):
-        cusps    = shift_sidereal(cusps, float(ayanamsa_deg))
+        cusps     = shift_sidereal(cusps, float(ayanamsa_deg))
         asc_deg_h = deg_wrap(asc_deg_h - float(ayanamsa_deg))
         mc_deg_h  = deg_wrap(mc_deg_h  - float(ayanamsa_deg))
 
@@ -406,7 +413,6 @@ def _houses_from_chart(
 # Parāśari system
 # =============================================================================
 
-# Richer mapping reused here
 _ENHANCED_QH = ENHANCED_QUESTION_HOUSES
 
 def _calculate_house_strength(house_num: int, question_type: Optional[QuestionType]) -> float:
@@ -444,7 +450,6 @@ def _radicality_flags(chart: Dict[str, Any], tz_name: str, date: str, time_: str
     """Lightweight: ASC lord vs day/hour lord. Hour lord ~ day lord placeholder."""
     asc_deg = chart.get("angles", {}).get("asc_deg", chart.get("asc_deg"))
     asc_lord = lord_of_sign(float(asc_deg or 0.0))
-    # day lord from local date (we assume the given tz_name)
     try:
         from zoneinfo import ZoneInfo
         dt_local = datetime.fromisoformat(f"{date}T{time_}").replace(tzinfo=ZoneInfo(tz_name))
@@ -462,7 +467,10 @@ def analyze_parashari(inp: HoraryInput) -> Dict[str, Any]:
                    zodiac_mode=inp.zodiac_mode, ayanamsa=inp.ayanamsa, topocentric=True)
 
     meta = chart.get("meta", {})
-    ay_deg = meta.get("ayanamsa_deg")
+    ay_from_chart = meta.get("ayanamsa_deg")
+    # Allow explicit override if client provided ayanamsa_deg
+    ay_deg = float(inp.ayanamsa_deg) if isinstance(inp.ayanamsa_deg, (int, float)) else ay_from_chart
+
     observer = meta.get("observer") or {}
     la = float(observer.get("latitude", inp.latitude or 0.0))
     lo = float(observer.get("longitude", inp.longitude or 0.0))
@@ -529,6 +537,7 @@ def analyze_parashari(inp: HoraryInput) -> Dict[str, Any]:
             "question_type": qtype.value,
             "zodiac_mode": inp.zodiac_mode,
             "ayanamsa": inp.ayanamsa,
+            "ayanamsa_deg_used": ay_deg,
             "house_system": inp.house_system,
             "analysis_time": datetime.now(timezone.utc).isoformat()
         },
@@ -775,14 +784,14 @@ def analyze_hybrid(inp: HybridPrasnaInput) -> Dict[str, Any]:
 
     # Evaluate components
     qtype = inp.question_type or QuestionType.JOB
-    target = _ENHANCED_QH.get(qtype, {})
+    target = ENHANCED_QUESTION_HOUSES.get(qtype, {})
     birth_relevance = question_strength = 0.0
 
     for p in b_chart.get("bodies", []):
         if p["name"] not in TRAD_PLANETS: continue
         h = _find_planet_house(p["longitude_deg"], b_houses.get("cusps_deg", []))
         dig = calculate_planetary_dignity(p["longitude_deg"], p["name"])
-        if h in target.get("primary", []):   birth_relevance += (dig + 2) * 0.3
+        if h in target.get("primary", []):     birth_relevance += (dig + 2) * 0.3
         elif h in target.get("secondary", []): birth_relevance += (dig + 2) * 0.2
     birth_relevance = max(0.0, min(1.0, birth_relevance))
 
@@ -790,7 +799,7 @@ def analyze_hybrid(inp: HybridPrasnaInput) -> Dict[str, Any]:
         if p["name"] not in TRAD_PLANETS: continue
         h = _find_planet_house(p["longitude_deg"], q_houses.get("cusps_deg", []))
         dig = calculate_planetary_dignity(p["longitude_deg"], p["name"])
-        if h in target.get("primary", []):   question_strength += (dig + 2) * 0.3
+        if h in target.get("primary", []):     question_strength += (dig + 2) * 0.3
         elif h in target.get("secondary", []): question_strength += (dig + 2) * 0.2
     question_strength = max(0.0, min(1.0, question_strength))
 
