@@ -147,7 +147,7 @@ except Exception:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Gochar / Ingress / Stations wrappers (from vedic_gochar)
+# Gochar / Ingress / Stations wrappers (for diagnostics)
 # ──────────────────────────────────────────────────────────────────────────────
 _GOCHAR_OK = False
 _GOCHAR_BRANCH = "none"
@@ -172,7 +172,7 @@ except Exception:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Predictive helpers from vedic_predictive
+# Predictive helpers from vedic_predictive (classic)
 # ──────────────────────────────────────────────────────────────────────────────
 _PRED_BRANCH = "none"
 _predict_dasha_periods = None   # type: ignore
@@ -190,6 +190,34 @@ try:
     _PRED_BRANCH = "vedic_predictive"
 except Exception:
     _PRED_BRANCH = "none"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# NEW: Payload-wired helpers from vedic_predictive (preferred)
+# ──────────────────────────────────────────────────────────────────────────────
+_PRED_PAYLOAD_BRANCH = "none"
+_dasha_from_payload = None
+_yoga_from_payload = None
+_gochar_from_payload = None
+_ingresses_rashi_from_payload = None
+_ingresses_nakshatra_from_payload = None
+_stations_from_payload = None
+_shadbala_from_payload = None
+_ashtakavarga_from_payload = None
+try:
+    from app.core.vedic_predictive import (  # type: ignore
+        dasha_from_payload as _dasha_from_payload,
+        yoga_from_payload as _yoga_from_payload,
+        gochar_from_payload as _gochar_from_payload,
+        ingresses_rashi_from_payload as _ingresses_rashi_from_payload,
+        ingresses_nakshatra_from_payload as _ingresses_nakshatra_from_payload,
+        stations_from_payload as _stations_from_payload,
+        shadbala_from_payload as _shadbala_from_payload,
+        ashtakavarga_from_payload as _ashtakavarga_from_payload,
+    )
+    _PRED_PAYLOAD_BRANCH = "predictive.payload"
+except Exception:
+    _PRED_PAYLOAD_BRANCH = "none"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -618,6 +646,17 @@ def _run_with_registry_first(
 
 
 def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
+    # Prefer payload helper if present
+    if callable(_dasha_from_payload):
+        try:
+            res = _dasha_from_payload(payload)  # type: ignore
+            if isinstance(res, dict) and res.get("ok"):
+                res.setdefault("meta", {}).update({"route": "vimshottari", "branch": _PRED_PAYLOAD_BRANCH,
+                                                   "tz_normalized": _tz_from_payload(payload)})
+                return res
+        except Exception:
+            pass
+    # Fallback chain
     return _run_with_registry_first(
         route_name="vimshottari",
         scheme_key="vimshottari",
@@ -628,6 +667,18 @@ def _run_vimshottari(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _run_ashtottari(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if callable(_dasha_from_payload):
+        try:
+            # dasha_from_payload defaults to vimshottari; preserve old behavior by setting scheme in body
+            body = dict(payload or {})
+            body.setdefault("scheme", "ashtottari")
+            res = _dasha_from_payload(body)  # type: ignore
+            if isinstance(res, dict) and res.get("ok") and res.get("system") in ("ashtottari", "ashto", "ashtottari"):
+                res.setdefault("meta", {}).update({"route": "ashtottari", "branch": _PRED_PAYLOAD_BRANCH,
+                                                   "tz_normalized": _tz_from_payload(payload)})
+                return res
+        except Exception:
+            pass
     return _run_with_registry_first(
         route_name="ashtottari",
         scheme_key="ashtottari",
@@ -638,6 +689,17 @@ def _run_ashtottari(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _run_yogini(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if callable(_dasha_from_payload):
+        try:
+            body = dict(payload or {})
+            body.setdefault("scheme", "yogini")
+            res = _dasha_from_payload(body)  # type: ignore
+            if isinstance(res, dict) and res.get("ok") and str(res.get("system","")).startswith("yogini"):
+                res.setdefault("meta", {}).update({"route": "yogini", "branch": _PRED_PAYLOAD_BRANCH,
+                                                   "tz_normalized": _tz_from_payload(payload)})
+                return res
+        except Exception:
+            pass
     return _run_with_registry_first(
         route_name="yogini",
         scheme_key="yogini",
@@ -648,6 +710,17 @@ def _run_yogini(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _run_chara(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if callable(_dasha_from_payload):
+        try:
+            body = dict(payload or {})
+            body.setdefault("scheme", "chara")
+            res = _dasha_from_payload(body)  # type: ignore
+            if isinstance(res, dict) and res.get("ok") and res.get("system") == "chara":
+                res.setdefault("meta", {}).update({"route": "chara", "branch": _PRED_PAYLOAD_BRANCH,
+                                                   "tz_normalized": _tz_from_payload(payload)})
+                return res
+        except Exception:
+            pass
     return _run_with_registry_first(
         route_name="chara",
         scheme_key="chara",
@@ -658,6 +731,17 @@ def _run_chara(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _run_kalachakra(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if callable(_dasha_from_payload):
+        try:
+            body = dict(payload or {})
+            body.setdefault("scheme", "kalachakra")
+            res = _dasha_from_payload(body)  # type: ignore
+            if isinstance(res, dict) and res.get("ok") and res.get("system") == "kalachakra":
+                res.setdefault("meta", {}).update({"route": "kalachakra", "branch": _PRED_PAYLOAD_BRANCH,
+                                                   "tz_normalized": _tz_from_payload(payload)})
+                return res
+        except Exception:
+            pass
     return _run_with_registry_first(
         route_name="kalachakra",
         scheme_key="kalachakra",
@@ -803,10 +887,20 @@ def vedic_diag():
         # Gochar diagnostics
         "gochar_present": _GOCHAR_OK,
         "gochar_branch": _GOCHAR_BRANCH,
-        # Predictive helpers
+        # Predictive helpers (classic)
         "predictive_branch": _PRED_BRANCH,
         "predictive_dasha_present": bool(_predict_dasha_periods),
         "yoga_detect_present": bool(_yoga_detect),
+        # NEW payload helpers
+        "payload_branch": _PRED_PAYLOAD_BRANCH,
+        "payload_dasha_present": bool(_dasha_from_payload),
+        "payload_yoga_present": bool(_yoga_from_payload),
+        "payload_gochar_present": bool(_gochar_from_payload),
+        "payload_rashi_present": bool(_ingresses_rashi_from_payload),
+        "payload_nakshatra_present": bool(_ingresses_nakshatra_from_payload),
+        "payload_stations_present": bool(_stations_from_payload),
+        "payload_shadbala_present": bool(_shadbala_from_payload),
+        "payload_ashtakavarga_present": bool(_ashtakavarga_from_payload),
         # Strength diagnostics
         "shadbala_present": bool(_shadbala_wrapper),
         "shadbala_branch": "vedic_predictive" if _shadbala_wrapper else "none",
@@ -870,7 +964,7 @@ def vedic_kalachakra():
     return jsonify(res), status
 
 
-# ──────────────── Yoga routes (wired via vedic_predictive.yoga_detect) ─────────
+# ──────────────── Yoga routes ────────────────
 @vedic_api.get("/yoga/catalog")
 @rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
 def vedic_yoga_catalog():
@@ -888,19 +982,30 @@ def vedic_yoga_catalog():
 @rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
 def vedic_yoga_detect():
     """
-    Yoga detection (civil/time + site only).
-    Uses vedic_predictive.yoga_detect which prefers core yoga engine and
-    falls back to legacy-basic detectors when needed.
+    Yoga detection: prefer payload-wired wrapper → fallback to legacy route that
+    calls vedic_predictive.yoga_detect directly.
     """
+    body = request.get_json(silent=True) or {}
+
+    # Payload-first
+    if callable(_yoga_from_payload):
+        try:
+            res = _yoga_from_payload(body)  # type: ignore
+            if isinstance(res, dict):
+                res.setdefault("meta", {}).update({"route": "yoga/detect", "tz_normalized": _tz_from_payload(body),
+                                                   "branch": _PRED_PAYLOAD_BRANCH})
+                return jsonify(res), (200 if res.get("ok") else 400)
+        except Exception:
+            pass
+
+    # Fallback path (original)
     if normalize_yoga_payload is None:
         return jsonify({"ok": False, "error": "validator_unavailable"}), 503
     if not callable(_yoga_detect):
         return jsonify({"ok": False, "error": "yoga_engine_unavailable"}), 503
 
-    body = request.get_json(silent=True) or {}
     norm, warns, tz_norm = normalize_yoga_payload(body)  # type: ignore[misc]
 
-    # Guardrails similar to the old route
     if not norm.get("date") or not norm.get("time"):
         return jsonify({
             "ok": False,
@@ -909,7 +1014,6 @@ def vedic_yoga_detect():
             "meta": {"route": "yoga/detect", "branch": _PRED_BRANCH, "tz_normalized": tz_norm},
         }), 400
 
-    # Call predictive wrapper (handles core + fallback)
     try:
         res = _yoga_detect(norm)
     except Exception as e:
@@ -929,18 +1033,27 @@ def vedic_yoga_detect():
 @rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
 def vedic_gochar_drishti():
     """
-    Degree-true graha dṛṣṭi transit hits within a civil window.
-    Body is normalized via normalize_gochar_payload.
+    Prefer payload wrapper; fallback to vedic_gochar direct call.
     """
+    body = request.get_json(silent=True) or {}
+
+    if callable(_gochar_from_payload):
+        try:
+            res = _gochar_from_payload(body)  # type: ignore
+            if isinstance(res, dict):
+                res.setdefault("meta", {}).update({"route": "gochar/drishti", "tz_normalized": _tz_from_payload(body),
+                                                   "branch": _PRED_PAYLOAD_BRANCH})
+                return jsonify(res), (200 if res.get("ok") else 400)
+        except Exception:
+            pass
+
+    # Fallback
     if not (_GOCHAR_OK and callable(_gochar_drishti)):
         return jsonify({"ok": False, "error": "gochar_engine_unavailable"}), 503
     if normalize_gochar_payload is None:
         return jsonify({"ok": False, "error": "validator_unavailable"}), 503
 
-    body = request.get_json(silent=True) or {}
     norm, warns, tz_norm = normalize_gochar_payload(body)  # type: ignore[misc]
-
-    # Guardrails
     tr = norm.get("time_range")
     if not (isinstance(tr, list) and len(tr) == 2 and tr[0] and tr[1]):
         return jsonify({
@@ -958,7 +1071,6 @@ def vedic_gochar_drishti():
             "meta": {"route": "gochar/drishti", "branch": _GOCHAR_BRANCH, "tz_normalized": tz_norm},
         }), 400
 
-    # Call core
     try:
         res = _gochar_drishti(
             natal_chart=norm.get("natal_chart") or {},
@@ -1010,14 +1122,25 @@ def vedic_gochar_drishti_proximity():
 @vedic_api.post("/ingress/rashi")
 @rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
 def vedic_ingress_rashi():
+    body = request.get_json(silent=True) or {}
+
+    if callable(_ingresses_rashi_from_payload):
+        try:
+            res = _ingresses_rashi_from_payload(body)  # type: ignore
+            if isinstance(res, dict):
+                res.setdefault("meta", {}).update({"route": "ingress/rashi", "tz_normalized": _tz_from_payload(body),
+                                                   "branch": _PRED_PAYLOAD_BRANCH})
+                return jsonify(res), (200 if res.get("ok") else 400)
+        except Exception:
+            pass
+
+    # Fallback
     if not (_GOCHAR_OK and callable(_ingresses_rashi)):
         return jsonify({"ok": False, "error": "gochar_engine_unavailable"}), 503
     if normalize_ingress_payload is None:
         return jsonify({"ok": False, "error": "validator_unavailable"}), 503
 
-    body = request.get_json(silent=True) or {}
     norm, warns, tz_norm = normalize_ingress_payload(body)  # type: ignore[misc]
-
     tr = norm.get("time_range")
     if not (isinstance(tr, list) and len(tr) == 2 and tr[0] and tr[1]):
         return jsonify({"ok": False, "error": "missing_date_window"}), 400
@@ -1051,12 +1174,24 @@ def vedic_ingress_rashi():
 @vedic_api.post("/ingress/nakshatra")
 @rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
 def vedic_ingress_nakshatra():
+    body = request.get_json(silent=True) or {}
+
+    if callable(_ingresses_nakshatra_from_payload):
+        try:
+            res = _ingresses_nakshatra_from_payload(body)  # type: ignore
+            if isinstance(res, dict):
+                res.setdefault("meta", {}).update({"route": "ingress/nakshatra", "tz_normalized": _tz_from_payload(body),
+                                                   "branch": _PRED_PAYLOAD_BRANCH})
+                return jsonify(res), (200 if res.get("ok") else 400)
+        except Exception:
+            pass
+
+    # Fallback
     if not (_GOCHAR_OK and callable(_ingresses_nakshatra)):
         return jsonify({"ok": False, "error": "gochar_engine_unavailable"}), 503
     if normalize_ingress_payload is None:
         return jsonify({"ok": False, "error": "validator_unavailable"}), 503
 
-    body = request.get_json(silent=True) or {}
     norm, warns, tz_norm = normalize_ingress_payload(body)  # type: ignore[misc]
     tr = norm.get("time_range")
     if not (isinstance(tr, list) and len(tr) == 2 and tr[0] and tr[1]):
@@ -1091,12 +1226,24 @@ def vedic_ingress_nakshatra():
 @vedic_api.post("/stations")
 @rate_limit(RL_VEDIC_PREDICTIVE, key_fn=fixed_key)
 def vedic_stations():
+    body = request.get_json(silent=True) or {}
+
+    if callable(_stations_from_payload):
+        try:
+            res = _stations_from_payload(body)  # type: ignore
+            if isinstance(res, dict):
+                res.setdefault("meta", {}).update({"route": "stations", "tz_normalized": _tz_from_payload(body),
+                                                   "branch": _PRED_PAYLOAD_BRANCH})
+                return jsonify(res), (200 if res.get("ok") else 400)
+        except Exception:
+            pass
+
+    # Fallback
     if not (_GOCHAR_OK and callable(_stations_retro_direct)):
         return jsonify({"ok": False, "error": "gochar_engine_unavailable"}), 503
     if normalize_stations_payload is None:
         return jsonify({"ok": False, "error": "validator_unavailable"}), 503
 
-    body = request.get_json(silent=True) or {}
     norm, warns, tz_norm = normalize_stations_payload(body)  # type: ignore[misc]
     tr = norm.get("time_range")
     if not (isinstance(tr, list) and len(tr) == 2 and tr[0] and tr[1]):
@@ -1284,7 +1431,7 @@ def _resolve_ayanamsa_for_engine(body: Dict[str, Any], method: str, jd_tt: Optio
 
 
 # =============================================================================
-# Śaḍbala & Aṣṭakavarga routes (via vedic_predictive wrappers when available)
+# Śaḍbala & Aṣṭakavarga routes
 # =============================================================================
 
 def _normalize_strength_payload_generic(body: Dict[str, Any]) -> tuple[Dict[str, Any], List[str], str]:
@@ -1297,7 +1444,7 @@ def _normalize_strength_payload_generic(body: Dict[str, Any]) -> tuple[Dict[str,
         norm, warns, tz = normalize_yoga_payload(body)  # type: ignore[misc]
     else:
         # Last-resort: minimal pass-through
-        warns: List[str] = ["validator_unavailable_minimal_fallback"]
+        warns = ["validator_unavailable_minimal_fallback"]
         tz = str(body.get("tz") or body.get("place_tz") or "UTC")
         norm = {
             "date": body.get("date") or body.get("birth_date"),
@@ -1341,6 +1488,19 @@ def _strength_call(fn, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _run_shadbala(body: Dict[str, Any]) -> Dict[str, Any]:
+    # Payload-first
+    if callable(_shadbala_from_payload):
+        try:
+            res = _shadbala_from_payload(body)  # type: ignore
+            if isinstance(res, dict):
+                res.setdefault("meta", {}).update({"route": "strength/shadbala",
+                                                   "tz_normalized": _tz_from_payload(body),
+                                                   "branch": _PRED_PAYLOAD_BRANCH})
+                return res
+        except Exception:
+            pass
+
+    # Predictive wrapper fallback (classic)
     if _shadbala_wrapper is None:
         return {"ok": False, "error": "shadbala_engine_unavailable",
                 "meta": {"route": "strength/shadbala", "branch": "none"}}
@@ -1389,6 +1549,19 @@ def _run_shadbala(body: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _run_ashtakavarga(body: Dict[str, Any]) -> Dict[str, Any]:
+    # Payload-first
+    if callable(_ashtakavarga_from_payload):
+        try:
+            res = _ashtakavarga_from_payload(body)  # type: ignore
+            if isinstance(res, dict):
+                res.setdefault("meta", {}).update({"route": "ashtakavarga",
+                                                   "tz_normalized": _tz_from_payload(body),
+                                                   "branch": _PRED_PAYLOAD_BRANCH})
+                return res
+        except Exception:
+            pass
+
+    # Classic fallback using predictive shim
     if _ashtakavarga_wrapper is None:
         return {
             "ok": False,
@@ -1396,13 +1569,11 @@ def _run_ashtakavarga(body: Dict[str, Any]) -> Dict[str, Any]:
             "meta": {"route": "ashtakavarga", "branch": "none"},
         }
 
-    # Prefer dedicated validator; fallback to generic
     if callable(normalize_ashtakavarga_payload):
         norm, warns, tz_norm = normalize_ashtakavarga_payload(body)  # type: ignore[misc]
     else:
         norm, warns, tz_norm = _normalize_strength_payload_generic(body)
 
-    # Guardrails
     if not norm.get("date") or not norm.get("time"):
         return {
             "ok": False,
@@ -1426,12 +1597,10 @@ def _run_ashtakavarga(body: Dict[str, Any]) -> Dict[str, Any]:
         "latitude": float(norm["latitude"]),
         "longitude": float(norm["longitude"]),
         "elevation_m": norm.get("elevation_m"),
-        # Optional: pass angles if present
         "angles": body.get("angles"),
     }
 
     try:
-        # Use predictive shim (accepts payload-like kwargs)
         res = _ashtakavarga_wrapper(
             {
                 "date": natal_chart["date"],
