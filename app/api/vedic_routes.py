@@ -204,6 +204,7 @@ _ingresses_nakshatra_from_payload = None
 _stations_from_payload = None
 _shadbala_from_payload = None
 _ashtakavarga_from_payload = None
+_horary_from_payload = None  # NEW
 try:
     from app.core.vedic_predictive import (  # type: ignore
         dasha_from_payload as _dasha_from_payload,
@@ -214,6 +215,7 @@ try:
         stations_from_payload as _stations_from_payload,
         shadbala_from_payload as _shadbala_from_payload,
         ashtakavarga_from_payload as _ashtakavarga_from_payload,
+        horary_from_payload as _horary_from_payload,  # NEW
     )
     _PRED_PAYLOAD_BRANCH = "predictive.payload"
 except Exception:
@@ -842,7 +844,7 @@ def _ayanamsa_deg_from_key(jd_tt: Optional[float], key: str) -> Optional[float]:
                 return float(get_ayanamsa_deg(jd_tt, key))  # type: ignore[misc]
             except Exception:
                 pass
-        return float(get_ayanamsa_deg(None, key))  # type: ignore[misc]
+        return float(get_ayanamsa_deg(None, key))  # type: ignore/misc
     except Exception:
         return None
 
@@ -901,6 +903,7 @@ def vedic_diag():
         "payload_stations_present": bool(_stations_from_payload),
         "payload_shadbala_present": bool(_shadbala_from_payload),
         "payload_ashtakavarga_present": bool(_ashtakavarga_from_payload),
+        "payload_horary_present": bool(_horary_from_payload),  # NEW
         # Strength diagnostics
         "shadbala_present": bool(_shadbala_wrapper),
         "shadbala_branch": "vedic_predictive" if _shadbala_wrapper else "none",
@@ -1441,7 +1444,7 @@ def _normalize_strength_payload_generic(body: Dict[str, Any]) -> tuple[Dict[str,
     and, importantly, *preserves* house/angles fields so engines can use them.
     """
     if callable(normalize_yoga_payload):
-        norm, warns, tz = normalize_yoga_payload(body)  # type: ignore[misc]
+        norm, warns, tz = normalize_yoga_payload(body)  # type: ignore/misc
     else:
         # Last-resort: minimal pass-through
         warns = ["validator_unavailable_minimal_fallback"]
@@ -1506,7 +1509,7 @@ def _run_shadbala(body: Dict[str, Any]) -> Dict[str, Any]:
                 "meta": {"route": "strength/shadbala", "branch": "none"}}
 
     if callable(normalize_shadbala_payload):
-        norm, warns, tz_norm = normalize_shadbala_payload(body)  # type: ignore[misc]
+        norm, warns, tz_norm = normalize_shadbala_payload(body)  # type: ignore/misc
     else:
         norm, warns, tz_norm = _normalize_strength_payload_generic(body)
 
@@ -1570,7 +1573,7 @@ def _run_ashtakavarga(body: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     if callable(normalize_ashtakavarga_payload):
-        norm, warns, tz_norm = normalize_ashtakavarga_payload(body)  # type: ignore[misc]
+        norm, warns, tz_norm = normalize_ashtakavarga_payload(body)  # type: ignore/misc
     else:
         norm, warns, tz_norm = _normalize_strength_payload_generic(body)
 
@@ -1760,7 +1763,7 @@ def _normalize_horary_payload(body: Dict[str, Any]) -> tuple[Dict[str, Any], Lis
     norm: Dict[str, Any] = {}
 
     if callable(normalize_yoga_payload):
-        norm, warns, tz_norm = normalize_yoga_payload(body)  # type: ignore[misc]
+        norm, warns, tz_norm = normalize_yoga_payload(body)  # type: ignore/misc
     else:
         warns.append("validator_unavailable_minimal_fallback")
         norm = {
@@ -1812,6 +1815,21 @@ def _horary_error(route: str, tz_norm: str, error: str, warns: List[str], status
 
 def _run_horary_single(method: str, body: Dict[str, Any], route_name: str):
     """Shared runner for single-method endpoints with strict raw validation."""
+    # NEW: Prefer payload helper first
+    if callable(_horary_from_payload):
+        try:
+            b = dict(body or {})
+            b["method"] = method
+            res = _horary_from_payload(b)  # type: ignore
+            if isinstance(res, dict):
+                res.setdefault("meta", {}).update({"route": route_name,
+                                                   "tz_normalized": _tz_from_payload(body),
+                                                   "branch": _PRED_PAYLOAD_BRANCH})
+                return jsonify(res), (200 if res.get("ok") else 400)
+        except Exception:
+            pass
+
+    # Fallback to horary core
     if not _HORARY_OK or not callable(_analyze_prasna_enhanced):
         return jsonify({"ok": False, "error": "horary_engine_unavailable"}), 503
 
@@ -1860,6 +1878,22 @@ def horary_hybrid():
     Hybrid horary: run both Parāśarī and KP on the same normalized payload
     and return both results plus a lightweight agreement summary.
     """
+    # NEW: Prefer payload helper first
+    if callable(_horary_from_payload):
+        body = request.get_json(silent=True) or {}
+        try:
+            b = dict(body or {})
+            b["method"] = "hybrid"
+            res = _horary_from_payload(b)  # type: ignore
+            if isinstance(res, dict):
+                res.setdefault("meta", {}).update({"route": "horary/hybrid",
+                                                   "tz_normalized": _tz_from_payload(body),
+                                                   "branch": _PRED_PAYLOAD_BRANCH})
+                return jsonify(res), (200 if res.get("ok") else 400)
+        except Exception:
+            pass
+
+    # Fallback to horary core
     if not _HORARY_OK or not callable(_analyze_prasna_enhanced):
         return jsonify({"ok": False, "error": "horary_engine_unavailable"}), 503
 
@@ -1924,13 +1958,31 @@ def horary_generic():
       - /api/vedic/horary/kp
       - /api/vedic/horary/hybrid
     """
-    if not _HORARY_OK or not callable(_analyze_prasna_enhanced):
-        return jsonify({"ok": False, "error": "horary_engine_unavailable"}), 503
-
     body = request.get_json(silent=True) or {}
     method = str(body.get("method") or "parashari").lower()
     if method not in ("parashari", "kp", "hybrid"):
         method = "parashari"
+
+    # NEW: Prefer payload helper first
+    if callable(_horary_from_payload):
+        try:
+            b = dict(body or {})
+            b["method"] = method
+            res = _horary_from_payload(b)  # type: ignore
+            if isinstance(res, dict):
+                res.setdefault("meta", {}).update({"route": "horary",
+                                                   "tz_normalized": _tz_from_payload(body),
+                                                   "branch": _PRED_PAYLOAD_BRANCH,
+                                                   "deprecated": True,
+                                                   "preferred_endpoints": ["/api/vedic/horary/parashari", "/api/vedic/horary/kp", "/api/vedic/horary/hybrid"]})
+                status = 200 if res.get("ok") else 400
+                return jsonify(res), status, {"X-Deprecated-Endpoint": "/api/vedic/horary"}
+        except Exception:
+            pass
+
+    # Fallback to horary core
+    if not _HORARY_OK or not callable(_analyze_prasna_enhanced):
+        return jsonify({"ok": False, "error": "horary_engine_unavailable"}), 503
 
     hw, warns, tz_norm = _normalize_horary_payload(body)
 
