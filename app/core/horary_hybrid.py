@@ -32,12 +32,12 @@ from datetime import datetime, timezone
 
 # Shared imports
 from .horary_shared import (
-    HybridPrasnaInput, QuerentBirthData, QuestionType, ENHANCED_QUESTION_HOUSES,
+    HybridPrasnaInput, QuerentBirthData, HoraryInput, QuestionType, ENHANCED_QUESTION_HOUSES,
     # constants/helpers
     deg_wrap, sign_index, sign_name_from_deg, lord_of_sign,
     angular_sep, house_of,
-    calculate_planetary_dignity, calculate_aspects,
-    kp_star_and_sublord,
+    calculate_aspects,                      # Ptolemaic aspects
+    calc_dignity_rich,                      # rich dignity score
     build_chart, compute_houses_from_chart, safe_get_asc, radicality_flags,
 )
 
@@ -53,17 +53,32 @@ from .horary_classical import (
 
 _BENEFICS: Set[str] = {"Jupiter", "Venus", "Moon"}
 _MALEFICS: Set[str] = {"Saturn", "Mars", "Sun"}
-_NEUTRAL:  Set[str] = {"Mercury"}  # will be treated as light-benefic nudge in places
+_NEUTRAL:  Set[str] = {"Mercury"}  # treated as slight-benefic in weights
 
 # ---------------------------------------------------------------------------
-# Utility: reasons / grounds formatters
+# Utilities
 # ---------------------------------------------------------------------------
+
+def _with_node_aliases(bodies_list: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """
+    Provide both Western ("North Node"/"South Node") and Vedic ("Rahu"/"Ketu") keys.
+    """
+    d = {b.get("name"): b for b in bodies_list if isinstance(b, dict) and b.get("name")}
+    if "North Node" in d and "Rahu" not in d:
+        d["Rahu"] = d["North Node"]
+    if "South Node" in d and "Ketu" not in d:
+        d["Ketu"] = d["South Node"]
+    return d
 
 def _mk_reason(source: str, weight: float, text: str) -> Dict[str, Any]:
     return {"source": source, "weight": round(max(0.0, min(1.0, float(weight))), 3), "text": text}
 
 def _top(items: List[Dict[str, Any]], n: int = 5) -> List[Dict[str, Any]]:
     return sorted(items, key=lambda x: x.get("weight", 0.0), reverse=True)[:n]
+
+# ---------------------------------------------------------------------------
+# Grounds formatters (Parāśarī & KP)
+# ---------------------------------------------------------------------------
 
 def _parashari_grounds_from_result(p_res: Dict[str, Any], mapping: Dict[str, List[int]]) -> Dict[str, Any]:
     """Summarize Parāśarī result into for/against/conflicts/notes grounds."""
@@ -85,7 +100,6 @@ def _parashari_grounds_from_result(p_res: Dict[str, Any], mapping: Dict[str, Lis
         sig = s.get("sign")
         base = f"{nm} in H{h} ({sig}), strength={w:.2f}"
         if h in primary or h in secondary or h in supportive:
-            # primary gets higher weight
             alpha = 0.6 if h in primary else (0.45 if h in secondary else 0.35)
             for_list.append(_mk_reason("parashari", alpha*w, base))
         elif h in obstructive:
@@ -97,10 +111,9 @@ def _parashari_grounds_from_result(p_res: Dict[str, Any], mapping: Dict[str, Lis
         notes.append("Benefic aspects (dṛṣṭi) aiding target houses.")
     if sb.get("drishti_malus", 0) > 0:
         against_list.append(_mk_reason("parashari", 0.12, "Malefic aspects (dṛṣṭi) on target houses"))
-    if sb.get("radicality_multiplier", 1.0) and float(sb.get("radicality_multiplier", 1.0)) > 1.0:
+    if float(sb.get("radicality_multiplier", 1.0) or 1.0) > 1.0:
         notes.append("Radicality fit (ASC lord vs day/hour) → +10% multiplier.")
 
-    # keep concise
     return {
         "for": _top(for_list, 6),
         "against": _top(against_list, 6),
@@ -173,7 +186,7 @@ def _build_question_bundle(inp: HybridPrasnaInput) -> Tuple[Dict[str, Any], Dict
     q_lat  = float(q_obs.get("latitude", inp.question_latitude or 0.0))
     q_lon  = float(q_obs.get("longitude", inp.question_longitude or 0.0))
     q_houses = compute_houses_from_chart(
-        q_chart, latitude=q_lat, longitude=q_lon,
+        chart=q_chart, latitude=q_lat, longitude=q_lon,
         house_system=inp.house_system, zodiac_mode=inp.zodiac_mode, ayanamsa_deg=q_aya,
     )
     q_cusps = list(q_houses.get("cusps_deg", []) or [])
@@ -191,7 +204,7 @@ def _build_birth_bundle(b: QuerentBirthData, house_system: str) -> Tuple[Dict[st
     b_lat  = float(b_obs.get("latitude", b.latitude or 0.0))
     b_lon  = float(b_obs.get("longitude", b.longitude or 0.0))
     b_houses = compute_houses_from_chart(
-        b_chart, latitude=b_lat, longitude=b_lon,
+        chart=b_chart, latitude=b_lat, longitude=b_lon,
         house_system=house_system, zodiac_mode=b.zodiac_mode, ayanamsa_deg=b_aya,
     )
     b_cusps = list(b_houses.get("cusps_deg", []) or [])
@@ -220,8 +233,8 @@ def _house_tier(h: int, mapping: Dict[str, List[int]]) -> float:
     return 0.40
 
 def _planet_weight(nm: str, tier: float, dignity: float) -> float:
-    # dignity -2..+2 → 0..1
-    dig_n = (dignity + 2.0) / 4.0
+    # dignity rough range ~[-2.5..+2.5] → 0..1 normalization
+    dig_n = max(0.0, min(1.0, (dignity + 2.5) / 5.0))
     nud = (0.06 if nm in _BENEFICS or nm in _NEUTRAL else (-0.05 if nm in _MALEFICS else 0.0))
     return max(0.0, min(1.0, 0.55*tier + 0.35*dig_n + nud))
 
@@ -238,8 +251,8 @@ def _cross_score_parashari(
     Returns (score_0..1, breakdown, grounds)
     """
     mapping = ENHANCED_QUESTION_HOUSES.get(qtype, {})
-    bodies_b = {b["name"]: b for b in birth_chart.get("bodies", [])}
-    bodies_q = {b["name"]: b for b in q_chart.get("bodies", [])}
+    bodies_b = _with_node_aliases(birth_chart.get("bodies", []))
+    bodies_q = _with_node_aliases(q_chart.get("bodies", []))
 
     per_item: List[Dict[str, Any]] = []
     total, count = 0.0, 0.0
@@ -249,16 +262,19 @@ def _cross_score_parashari(
 
     # A) Question planets in BIRTH houses
     for nm, qb in bodies_q.items():
-        if nm not in bodies_b:  # keep to 7 classical where possible
+        if nm not in bodies_b:  # limit to grahas present in both for stability
             continue
-        lon = float(qb["longitude_deg"])
+        try:
+            lon = float(qb["longitude_deg"])
+        except Exception:
+            continue
         h = house_of(lon, birth_cusps)
         tier = _house_tier(h, mapping)
-        dig  = calculate_planetary_dignity(lon, nm)
+        dig  = float(calc_dignity_rich(lon, nm))
         w    = _planet_weight(nm, tier, dig)
-        per_item.append({"where":"Q→B", "planet":nm, "house":h, "tier":tier, "dignity":dig, "weight":round(w,4)})
+        per_item.append({"where":"Q→B", "planet":nm, "house":h, "tier":tier, "dignity":round(dig,3), "weight":round(w,4)})
         total += w; count += 1
-        txt = f"Q {nm} in BIRTH H{h} ({sign_name_from_deg(lon)}), dignity {dig:+.0f}"
+        txt = f"Q {nm} in BIRTH H{h} ({sign_name_from_deg(lon)}), dignity {dig:+.2f}"
         if h in set(mapping.get("obstructive", [])):
             reasons_against.append(_mk_reason("parashari_cross", 0.45*w, txt + " in obstructive house"))
         else:
@@ -268,14 +284,17 @@ def _cross_score_parashari(
     for nm, bb in bodies_b.items():
         if nm not in bodies_q:
             continue
-        lon = float(bb["longitude_deg"])
+        try:
+            lon = float(bb["longitude_deg"])
+        except Exception:
+            continue
         h = house_of(lon, q_cusps)
         tier = _house_tier(h, mapping)
-        dig  = calculate_planetary_dignity(lon, nm)
+        dig  = float(calc_dignity_rich(lon, nm))
         w    = _planet_weight(nm, tier, dig)
-        per_item.append({"where":"B→Q", "planet":nm, "house":h, "tier":tier, "dignity":dig, "weight":round(w,4)})
+        per_item.append({"where":"B→Q", "planet":nm, "house":h, "tier":tier, "dignity":round(dig,3), "weight":round(w,4)})
         total += w; count += 1
-        txt = f"B {nm} in QUESTION H{h} ({sign_name_from_deg(lon)}), dignity {dig:+.0f}"
+        txt = f"B {nm} in QUESTION H{h} ({sign_name_from_deg(lon)}), dignity {dig:+.2f}"
         if h in set(mapping.get("obstructive", [])):
             reasons_against.append(_mk_reason("parashari_cross", 0.40*w, txt + " in obstructive house"))
         else:
@@ -287,15 +306,18 @@ def _cross_score_parashari(
     for nm in list(set(bodies_b.keys()) & set(bodies_q.keys())):
         if nm not in {"Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn"}:
             continue
-        bL = float(bodies_b[nm]["longitude_deg"])
-        qL = float(bodies_q[nm]["longitude_deg"])
+        try:
+            bL = float(bodies_b[nm]["longitude_deg"])
+            qL = float(bodies_q[nm]["longitude_deg"])
+        except Exception:
+            continue
         sep, asp = calculate_aspects(bL, qL)
         if asp in soft_aspects:
             reasons_for.append(_mk_reason("parashari_cross", 0.15, f"{nm} {asp} across charts ({sep:.1f}°) — harmony"))
             total += 0.08; count += 1
         elif asp in hard_aspects and nm in _MALEFICS:
             reasons_against.append(_mk_reason("parashari_cross", 0.15, f"{nm} {asp} across charts ({sep:.1f}°) — stress"))
-            total += 0.02; count += 1  # mild penalty (kept bounded)
+            total += 0.02; count += 1  # mild penalty (bounded)
 
     score = 0.0 if count == 0 else max(0.0, min(1.0, total / count))
 
@@ -375,6 +397,32 @@ def _fuse_scores(step2_cross_p: float, step3_parashari_p: float, step3_kp_signal
     return answer, round(min(0.97, conf), 3), round(pos, 3)
 
 # ---------------------------------------------------------------------------
+# Helpers to call classical engines with proper inputs
+# ---------------------------------------------------------------------------
+
+def _hi_from_birth(b: QuerentBirthData, *, qtype: QuestionType, house_system: str) -> HoraryInput:
+    return HoraryInput(
+        date=b.date, time=b.time, tz_name=b.tz_name,
+        place=b.place, latitude=b.latitude, longitude=b.longitude,
+        zodiac_mode=b.zodiac_mode, ayanamsa=b.ayanamsa,
+        house_system=house_system,
+        kp_house_system="placidus", kp_ayanamsa="krishnamurti",
+        kp_number=None, kp_number_mode="anchor_asc",
+        question_type=qtype, question_text=None, querent_house=1, quesited_house=None
+    )
+
+def _hi_from_question(inp: HybridPrasnaInput, *, qtype: QuestionType) -> HoraryInput:
+    return HoraryInput(
+        date=inp.question_date, time=inp.question_time, tz_name=inp.question_tz,
+        place=inp.question_place, latitude=inp.question_latitude, longitude=inp.question_longitude,
+        zodiac_mode=inp.zodiac_mode, ayanamsa=inp.ayanamsa,
+        house_system=inp.house_system,
+        kp_house_system="placidus", kp_ayanamsa="krishnamurti",
+        kp_number=getattr(inp, "kp_number", None), kp_number_mode=getattr(inp, "kp_number_mode", "anchor_asc"),
+        question_type=qtype, question_text=inp.question_text, querent_house=1, quesited_house=None
+    )
+
+# ---------------------------------------------------------------------------
 # Public analysis
 # ---------------------------------------------------------------------------
 
@@ -395,27 +443,9 @@ def analyze_hybrid(inp: HybridPrasnaInput) -> Dict[str, Any]:
     b_snap = _snapshot(b_chart, b_cusps)
 
     # --- Step 1: Analyze BIRTH (Parāśarī + KP) with the SAME classical engines
-    # Build surrogate HoraryInput-like dicts for classical engines
-    b_parashari = parashari_classical(
-        inp=type("HI", (), dict(
-            date=inp.querent_birth.date, time=inp.querent_birth.time, tz_name=inp.querent_birth.tz_name,
-            place=inp.querent_birth.place, latitude=inp.querent_birth.latitude, longitude=inp.querent_birth.longitude,
-            zodiac_mode=inp.querent_birth.zodiac_mode, ayanamsa=inp.querent_birth.ayanamsa, ayanamsa_deg=None,
-            house_system=inp.house_system,
-            kp_house_system="placidus", kp_ayanamsa="krishnamurti", kp_number=None, kp_number_mode="anchor_asc",
-            question_type=qtype, question_text=None, querent_house=1, quesited_house=None
-        ))()
-    )
-    b_kp = kp_classical(
-        inp=type("HI", (), dict(
-            date=inp.querent_birth.date, time=inp.querent_birth.time, tz_name=inp.querent_birth.tz_name,
-            place=inp.querent_birth.place, latitude=inp.querent_birth.latitude, longitude=inp.querent_birth.longitude,
-            zodiac_mode=inp.querent_birth.zodiac_mode, ayanamsa=inp.querent_birth.ayanamsa, ayanamsa_deg=None,
-            house_system=inp.house_system,
-            kp_house_system="placidus", kp_ayanamsa="krishnamurti", kp_number=None, kp_number_mode="anchor_asc",
-            question_type=qtype, question_text=None, querent_house=1, quesited_house=None
-        ))()
-    )
+    b_hi = _hi_from_birth(inp.querent_birth, qtype=qtype, house_system=inp.house_system)
+    b_parashari = parashari_classical(b_hi)
+    b_kp        = kp_classical(b_hi)
 
     # --- Step 2: Parāśarī CROSS (birth ↔ question)
     cross_p_score, cross_break, cross_grounds = _cross_score_parashari(
@@ -425,28 +455,9 @@ def analyze_hybrid(inp: HybridPrasnaInput) -> Dict[str, Any]:
     )
 
     # --- Step 3: Analyze QUESTION (Parāśarī + KP) with classical engines
-    q_parashari = parashari_classical(
-        inp=type("HI", (), dict(
-            date=inp.question_date, time=inp.question_time, tz_name=inp.question_tz,
-            place=inp.question_place, latitude=inp.question_latitude, longitude=inp.question_longitude,
-            zodiac_mode=inp.zodiac_mode, ayanamsa=inp.ayanamsa, ayanamsa_deg=None,
-            house_system=inp.house_system,
-            kp_house_system="placidus", kp_ayanamsa="krishnamurti", kp_number=inp.__dict__.get("kp_number"),
-            kp_number_mode=inp.__dict__.get("kp_number_mode", "anchor_asc"),
-            question_type=qtype, question_text=inp.question_text, querent_house=1, quesited_house=None
-        ))()
-    )
-    q_kp = kp_classical(
-        inp=type("HI", (), dict(
-            date=inp.question_date, time=inp.question_time, tz_name=inp.question_tz,
-            place=inp.question_place, latitude=inp.question_latitude, longitude=inp.question_longitude,
-            zodiac_mode="sidereal", ayanamsa="krishnamurti", ayanamsa_deg=None,
-            house_system=inp.house_system,
-            kp_house_system="placidus", kp_ayanamsa="krishnamurti", kp_number=inp.__dict__.get("kp_number"),
-            kp_number_mode=inp.__dict__.get("kp_number_mode", "anchor_asc"),
-            question_type=qtype, question_text=inp.question_text, querent_house=1, quesited_house=None
-        ))()
-    )
+    q_hi = _hi_from_question(inp, qtype=qtype)
+    q_parashari = parashari_classical(q_hi)
+    q_kp        = kp_classical(q_hi)
 
     # --- Grounds assembly for Step 1 & 3 Parāśarī/KP (for transparency)
     mapping = ENHANCED_QUESTION_HOUSES.get(qtype, {})
@@ -556,4 +567,3 @@ __all__ = [
     "analyze_hybrid",
     "analyze_hybrid_enhanced",
 ]
-
