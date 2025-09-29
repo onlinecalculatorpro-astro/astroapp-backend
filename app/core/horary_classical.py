@@ -1,25 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-Horary / Prashna systems (Parāśari, KP, Hybrid) — single-file module.
+horary_classical.py
+-------------------
+Classical Horary / Prashna systems: Parāśarī and KP (no Hybrid here).
 
 Key points
 ----------
-- No dependency on app.core.houses.compute_houses.
-  We call app.core.houses_advanced.compute_house_system(...) directly.
-- Timescales are taken from compute_chart(...).meta.timescales (jd_tt, jd_ut1, jd_utc).
-- If zodiac_mode == "sidereal", house cusps are shifted by ayanamsa so
-  house tests (occupancy, sign lords, KP sub-lords) are internally consistent.
+- Uses app.core.astronomy.compute_chart(...) for planets/angles + timescales.
+- Uses app.core.houses_advanced.compute_house_system(...) (strict JD inputs).
+- If zodiac_mode == "sidereal", house cusps are shifted by ayanāṃśa so tests
+  (occupancy, sign lords, KP sub-lords) stay internally consistent.
 - Public entrypoints:
-    - analyze_prasna_enhanced(method=...), for route compatibility
-    - analyze_prasna(method=...)
-    - analyze_parashari / analyze_kp / analyze_hybrid
+    - analyze_parashari(inp: HoraryInput) -> dict
+    - analyze_kp(inp: HoraryInput) -> dict
+    - analyze_prasna_enhanced(inp, method="parashari") -> dict  # route wrapper
+    - analyze_prasna(inp, method="parashari"|"kp") -> dict
 
 Exports
 -------
-- HoraryInput, QuestionType
-- QuerentBirthData, HybridPrasnaInput
+- HoraryInput, QuestionType, ENHANCED_QUESTION_HOUSES
 - analyze_prasna_enhanced, analyze_prasna
-- analyze_parashari, analyze_kp, analyze_hybrid
+- analyze_parashari, analyze_kp
 """
 
 from __future__ import annotations
@@ -174,7 +175,7 @@ class HoraryInput:
     # astro mode
     zodiac_mode: str = "sidereal"
     ayanamsa: str | float = "lahiri"
-    ayanamsa_deg: Optional[float] = None   # <-- accept explicit ayanamsa degrees if provided
+    ayanamsa_deg: Optional[float] = None   # accept explicit ayanamsa degrees if provided
     house_system: str = "sripati"
     # KP options
     kp_house_system: str = "placidus"
@@ -186,36 +187,6 @@ class HoraryInput:
     question_text: Optional[str] = None
     querent_house: int = 1
     quesited_house: Optional[int] = None
-
-@dataclass
-class QuerentBirthData:
-    date: str
-    time: str
-    tz_name: str
-    place: Optional[str] = None
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
-    zodiac_mode: str = "sidereal"
-    ayanamsa: str | float = "lahiri"
-
-@dataclass
-class HybridPrasnaInput:
-    # Question moment
-    question_date: Optional[str] = None
-    question_time: Optional[str] = None
-    question_tz: Optional[str] = None
-    question_place: Optional[str] = None
-    question_latitude: Optional[float] = None
-    question_longitude: Optional[float] = None
-    # Birth
-    querent_birth: Optional[QuerentBirthData] = None
-    # meta
-    question_type: Optional[QuestionType] = None
-    question_text: Optional[str] = None
-    # astro settings
-    zodiac_mode: str = "sidereal"
-    ayanamsa: str | float = "lahiri"
-    house_system: str = "sripati"
 
 # =============================================================================
 # Shared: dignity, aspects, etc.
@@ -253,7 +224,7 @@ def calculate_aspects(long1: float, long2: float) -> Tuple[float, Optional[str]]
     return diff, None
 
 # =============================================================================
-# Low-level: get charts + houses in a consistent way (with sidereal shift for cusps)
+# Low-level: charts + houses (with robust fallback)
 # =============================================================================
 
 def _ensure_coords_and_tz(
@@ -331,7 +302,6 @@ def _houses_from_chart(
     jd_tt  = _pick_ts(ts, "jd_tt", "tt_jd", "jd_tdb")
     jd_ut1 = _pick_ts(ts, "jd_ut1", "ut1_jd")
 
-    # Helper: try calling the engine with different kw layouts
     def _try_engine() -> Optional[Dict[str, Any]]:
         trials = [
             dict(latitude=latitude, longitude=longitude, house_system=house_system,
@@ -344,7 +314,7 @@ def _houses_from_chart(
                  jd_tt=jd_tt),
         ]
         for kwargs in trials:
-            if "jd_tt" in kwargs and kwargs["jd_tt"] is None: 
+            if "jd_tt" in kwargs and kwargs["jd_tt"] is None:
                 continue
             if "jd_ut1" in kwargs and kwargs["jd_ut1"] is None:
                 continue
@@ -410,7 +380,7 @@ def _houses_from_chart(
     }
 
 # =============================================================================
-# Parāśari system
+# Parāśarī system
 # =============================================================================
 
 _ENHANCED_QH = ENHANCED_QUESTION_HOUSES
@@ -702,189 +672,19 @@ def analyze_kp(inp: HoraryInput) -> Dict[str, Any]:
     }
 
 # =============================================================================
-# Hybrid system (Birth chart + Question moment)
+# Public dispatcher (classical only)
 # =============================================================================
 
-def _find_planet_house(longitude: float, cusps: List[float]) -> int:
-    """House membership using forward intervals (wrap-safe)."""
-    if not cusps or len(cusps) != 12:
-        return 1
-    for i in range(12):
-        a = deg_wrap(cusps[i])
-        b = deg_wrap(cusps[(i + 1) % 12])
-        x = deg_wrap(longitude)
-        if a <= b:
-            if a <= x < b: return i + 1
-        else:
-            if x >= a or x < b: return i + 1
-    return 1
-
-def _compare_birth_question(birth_chart: Dict, question_chart: Dict,
-                            birth_cusps: List[float], question_cusps: List[float]) -> List[Dict[str, Any]]:
-    comps = []
-    birth_planets = {p["name"]: p for p in birth_chart.get("bodies", []) if p["name"] in TRAD_PLANETS}
-    question_planets = {p["name"]: p for p in question_chart.get("bodies", []) if p["name"] in TRAD_PLANETS}
-    for nm in TRAD_PLANETS:
-        if nm in birth_planets and nm in question_planets:
-            b = birth_planets[nm]; q = question_planets[nm]
-            bL, qL = float(b["longitude_deg"]), float(q["longitude_deg"])
-            bH = _find_planet_house(bL, birth_cusps)
-            qH = _find_planet_house(qL, question_cusps)
-            sep, asp = calculate_aspects(bL, qL)
-            dig_b = calculate_planetary_dignity(bL, nm)
-            dig_q = calculate_planetary_dignity(qL, nm)
-            comps.append({
-                "planet": nm,
-                "birth_longitude": bL,
-                "birth_sign": sign_name_from_deg(bL),
-                "birth_house": bH,
-                "question_longitude": qL,
-                "question_sign": sign_name_from_deg(qL),
-                "question_house": qH,
-                "angular_distance": sep,
-                "aspect_type": asp,
-                "strength_change": dig_q - dig_b
-            })
-    return comps
-
-def analyze_hybrid(inp: HybridPrasnaInput) -> Dict[str, Any]:
-    if not inp.querent_birth:
-        return {"ok": False, "system": "hybrid", "error": "Querent birth data required"}
-
-    # Question chart/houses
-    q_chart = _chart(inp.question_date, inp.question_time, inp.question_tz,
-                     inp.question_place, inp.question_latitude, inp.question_longitude,
-                     zodiac_mode=inp.zodiac_mode, ayanamsa=inp.ayanamsa, topocentric=True)
-    q_meta = q_chart.get("meta", {})
-    q_aya = q_meta.get("ayanamsa_deg")
-    q_obs = q_meta.get("observer") or {}
-    q_la = float(q_obs.get("latitude", inp.question_latitude or 0.0))
-    q_lo = float(q_obs.get("longitude", inp.question_longitude or 0.0))
-    q_houses = _houses_from_chart(q_chart, latitude=q_la, longitude=q_lo,
-                                  house_system=inp.house_system,
-                                  zodiac_mode=inp.zodiac_mode, ayanamsa_deg=q_aya)
-
-    # Birth chart/houses
-    b = inp.querent_birth
-    b_chart = _chart(b.date, b.time, b.tz_name, b.place, b.latitude, b.longitude,
-                     zodiac_mode=b.zodiac_mode, ayanamsa=b.ayanamsa, topocentric=True)
-    b_meta = b_chart.get("meta", {})
-    b_aya = b_meta.get("ayanamsa_deg")
-    b_obs = b_meta.get("observer") or {}
-    b_la = float(b_obs.get("latitude", b.latitude or 0.0))
-    b_lo = float(b_obs.get("longitude", b.longitude or 0.0))
-    b_houses = _houses_from_chart(b_chart, latitude=b_la, longitude=b_lo,
-                                  house_system=inp.house_system,
-                                  zodiac_mode=b.zodiac_mode, ayanamsa_deg=b_aya)
-
-    # Comparisons
-    comps = _compare_birth_question(b_chart, q_chart,
-                                    b_houses.get("cusps_deg", []),
-                                    q_houses.get("cusps_deg", []))
-
-    # Evaluate components
-    qtype = inp.question_type or QuestionType.JOB
-    target = ENHANCED_QUESTION_HOUSES.get(qtype, {})
-    birth_relevance = question_strength = 0.0
-
-    for p in b_chart.get("bodies", []):
-        if p["name"] not in TRAD_PLANETS: continue
-        h = _find_planet_house(p["longitude_deg"], b_houses.get("cusps_deg", []))
-        dig = calculate_planetary_dignity(p["longitude_deg"], p["name"])
-        if h in target.get("primary", []):     birth_relevance += (dig + 2) * 0.3
-        elif h in target.get("secondary", []): birth_relevance += (dig + 2) * 0.2
-    birth_relevance = max(0.0, min(1.0, birth_relevance))
-
-    for p in q_chart.get("bodies", []):
-        if p["name"] not in TRAD_PLANETS: continue
-        h = _find_planet_house(p["longitude_deg"], q_houses.get("cusps_deg", []))
-        dig = calculate_planetary_dignity(p["longitude_deg"], p["name"])
-        if h in target.get("primary", []):     question_strength += (dig + 2) * 0.3
-        elif h in target.get("secondary", []): question_strength += (dig + 2) * 0.2
-    question_strength = max(0.0, min(1.0, question_strength))
-
-    # Placeholder dasha support (tunable / plug real Vimshottari)
-    moon_long = next((p["longitude_deg"] for p in b_chart.get("bodies", []) if p["name"]=="Moon"), 0.0)
-    moon_lord = lord_of_sign(moon_long)
-    dasha_support = 0.5 + (0.2 if moon_lord in ("Jupiter","Venus","Moon") else (-0.1 if moon_lord in ("Saturn","Mars") else 0.0))
-    dasha_support = max(0.0, min(1.0, dasha_support))
-
-    # Transit support proxy (constant for now; slot for your transit engine)
-    transit_support = 0.6
-
-    # Harmony (beneficial aspect fraction among TRAD planets)
-    bene, total = 0, 0
-    q_map = {p["name"]: p for p in q_chart.get("bodies", []) if p["name"] in TRAD_PLANETS}
-    b_map = {p["name"]: p for p in b_chart.get("bodies", []) if p["name"] in TRAD_PLANETS}
-    for nm in TRAD_PLANETS:
-        if nm in q_map and nm in b_map:
-            _, asp = calculate_aspects(q_map[nm]["longitude_deg"], b_map[nm]["longitude_deg"])
-            if asp in ("trine","sextile","conjunction"): bene += 1
-            total += 1
-    harmony = (bene / total) if total else 0.0
-
-    # Composite
-    W = {"birth":0.25, "question":0.30, "dasha":0.20, "transit":0.15, "harm":0.10}
-    composite = (birth_relevance*W["birth"] + question_strength*W["question"] +
-                 dasha_support*W["dasha"] + transit_support*W["transit"] +
-                 harmony*W["harm"])
-
-    if composite > 0.65:
-        answer = "yes"; confidence = 0.70 + (composite - 0.65) * 0.6
-    elif composite < 0.35:
-        answer = "no";  confidence = 0.70 + (0.35 - composite) * 0.6
-    else:
-        answer = "uncertain"; confidence = 0.55 + abs(composite - 0.5) * 0.2
-
-    return {
-        "ok": True,
-        "system": "hybrid",
-        "meta": {
-            "question_type": qtype.value,
-            "analysis_time": datetime.now(timezone.utc).isoformat(),
-            "zodiac_mode": inp.zodiac_mode,
-            "ayanamsa": inp.ayanamsa
-        },
-        "charts": {
-            "birth_asc": f"{b_chart.get('angles',{}).get('asc_deg', b_chart.get('asc_deg')):.2f}° {sign_name_from_deg(b_chart.get('angles',{}).get('asc_deg', b_chart.get('asc_deg')))}",
-            "question_asc": f"{q_chart.get('angles',{}).get('asc_deg', q_chart.get('asc_deg')):.2f}° {sign_name_from_deg(q_chart.get('angles',{}).get('asc_deg', q_chart.get('asc_deg')))}",
-        },
-        "analysis_components": {
-            "birth_chart_relevance": round(birth_relevance, 3),
-            "question_chart_strength": round(question_strength, 3),
-            "dasha_timing_support": round(dasha_support, 3),
-            "transit_support": round(transit_support, 3),
-            "chart_harmony": round(harmony, 3),
-            "composite_score": round(composite, 3)
-        },
-        "chart_comparisons": comps,
-        "judgement": {
-            "answer": answer,
-            "confidence": round(min(0.95, confidence), 3),
-            "reasoning": f"Hybrid synthesis of birth potential and question-moment factors ({qtype.value})."
-        }
-    }
-
-# =============================================================================
-# Public dispatcher
-# =============================================================================
-
-def analyze_prasna(inp: HoraryInput | HybridPrasnaInput,
-                   method: str = "parashari") -> Dict[str, Any]:
+def analyze_prasna(inp: HoraryInput, method: str = "parashari") -> Dict[str, Any]:
     """
-    method in {"parashari","kp","hybrid"}
-    - For "hybrid", pass HybridPrasnaInput (with querent_birth).
-    - For "parashari"/"kp", pass HoraryInput.
+    method in {"parashari","kp"}.
+    (Hybrid is intentionally NOT implemented in this classical module.)
     """
     try:
         m = (method or "parashari").strip().lower()
         if m == "kp":
-            assert isinstance(inp, HoraryInput)
             return analyze_kp(inp)
-        if m == "hybrid":
-            assert isinstance(inp, HybridPrasnaInput)
-            return analyze_hybrid(inp)
-        assert isinstance(inp, HoraryInput)
+        # default: parashari
         return analyze_parashari(inp)
     except Exception as e:
         return {"ok": False, "system": method, "error": str(e), "error_type": type(e).__name__}
@@ -902,8 +702,7 @@ def analyze_prasna_enhanced(inp, method: str = "parashari"):
     return res
 
 __all__ = [
-    "HoraryInput", "QuestionType",
-    "QuerentBirthData", "HybridPrasnaInput",
+    "HoraryInput", "QuestionType", "ENHANCED_QUESTION_HOUSES",
     "analyze_prasna_enhanced",
-    "analyze_prasna", "analyze_parashari", "analyze_kp", "analyze_hybrid",
+    "analyze_prasna", "analyze_parashari", "analyze_kp",
 ]
