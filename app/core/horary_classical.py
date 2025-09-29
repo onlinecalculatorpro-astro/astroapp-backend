@@ -1,20 +1,36 @@
 # -*- coding: utf-8 -*-
 """
-horary_classical.py
--------------------
+horary_classical.py — REWRITE (2025-09-29)
+-----------------------------------------
 Classical Horary / Prashna systems: Parāśarī and KP (no Hybrid here).
 
-Key points
+Highlights
 ----------
-- Uses app.core.astronomy.compute_chart(...) for planets/angles + timescales.
-- Uses app.core.houses_advanced.compute_house_system(...) (strict JD inputs).
-- If zodiac_mode == "sidereal", house cusps are shifted by ayanāṃśa so tests
-  (occupancy, sign lords, KP sub-lords) stay internally consistent.
-- Public entrypoints:
-    - analyze_parashari(inp: HoraryInput) -> dict
-    - analyze_kp(inp: HoraryInput) -> dict
-    - analyze_prasna_enhanced(inp, method="parashari") -> dict  # route wrapper
-    - analyze_prasna(inp, method="parashari"|"kp") -> dict
+- Sidereal-correct houses: If zodiac_mode == "sidereal", cusps/angles shift by
+  ayanāṃśa so sign lords, KP partitions, and house assignments are consistent.
+- Whole-Sign support: `house_system="whole_sign"` yields house = sign from Lagna.
+- Robust houses: advanced `houses_advanced.compute_house_system(...)` tried with
+  multiple JD signatures; fallback to Equal-from-ASC (never crash analysis).
+- Parāśarī upgrades:
+    • Rich dignity (own/exalt/debil + mūlatrikoṇa, friend/enemy, combustion,
+      retrograde, sandhi) → normalized score.
+    • Vedic graha-dṛṣṭi (special aspects of Mars/Jupiter/Saturn, everyone 7th)
+      contributes malefic/benefic pressure on target houses.
+    • Moon proximity bonus to lords of target houses; “radicality” (day-lord).
+    • Optional pañcāṅga snapshot (tithi index & Moon nakṣatra star).
+- KP upgrades:
+    • Nakṣatra star → sub → sub-sub (SSL) partition.
+    • Significator chain: planet ⇒ star-lord ⇒ sign-lord (+ nodes as agents).
+    • Cusp evaluation by sub-lord (primary houses) with SSL tie-break heuristic.
+    • KP number anchoring *rotates cusps* (not just ASC label).
+    • Ruling Planets (RP) used as a tie-breaker to bias close calls.
+
+Public entrypoints (unchanged)
+------------------------------
+- analyze_parashari(inp: HoraryInput) -> dict
+- analyze_kp(inp: HoraryInput) -> dict
+- analyze_prasna_enhanced(inp, method="parashari") -> dict
+- analyze_prasna(inp, method="parashari"|"kp") -> dict
 
 Exports
 -------
@@ -31,24 +47,20 @@ from datetime import datetime, timezone
 from enum import Enum
 import math
 
-# --- Core engines (already in your project) ---
+# --- Core engines (in your project) ---
 from app.core.astronomy import compute_chart, resolve_place
 from app.core.houses_advanced import compute_house_system  # strict JD(TT)+UT1
 
 # =============================================================================
-# Basic helpers
+# Constants & helpers
 # =============================================================================
-
-DEG = math.degrees
-RAD = math.radians
 
 SIGN_NAMES = [
     "Aries","Taurus","Gemini","Cancer","Leo","Virgo",
     "Libra","Scorpio","Sagittarius","Capricorn","Aquarius","Pisces"
 ]
-
-# Use the traditional 7 for horary scoring; we’ll also accept any present bodies.
-TRAD_PLANETS = ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn"]
+PARASHARI_PLANETS = ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn"]
+PLANETS_WITH_NODES = PARASHARI_PLANETS + ["Rahu","Ketu"]
 
 # Sign lords by sign index (0=Aries..11=Pisces)
 SIGN_LORDS = {
@@ -56,22 +68,127 @@ SIGN_LORDS = {
     6: "Venus", 7: "Mars", 8: "Jupiter", 9: "Saturn", 10: "Saturn", 11: "Jupiter"
 }
 
+# Mūlatrikoṇa signs (sign-level bonus)
+MOOLATRIKONA = {
+    "Sun": 4,       # Leo (we use sign-level bonus)
+    "Moon": None,   # Variable/rarely used sign-level bonus in horary
+    "Mars": 0,      # Aries
+    "Mercury": 5,   # Virgo
+    "Jupiter": 8,   # Sagittarius
+    "Venus": 1,     # Taurus
+    "Saturn": 10,   # Aquarius
+}
+
+# Permanent friendship (simplified standard)
+FRIENDS = {
+    "Sun": {"Moon","Mars","Jupiter"},
+    "Moon": {"Sun","Mercury"},
+    "Mars": {"Sun","Moon","Jupiter"},
+    "Mercury": {"Sun","Venus"},
+    "Jupiter": {"Sun","Moon","Mars"},
+    "Venus": {"Mercury","Saturn"},
+    "Saturn": {"Mercury","Venus"},
+}
+ENEMIES = {
+    "Sun": {"Venus","Saturn"},
+    "Moon": set(),
+    "Mars": {"Mercury"},
+    "Mercury": {"Moon"},
+    "Jupiter": {"Venus","Mercury"},
+    "Venus": {"Sun","Moon"},
+    "Saturn": {"Sun","Moon"},
+}
+
+# Combustion thresholds (deg from Sun) — conservative defaults
+COMBUST_DEG = {"Moon": 12.0,"Mercury": 12.0,"Venus": 10.0,"Mars": 17.0,"Jupiter": 11.0,"Saturn": 15.0}
+
+STAR_ORDER = ["Ketu","Venus","Sun","Moon","Mars","Rahu","Jupiter","Saturn","Mercury"]
+KP_DASHA_YEARS = {"Ketu":7,"Venus":20,"Sun":6,"Moon":10,"Mars":7,"Rahu":18,"Jupiter":16,"Saturn":19,"Mercury":17}
+STAR_LEN_DEG = 360.0 / 27.0
+TOTAL_DASHA = 120.0
+
+BENEFICS = {"Jupiter","Venus","Moon"}   # simple model; Mercury often treated neutral/benefic
+MALEFICS = {"Saturn","Mars","Sun","Rahu","Ketu"}  # Sun mild malefic; nodes malefic in horary
+
+# Panchanga labels (simple tithi indexing)
+TITHI_NAMES = [
+    "Pratipada","Dvitiya","Tritiya","Chaturthi","Panchami","Shashthi","Saptami","Ashtami","Navami","Dashami",
+    "Ekadashi","Dwadashi","Trayodashi","Chaturdashi","Purnima/Amavasya",
+]*2  # 30 entries
+
+# =============================================================================
+# Math & sign helpers
+# =============================================================================
+
 def deg_wrap(x: float) -> float:
     return (x % 360.0 + 360.0) % 360.0
 
 def sign_index(deg: float) -> int:
     return int(deg_wrap(deg) // 30)
 
-def sign_name_from_deg(deg: float) -> str:
-    return SIGN_NAMES[sign_index(deg)]
+def sign_name_from_deg(deg: float | None) -> Optional[str]:
+    if deg is None:
+        return None
+    return SIGN_NAMES[sign_index(float(deg))]
 
 def lord_of_sign(deg: float) -> str:
     return SIGN_LORDS[sign_index(deg)]
 
 def angular_sep(a: float, b: float) -> float:
-    """Smallest absolute angular separation in degrees [0..180]."""
     d = abs(deg_wrap(a) - deg_wrap(b))
     return d if d <= 180.0 else 360.0 - d
+
+def is_sandhi(deg: float, window: float = 1.0) -> bool:
+    """Near sign boundary within `window` degrees."""
+    d = deg_wrap(deg) % 30.0
+    return (d < window) or (30.0 - d < window)
+
+# =============================================================================
+# Nakṣatra star/sub/subsub partition — KP
+# =============================================================================
+
+def kp_star_sub_sub(ecl_deg_sidereal: float) -> Tuple[str, str, str, float, float, float, float]:
+    """
+    Return (star_lord, sub_lord, sub_sub_lord, star_span_deg, pos_in_star_deg,
+            sub_span_deg, pos_in_sub_deg). Proportions follow Vimśottari years.
+    """
+    pos = deg_wrap(ecl_deg_sidereal)
+    star_idx = int(pos // STAR_LEN_DEG)  # 0..26
+    star_lord = STAR_ORDER[star_idx % 9]
+    pos_in_star = pos - STAR_LEN_DEG * star_idx
+
+    # Sub level
+    cycle = STAR_ORDER[STAR_ORDER.index(star_lord):] + STAR_ORDER[:STAR_ORDER.index(star_lord)]
+    acc = 0.0
+    sub_lord = STAR_ORDER[-1]
+    sub_start = 0.0
+    sub_span = STAR_LEN_DEG  # default
+    for lord in cycle:
+        portion = STAR_LEN_DEG * (KP_DASHA_YEARS[lord] / TOTAL_DASHA)
+        if pos_in_star < acc + portion:
+            sub_lord = lord
+            sub_start = acc
+            sub_span = portion
+            break
+        acc += portion
+    pos_in_sub = pos_in_star - sub_start
+
+    # Sub-sub level: cycle from sub_lord
+    cycle2 = STAR_ORDER[STAR_ORDER.index(sub_lord):] + STAR_ORDER[:STAR_ORDER.index(sub_lord)]
+    acc2 = 0.0
+    ssl = STAR_ORDER[-1]
+    for lord in cycle2:
+        portion2 = sub_span * (KP_DASHA_YEARS[lord] / TOTAL_DASHA)
+        if pos_in_sub < acc2 + portion2:
+            ssl = lord
+            break
+        acc2 += portion2
+
+    return (star_lord, sub_lord, ssl, STAR_LEN_DEG, pos_in_star, sub_span, pos_in_sub)
+
+# =============================================================================
+# House utilities
+# =============================================================================
 
 def house_of(long_deg: float, cusps_deg: List[float]) -> int:
     """
@@ -85,52 +202,54 @@ def house_of(long_deg: float, cusps_deg: List[float]) -> int:
     for i in range(12):
         a = c[i]
         b = c[(i + 1) % 12]
-        if a <= b:
-            inside = (a <= x) and (x < b)
-        else:
-            inside = (x >= a) or (x < b)   # wrap interval
+        inside = ((a <= x) and (x < b)) if a <= b else ((x >= a) or (x < b))
         if inside:
             return i + 1
     return 1
 
 def shift_sidereal(values: List[float], ay_deg: float) -> List[float]:
-    """Shift a list of ecliptic longitudes by -ayanamsa (tropical→sidereal)."""
     return [deg_wrap(v - ay_deg) for v in values]
 
+def whole_sign_cusps_from_asc(asc_deg: float) -> List[float]:
+    """House 1 cusp = 0° of ascendant's sign, then every 30°."""
+    first = sign_index(asc_deg) * 30.0
+    return [deg_wrap(first + 30.0 * i) for i in range(12)]
+
 # =============================================================================
-# KP partitions (nakshatra/sub) — minimal engine for cusp sub-lord & planet labels
+# Vedic drishti (sign-based)
 # =============================================================================
 
-KP_STAR_ORDER = ["Ketu","Venus","Sun","Moon","Mars","Rahu","Jupiter","Saturn","Mercury"]
-KP_DASHA_YEARS = {"Ketu":7,"Venus":20,"Sun":6,"Moon":10,"Mars":7,"Rahu":18,"Jupiter":16,"Saturn":19,"Mercury":17}
-STAR_LEN_DEG = 360.0 / 27.0  # 13°20′
-
-def kp_star_and_sublord(ecl_deg_sidereal: float) -> Tuple[str, str, float, float]:
+def graha_drishti_offsets(planet: str, include_nodes_special: bool = True) -> Set[int]:
     """
-    Return (star_lord, sub_lord, star_span_deg, pos_within_star_deg).
-    Sub-lords proportioned by Vimshottari years (starting at the star-lord).
+    Returns house offsets (1..12 relative to planet's house) that receive aspect.
+    Everyone: 7th; Mars: 4th & 8th; Jupiter: 5th & 9th; Saturn: 3rd & 10th;
+    Nodes optional: 5th & 9th in some traditions.
     """
-    pos = deg_wrap(ecl_deg_sidereal)
-    star_idx = int(pos // STAR_LEN_DEG)  # 0..26
-    star_lord = KP_STAR_ORDER[star_idx % 9]
-    inside = pos - STAR_LEN_DEG * star_idx
+    base = {7}
+    if planet == "Mars":
+        base |= {4, 8}
+    elif planet == "Jupiter":
+        base |= {5, 9}
+    elif planet == "Saturn":
+        base |= {3, 10}
+    elif include_nodes_special and planet in {"Rahu","Ketu"}:
+        base |= {5, 9}
+    return base
 
-    total_years = 120.0
-    acc = 0.0
-    sub_lord = KP_STAR_ORDER[-1]
-    sub_start = 0.0
-
-    # start at star_lord in the Vim cycle
-    cycle = KP_STAR_ORDER[(KP_STAR_ORDER.index(star_lord)):] + KP_STAR_ORDER[:KP_STAR_ORDER.index(star_lord)]
-    for lord in cycle:
-        portion = STAR_LEN_DEG * (KP_DASHA_YEARS[lord] / total_years)
-        if inside < acc + portion:
-            sub_lord = lord
-            sub_start = acc
-            break
-        acc += portion
-
-    return (star_lord, sub_lord, STAR_LEN_DEG, inside - sub_start)
+def houses_aspected_by(planet_name: str, cusps: List[float], bodies: Dict[str, Any]) -> Set[int]:
+    """
+    Compute sign-based drishti targets for a planet using cusps (house = sign zone).
+    """
+    p = bodies.get(planet_name)
+    if not p:
+        return set()
+    lon = float(p.get("longitude_deg"))
+    h = house_of(lon, cusps)
+    targets: Set[int] = set()
+    for off in graha_drishti_offsets(planet_name):
+        t = ((h - 1 + (off - 1)) % 12) + 1
+        targets.add(t)
+    return targets
 
 # =============================================================================
 # Dataclasses / Inputs
@@ -175,53 +294,18 @@ class HoraryInput:
     # astro mode
     zodiac_mode: str = "sidereal"
     ayanamsa: str | float = "lahiri"
-    ayanamsa_deg: Optional[float] = None   # accept explicit ayanamsa degrees if provided
-    house_system: str = "sripati"
+    ayanamsa_deg: Optional[float] = None   # explicit override (deg)
+    house_system: str = "sripati"          # accepts "whole_sign"
     # KP options
     kp_house_system: str = "placidus"
     kp_ayanamsa: str | float = "krishnamurti"
     kp_number: Optional[int] = None
-    kp_number_mode: str = "anchor_asc"  # "anchor_asc" | "advisory"
+    kp_number_mode: str = "anchor_asc"     # "anchor_asc" | "advisory"
     # question
     question_type: Optional[QuestionType] = None
     question_text: Optional[str] = None
     querent_house: int = 1
     quesited_house: Optional[int] = None
-
-# =============================================================================
-# Shared: dignity, aspects, etc.
-# =============================================================================
-
-def calculate_planetary_dignity(longitude: float, planet: str) -> float:
-    """
-    Simple dignity score (-2..+2). Tunable if you want finer granularity.
-    """
-    s = sign_index(longitude)
-    exalt = {
-        "Sun": 0, "Moon": 1, "Mars": 9, "Mercury": 5,
-        "Jupiter": 3, "Venus": 11, "Saturn": 6
-    }
-    own = {
-        "Sun": [4], "Moon": [3], "Mars": [0,7], "Mercury": [2,5],
-        "Jupiter": [8,11], "Venus": [1,6], "Saturn": [9,10]
-    }
-    if planet in exalt and s == exalt[planet]:
-        return 2.0
-    if planet in own and s in own[planet]:
-        return 1.0
-    if planet in exalt and s == (exalt[planet] + 6) % 12:
-        return -2.0
-    return 0.0
-
-def calculate_aspects(long1: float, long2: float) -> Tuple[float, Optional[str]]:
-    """Loose Ptolemaic aspects; returns (sep, name|None)."""
-    diff = abs(deg_wrap(long1 - long2))
-    if diff > 180: diff = 360 - diff
-    for deg, orb, name in [(0,8,"conjunction"),(60,6,"sextile"),
-                           (90,8,"square"),(120,8,"trine"),(180,8,"opposition")]:
-        if abs(diff - deg) <= orb:
-            return diff, name
-    return diff, None
 
 # =============================================================================
 # Low-level: charts + houses (with robust fallback)
@@ -249,7 +333,6 @@ def _ensure_coords_and_tz(
         tz = tz or rp.get("tz") or "UTC"
     tz = tz or "UTC"
     if lat is None or lon is None:
-        # last resort: (0,0)
         lat, lon = 0.0, 0.0
     return str(date), str(time_), str(tz), float(lat), float(lon)
 
@@ -273,6 +356,17 @@ def _chart(
         "topocentric": bool(topocentric)
     })
 
+def _pick_ts(ts: Dict[str, Any], *keys: str) -> Optional[float]:
+    for k in keys:
+        v = ts.get(k)
+        if v is None:
+            continue
+        try:
+            return float(v)
+        except Exception:
+            pass
+    return None
+
 def _houses_from_chart(
     chart: Dict[str, Any],
     *,
@@ -284,23 +378,38 @@ def _houses_from_chart(
 ) -> Dict[str, Any]:
     """
     Try advanced house engine with multiple signatures; if it fails,
-    fall back to Equal Houses from ASC (so analysis still works).
+    fall back to Equal Houses from ASC. If house_system == "whole_sign",
+    build whole-sign cusps from ASC.
     """
-    def _pick_ts(ts: Dict[str, Any], *keys: str) -> Optional[float]:
-        for k in keys:
-            v = ts.get(k)
-            if v is None:
-                continue
-            try:
-                return float(v)
-            except Exception:
-                pass
-        return None
-
+    ang = chart.get("angles") or {}
+    asc_any = ang.get("asc_deg", chart.get("asc_deg"))
+    mc_any  = ang.get("mc_deg", chart.get("mc_deg"))
     ts = (chart.get("meta", {}) or {}).get("timescales", {}) or {}
+
     jd_ut  = _pick_ts(ts, "jd_ut", "jd_utc")
     jd_tt  = _pick_ts(ts, "jd_tt", "tt_jd", "jd_tdb")
     jd_ut1 = _pick_ts(ts, "jd_ut1", "ut1_jd")
+
+    # Whole-Sign shortcut (ASC required)
+    if (house_system or "").lower() == "whole_sign" and asc_any is not None:
+        asc_deg = float(asc_any)
+        cusps = whole_sign_cusps_from_asc(asc_deg)
+        if zodiac_mode.lower() == "sidereal" and isinstance(ayanamsa_deg, (int, float)):
+            cusps = shift_sidereal(cusps, float(ayanamsa_deg))
+            asc_out = deg_wrap(asc_deg - float(ayanamsa_deg))
+            mc_out  = deg_wrap(float(mc_any) - float(ayanamsa_deg)) if mc_any is not None else deg_wrap(asc_out + 90.0)
+        else:
+            asc_out = asc_deg
+            mc_out  = float(mc_any) if mc_any is not None else deg_wrap(asc_deg + 90.0)
+        return {
+            "house_system": "whole_sign",
+            "cusps_deg": cusps,
+            "asc_deg": asc_out,
+            "mc_deg": mc_out,
+            "vertex": None,
+            "eastpoint": None,
+            "warnings": [],
+        }
 
     def _try_engine() -> Optional[Dict[str, Any]]:
         trials = [
@@ -314,12 +423,10 @@ def _houses_from_chart(
                  jd_tt=jd_tt),
         ]
         for kwargs in trials:
-            if "jd_tt" in kwargs and kwargs["jd_tt"] is None:
-                continue
-            if "jd_ut1" in kwargs and kwargs["jd_ut1"] is None:
-                continue
-            if "jd_ut" in kwargs and kwargs["jd_ut"] is None:
-                continue
+            # Skip invalid None combos
+            if "jd_tt" in kwargs and kwargs["jd_tt"] is None: continue
+            if "jd_ut1" in kwargs and kwargs["jd_ut1"] is None: continue
+            if "jd_ut" in kwargs and kwargs["jd_ut"] is None: continue
             try:
                 return compute_house_system(**kwargs)  # type: ignore[arg-type]
             except TypeError:
@@ -330,25 +437,19 @@ def _houses_from_chart(
 
     payload = _try_engine()
 
-    # Fallback: Equal Houses from ASC (never crash analysis)
+    # Fallback: Equal Houses from ASC
     if not payload:
-        ang = chart.get("angles") or {}
-        asc_any = ang.get("asc_deg", chart.get("asc_deg"))
         if asc_any is None:
             raise ValueError("houses_fallback_failed:no_asc_in_chart")
-
         asc_deg = float(asc_any)
         cusps = [deg_wrap(asc_deg + i * 30.0) for i in range(12)]
-        mc_guess = (ang.get("mc_deg") if ang.get("mc_deg") is not None else deg_wrap(asc_deg + 90.0))
-
+        mc_guess = float(mc_any) if mc_any is not None else deg_wrap(asc_deg + 90.0)
         if zodiac_mode.lower() == "sidereal" and isinstance(ayanamsa_deg, (int, float)):
             cusps = shift_sidereal(cusps, float(ayanamsa_deg))
             asc_out = deg_wrap(asc_deg - float(ayanamsa_deg))
-            mc_out  = deg_wrap(float(mc_guess) - float(ayanamsa_deg))
+            mc_out  = deg_wrap(mc_guess - float(ayanamsa_deg))
         else:
-            asc_out = asc_deg
-            mc_out  = float(mc_guess)
-
+            asc_out, mc_out = asc_deg, mc_guess
         return {
             "house_system": f"{house_system} (fallback=Equal from ASC)",
             "cusps_deg": cusps,
@@ -380,39 +481,130 @@ def _houses_from_chart(
     }
 
 # =============================================================================
-# Parāśarī system
+# Panchanga mini: tithi & Moon nakshatra
 # =============================================================================
 
-_ENHANCED_QH = ENHANCED_QUESTION_HOUSES
+def _tithi_index(moon_deg: Optional[float], sun_deg: Optional[float]) -> Optional[int]:
+    if moon_deg is None or sun_deg is None:
+        return None
+    el = deg_wrap(moon_deg - sun_deg)  # Moon - Sun elongation
+    return int(el // 12.0)  # 0..29
 
-def _calculate_house_strength(house_num: int, question_type: Optional[QuestionType]) -> float:
-    if not question_type or question_type not in _ENHANCED_QH:
-        return 0.5
-    m = _ENHANCED_QH[question_type]
-    if house_num in m.get("primary", []):    return 1.0
-    if house_num in m.get("secondary", []):  return 0.8
-    if house_num in m.get("supportive", []): return 0.6
-    if house_num in m.get("obstructive", []):return 0.2
-    return 0.4
+def _moon_star(chart: Dict[str, Any]) -> Optional[str]:
+    moon = next((b for b in chart.get("bodies", []) if b.get("name") == "Moon"), None)
+    if not moon: return None
+    star, *_ = kp_star_sub_sub(float(moon["longitude_deg"]))
+    return star
+
+# =============================================================================
+# Parāśarī system (enhanced)
+# =============================================================================
+
+def _calculate_planetary_dignity(long_deg: float, planet: str) -> float:
+    """
+    Rich dignity score. Rough scale ~ [-2.5 .. +2.5] (before normalization):
+      +2.0 exaltation (sign-level)
+      +1.0 own sign
+      +0.75 moolatrikona (sign-level)
+      +0.5 friend sign / -0.5 enemy sign
+      -2.0 debilitation
+      -0.3 combustion penalty (if combust)
+      -0.2 sandhi penalty (near sign boundary)
+      +/-0.25 retrograde (malefics +0.25, benefics -0.25)
+    """
+    sidx = sign_index(long_deg)
+    dign = 0.0
+
+    # Exaltation/debilitation (sign-level, simplified canonical pairs)
+    exalt_sign = {
+        "Sun": 0, "Moon": 2, "Mars": 9, "Mercury": 5,
+        "Jupiter": 3, "Venus": 11, "Saturn": 6
+    }
+    if planet in exalt_sign and sidx == exalt_sign[planet]:
+        dign += 2.0
+    elif planet in exalt_sign and sidx == (exalt_sign[planet] + 6) % 12:
+        dign -= 2.0
+
+    # Own signs
+    own = {"Sun":[4], "Moon":[3], "Mars":[0,7], "Mercury":[2,5],
+           "Jupiter":[8,11], "Venus":[1,6], "Saturn":[9,10]}
+    if planet in own and sidx in own[planet]:
+        dign += 1.0
+
+    # Moolatrikona
+    if MOOLATRIKONA.get(planet) is not None and sidx == MOOLATRIKONA[planet]:
+        dign += 0.75
+
+    # Friend/enemy sign
+    lord = SIGN_LORDS[sidx]
+    if planet in FRIENDS and lord in FRIENDS[planet]:
+        dign += 0.5
+    if planet in ENEMIES and lord in ENEMIES[planet]:
+        dign -= 0.5
+
+    # Sandhi penalty
+    if is_sandhi(long_deg, 1.0):
+        dign -= 0.2
+
+    # Combustion & retro handled outside (need Sun distance & speed)
+    return dign
 
 def _parashari_strengths(chart: Dict[str, Any], cusps: List[float],
                          question_type: Optional[QuestionType]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
-    byname = {b["name"]: b for b in chart.get("bodies", [])}
-    for nm, b in byname.items():
-        if nm not in TRAD_PLANETS:
-            continue
+    bodies = {b["name"]: b for b in chart.get("bodies", [])}
+    # include nodes as malefics for visibility in table
+    planet_order = [p for p in PLANETS_WITH_NODES if p in bodies]
+
+    # Sun needed for combustion distances
+    sun_lon: Optional[float] = None
+    if "Sun" in bodies:
+        sun_lon = float(bodies["Sun"].get("longitude_deg"))
+
+    def _house_relevance(h: int) -> float:
+        if not question_type or question_type not in ENHANCED_QUESTION_HOUSES:
+            return 0.5
+        m = ENHANCED_QUESTION_HOUSES[question_type]
+        if h in m.get("primary", []):    return 1.0
+        if h in m.get("secondary", []):  return 0.8
+        if h in m.get("supportive", []): return 0.6
+        if h in m.get("obstructive", []):return 0.2
+        return 0.4
+
+    for nm in planet_order:
+        b = bodies[nm]
         lon = float(b["longitude_deg"])
+        spd = float(b.get("speed_deg_per_day") or b.get("speed") or 0.0)
         h = house_of(lon, cusps)
-        dig = calculate_planetary_dignity(lon, nm)
-        hstr = _calculate_house_strength(h, question_type)
-        is_retro = bool((b.get("speed_deg_per_day") or b.get("speed") or 0) < 0)
-        overall = (dig + hstr + 2.0) / 4.0  # normalize approx to 0..1
+
+        # Base dignity
+        dig = _calculate_planetary_dignity(lon, nm)
+
+        # Combustion penalty (skip for Sun)
+        if nm != "Sun" and sun_lon is not None and nm in COMBUST_DEG:
+            if angular_sep(lon, sun_lon) <= COMBUST_DEG[nm]:
+                dig -= 0.3
+
+        # Retrograde adjustment
+        if spd < 0:
+            if nm in MALEFICS:
+                dig += 0.25
+            elif nm in BENEFICS:
+                dig -= 0.25
+
+        hstr = _house_relevance(h)
+        is_retro = spd < 0
+        overall = (dig + hstr + 2.5) / 5.0  # normalize rough range to ~0..1
+
         out.append({
-            "planet": nm, "longitude_deg": lon, "sign": sign_name_from_deg(lon),
-            "house": h, "is_retrograde": is_retro,
-            "dignity_score": dig, "house_strength": hstr,
-            "overall_strength": round(overall, 4)
+            "planet": nm,
+            "longitude_deg": round(lon, 4),
+            "sign": sign_name_from_deg(lon),
+            "house": h,
+            "is_retrograde": is_retro,
+            "dignity_score": round(dig, 3),
+            "house_strength": round(hstr, 3),
+            "overall_strength": round(max(0.0, min(1.0, overall)), 4)
         })
     return out
 
@@ -438,7 +630,6 @@ def analyze_parashari(inp: HoraryInput) -> Dict[str, Any]:
 
     meta = chart.get("meta", {})
     ay_from_chart = meta.get("ayanamsa_deg")
-    # Allow explicit override if client provided ayanamsa_deg
     ay_deg = float(inp.ayanamsa_deg) if isinstance(inp.ayanamsa_deg, (int, float)) else ay_from_chart
 
     observer = meta.get("observer") or {}
@@ -450,19 +641,38 @@ def analyze_parashari(inp: HoraryInput) -> Dict[str, Any]:
                                 house_system=inp.house_system,
                                 zodiac_mode=inp.zodiac_mode,
                                 ayanamsa_deg=ay_deg)
-
     cusps = houses.get("cusps_deg", []) or []
     asc_deg = chart.get("angles", {}).get("asc_deg", chart.get("asc_deg"))
     moon_lon = next((b["longitude_deg"] for b in chart.get("bodies", []) if b["name"]=="Moon"), None)
+    sun_lon  = next((b["longitude_deg"] for b in chart.get("bodies", []) if b["name"]=="Sun"), None)
 
     qtype = inp.question_type or QuestionType.JOB
     strengths = _parashari_strengths(chart, cusps, qtype)
 
-    # House lords (by sign on cusps)
+    # House lords by cusp sign
     house_lords: Dict[int, str] = {i+1: lord_of_sign(c) for i, c in enumerate(cusps)}
 
-    # Scoring
-    mapping = _ENHANCED_QH.get(qtype, {})
+    # Drishti pressure on target houses
+    bodies_by_name = {b["name"]: b for b in chart.get("bodies", [])}
+    mapping = ENHANCED_QUESTION_HOUSES.get(qtype, {})
+    target_pos = set(mapping.get("primary", []) + mapping.get("secondary", []) + mapping.get("supportive", []))
+    target_neg = set(mapping.get("obstructive", []))
+
+    drishti_bonus = drishti_malus = 0.0
+    for nm in bodies_by_name:
+        if nm not in PLANETS_WITH_NODES:  # use 7 + nodes
+            continue
+        tgt_houses = houses_aspected_by(nm, cusps, bodies_by_name)
+        hits_pos = len(tgt_houses & target_pos)
+        hits_neg = len(tgt_houses & target_neg)
+        if nm in BENEFICS:
+            drishti_bonus += 0.15 * hits_pos
+            drishti_malus += 0.10 * hits_neg  # benefic hitting obstructive may amplify those topics mildly
+        else:
+            drishti_malus += 0.20 * hits_pos
+            drishti_bonus += 0.05 * hits_neg  # malefic hitting obstructive can cancel it slightly
+
+    # Scoring buckets from planetary strengths
     primary, secondary = mapping.get("primary", []), mapping.get("secondary", [])
     supportive, obstructive = mapping.get("supportive", []), mapping.get("obstructive", [])
 
@@ -477,10 +687,9 @@ def analyze_parashari(inp: HoraryInput) -> Dict[str, Any]:
     prox_bonus = 0.0
     if moon_lon is not None:
         target_lords = {house_lords.get(h) for h in (primary + secondary)}
-        bodies = {b["name"]: b for b in chart.get("bodies", [])}
         for pl in filter(None, target_lords):
-            if pl in bodies:
-                if angular_sep(float(moon_lon), float(bodies[pl]["longitude_deg"])) < 12.0:
+            if pl in bodies_by_name:
+                if angular_sep(float(moon_lon), float(bodies_by_name[pl]["longitude_deg"])) < 12.0:
                     prox_bonus += 1.0
 
     # Radicality multiplier
@@ -489,16 +698,21 @@ def analyze_parashari(inp: HoraryInput) -> Dict[str, Any]:
     rad = _radicality_flags(chart, inp.tz_name or "UTC", date, time_)
     rad_mult = 1.10 if rad["fits"] else 1.0
 
-    total_positive = (primary_score + secondary_score + prox_bonus) * rad_mult
-    total_negative = obstruction_score
+    # Panchanga snapshot
+    tithi_idx = _tithi_index(moon_lon, sun_lon)
+    moon_star = _moon_star(chart)
+
+    # Final scores
+    total_positive = (primary_score + secondary_score + prox_bonus + drishti_bonus) * rad_mult
+    total_negative = obstruction_score + drishti_malus
     net_score = total_positive - total_negative
 
-    if net_score > 0.75:
-        answer, conf = "yes", min(0.95, 0.72 + 0.06 * net_score)
-    elif net_score < -0.75:
-        answer, conf = "no",  min(0.95, 0.72 + 0.06 * abs(net_score))
+    if net_score > 1.25:
+        answer, conf = "yes", min(0.96, 0.74 + 0.06 * net_score)
+    elif net_score < -1.25:
+        answer, conf = "no",  min(0.96, 0.74 + 0.06 * abs(net_score))
     else:
-        answer, conf = "uncertain", 0.60
+        answer, conf = "uncertain", 0.62
 
     return {
         "ok": True,
@@ -510,6 +724,11 @@ def analyze_parashari(inp: HoraryInput) -> Dict[str, Any]:
             "ayanamsa_deg_used": ay_deg,
             "house_system": inp.house_system,
             "analysis_time": datetime.now(timezone.utc).isoformat()
+        },
+        "panchanga": {
+            "tithi_index": tithi_idx,
+            "tithi_label": (TITHI_NAMES[tithi_idx] if tithi_idx is not None else None),
+            "moon_star": moon_star
         },
         "chart_data": {
             "ASC_deg": asc_deg,
@@ -525,6 +744,8 @@ def analyze_parashari(inp: HoraryInput) -> Dict[str, Any]:
             "secondary_score": round(secondary_score, 3),
             "obstruction_score": round(obstruction_score, 3),
             "moon_proximity_bonus": round(prox_bonus, 3),
+            "drishti_bonus": round(drishti_bonus, 3),
+            "drishti_malus": round(drishti_malus, 3),
             "radicality_multiplier": rad_mult,
             "net_score": round(net_score, 3)
         },
@@ -532,14 +753,11 @@ def analyze_parashari(inp: HoraryInput) -> Dict[str, Any]:
     }
 
 # =============================================================================
-# KP system
+# KP system (enhanced)
 # =============================================================================
 
-def kp_signified_houses(planet_name: str, chart: Dict[str, Any], cusps: List[float]) -> Set[int]:
-    """
-    Minimal KP signification: sub-lord's own occupancy + lordship of cusp signs,
-    and star-lord's occupancy + lordship.
-    """
+def _kp_signified_houses_base(planet_name: str, chart: Dict[str, Any], cusps: List[float]) -> Set[int]:
+    """Occupancy + lordship of cusp signs for the given planet."""
     houses: Set[int] = set()
     bodies = {b["name"]: b for b in chart.get("bodies", [])}
     p = bodies.get(planet_name)
@@ -547,31 +765,90 @@ def kp_signified_houses(planet_name: str, chart: Dict[str, Any], cusps: List[flo
         return houses
 
     # Occupancy of planet
-    houses.add(house_of(p["longitude_deg"], cusps))
+    houses.add(house_of(float(p["longitude_deg"]), cusps))
 
     # Lordship of cusp signs
     for i, cusp in enumerate(cusps, 1):
         if lord_of_sign(cusp) == planet_name:
             houses.add(i)
-
-    # Star-lord chain
-    star_lord, _, _, _ = kp_star_and_sublord(p["longitude_deg"])
-    s = bodies.get(star_lord)
-    if s:
-        houses.add(house_of(s["longitude_deg"], cusps))
-        for i, cusp in enumerate(cusps, 1):
-            if lord_of_sign(cusp) == star_lord:
-                houses.add(i)
     return houses
 
-def kp_cusp_sub_lord_ok(cusp_house: int, chart: Dict[str, Any], cusps: List[float],
-                        positive: Set[int], negative: Set[int]) -> Tuple[bool, Set[int], str]:
+def _kp_signified_houses_chain(planet_name: str, chart: Dict[str, Any], cusps: List[float]) -> Set[int]:
+    """
+    KP chain: planet ⇒ star-lord ⇒ sign-lord.
+    Nodes act as agents of their star-/sign-lords and the planets they conjoin (±3°) or oppose (7th).
+    """
+    bodies = {b["name"]: b for b in chart.get("bodies", [])}
+    p = bodies.get(planet_name)
+    if not p:
+        return set()
+
+    lon = float(p["longitude_deg"])
+    star_lord, sub_lord, ssl, *_ = kp_star_sub_sub(lon)
+    signlord = lord_of_sign(lon)
+
+    sig: Set[int] = set()
+    for who in {planet_name, star_lord, signlord}:
+        sig |= _kp_signified_houses_base(who, chart, cusps)
+
+    # Node agent rule: if planet itself is Rahu/Ketu, expand to its star-lord/sign-lord
+    if planet_name in {"Rahu","Ketu"}:
+        sig |= _kp_signified_houses_base(star_lord, chart, cusps)
+        sig |= _kp_signified_houses_base(signlord, chart, cusps)
+
+        # Conjunction (±3°) & opposition (7th sign)
+        for other in bodies:
+            if other == planet_name: continue
+            olon = float(bodies[other]["longitude_deg"])
+            if angular_sep(lon, olon) <= 3.0 or abs(sign_index(lon) - sign_index(olon)) in {6, 6 % 12}:
+                sig |= _kp_signified_houses_base(other, chart, cusps)
+
+    # SSL tie-break: mark presence (used later, not added here to avoid overreach)
+    return sig
+
+def _kp_cusp_sub_lord_eval(cusp_house: int, chart: Dict[str, Any], cusps: List[float],
+                           positive: Set[int], negative: Set[int]) -> Tuple[bool, Set[int], str, Optional[str]]:
+    """
+    Evaluate a cusp by its sub-lord; if borderline, peek at SSL for tie-break.
+    """
     cusp_deg = cusps[cusp_house-1]
-    _, sub_lord, _, _ = kp_star_and_sublord(cusp_deg)
-    sig = kp_signified_houses(sub_lord, chart, cusps)
+    star_lord, sub_lord, ssl, star_deg, sub_pos, sub_span, pos_in_sub = kp_star_sub_sub(cusp_deg)
+    sig = _kp_signified_houses_chain(sub_lord, chart, cusps)
     good = (len(sig & positive) > 0) and (len(sig & negative) == 0)
-    reason = f"sub={sub_lord}, signified={sorted(sig)}"
-    return good, sig, reason
+
+    # SSL tie-breaker: if not good, but SSL chain is clean positive, flip weakly
+    ssl_sig = _kp_signified_houses_chain(ssl, chart, cusps)
+    ssl_good = (len(ssl_sig & positive) > 0) and (len(ssl_sig & negative) == 0)
+    reason = f"sub={sub_lord}, ssl={ssl}, signified={sorted(sig)}, ssl_signified={sorted(ssl_sig)}"
+    chosen_ssl = ssl if (not good and ssl_good) else None
+    return good or ssl_good, (sig if good else (ssl_sig if ssl_good else sig)), reason, chosen_ssl
+
+def _ruling_planets(chart: Dict[str, Any], cusps: List[float], tz_name: str, date: str, time_: str) -> Set[str]:
+    """KP Ruling Planets: day-lord, Moon sign-lord, Moon star-lord, ASC sign-lord, ASC star-lord."""
+    bodies = {b["name"]: b for b in chart.get("bodies", [])}
+    # Day-lord
+    try:
+        from zoneinfo import ZoneInfo
+        dt_local = datetime.fromisoformat(f"{date}T{time_}").replace(tzinfo=ZoneInfo(tz_name))
+    except Exception:
+        dt_local = datetime.fromisoformat(f"{date}T{time_}").replace(tzinfo=timezone.utc)
+    WEEK_TO_LORD = ["Moon","Mars","Mercury","Jupiter","Venus","Saturn","Sun"]
+    daylord = WEEK_TO_LORD[dt_local.weekday()]
+
+    # Moon sign/star
+    moon = bodies.get("Moon")
+    moon_lord = moon_star = None
+    if moon:
+        md = float(moon["longitude_deg"])
+        moon_lord = lord_of_sign(md)
+        moon_star, *_ = kp_star_sub_sub(md)
+
+    # ASC sign/star
+    asc_deg = chart.get("angles", {}).get("asc_deg", chart.get("asc_deg")) or 0.0
+    asc_lord = lord_of_sign(float(asc_deg))
+    asc_star, *_ = kp_star_sub_sub(float(asc_deg))
+
+    return {p for p in [daylord, moon_lord, moon_star, asc_lord, asc_star] if p}
 
 def analyze_kp(inp: HoraryInput) -> Dict[str, Any]:
     kp_aya = inp.kp_ayanamsa if inp.kp_ayanamsa is not None else "krishnamurti"
@@ -589,65 +866,91 @@ def analyze_kp(inp: HoraryInput) -> Dict[str, Any]:
     houses = _houses_from_chart(chart, latitude=la, longitude=lo,
                                 house_system=inp.kp_house_system,
                                 zodiac_mode="sidereal", ayanamsa_deg=ay_deg)
-    cusps = houses.get("cusps_deg", []) or []
+    cusps = list(houses.get("cusps_deg", []) or [])
 
-    # (Optional) KP number anchoring of ASC (advisory/override)
-    asc_deg_sid = chart.get("angles", {}).get("asc_deg", chart.get("asc_deg"))
+    # KP number anchoring: rotate cusps so ASC equals number-derived degree
+    asc_deg_sid = float(houses.get("asc_deg"))
     if inp.kp_number and (inp.kp_number_mode or "anchor_asc").lower() == "anchor_asc":
-        # 1..249 mapped evenly on zodiac (anchor only, we do not rotate houses)
-        asc_deg_sid = (max(1, min(249, int(inp.kp_number))) - 1) * (360.0 / 249.0)
+        target = (max(1, min(249, int(inp.kp_number))) - 1) * (360.0 / 249.0)
+        delta = deg_wrap(target - asc_deg_sid)
+        cusps = [deg_wrap(c + delta) for c in cusps]
+        asc_deg_sid = target
 
     # Decision via cusp sub-lords on primary houses
     qtype = inp.question_type or QuestionType.JOB
-    mapping = _ENHANCED_QH.get(qtype, {})
+    mapping = ENHANCED_QUESTION_HOUSES.get(qtype, {})
     pos_h = set(mapping.get("primary", []) + mapping.get("secondary", []) + mapping.get("supportive", []))
     neg_h = set(mapping.get("obstructive", []))
 
     yes_hits = no_hits = 0
     evidence = []
     for h in mapping.get("primary", []):
-        ok, sig, reason = kp_cusp_sub_lord_ok(h, chart, cusps, pos_h, neg_h)
-        evidence.append({"cusp": h, "ok": ok, "reason": reason})
+        ok, sig, reason, ssl_used = _kp_cusp_sub_lord_eval(h, chart, cusps, pos_h, neg_h)
+        evidence.append({"cusp": h, "ok": ok, "reason": reason, "ssl_used": ssl_used})
         yes_hits += int(ok)
         no_hits += int(not ok)
 
-    if yes_hits > no_hits:
-        answer, conf = "yes", round(0.68 + 0.06*(yes_hits - no_hits), 3)
-    elif no_hits > yes_hits:
-        answer, conf = "no",  round(0.68 + 0.06*(no_hits - yes_hits), 3)
-    else:
-        answer, conf = "uncertain", 0.62
+    # Ruling Planets bias
+    date = inp.date or datetime.now(timezone.utc).date().isoformat()
+    time_ = inp.time or datetime.now(timezone.utc).time().replace(microsecond=0).isoformat()
+    rp = _ruling_planets(chart, cusps, inp.tz_name or "UTC", date, time_)
+    rp_support = 0
+    # Count RP that also signify positive houses via chains
+    for p in rp:
+        sig = _kp_signified_houses_chain(p, chart, cusps)
+        if len(sig & pos_h) > 0 and len(sig & neg_h) == 0:
+            rp_support += 1
 
-    # Cusp table with star/sub
+    # Verdict
+    if yes_hits > no_hits:
+        base_conf = 0.70 + 0.05*(yes_hits - no_hits)
+        base_ans = "yes"
+    elif no_hits > yes_hits:
+        base_conf = 0.70 + 0.05*(no_hits - yes_hits)
+        base_ans = "no"
+    else:
+        base_conf = 0.62
+        base_ans = "uncertain"
+
+    # RP bias: nudge confidence up to +0.06
+    conf = min(0.97, base_conf + min(0.06, 0.02 * rp_support))
+
+    # Cusp table with star/sub/ssl
     detailed_cusps = []
     for i, cusp_deg in enumerate(cusps, 1):
-        star_lord, sub_lord, star_deg, sub_pos = kp_star_and_sublord(cusp_deg)
+        star_lord, sub_lord, ssl, star_deg, pos_in_star, sub_span, pos_in_sub = kp_star_sub_sub(cusp_deg)
         detailed_cusps.append({
             "house": i,
             "degree": round(cusp_deg, 4),
             "sign": sign_name_from_deg(cusp_deg),
             "star_lord": star_lord,
             "sub_lord": sub_lord,
+            "sub_sub_lord": ssl,
             "star_span_deg": round(star_deg, 4),
-            "pos_within_star_deg": round(sub_pos, 4)
+            "pos_within_star_deg": round(pos_in_star, 4),
+            "sub_span_deg": round(sub_span, 4),
+            "pos_within_sub_deg": round(pos_in_sub, 4),
         })
 
-    # Planetary star/sub snapshot
+    # Planetary star/sub snapshot (trad planets only for KP horary table)
     planetary_kp = []
     for b in chart.get("bodies", []):
         nm = b["name"]
-        if nm not in TRAD_PLANETS:
+        if nm not in PARASHARI_PLANETS:
             continue
         lon = float(b["longitude_deg"])
-        star_lord, sub_lord, star_deg, sub_pos = kp_star_and_sublord(lon)
+        star_lord, sub_lord, ssl, star_deg, pos_in_star, sub_span, pos_in_sub = kp_star_sub_sub(lon)
         planetary_kp.append({
             "planet": nm,
             "longitude_deg": round(lon, 4),
             "sign": sign_name_from_deg(lon),
             "star_lord": star_lord,
             "sub_lord": sub_lord,
+            "sub_sub_lord": ssl,
             "star_span_deg": round(star_deg, 4),
-            "pos_within_star_deg": round(sub_pos, 4)
+            "pos_within_star_deg": round(pos_in_star, 4),
+            "sub_span_deg": round(sub_span, 4),
+            "pos_within_sub_deg": round(pos_in_sub, 4),
         })
 
     return {
@@ -664,11 +967,12 @@ def analyze_kp(inp: HoraryInput) -> Dict[str, Any]:
         "kp_core": {
             "ASC_deg_sid": asc_deg_sid,
             "ASC_sign": sign_name_from_deg(float(asc_deg_sid or 0.0)),
+            "ruling_planets": sorted(list(rp)),
         },
         "cusp_analysis": detailed_cusps,
         "planetary_kp": planetary_kp,
         "signification_evidence": evidence,
-        "judgement": {"answer": answer, "confidence": conf, "method": "KP cusp sub-lords"}
+        "judgement": {"answer": base_ans, "confidence": round(conf, 3), "method": "KP cusp sub-lords (+SSL & RP bias)"}
     }
 
 # =============================================================================
@@ -684,7 +988,6 @@ def analyze_prasna(inp: HoraryInput, method: str = "parashari") -> Dict[str, Any
         m = (method or "parashari").strip().lower()
         if m == "kp":
             return analyze_kp(inp)
-        # default: parashari
         return analyze_parashari(inp)
     except Exception as e:
         return {"ok": False, "system": method, "error": str(e), "error_type": type(e).__name__}
