@@ -1,288 +1,167 @@
 # -*- coding: utf-8 -*-
 """
-horary_hybrid.py
-----------------
-Hybrid (birth + question-moment) prashna core.
+horary_hybrid.py — hybrid pipeline (2025-09-29)
+-----------------------------------------------
+Hybrid (birth + question-moment) prashna analysis.
 
-Requirements & design
-- Birth details are **mandatory** (QuerentBirthData).
-- Uses horary_shared.py for dataclasses, chart/house engines, dignity/aspects, etc.
-- Produces:
-    * composite scoring from multiple components
-    * narrative evidence (positives/negatives/neutrals)
-    * rough timing windows (heuristic; plug real dasha/transit later)
-- Conservative defaults; never crashes if houses engine is unavailable
-  (falls back to Equal from ASC via shared helper).
+Pipeline
+- Step 1: Analyze BIRTH chart with the SAME engines as classical:
+          Parāśarī + KP (via horary_classical.analyze_*).
+- Step 2: Parāśarī CROSS analysis (birth ↔ question) using house relevance,
+          dignity, and inter-chart aspects (soft/hard).
+- Step 3: Analyze QUESTION (horary) chart: Parāśarī + KP (classical engines).
+- Step 4: Fuse Step 2 & Step 3 into the FINAL verdict, with explicit grounds.
+
+Outputs
+- Clear, structured results per step + final:
+  - judgement {answer, confidence}
+  - scores/strengths and compact “grounds”:
+      {for: [], against: [], conflicts: [], notes: []}
+- Conservative defaults; robust fallbacks (Equal from ASC via shared module).
 
 Public API
 - analyze_hybrid(inp: HybridPrasnaInput) -> Dict[str, Any]
-- analyze_hybrid_enhanced(inp) -> adds {"method": "hybrid"} convenience key
+- analyze_hybrid_enhanced(inp) -> adds {"method": "hybrid"}
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple, Set
 from dataclasses import asdict
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 # Shared imports
 from .horary_shared import (
-     HybridPrasnaInput, QuerentBirthData, QuestionType, ENHANCED_QUESTION_HOUSES,
-     TRAD_PLANETS, SIGN_NAMES, SIGN_LORDS,
-     deg_wrap, sign_index, sign_name_from_deg, lord_of_sign,
-     angular_sep, shift_sidereal, house_of,
-     calculate_planetary_dignity, calculate_aspects,
-     kp_star_and_sublord,
-     ensure_coords_and_tz, build_chart, compute_houses_from_chart, safe_get_asc,
-     radicality_flags,
- )
+    HybridPrasnaInput, QuerentBirthData, QuestionType, ENHANCED_QUESTION_HOUSES,
+    # constants/helpers
+    deg_wrap, sign_index, sign_name_from_deg, lord_of_sign,
+    angular_sep, house_of,
+    calculate_planetary_dignity, calculate_aspects,
+    kp_star_and_sublord,
+    build_chart, compute_houses_from_chart, safe_get_asc, radicality_flags,
+)
+
+# Use the SAME classical engines for consistency (Step 1 & Step 3)
+from .horary_classical import (
+    analyze_parashari as parashari_classical,
+    analyze_kp as kp_classical,
+)
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Local role tags (kept light & traditional for scoring/grounds)
 # ---------------------------------------------------------------------------
 
-_BENEFICS = {"Jupiter", "Venus", "Moon", "Mercury"}
-_MALEFICS = {"Saturn", "Mars", "Sun"}
+_BENEFICS: Set[str] = {"Jupiter", "Venus", "Moon"}
+_MALEFICS: Set[str] = {"Saturn", "Mars", "Sun"}
+_NEUTRAL:  Set[str] = {"Mercury"}  # will be treated as light-benefic nudge in places
 
-def _find_house_of(longitude: float, cusps: List[float]) -> int:
-    """Wrap-safe house membership; alias to horary_shared.house_of for clarity."""
-    return house_of(longitude, cusps)
+# ---------------------------------------------------------------------------
+# Utility: reasons / grounds formatters
+# ---------------------------------------------------------------------------
 
-def _score_chart_relevance(chart: Dict[str, Any], cusps: List[float], qtype: QuestionType) -> Tuple[float, Dict[str, Any]]:
-    """
-    Score a single chart for question relevance:
-    - Weight planets by (house tier + dignity), with light benefic/malefic adjustments.
-    - Return (0..1) score and a per-planet breakdown.
-    """
-    mapping = ENHANCED_QUESTION_HOUSES.get(qtype, {})
-    primary    = set(mapping.get("primary", []))
-    secondary  = set(mapping.get("secondary", []))
+def _mk_reason(source: str, weight: float, text: str) -> Dict[str, Any]:
+    return {"source": source, "weight": round(max(0.0, min(1.0, float(weight))), 3), "text": text}
+
+def _top(items: List[Dict[str, Any]], n: int = 5) -> List[Dict[str, Any]]:
+    return sorted(items, key=lambda x: x.get("weight", 0.0), reverse=True)[:n]
+
+def _parashari_grounds_from_result(p_res: Dict[str, Any], mapping: Dict[str, List[int]]) -> Dict[str, Any]:
+    """Summarize Parāśarī result into for/against/conflicts/notes grounds."""
+    for_list: List[Dict[str, Any]] = []
+    against_list: List[Dict[str, Any]] = []
+    notes: List[str] = []
+
+    strengths = p_res.get("planetary_analysis", []) or []
+    sb = p_res.get("scoring_breakdown", {}) or {}
+    primary = set(mapping.get("primary", []))
+    secondary = set(mapping.get("secondary", []))
     supportive = set(mapping.get("supportive", []))
-    obstruct   = set(mapping.get("obstructive", []))
+    obstructive = set(mapping.get("obstructive", []))
 
-    per_planet = []
-    total = 0.0
-    max_possible = 0.0
+    for s in strengths:
+        nm = s.get("planet")
+        h  = int(s.get("house", 0) or 0)
+        w  = float(s.get("overall_strength", 0.0) or 0.0)
+        sig = s.get("sign")
+        base = f"{nm} in H{h} ({sig}), strength={w:.2f}"
+        if h in primary or h in secondary or h in supportive:
+            # primary gets higher weight
+            alpha = 0.6 if h in primary else (0.45 if h in secondary else 0.35)
+            for_list.append(_mk_reason("parashari", alpha*w, base))
+        elif h in obstructive:
+            against_list.append(_mk_reason("parashari", 0.5*w, base + " in obstructive house"))
 
-    for b in chart.get("bodies", []):
-        nm = b["name"]
-        if nm not in TRAD_PLANETS: 
-            continue
-        lon = float(b["longitude_deg"])
-        h   = _find_house_of(lon, cusps)
-        dig = calculate_planetary_dignity(lon, nm)
+    if sb.get("moon_proximity_bonus", 0) > 0:
+        notes.append("Moon close to key house-lord(s) → timing/strength boost.")
+    if sb.get("drishti_bonus", 0) > 0:
+        notes.append("Benefic aspects (dṛṣṭi) aiding target houses.")
+    if sb.get("drishti_malus", 0) > 0:
+        against_list.append(_mk_reason("parashari", 0.12, "Malefic aspects (dṛṣṭi) on target houses"))
+    if sb.get("radicality_multiplier", 1.0) and float(sb.get("radicality_multiplier", 1.0)) > 1.0:
+        notes.append("Radicality fit (ASC lord vs day/hour) → +10% multiplier.")
 
-        # Base tier weights
-        if h in primary:     tier = 1.00
-        elif h in secondary: tier = 0.80
-        elif h in supportive:tier = 0.60
-        elif h in obstruct:  tier = 0.20
-        else:                tier = 0.40
-
-        # Benefic/malefic nudge (very light)
-        nud = 0.08 if nm in _BENEFICS else (-0.05 if nm in _MALEFICS else 0.0)
-
-        # Normalize dignity -2..+2 → 0..1 via (dig+2)/4
-        dig_n = (dig + 2.0) / 4.0
-
-        # Planet weight (bounded)
-        w = max(0.0, min(1.0, 0.55*tier + 0.35*dig_n + nud))
-
-        per_planet.append({
-            "planet": nm,
-            "longitude_deg": round(lon, 4),
-            "sign": sign_name_from_deg(lon),
-            "house": h,
-            "dignity": dig,
-            "weight": round(w, 4),
-            "tier": tier,
-        })
-        total += w
-        max_possible += 1.0  # each traditional planet capped to ~1
-
-    score = 0.0 if max_possible <= 0 else max(0.0, min(1.0, total / max_possible))
-    return score, {
-        "per_planet": per_planet,
-        "summary": {"sum": round(total, 3), "max": round(max_possible, 3)}
-    }
-
-def _chart_snapshot(chart: Dict[str, Any], cusps: List[float]) -> Dict[str, Any]:
-    """Basic snapshot for UI/debug."""
-    asc = safe_get_asc(chart)
-    moon = next((p for p in chart.get("bodies", []) if p["name"] == "Moon"), None)
+    # keep concise
     return {
-        "ASC_deg": asc,
-        "ASC_sign": (sign_name_from_deg(float(asc)) if asc is not None else None),
-        "Moon_deg": (moon["longitude_deg"] if moon else None),
-        "Moon_sign": (sign_name_from_deg(moon["longitude_deg"]) if moon else None),
-        "cusps_deg": cusps,
+        "for": _top(for_list, 6),
+        "against": _top(against_list, 6),
+        "conflicts": [],
+        "notes": notes[:6],
     }
 
-def _evidence_from_chart(chart: Dict[str, Any], cusps: List[float], qtype: QuestionType) -> Dict[str, List[str]]:
-    """
-    Build narrative evidence lists: positives/negatives/neutrals.
-    Heuristics:
-      + Benefics in primary/secondary/supportive houses
-      + House lords strengthened by dignity/aspects to Moon
-      - Malefics in obstructive houses or afflicting Moon/house lords
-    """
-    mapping = ENHANCED_QUESTION_HOUSES.get(qtype, {})
-    primary    = set(mapping.get("primary", []))
-    secondary  = set(mapping.get("secondary", []))
-    supportive = set(mapping.get("supportive", []))
-    obstruct   = set(mapping.get("obstructive", []))
+def _kp_grounds_from_result(kp_res: Dict[str, Any]) -> Dict[str, Any]:
+    """Summarize KP result into for/against/conflicts/notes grounds."""
+    for_list: List[Dict[str, Any]] = []
+    against_list: List[Dict[str, Any]] = []
+    notes: List[str] = []
 
-    positives: List[str] = []
-    negatives: List[str] = []
-    neutrals:  List[str] = []
-
-    bodies = chart.get("bodies", [])
-    byname = {b["name"]: b for b in bodies}
-    moon   = byname.get("Moon")
-    moonL  = float(moon["longitude_deg"]) if moon else None
-
-    # House lords from cusp signs
-    house_lords: Dict[int, str] = {i+1: lord_of_sign(c) for i, c in enumerate(cusps)}
-
-    for b in bodies:
-        nm = b["name"]
-        if nm not in TRAD_PLANETS:
-            continue
-        lon = float(b["longitude_deg"])
-        h   = _find_house_of(lon, cusps)
-        dig = calculate_planetary_dignity(lon, nm)
-
-        # Moon proximity to house lord?
-        if moonL is not None and nm in set(house_lords.values()):
-            sep = angular_sep(moonL, lon)
-            if sep < 12.0:
-                positives.append(f"Moon close to {nm} (house lord) by {round(sep,1)}° — supportive timing.")
-
-        # Planet position evidence
-        tag = f"{nm} in H{h} ({sign_name_from_deg(lon)}), dignity {dig:+.0f}"
-        if nm in _BENEFICS and (h in (primary | secondary | supportive)):
-            positives.append(f"Benefic {tag}.")
-        elif nm in _MALEFICS and (h in obstruct):
-            negatives.append(f"Malefic {tag} in obstructive house.")
+    for ev in kp_res.get("signification_evidence", []) or []:
+        ok = bool(ev.get("ok"))
+        desc = ev.get("reason", "")
+        cusp = ev.get("cusp")
+        if ok:
+            for_list.append(_mk_reason("kp", 0.35, f"Cusp {cusp}: {desc}"))
         else:
-            neutrals.append(tag + ".")
+            against_list.append(_mk_reason("kp", 0.35, f"Cusp {cusp}: {desc} → obstructive involvement"))
+        if ev.get("ssl_used"):
+            notes.append(f"Cusp {cusp}: SSL tie-break used ({ev['ssl_used']}).")
 
-        # Aspect Moon stress/support
-        if moonL is not None and nm != "Moon":
-            sep, asp = calculate_aspects(lon, moonL)
-            if asp in ("trine","sextile","conjunction") and nm in _BENEFICS:
-                positives.append(f"{nm} {asp} Moon — supportive.")
-            if asp in ("square","opposition") and nm in _MALEFICS:
-                negatives.append(f"{nm} {asp} Moon — stress.")
-
-    return {"positives": positives, "negatives": negatives, "neutrals": neutrals}
-
-def _dasha_support_from_birth(birth_chart: Dict[str, Any]) -> Tuple[float, str]:
-    """
-    Placeholder: infer 'friendly' vs 'tough' period from Moon sign lord in birth chart.
-    Returns (0..1, explanation).
-    """
-    moon = next((p for p in birth_chart.get("bodies", []) if p["name"] == "Moon"), None)
-    if not moon:
-        return 0.5, "Moon unknown; neutral period."
-    moon_lord = lord_of_sign(float(moon["longitude_deg"]))
-    if moon_lord in {"Jupiter","Venus","Moon"}:
-        return 0.7, f"Moon sign lord {moon_lord} — generally supportive period."
-    if moon_lord in {"Saturn","Mars"}:
-        return 0.4, f"Moon sign lord {moon_lord} — somewhat challenging period."
-    return 0.55, f"Moon sign lord {moon_lord} — mixed period."
-
-def _harmony_between_charts(birth_chart: Dict[str, Any], q_chart: Dict[str, Any]) -> Tuple[float, Dict[str, Any]]:
-    """
-    Fraction of 'soft' aspects (trine, sextile, conjunction) across the seven classical planets.
-    """
-    bene, total = 0, 0
-    bmap = {p["name"]: p for p in birth_chart.get("bodies", []) if p["name"] in TRAD_PLANETS}
-    qmap = {p["name"]: p for p in q_chart.get("bodies", []) if p["name"] in TRAD_PLANETS}
-
-    details = []
-    for nm in TRAD_PLANETS:
-        if nm in bmap and nm in qmap:
-            bL = float(bmap[nm]["longitude_deg"])
-            qL = float(qmap[nm]["longitude_deg"])
-            sep, asp = calculate_aspects(bL, qL)
-            soft = asp in ("trine","sextile","conjunction")
-            if soft:
-                bene += 1
-            total += 1
-            details.append({"planet": nm, "sep": round(sep,2), "aspect": asp, "soft": soft})
-
-    frac = (bene / total) if total else 0.0
-    return frac, {"per_planet": details, "count_soft": bene, "count_total": total}
-
-def _rough_timing(
-    now_iso: str,
-    composite: float,
-    dasha_support: float,
-    qtype: QuestionType,
-    q_chart_snap: Dict[str, Any],
-) -> Dict[str, Any]:
-    """
-    Heuristic timing windows based on composite & dasha_support.
-    Produces broad windows relative to the question time.
-    """
-    try:
-        now_dt = datetime.fromisoformat(now_iso.replace("Z","")).replace(tzinfo=timezone.utc)
-    except Exception:
-        now_dt = datetime.now(timezone.utc)
-
-    # Baseline windows by composite strength
-    if composite >= 0.70:
-        base = [(0, 9), (9, 18)]
-        assessment = "near-term likely"
-    elif composite >= 0.60:
-        base = [(3, 12), (12, 24)]
-        assessment = "moderately soon"
-    elif composite >= 0.50:
-        base = [(6, 18), (18, 30)]
-        assessment = "possible, needs conditions"
-    else:
-        base = [(12, 36)]
-        assessment = "deferred or unlikely"
-
-    # Adjust by dasha support (shift earlier/later)
-    shift = -2 if dasha_support >= 0.65 else (2 if dasha_support <= 0.45 else 0)
-    windows = []
-    for a, b in base:
-        start = now_dt + timedelta(days=30 * max(0, a + shift))
-        end   = now_dt + timedelta(days=30 * max(0, b + shift))
-        windows.append({
-            "from": start.date().isoformat(),
-            "to": end.date().isoformat(),
-            "reason": f"{assessment}; dasha support={round(dasha_support,2)}",
-        })
-
-    # Add a clue from Moon nakshatra at question time (label only)
-    moon_deg = q_chart_snap.get("Moon_deg")
-    nak_label = None
-    if isinstance(moon_deg, (int, float)):
-        star, sub, star_span, _ = kp_star_and_sublord(float(moon_deg))
-        nak_label = f"Moon nakshatra={star}, sub={sub}"
+    rp = (kp_res.get("kp_core") or {}).get("ruling_planets", [])
+    if rp:
+        notes.append(f"KP Ruling Planets: {', '.join(rp)} (minor confidence nudge).")
 
     return {
-        "assessment": assessment,
-        "windows": windows,
-        "clues": [nak_label] if nak_label else [],
+        "for": _top(for_list, 6),
+        "against": _top(against_list, 6),
+        "conflicts": [],
+        "notes": notes[:6],
+    }
+
+def _fuse_grounds(step2_p: Dict[str, Any], step3_p: Dict[str, Any], step3_kp: Dict[str, Any],
+                  kp_answer: str, kp_conf: float) -> Dict[str, Any]:
+    """Merge grounds across Step2 (cross Parāśarī) + Step3 (Parāśarī + KP); surface conflicts."""
+    for_all = (step2_p.get("for", []) + step3_p.get("for", []) + step3_kp.get("for", []))
+    against_all = (step2_p.get("against", []) + step3_p.get("against", []) + step3_kp.get("against", []))
+    notes = (step2_p.get("notes", []) + step3_p.get("notes", []) + step3_kp.get("notes", []))
+    conflicts = (step2_p.get("conflicts", []) + step3_p.get("conflicts", []) + step3_kp.get("conflicts", []))
+
+    # If KP is strong and contradicts Parāśarī tone, record a conflict
+    if kp_answer in {"yes", "no"} and kp_conf >= 0.75:
+        tone_parashari_positive = (len(for_all) >= len(against_all))
+        if (kp_answer == "yes" and not tone_parashari_positive) or (kp_answer == "no" and tone_parashari_positive):
+            conflicts.append(f"Strong KP '{kp_answer.upper()}' vs Parāśarī opposite tone (KP conf={kp_conf:.2f}).")
+
+    return {
+        "for": _top(for_all, 6),
+        "against": _top(against_all, 6),
+        "conflicts": conflicts[:4],
+        "notes": notes[:6],
     }
 
 # ---------------------------------------------------------------------------
-# Public analysis
+# Builders (charts / houses)
 # ---------------------------------------------------------------------------
 
-def analyze_hybrid(inp: HybridPrasnaInput) -> Dict[str, Any]:
-    if not inp or not isinstance(inp, HybridPrasnaInput):
-        return {"ok": False, "system": "hybrid", "error": "invalid_input"}
-    if not inp.querent_birth:
-        return {"ok": False, "system": "hybrid", "error": "Querent birth data required"}
-
-    qtype = inp.question_type or QuestionType.JOB
-
-    # ---- Build Question Chart + Houses
+def _build_question_bundle(inp: HybridPrasnaInput) -> Tuple[Dict[str, Any], Dict[str, Any], List[float]]:
     q_chart = build_chart(
         date=inp.question_date, time=inp.question_time, tz=inp.question_tz,
         place=inp.question_place, latitude=inp.question_latitude, longitude=inp.question_longitude,
@@ -297,11 +176,10 @@ def analyze_hybrid(inp: HybridPrasnaInput) -> Dict[str, Any]:
         q_chart, latitude=q_lat, longitude=q_lon,
         house_system=inp.house_system, zodiac_mode=inp.zodiac_mode, ayanamsa_deg=q_aya,
     )
-    q_cusps = q_houses.get("cusps_deg", []) or []
-    q_snap  = _chart_snapshot(q_chart, q_cusps)
+    q_cusps = list(q_houses.get("cusps_deg", []) or [])
+    return q_chart, q_houses, q_cusps
 
-    # ---- Build Birth Chart + Houses
-    b = inp.querent_birth
+def _build_birth_bundle(b: QuerentBirthData, house_system: str) -> Tuple[Dict[str, Any], Dict[str, Any], List[float]]:
     b_chart = build_chart(
         date=b.date, time=b.time, tz=b.tz_name,
         place=b.place, latitude=b.latitude, longitude=b.longitude,
@@ -314,116 +192,349 @@ def analyze_hybrid(inp: HybridPrasnaInput) -> Dict[str, Any]:
     b_lon  = float(b_obs.get("longitude", b.longitude or 0.0))
     b_houses = compute_houses_from_chart(
         b_chart, latitude=b_lat, longitude=b_lon,
-        house_system=inp.house_system, zodiac_mode=b.zodiac_mode, ayanamsa_deg=b_aya,
+        house_system=house_system, zodiac_mode=b.zodiac_mode, ayanamsa_deg=b_aya,
     )
-    b_cusps = b_houses.get("cusps_deg", []) or []
-    b_snap  = _chart_snapshot(b_chart, b_cusps)
+    b_cusps = list(b_houses.get("cusps_deg", []) or [])
+    return b_chart, b_houses, b_cusps
 
-    # ---- Scores
-    birth_score, birth_break = _score_chart_relevance(b_chart, b_cusps, qtype)
-    ques_score,  ques_break  = _score_chart_relevance(q_chart, q_cusps, qtype)
-    dasha_support, dasha_note = _dasha_support_from_birth(b_chart)
-    harmony, harmony_detail   = _harmony_between_charts(b_chart, q_chart)
+def _snapshot(chart: Dict[str, Any], cusps: List[float]) -> Dict[str, Any]:
+    asc = safe_get_asc(chart)
+    moon = next((p for p in chart.get("bodies", []) if p.get("name") == "Moon"), None)
+    return {
+        "ASC_deg": asc,
+        "ASC_sign": (sign_name_from_deg(float(asc)) if asc is not None else None),
+        "Moon_deg": (float(moon["longitude_deg"]) if moon else None),
+        "Moon_sign": (sign_name_from_deg(float(moon["longitude_deg"])) if moon else None),
+        "cusps_deg": cusps,
+    }
 
-    # Tunable weights (sum ~1.0)
-    W = {"birth": 0.30, "question": 0.35, "dasha": 0.20, "harm": 0.15}
-    composite = max(0.0, min(1.0,
-        birth_score*W["birth"] + ques_score*W["question"] +
-        dasha_support*W["dasha"] + harmony*W["harm"]
-    ))
+# ---------------------------------------------------------------------------
+# Step 2: Parāśarī cross-analysis (birth ↔ question)
+# ---------------------------------------------------------------------------
 
-    # ---- Evidence
-    ev_q = _evidence_from_chart(q_chart, q_cusps, qtype)
-    ev_b = _evidence_from_chart(b_chart, b_cusps, qtype)
-    positives = (ev_q["positives"] + ev_b["positives"])[:20]
-    negatives = (ev_q["negatives"] + ev_b["negatives"])[:20]
-    neutrals  = (ev_q["neutrals"]  + ev_b["neutrals"]) [:20]
+def _house_tier(h: int, mapping: Dict[str, List[int]]) -> float:
+    if h in set(mapping.get("primary", [])):    return 1.00
+    if h in set(mapping.get("secondary", [])):  return 0.80
+    if h in set(mapping.get("supportive", [])): return 0.60
+    if h in set(mapping.get("obstructive", [])):return 0.20
+    return 0.40
 
-    # ---- Judgement bands
-    if composite > 0.66:
-        answer = "yes"
-        confidence = min(0.95, 0.70 + 0.30*(composite-0.66)/(1.0-0.66))
-    elif composite < 0.40:
-        answer = "no"
-        confidence = min(0.95, 0.70 + 0.30*(0.40-composite)/0.40)
+def _planet_weight(nm: str, tier: float, dignity: float) -> float:
+    # dignity -2..+2 → 0..1
+    dig_n = (dignity + 2.0) / 4.0
+    nud = (0.06 if nm in _BENEFICS or nm in _NEUTRAL else (-0.05 if nm in _MALEFICS else 0.0))
+    return max(0.0, min(1.0, 0.55*tier + 0.35*dig_n + nud))
+
+def _cross_score_parashari(
+    birth_chart: Dict[str, Any], birth_cusps: List[float],
+    q_chart: Dict[str, Any], q_cusps: List[float],
+    qtype: QuestionType
+) -> Tuple[float, Dict[str, Any], Dict[str, Any]]:
+    """
+    Evaluate synergy between birth and question charts:
+      A) Question planets placed into BIRTH houses
+      B) Birth planets placed into QUESTION houses
+      C) Inter-chart aspects (same-name classical planets)
+    Returns (score_0..1, breakdown, grounds)
+    """
+    mapping = ENHANCED_QUESTION_HOUSES.get(qtype, {})
+    bodies_b = {b["name"]: b for b in birth_chart.get("bodies", [])}
+    bodies_q = {b["name"]: b for b in q_chart.get("bodies", [])}
+
+    per_item: List[Dict[str, Any]] = []
+    total, count = 0.0, 0.0
+    reasons_for: List[Dict[str, Any]] = []
+    reasons_against: List[Dict[str, Any]] = []
+    notes: List[str] = []
+
+    # A) Question planets in BIRTH houses
+    for nm, qb in bodies_q.items():
+        if nm not in bodies_b:  # keep to 7 classical where possible
+            continue
+        lon = float(qb["longitude_deg"])
+        h = house_of(lon, birth_cusps)
+        tier = _house_tier(h, mapping)
+        dig  = calculate_planetary_dignity(lon, nm)
+        w    = _planet_weight(nm, tier, dig)
+        per_item.append({"where":"Q→B", "planet":nm, "house":h, "tier":tier, "dignity":dig, "weight":round(w,4)})
+        total += w; count += 1
+        txt = f"Q {nm} in BIRTH H{h} ({sign_name_from_deg(lon)}), dignity {dig:+.0f}"
+        if h in set(mapping.get("obstructive", [])):
+            reasons_against.append(_mk_reason("parashari_cross", 0.45*w, txt + " in obstructive house"))
+        else:
+            reasons_for.append(_mk_reason("parashari_cross", 0.50*w if h in set(mapping.get("primary", [])) else 0.40*w, txt))
+
+    # B) Birth planets in QUESTION houses
+    for nm, bb in bodies_b.items():
+        if nm not in bodies_q:
+            continue
+        lon = float(bb["longitude_deg"])
+        h = house_of(lon, q_cusps)
+        tier = _house_tier(h, mapping)
+        dig  = calculate_planetary_dignity(lon, nm)
+        w    = _planet_weight(nm, tier, dig)
+        per_item.append({"where":"B→Q", "planet":nm, "house":h, "tier":tier, "dignity":dig, "weight":round(w,4)})
+        total += w; count += 1
+        txt = f"B {nm} in QUESTION H{h} ({sign_name_from_deg(lon)}), dignity {dig:+.0f}"
+        if h in set(mapping.get("obstructive", [])):
+            reasons_against.append(_mk_reason("parashari_cross", 0.40*w, txt + " in obstructive house"))
+        else:
+            reasons_for.append(_mk_reason("parashari_cross", 0.45*w if h in set(mapping.get("secondary", [])) else 0.35*w, txt))
+
+    # C) Inter-chart aspects (same planet ↔ same planet)
+    soft_aspects = {"conjunction","trine","sextile"}
+    hard_aspects = {"square","opposition"}
+    for nm in list(set(bodies_b.keys()) & set(bodies_q.keys())):
+        if nm not in {"Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn"}:
+            continue
+        bL = float(bodies_b[nm]["longitude_deg"])
+        qL = float(bodies_q[nm]["longitude_deg"])
+        sep, asp = calculate_aspects(bL, qL)
+        if asp in soft_aspects:
+            reasons_for.append(_mk_reason("parashari_cross", 0.15, f"{nm} {asp} across charts ({sep:.1f}°) — harmony"))
+            total += 0.08; count += 1
+        elif asp in hard_aspects and nm in _MALEFICS:
+            reasons_against.append(_mk_reason("parashari_cross", 0.15, f"{nm} {asp} across charts ({sep:.1f}°) — stress"))
+            total += 0.02; count += 1  # mild penalty (kept bounded)
+
+    score = 0.0 if count == 0 else max(0.0, min(1.0, total / count))
+
+    grounds = {
+        "for": _top(reasons_for, 6),
+        "against": _top(reasons_against, 6),
+        "conflicts": [],
+        "notes": notes[:6],
+    }
+    breakdown = {"items": per_item, "mean": round(score, 3), "count": int(count)}
+    return score, breakdown, grounds
+
+# ---------------------------------------------------------------------------
+# Scoring normalization & final fusion
+# ---------------------------------------------------------------------------
+
+def _parashari_positivity_from_result(p_res: Dict[str, Any]) -> float:
+    """
+    Map Parāśarī judgement to a 0..1 positivity for fusion.
+    Yes with high confidence → close to 1.0; No → close to 0.0; Uncertain → ~0.5.
+    """
+    j = p_res.get("judgement", {}) or {}
+    ans = (j.get("answer") or "").lower()
+    conf = float(j.get("confidence", 0.62) or 0.62)
+    if ans == "yes":
+        return min(1.0, 0.5 + 0.5*conf)
+    if ans == "no":
+        return max(0.0, 0.5 - 0.5*conf)
+    return 0.5
+
+def _kp_signed_signal(kp_res: Dict[str, Any]) -> Tuple[float, str, float]:
+    """
+    Convert KP verdict to signed signal in [-1..+1] times confidence.
+    Returns (signal, answer, confidence).
+    """
+    j = kp_res.get("judgement", {}) or {}
+    ans = (j.get("answer") or "").lower()
+    conf = float(j.get("confidence", 0.62) or 0.62)
+    if ans == "yes":
+        return (+1.0*conf, ans, conf)
+    if ans == "no":
+        return (-1.0*conf, ans, conf)
+    return (0.0, ans, conf)
+
+def _fuse_scores(step2_cross_p: float, step3_parashari_p: float, step3_kp_signal: float,
+                 radicality_ok: bool, rp_bonus_cap: float = 0.06, rp_count: int = 0) -> Tuple[str, float, float]:
+    """
+    Combine Step 2 & Step 3 into a final 0..1 positivity and textual verdict.
+    """
+    # Base weights (transparent & tunable)
+    w_cross = 0.45
+    w_p_hor = 0.30
+    w_kp    = 0.25  # KP signal already in [-1..+1], we map it to 0..1 contribution below
+
+    # Map KP signal to 0..1 positivity
+    kp_pos = 0.5 + 0.5*step3_kp_signal
+
+    # Combine
+    pos = w_cross*step2_cross_p + w_p_hor*step3_parashari_p + w_kp*kp_pos
+
+    # Radicality nudge
+    if radicality_ok:
+        pos = min(1.0, pos * 1.10)
+
+    # RP (Ruling Planets) tiny bias (estimated via rp_count)
+    rp_nudge = min(rp_bonus_cap, 0.02 * max(0, rp_count))
+    pos = min(1.0, max(0.0, pos + rp_nudge))
+
+    # Verdict bands
+    if pos >= 0.66:
+        answer, conf = "yes", 0.70 + 0.30*(pos - 0.66)/(1.0-0.66)
+    elif pos <= 0.40:
+        answer, conf = "no",  0.70 + 0.30*(0.40 - pos)/0.40
     else:
-        answer = "uncertain"
-        confidence = 0.58 + abs(composite - 0.53) * 0.30
+        answer, conf = "uncertain", 0.58 + abs(pos - 0.53) * 0.30
 
-    # ---- Timing windows (heuristic)
-    q_timescales = (q_meta.get("timescales") or {})
-    # Prefer explicit question datetime if provided; else fallback to now UTC
-    q_date = inp.question_date or ""
-    q_time = inp.question_time or ""
-    q_tz   = inp.question_tz   or "UTC"
-    try:
-        from zoneinfo import ZoneInfo
-        dt_local = datetime.fromisoformat(f"{q_date}T{q_time}").replace(tzinfo=ZoneInfo(q_tz))
-        now_iso = dt_local.astimezone(timezone.utc).isoformat()
-    except Exception:
-        now_iso = datetime.now(timezone.utc).isoformat()
+    return answer, round(min(0.97, conf), 3), round(pos, 3)
 
-    timing = _rough_timing(
-        now_iso=now_iso,
-        composite=composite,
-        dasha_support=dasha_support,
-        qtype=qtype,
-        q_chart_snap=q_snap,
+# ---------------------------------------------------------------------------
+# Public analysis
+# ---------------------------------------------------------------------------
+
+def analyze_hybrid(inp: HybridPrasnaInput) -> Dict[str, Any]:
+    if not inp or not isinstance(inp, HybridPrasnaInput):
+        return {"ok": False, "system": "hybrid", "error": "invalid_input"}
+    if not inp.querent_birth:
+        return {"ok": False, "system": "hybrid", "error": "Querent birth data required"}
+
+    qtype = inp.question_type or QuestionType.JOB
+
+    # --- Build charts & houses
+    q_chart, q_houses, q_cusps = _build_question_bundle(inp)
+    b_chart, b_houses, b_cusps = _build_birth_bundle(inp.querent_birth, inp.house_system)
+
+    # Snapshots (for UI/debug)
+    q_snap = _snapshot(q_chart, q_cusps)
+    b_snap = _snapshot(b_chart, b_cusps)
+
+    # --- Step 1: Analyze BIRTH (Parāśarī + KP) with the SAME classical engines
+    # Build surrogate HoraryInput-like dicts for classical engines
+    b_parashari = parashari_classical(
+        inp=type("HI", (), dict(
+            date=inp.querent_birth.date, time=inp.querent_birth.time, tz_name=inp.querent_birth.tz_name,
+            place=inp.querent_birth.place, latitude=inp.querent_birth.latitude, longitude=inp.querent_birth.longitude,
+            zodiac_mode=inp.querent_birth.zodiac_mode, ayanamsa=inp.querent_birth.ayanamsa, ayanamsa_deg=None,
+            house_system=inp.house_system,
+            kp_house_system="placidus", kp_ayanamsa="krishnamurti", kp_number=None, kp_number_mode="anchor_asc",
+            question_type=qtype, question_text=None, querent_house=1, quesited_house=None
+        ))()
+    )
+    b_kp = kp_classical(
+        inp=type("HI", (), dict(
+            date=inp.querent_birth.date, time=inp.querent_birth.time, tz_name=inp.querent_birth.tz_name,
+            place=inp.querent_birth.place, latitude=inp.querent_birth.latitude, longitude=inp.querent_birth.longitude,
+            zodiac_mode=inp.querent_birth.zodiac_mode, ayanamsa=inp.querent_birth.ayanamsa, ayanamsa_deg=None,
+            house_system=inp.house_system,
+            kp_house_system="placidus", kp_ayanamsa="krishnamurti", kp_number=None, kp_number_mode="anchor_asc",
+            question_type=qtype, question_text=None, querent_house=1, quesited_house=None
+        ))()
     )
 
-    # ---- Radicality (FYI)
-    try:
-        rad = radicality_flags(q_chart, q_tz, q_date or now_iso[:10], q_time or now_iso[11:19])
-    except Exception:
-        rad = {"fits": True}
+    # --- Step 2: Parāśarī CROSS (birth ↔ question)
+    cross_p_score, cross_break, cross_grounds = _cross_score_parashari(
+        birth_chart=b_chart, birth_cusps=b_cusps,
+        q_chart=q_chart, q_cusps=q_cusps,
+        qtype=qtype
+    )
 
+    # --- Step 3: Analyze QUESTION (Parāśarī + KP) with classical engines
+    q_parashari = parashari_classical(
+        inp=type("HI", (), dict(
+            date=inp.question_date, time=inp.question_time, tz_name=inp.question_tz,
+            place=inp.question_place, latitude=inp.question_latitude, longitude=inp.question_longitude,
+            zodiac_mode=inp.zodiac_mode, ayanamsa=inp.ayanamsa, ayanamsa_deg=None,
+            house_system=inp.house_system,
+            kp_house_system="placidus", kp_ayanamsa="krishnamurti", kp_number=inp.__dict__.get("kp_number"),
+            kp_number_mode=inp.__dict__.get("kp_number_mode", "anchor_asc"),
+            question_type=qtype, question_text=inp.question_text, querent_house=1, quesited_house=None
+        ))()
+    )
+    q_kp = kp_classical(
+        inp=type("HI", (), dict(
+            date=inp.question_date, time=inp.question_time, tz_name=inp.question_tz,
+            place=inp.question_place, latitude=inp.question_latitude, longitude=inp.question_longitude,
+            zodiac_mode="sidereal", ayanamsa="krishnamurti", ayanamsa_deg=None,
+            house_system=inp.house_system,
+            kp_house_system="placidus", kp_ayanamsa="krishnamurti", kp_number=inp.__dict__.get("kp_number"),
+            kp_number_mode=inp.__dict__.get("kp_number_mode", "anchor_asc"),
+            question_type=qtype, question_text=inp.question_text, querent_house=1, quesited_house=None
+        ))()
+    )
+
+    # --- Grounds assembly for Step 1 & 3 Parāśarī/KP (for transparency)
+    mapping = ENHANCED_QUESTION_HOUSES.get(qtype, {})
+    b_parashari_grounds = _parashari_grounds_from_result(b_parashari, mapping) if b_parashari.get("ok") else {"for":[], "against":[], "conflicts":[], "notes":["birth parashari error"]}
+    b_kp_grounds        = _kp_grounds_from_result(b_kp) if b_kp.get("ok") else {"for":[], "against":[], "conflicts":[], "notes":["birth kp error"]}
+
+    q_parashari_grounds = _parashari_grounds_from_result(q_parashari, mapping) if q_parashari.get("ok") else {"for":[], "against":[], "conflicts":[], "notes":["question parashari error"]}
+    q_kp_grounds        = _kp_grounds_from_result(q_kp) if q_kp.get("ok") else {"for":[], "against":[], "conflicts":[], "notes":["question kp error"]}
+
+    # --- Radicality & RP info (for fusion nudges and grounds)
+    try:
+        rad = radicality_flags(q_chart, inp.question_tz or "UTC",
+                               inp.question_date or datetime.now(timezone.utc).date().isoformat(),
+                               inp.question_time or datetime.now(timezone.utc).time().replace(microsecond=0).isoformat())
+    except Exception:
+        rad = {"fits": False}
+    rp_list = (q_kp.get("kp_core", {}) or {}).get("ruling_planets", []) if q_kp.get("ok") else []
+    rp_support_count = len(rp_list)  # small bias cap applied in fusion
+
+    # --- Step 4: Fusion
+    step2_cross_pos = float(cross_p_score)
+    step3_parashari_pos = _parashari_positivity_from_result(q_parashari)
+    kp_signal, kp_answer, kp_conf = _kp_signed_signal(q_kp)
+
+    final_answer, final_conf, final_pos = _fuse_scores(
+        step2_cross_p=step2_cross_pos,
+        step3_parashari_p=step3_parashari_pos,
+        step3_kp_signal=kp_signal,
+        radicality_ok=bool(rad.get("fits")),
+        rp_count=rp_support_count
+    )
+
+    # Final grounds
+    fused_grounds = _fuse_grounds(
+        step2_p=cross_grounds,
+        step3_p=q_parashari_grounds,
+        step3_kp=q_kp_grounds,
+        kp_answer=kp_answer, kp_conf=kp_conf
+    )
+
+    # Return full structured response
     return {
         "ok": True,
         "system": "hybrid",
         "meta": {
             "question_type": qtype.value,
             "analysis_time_utc": datetime.now(timezone.utc).isoformat(),
-            "weights": W,
+            "house_system_used": inp.house_system,
+            "zodiac_mode_question": inp.zodiac_mode,
+            "ayanamsa_question": inp.ayanamsa,
             "radicality": rad,
         },
-        "charts": {
-            "birth":  b_snap,
-            "question": q_snap,
-            "house_system_used": inp.house_system,
-            "zodiac_mode": inp.zodiac_mode,
-            "ayanamsa": inp.ayanamsa,
+        "step1_birth": {
+            "parashari": b_parashari,
+            "kp": b_kp,
+            "grounds": {
+                "parashari": b_parashari_grounds,
+                "kp": b_kp_grounds,
+            },
+            "snapshot": b_snap,
         },
-        "scores": {
-            "birth_chart_relevance": round(birth_score, 3),
-            "question_chart_strength": round(ques_score, 3),
-            "dasha_support": round(dasha_support, 3),
-            "harmony": round(harmony, 3),
-            "composite": round(composite, 3),
-            "details": {
-                "birth_breakdown": birth_break,
-                "question_breakdown": ques_break,
-                "harmony_detail": harmony_detail,
-                "dasha_note": dasha_note,
-            }
+        "step2_cross_parashari": {
+            "score_0_1": round(step2_cross_pos, 3),
+            "breakdown": cross_break,
+            "grounds": cross_grounds,
         },
-        "evidence": {
-            "positives": positives,
-            "negatives": negatives,
-            "neutrals":  neutrals,
+        "step3_question": {
+            "parashari": q_parashari,
+            "kp": q_kp,
+            "grounds": {
+                "parashari": q_parashari_grounds,
+                "kp": q_kp_grounds,
+            },
+            "snapshot": q_snap,
         },
-        "timing": timing,
-        "judgement": {
-            "answer": answer,
-            "confidence": round(confidence, 3),
-            "reason": "Hybrid synthesis of birth potential and question-moment factors.",
-            "band_explanation": {
-                "yes_if":  ">0.66 composite",
-                "no_if":   "<0.40 composite",
-                "else":    "uncertain band",
-            }
+        "final": {
+            "answer": final_answer,
+            "confidence": final_conf,
+            "positivity_0_1": final_pos,
+            "grounds": fused_grounds,
+            "fusion_weights": {"cross_parashari": 0.45, "horary_parashari": 0.30, "kp": 0.25},
+            "fusion_notes": [
+                "KP signal converted to signed contribution (−1..+1) × confidence → mapped to 0..1.",
+                "Radicality fit adds ~10%; KP Ruling Planets add up to +0.06 in total.",
+                "If KP (high-conf) contradicts Parāśarī tone, conflict is surfaced in grounds."
+            ],
         },
         "notes": {
-            "disclaimer": "Timing windows are heuristic. For production, replace with full Vimshottari/transit engine.",
             "inputs_used": {
                 "question": {
                     "date": inp.question_date, "time": inp.question_time, "tz": inp.question_tz,
@@ -445,3 +556,4 @@ __all__ = [
     "analyze_hybrid",
     "analyze_hybrid_enhanced",
 ]
+
