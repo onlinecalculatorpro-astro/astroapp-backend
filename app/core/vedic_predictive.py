@@ -33,7 +33,7 @@ normalizers from `app.core.vedic_validator`, and then call the engines:
     ashtakavarga_from_payload(payload)          -> dict
 
 BONUS:
-    horary_from_payload(payload)                -> dict  # dispatches parashari/kp/hybrid to app.core.horary
+    horary_from_payload(payload)                -> dict  # dispatches parashari/kp/hybrid to *three* core modules via vedic_validator wiring.
 """
 
 from dataclasses import dataclass
@@ -47,7 +47,8 @@ from app.core.common_predictive import (
 )
 from app.core.ephem_singleton import TS, PLANETS  # TS is used for TT<->UTC conversions
 
-# ───────────────────────── Validator wiring (NEW) ────────────────────────────
+# ───────────────────────── Validator wiring (UPDATED) ─────────────────────────
+# We rely on vedic_validator both for normalization and for horary core dispatch
 try:
     from app.core.vedic_validator import (
         normalize_vim_payload,
@@ -57,11 +58,15 @@ try:
         normalize_stations_payload,
         normalize_shadbala_payload,
         normalize_ashtakavarga_payload,
-        normalize_horary_payload,  # <-- NEW
+        normalize_horary_payload,    # still exposed if callers want it directly
+        run_horary,                  # <-- dispatches to horary_shared + horary_classical + horary_hybrid
+        run_horary_from_norm,        # <-- optional: dispatch from a normalized dict
+        prepare_horary_inputs,       # <-- optional: build dataclass inputs
     )
     _VALIDATOR_OK = True
 except Exception:
     _VALIDATOR_OK = False
+    # fallbacks set below when needed
 
 # ───────────────────────── Gochar/Ingress/Stations ──────────────────────────
 _GOCHAR_OK = False
@@ -179,40 +184,6 @@ except Exception:
     _ASHTAKAVARGA_OK = False
     _compute_ashtakavarga = None  # type: ignore
 
-# ───────────────────────── Horary engines (NEW) ──────────────────────────────
-_HORARY_PAR_OK = _HORARY_KP_OK = _HORARY_HYB_OK = False
-_horary_parashari = _horary_kp = _horary_hybrid = None  # type: ignore
-try:
-    # Preferred names
-    from app.core.horary import analyze_parashari as _horary_parashari  # type: ignore
-    _HORARY_PAR_OK = True
-except Exception:
-    try:
-        from app.core.horary import compute_parashari as _horary_parashari  # type: ignore
-        _HORARY_PAR_OK = True
-    except Exception:
-        _HORARY_PAR_OK = False
-
-try:
-    from app.core.horary import analyze_kp as _horary_kp  # type: ignore
-    _HORARY_KP_OK = True
-except Exception:
-    try:
-        from app.core.horary import compute_kp as _horary_kp  # type: ignore
-        _HORARY_KP_OK = True
-    except Exception:
-        _HORARY_KP_OK = False
-
-try:
-    from app.core.horary import analyze_hybrid as _horary_hybrid  # type: ignore
-    _HORARY_HYB_OK = True
-except Exception:
-    try:
-        from app.core.horary import compute_hybrid as _horary_hybrid  # type: ignore
-        _HORARY_HYB_OK = True
-    except Exception:
-        _HORARY_HYB_OK = False
-
 
 __all__ = [
     # Dasha
@@ -242,8 +213,10 @@ __all__ = [
     "gochar_from_payload", "ingresses_rashi_from_payload",
     "ingresses_nakshatra_from_payload", "stations_from_payload",
     "shadbala_from_payload", "ashtakavarga_from_payload",
-    # NEW horary dispatcher
+    # NEW horary dispatcher (wired to the THREE core files via vedic_validator)
     "horary_from_payload",
+    # Optionally re-export these convenience builders if callers want them
+    "prepare_horary_inputs", "run_horary_from_norm",
 ]
 
 # =============================================================================
@@ -1086,7 +1059,6 @@ def compute_ashtakavarga(payload: Dict[str, Any] = None, **opts) -> Dict[str, An
 
 def compute_vargas_for_point(
     *,
-//
     lon_deg: float,
     zodiac_mode: Literal["tropical","sidereal"] = "sidereal",
     ayanamsa: Any = "lahiri",
@@ -1723,48 +1695,38 @@ def ashtakavarga_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return res
 
 # =============================================================================
-# NEW: HORARY DISPATCH (validator → app.core.horary engines)
+# NEW: HORARY DISPATCH (validator → THREE CORE MODULES via vedic_validator)
 # =============================================================================
 
 def horary_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Normalize with `normalize_horary_payload`, then dispatch to app.core.horary:
-      - method="parashari" -> analyze_parashari|compute_parashari
-      - method="kp"        -> analyze_kp|compute_kp
-      - method="hybrid"    -> analyze_hybrid|compute_hybrid
+    Dispatch Horary/Prasna with strict normalization and wiring to the three core modules:
+      - app.core.horary_shared (dataclasses & enums)
+      - app.core.horary_classical (Parāśarī / KP analyzers)
+      - app.core.horary_hybrid (Hybrid Prasna analyzer)
 
-    Returns {"ok": False, "error": "..."} if the appropriate engine is unavailable.
+    Implementation note:
+    We reuse `run_horary` from vedic_validator which:
+      • normalizes the payload (strict geocoding)
+      • builds the appropriate dataclass input for the selected method
+      • calls the correct core analyzer
+      • returns (result_dict, warns, tz_norm)
     """
     if not _VALIDATOR_OK:
         return {"ok": False, "error": "validator_unavailable"}
-    norm, warns, tz = normalize_horary_payload(payload)
-    if norm.get("fatal"):
-        return {"ok": False, "fatal": norm.get("fatal"), "warnings": warns, "system": "horary"}
 
-    method = (norm.get("method") or "parashari").lower()
     try:
-        if method == "parashari":
-            if not _HORARY_PAR_OK or _horary_parashari is None:  # type: ignore
-                return {"ok": False, "error": "horary_engine_unavailable:parashari", "warnings": warns}
-            res = _horary_parashari(norm)  # type: ignore[misc]
-        elif method == "kp":
-            if not _HORARY_KP_OK or _horary_kp is None:  # type: ignore
-                return {"ok": False, "error": "horary_engine_unavailable:kp", "warnings": warns}
-            res = _horary_kp(norm)  # type: ignore[misc]
-        elif method == "hybrid":
-            if not _HORARY_HYB_OK or _horary_hybrid is None:  # type: ignore
-                return {"ok": False, "error": "horary_engine_unavailable:hybrid", "warnings": warns}
-            res = _horary_hybrid(norm)  # type: ignore[misc]
-        else:
-            return {"ok": False, "error": f"unsupported_horary_method:{method}", "warnings": warns}
+        res, warns, _tz = run_horary(payload)  # uses all three core files internally
     except Exception as e:
-        return {"ok": False, "error": f"horary_engine_error:{method}:{e}", "warnings": warns, "input": {"method": method}}
+        return {"ok": False, "error": f"horary_dispatch_error:{e}"}
 
     if isinstance(res, dict):
         if warns:
             res.setdefault("warnings", []).extend(warns)
         res.setdefault("system", "horary")
-        res.setdefault("method", method)
+        # method is set by run_horary_from_norm, but setdefault for safety
+        res.setdefault("method", (payload.get("method") or payload.get("mode") or "parashari").lower())
         return res
-    # If the engine returns a non-dict (unlikely), wrap it.
-    return {"ok": True, "method": method, "result": res, "warnings": warns}
+
+    # If core returned a non-dict (unlikely), wrap it for API stability
+    return {"ok": True, "system": "horary", "method": str(payload.get("method") or "parashari").lower(), "result": res}
