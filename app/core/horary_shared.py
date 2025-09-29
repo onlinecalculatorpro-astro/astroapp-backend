@@ -1,47 +1,40 @@
 # -*- coding: utf-8 -*-
 """
-horary_shared.py — upgraded (2025-09-29)
----------------------------------------
-Shared utilities and dataclasses for Horary / Prashna analysis.
+horary_shared.py — unified Vedic/Prashna helpers (2025-09-29)
 
-What this module provides (system-agnostic)
-- Dataclasses:
-    • HoraryInput, QuerentBirthData, HybridPrasnaInput
-    • QuestionType enum
-- Question → house mappings (ENHANCED_QUESTION_HOUSES)
-- Zodiac helpers:
-    • deg_wrap, sign_index, sign_name_from_deg, lord_of_sign, angular_sep, is_sandhi
-- Planet sets, sign lords, dignity & relationships:
-    • PARASHARI_PLANETS, PLANETS_WITH_NODES, SIGN_LORDS
-    • MOOLATRIKONA, FRIENDS, ENEMIES
-    • COMBUST_DEG (approx), BENEFICS, MALEFICS
-- Dignity & aspects:
-    • calculate_aspects (Ptolemaic, Western)
-    • calc_dignity_simple (compat), calc_dignity_rich (optional richer score)
-- KP nakṣatra partitions:
-    • KP_STAR_ORDER, KP_DASHA_YEARS, STAR_LEN_DEG, TOTAL_DASHA
-    • kp_star_sub_sub (star→sub→sub-sub)
-    • kp_star_and_sublord (compat wrapper using kp_star_sub_sub)
-- Chart & Houses helpers:
-    • ensure_coords_and_tz(...)      -> (date, time, tz, lat, lon)
-    • build_chart(...)               -> compute_chart wrapper
-    • compute_houses_from_chart(..., house_system, zodiac_mode, ayanamsa_deg)
-        - Tries app.core.houses_advanced.compute_house_system (various JD signatures)
-        - Supports Whole-Sign (house_system="whole_sign")
-        - Fallback to Equal-from-ASC
-        - Applies sidereal shift to cusps as needed
-    • whole_sign_cusps_from_asc, rotate_cusps_to_target_asc
-    • safe_get_asc, safe_get_mc
-- Vedic dṛṣṭi helpers:
-    • graha_drishti_offsets, houses_aspected_by
-- Pañcāṅga mini-helpers:
-    • tithi_index (Moon–Sun elongation → 0..29), moon_star (star-lord of Moon)
-- Radicality:
-    • radicality_flags (ASC lord vs day/hour lord)
-
-Notes
-- Western aspects are provided for general use; Vedic graha-dṛṣṭi helpers are separate.
-- No system-specific judgement is implemented here.
+What this module provides
+-------------------------
+• Dataclasses & enums:
+    - HoraryInput, QuerentBirthData, HybridPrasnaInput
+    - QuestionType (Sanskrit, with legacy-English aliasing)
+• Traditional constants:
+    - SIGN_NAMES (Sanskrit) + SIGN_NAMES_EN (English)
+    - TRAD_PLANETS, RAHU_KETU, ALL_GRAHAS
+    - SIGN_LORDS, EXALTATION_SIGNS, MOOLATRIKONA_SIGNS
+    - NAKSHATRAS (27 + Abhijit), NAKSHATRA_LORDS
+    - VIMSHOTTARI_ORDER, VIMSHOTTARI_YEARS
+    - VEDIC_ASPECTS (graha dṛṣṭi), GANDANTA ranges (helpers provided)
+    - BENEFICS/MALEFICS, COMBUST_DEG
+• Zodiac math & dignity:
+    - deg_wrap, sign_index, sign_name_from_deg(lang="en"/"sa")
+    - lord_of_sign, angular_sep, is_sandhi, is_gandanta
+    - calculate_aspects (Ptolemaic), calc_dignity_simple / calc_dignity_rich
+• KP-like star/sub/ssub helpers:
+    - kp_star_sub_sub, kp_star_and_sublord (27-equal scheme; Abhijit is informational only)
+• Houses & charts:
+    - ensure_coords_and_tz, build_chart (wraps compute_chart)
+    - compute_houses_from_chart (tries strict JD → engine; fallback Equal)
+    - whole_sign_cusps_from_asc, rotate_cusps_to_target_asc, house_of
+    - safe_get_asc, safe_get_mc
+• Vedic dṛṣṭi utilities:
+    - graha_drishti_offsets, houses_aspected_by
+• Pañcāṅga mini:
+    - tithi_index, moon_star
+• Radicality (light):
+    - radicality_flags
+• Question mapping (classical + karakas):
+    - ENHANCED_QUESTION_HOUSES
+    - normalize_question_type / normalize_question_type_str
 """
 
 from __future__ import annotations
@@ -57,53 +50,37 @@ from app.core.astronomy import compute_chart, resolve_place
 from app.core.houses_advanced import compute_house_system  # requires JD(TT)/UT/UT1
 
 # =============================================================================
-# Constants & basic helpers
+# Enhanced Constants & Traditional Data
 # =============================================================================
 
 SIGN_NAMES = [
+    "Mesha","Vrishabha","Mithuna","Karkataka","Simha","Kanya",
+    "Tula","Vrishchika","Dhanus","Makara","Kumbha","Meena"
+]
+
+SIGN_NAMES_EN = [
     "Aries","Taurus","Gemini","Cancer","Leo","Virgo",
     "Libra","Scorpio","Sagittarius","Capricorn","Aquarius","Pisces"
 ]
 
-# 7 classical planets; nodes for KP/optional use elsewhere
-PARASHARI_PLANETS = ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn"]
-PLANETS_WITH_NODES = PARASHARI_PLANETS + ["Rahu","Ketu"]
+TRAD_PLANETS = ["Sun","Moon","Mars","Mercury","Jupiter","Venus","Saturn"]
+RAHU_KETU = ["Rahu","Ketu"]
+ALL_GRAHAS = TRAD_PLANETS + RAHU_KETU
 
-# Sign lords by sign index (0=Aries..11=Pisces)
+# Traditional dignities
 SIGN_LORDS: Dict[int, str] = {
     0: "Mars", 1: "Venus", 2: "Mercury", 3: "Moon", 4: "Sun", 5: "Mercury",
     6: "Venus", 7: "Mars", 8: "Jupiter", 9: "Saturn", 10: "Saturn", 11: "Jupiter"
 }
 
-# Mūlatrikoṇa (sign-level bonus; used by calc_dignity_rich)
-MOOLATRIKONA: Dict[str, Optional[int]] = {
-    "Sun": 4,      # Leo
-    "Moon": None,
-    "Mars": 0,     # Aries
-    "Mercury": 5,  # Virgo
-    "Jupiter": 8,  # Sagittarius
-    "Venus": 1,    # Taurus
-    "Saturn": 10,  # Aquarius
+EXALTATION_SIGNS: Dict[str, int] = {
+    "Sun": 0, "Moon": 1, "Mars": 9, "Mercury": 5,
+    "Jupiter": 3, "Venus": 11, "Saturn": 6
 }
 
-# Permanent friendship (simplified standard tables)
-FRIENDS: Dict[str, Set[str]] = {
-    "Sun": {"Moon","Mars","Jupiter"},
-    "Moon": {"Sun","Mercury"},
-    "Mars": {"Sun","Moon","Jupiter"},
-    "Mercury": {"Sun","Venus"},
-    "Jupiter": {"Sun","Moon","Mars"},
-    "Venus": {"Mercury","Saturn"},
-    "Saturn": {"Mercury","Venus"},
-}
-ENEMIES: Dict[str, Set[str]] = {
-    "Sun": {"Venus","Saturn"},
-    "Moon": set(),
-    "Mars": {"Mercury"},
-    "Mercury": {"Moon"},
-    "Jupiter": {"Venus","Mercury"},
-    "Venus": {"Sun","Moon"},
-    "Saturn": {"Sun","Moon"},
+MOOLATRIKONA_SIGNS: Dict[str, int] = {
+    "Sun": 4, "Moon": 1, "Mars": 0, "Mercury": 5,
+    "Jupiter": 8, "Venus": 6, "Saturn": 10
 }
 
 # Combustion thresholds (deg from Sun) — conservative defaults
@@ -111,36 +88,162 @@ COMBUST_DEG: Dict[str, float] = {
     "Moon": 12.0, "Mercury": 12.0, "Venus": 10.0, "Mars": 17.0, "Jupiter": 11.0, "Saturn": 15.0
 }
 
-# Simple benefic/malefic sets for heuristics
+# Simple benefic/malefic sets
 BENEFICS: Set[str] = {"Jupiter","Venus","Moon"}
-MALEFICS: Set[str] = {"Saturn","Mars","Sun","Rahu","Ketu"}  # Sun mild malefic in horary
+MALEFICS: Set[str] = {"Saturn","Mars","Sun","Rahu","Ketu"}  # Sun often treated mild malefic in horary
 
-# KP nakṣatra cycle & spans
-KP_STAR_ORDER = ["Ketu","Venus","Sun","Moon","Mars","Rahu","Jupiter","Saturn","Mercury"]
-KP_DASHA_YEARS = {"Ketu":7,"Venus":20,"Sun":6,"Moon":10,"Mars":7,"Rahu":18,"Jupiter":16,"Saturn":19,"Mercury":17}
-STAR_LEN_DEG: float = 360.0 / 27.0   # 13°20′
+# Nakshatra system (27 regular + Abhijit informational; KP math uses 27 equal)
+NAKSHATRAS = [
+    "Ashwini","Bharani","Krittika","Rohini","Mrigashirsha","Ardra","Punarvasu",
+    "Pushya","Ashlesha","Magha","Purva Phalguni","Uttara Phalguni","Hasta",
+    "Chitra","Swati","Vishakha","Anuradha","Jyeshtha","Mula","Purva Ashadha",
+    "Uttara Ashadha","Shravana","Dhanishta","Shatabhisha","Purva Bhadrapada",
+    "Uttara Bhadrapada","Revati","Abhijit"
+]
+
+NAKSHATRA_LORDS = [
+    "Ketu","Venus","Sun","Moon","Mars","Rahu","Jupiter",
+    "Saturn","Mercury","Ketu","Venus","Sun","Moon",
+    "Mars","Rahu","Jupiter","Saturn","Mercury","Ketu",
+    "Venus","Sun","Moon","Mars","Rahu","Jupiter",
+    "Saturn","Mercury","Sun"  # Abhijit (traditional lore; not part of 27-equal KP)
+]
+
+# Gandanta (last/first 3.6° of Cancer↔Leo, Scorpio↔Sagittarius, Pisces↔Aries)
+GANDANTA_WATER_SIGNS = {3, 7, 11}  # Cancer, Scorpio, Pisces
+GANDANTA_FIRE_SIGNS  = {4, 8, 0}   # Leo, Sagittarius, Aries
+GANDANTA_WINDOW_DEG = 3.6
+
+# Traditional Vedic aspects (graha dṛṣṭi) — sign-based offsets from planet's house
+VEDIC_ASPECTS: Dict[str, List[int]] = {
+    "Sun": [7], "Moon": [7], "Mercury": [7], "Venus": [7],
+    "Mars": [4,7,8], "Jupiter": [5,7,9], "Saturn": [3,7,10],
+    "Rahu": [5,7,9], "Ketu": [5,7,9]
+}
+
+# Vimshottari dasha sequence and years
+VIMSHOTTARI_ORDER = ["Ketu","Venus","Sun","Moon","Mars","Rahu","Jupiter","Saturn","Mercury"]
+VIMSHOTTARI_YEARS = {"Ketu":7, "Venus":20, "Sun":6, "Moon":10, "Mars":7, "Rahu":18, "Jupiter":16, "Saturn":19, "Mercury":17}
+STAR_LEN_DEG: float = 360.0 / 27.0
 TOTAL_DASHA: float = 120.0
 
-# Pañcāṅga tithi labels (index 0..29)
-TITHI_NAMES = [
-    "Pratipada","Dvitiya","Tritiya","Chaturthi","Panchami","Shashthi","Saptami","Ashtami","Navami","Dashami",
-    "Ekadashi","Dwadashi","Trayodashi","Chaturdashi","Purnima/Amavasya",
-]*2
+# =============================================================================
+# Question Types (Classical + Legacy Aliases)
+# =============================================================================
+
+class QuestionType(Enum):
+    # Classical Sanskrit taxonomy
+    DHANA   = "dhana"        # wealth/finances (2)
+    SAHAJA  = "sahaja"       # siblings/effort (3)
+    GRIHA   = "griha"        # home/property (4)
+    SANTANA = "santana"      # children (5)
+    ROGA    = "roga"         # health (1/6)
+    KALATRA = "kalatra"      # marriage/spouse (7)
+    MRITYU  = "mrityu"       # longevity/transformations (8)
+    VIDYA   = "vidya"        # education (4/5)
+    KARMA   = "karma"        # profession (10)
+    LABHA   = "labha"        # gains (11)
+    VYAYA   = "vyaya"        # losses (12)
+    PRAVASA = "pravasa"      # travel/foreign (12/9)
+    YUDDHA  = "yuddha"       # conflict/litigation (6)
+    NASHTA  = "nashta"       # lost objects (2)
+
+    # Legacy English (kept for compatibility with older callers)
+    JOB        = "job"
+    MARRIAGE   = "marriage"
+    LITIGATION = "litigation"
+    HEALTH     = "health"
+    LOST_ITEM  = "lost_item"
+    PROPERTY   = "property"
+    FOREIGN    = "foreign"
+    EDUCATION  = "education"
+    CHILDREN   = "children"
+    BUSINESS   = "business"
+
+# Map legacy English → canonical Sanskrit
+_QUESTION_ALIASES: Dict[QuestionType, QuestionType] = {
+    QuestionType.JOB:        QuestionType.KARMA,
+    QuestionType.MARRIAGE:   QuestionType.KALATRA,
+    QuestionType.LITIGATION: QuestionType.YUDDHA,
+    QuestionType.HEALTH:     QuestionType.ROGA,
+    QuestionType.LOST_ITEM:  QuestionType.NASHTA,
+    QuestionType.PROPERTY:   QuestionType.GRIHA,
+    QuestionType.FOREIGN:    QuestionType.PRAVASA,
+    QuestionType.EDUCATION:  QuestionType.VIDYA,
+    QuestionType.CHILDREN:   QuestionType.SANTANA,
+    QuestionType.BUSINESS:   QuestionType.KARMA,  # many schools also use 7th; tune if needed
+}
+
+def normalize_question_type(q: QuestionType) -> QuestionType:
+    return _QUESTION_ALIASES.get(q, q)
+
+def normalize_question_type_str(s: str) -> QuestionType:
+    """Accept either Sanskrit/English strings and return enum."""
+    key = str(s or "").strip().lower()
+    # First try exact enum values
+    for qt in QuestionType:
+        if qt.value == key:
+            return normalize_question_type(qt)
+    # Heuristics
+    table = {
+        "wealth":"dhana", "money":"dhana", "finance":"dhana",
+        "siblings":"sahaja", "effort":"sahaja", "property":"griha", "home":"griha",
+        "children":"santana", "progeny":"santana",
+        "health":"roga", "disease":"roga",
+        "marriage":"kalatra", "spouse":"kalatra", "relationship":"kalatra",
+        "longevity":"mrityu", "death":"mrityu",
+        "education":"vidya", "study":"vidya", "studies":"vidya",
+        "career":"karma", "profession":"karma", "job":"karma", "business":"karma",
+        "gains":"labha", "income":"labha",
+        "loss":"vyaya", "expenses":"vyaya",
+        "foreign":"pravasa", "travel":"pravasa",
+        "conflict":"yuddha", "litigation":"yuddha", "lawsuit":"yuddha",
+        "lost":"nashta", "lost_item":"nashta"
+    }
+    mapped = table.get(key, key)
+    for qt in QuestionType:
+        if qt.value == mapped:
+            return normalize_question_type(qt)
+    # Default
+    return QuestionType.KARMA
+
+# Enhanced question-house mappings (classical + karaka list)
+ENHANCED_QUESTION_HOUSES: Dict[QuestionType, Dict[str, List[int]]] = {
+    QuestionType.DHANA:     {"primary":[2],    "secondary":[11,9],  "supportive":[1,5,10], "obstructive":[6,8,12], "karaka":["Jupiter","Mercury"]},
+    QuestionType.SAHAJA:    {"primary":[3],    "secondary":[1,11],  "supportive":[5,9],    "obstructive":[6,8,12], "karaka":["Mars"]},
+    QuestionType.GRIHA:     {"primary":[4],    "secondary":[2,11],  "supportive":[1,9,10], "obstructive":[6,8,12], "karaka":["Moon","Mars"]},
+    QuestionType.SANTANA:   {"primary":[5],    "secondary":[1,9],   "supportive":[2,7,11], "obstructive":[6,8,12], "karaka":["Jupiter"]},
+    QuestionType.ROGA:      {"primary":[1,6],  "secondary":[8],     "supportive":[9,10],   "obstructive":[2,12],   "karaka":["Sun","Mars"]},
+    QuestionType.KALATRA:   {"primary":[7],    "secondary":[2,8],   "supportive":[1,5,11], "obstructive":[6,12],   "karaka":["Venus"]},
+    QuestionType.MRITYU:    {"primary":[8],    "secondary":[3,12],  "supportive":[1,9],    "obstructive":[2,6],    "karaka":["Saturn"]},
+    QuestionType.VIDYA:     {"primary":[4,5],  "secondary":[2,9],   "supportive":[1,10],   "obstructive":[6,8,12], "karaka":["Mercury","Jupiter"]},
+    QuestionType.KARMA:     {"primary":[10],   "secondary":[6,2],   "supportive":[1,9,11], "obstructive":[8,12],   "karaka":["Sun","Mercury","Saturn"]},
+    QuestionType.LABHA:     {"primary":[11],   "secondary":[2,9],   "supportive":[1,5,10], "obstructive":[6,8,12], "karaka":["Jupiter"]},
+    QuestionType.VYAYA:     {"primary":[12],   "secondary":[8,9],   "supportive":[1,4],    "obstructive":[2,6],    "karaka":["Saturn"]},
+    QuestionType.PRAVASA:   {"primary":[12,9], "secondary":[3,7],   "supportive":[1,11],   "obstructive":[2,4,8],  "karaka":["Moon","Rahu"]},
+    QuestionType.YUDDHA:    {"primary":[6],    "secondary":[8,3],   "supportive":[1,10],   "obstructive":[7,12],   "karaka":["Mars"]},
+    QuestionType.NASHTA:    {"primary":[2],    "secondary":[4,8],   "supportive":[1,11],   "obstructive":[6,12],   "karaka":["Mercury"]},
+}
+
+def get_question_profile(q: QuestionType) -> Dict[str, List[int]]:
+    return ENHANCED_QUESTION_HOUSES[normalize_question_type(q)]
 
 # =============================================================================
-# Math & zodiac helpers
+# Math & Zodiac helpers
 # =============================================================================
 
 def deg_wrap(x: float) -> float:
-    return (x % 360.0 + 360.0) % 360.0
+    r = math.fmod(float(x), 360.0)
+    return r + 360.0 if r < 0.0 else (0.0 if abs(r) < 1e-12 else r)
 
 def sign_index(deg: float) -> int:
-    return int(deg_wrap(deg) // 30)
+    return int(deg_wrap(deg) // 30) % 12
 
-def sign_name_from_deg(deg: Optional[float]) -> Optional[str]:
+def sign_name_from_deg(deg: Optional[float], *, lang: str = "en") -> Optional[str]:
     if deg is None:
         return None
-    return SIGN_NAMES[sign_index(float(deg))]
+    idx = sign_index(float(deg))
+    return (SIGN_NAMES_EN if lang.lower().startswith("en") else SIGN_NAMES)[idx]
 
 def lord_of_sign(deg: float) -> str:
     return SIGN_LORDS[sign_index(deg)]
@@ -150,77 +253,100 @@ def angular_sep(a: float, b: float) -> float:
     return d if d <= 180.0 else 360.0 - d
 
 def is_sandhi(deg: float, window: float = 1.0) -> bool:
-    """Near sign boundary within `window` degrees."""
+    """Within `window` degrees of any sign boundary."""
     d = deg_wrap(deg) % 30.0
     return (d < window) or (30.0 - d < window)
 
+def is_gandanta(deg: float, window: float = GANDANTA_WINDOW_DEG) -> bool:
+    """True if in last/first `window` degrees of Cancer↔Leo, Scorpio↔Sagittarius, Pisces↔Aries."""
+    idx = sign_index(deg)
+    pos = deg_wrap(deg) % 30.0
+    if idx in GANDANTA_WATER_SIGNS:
+        return pos >= (30.0 - window)
+    if idx in GANDANTA_FIRE_SIGNS:
+        return pos <= window
+    return False
+
 # =============================================================================
-# Aspects (Western/Ptolemaic — for general use)
+# Aspects (Western/Ptolemaic — general use)
 # =============================================================================
 
 def calculate_aspects(long1: float, long2: float) -> Tuple[float, Optional[str]]:
     """Loose Ptolemaic aspects; returns (sep_degrees, aspect_name|None)."""
-    diff = abs(deg_wrap(long1 - long2))
-    if diff > 180: diff = 360 - diff
-    for deg, orb, name in [
-        (0,8,"conjunction"), (60,6,"sextile"),
-        (90,8,"square"),     (120,8,"trine"),
-        (180,8,"opposition")
-    ]:
-        if abs(diff - deg) <= orb:
+    diff = angular_sep(long1, long2)
+    for deg0, orb, name in [(0,8,"conjunction"), (60,6,"sextile"), (90,8,"square"), (120,8,"trine"), (180,8,"opposition")]:
+        if abs(diff - deg0) <= orb:
             return diff, name
     return diff, None
 
-# Simple dignity (compat) — classic own/exalt/fall
+# Simple dignity — own/exalt/fall
 def calc_dignity_simple(longitude: float, planet: str) -> float:
     s = sign_index(longitude)
-    exalt = {"Sun": 0, "Moon": 1, "Mars": 9, "Mercury": 5, "Jupiter": 3, "Venus": 11, "Saturn": 6}
+    exalt = EXALTATION_SIGNS
     own   = {"Sun":[4], "Moon":[3], "Mars":[0,7], "Mercury":[2,5], "Jupiter":[8,11], "Venus":[1,6], "Saturn":[9,10]}
     if planet in exalt and s == exalt[planet]: return 2.0
     if planet in own and s in own[planet]:     return 1.0
     if planet in exalt and s == (exalt[planet] + 6) % 12: return -2.0
     return 0.0
 
-# Richer dignity (optional): adds moolatrikona, friend/enemy, sandhi
+# Richer dignity — adds moolatrikona, friend/enemy, sandhi/gandanta penalties
+_FRIENDS = {
+    "Sun":{"Moon","Mars","Jupiter"},
+    "Moon":{"Sun","Mercury"},
+    "Mars":{"Sun","Moon","Jupiter"},
+    "Mercury":{"Sun","Venus"},
+    "Jupiter":{"Sun","Moon","Mars"},
+    "Venus":{"Mercury","Saturn"},
+    "Saturn":{"Mercury","Venus"},
+}
+_ENEMIES = {
+    "Sun":{"Venus","Saturn"},
+    "Moon":set(),
+    "Mars":{"Mercury"},
+    "Mercury":{"Moon"},
+    "Jupiter":{"Venus","Mercury"},
+    "Venus":{"Sun","Moon"},
+    "Saturn":{"Sun","Moon"},
+}
+
 def calc_dignity_rich(longitude: float, planet: str) -> float:
     sidx = sign_index(longitude)
     dign = 0.0
-    exalt = {"Sun": 0, "Moon": 2, "Mars": 9, "Mercury": 5, "Jupiter": 3, "Venus": 11, "Saturn": 6}
-    own   = {"Sun":[4], "Moon":[3], "Mars":[0,7], "Mercury":[2,5], "Jupiter":[8,11], "Venus":[1,6], "Saturn":[9,10]}
-    if planet in exalt and sidx == exalt[planet]: dign += 2.0
-    elif planet in exalt and sidx == (exalt[planet] + 6) % 12: dign -= 2.0
+    if planet in EXALTATION_SIGNS:
+        if sidx == EXALTATION_SIGNS[planet]: dign += 2.0
+        elif sidx == (EXALTATION_SIGNS[planet] + 6) % 12: dign -= 2.0
+    own = {"Sun":[4], "Moon":[3], "Mars":[0,7], "Mercury":[2,5], "Jupiter":[8,11], "Venus":[1,6], "Saturn":[9,10]}
     if planet in own and sidx in own[planet]: dign += 1.0
-    if MOOLATRIKONA.get(planet) is not None and sidx == MOOLATRIKONA[planet]: dign += 0.75
+    if planet in MOOLATRIKONA_SIGNS and sidx == MOOLATRIKONA_SIGNS[planet]: dign += 0.75
     lord = SIGN_LORDS[sidx]
-    if planet in FRIENDS and lord in FRIENDS[planet]: dign += 0.5
-    if planet in ENEMIES and lord in ENEMIES[planet]: dign -= 0.5
+    if planet in _FRIENDS and lord in _FRIENDS[planet]: dign += 0.5
+    if planet in _ENEMIES and lord in _ENEMIES[planet]: dign -= 0.5
     if is_sandhi(longitude, 1.0): dign -= 0.2
+    if is_gandanta(longitude): dign -= 0.4
     return dign
 
 # =============================================================================
-# KP nakṣatra star/sub/sub-sub
+# KP / Nakshatra star/sub/sub-sub (27-equal only)
 # =============================================================================
 
 def kp_star_sub_sub(ecl_deg_sidereal: float) -> Tuple[str, str, str, float, float, float, float]:
     """
-    Returns:
-      (star_lord, sub_lord, sub_sub_lord, star_span_deg, pos_in_star_deg, sub_span_deg, pos_in_sub_deg)
-    Proportions follow Vimśottari years at each level, cycling from the governing lord.
+    Returns: (star_lord, sub_lord, sub_sub_lord, star_span_deg, pos_in_star_deg, sub_span_deg, pos_in_sub_deg)
     """
     pos = deg_wrap(ecl_deg_sidereal)
     star_idx = int(pos // STAR_LEN_DEG)  # 0..26
-    star_lord = KP_STAR_ORDER[star_idx % 9]
+    star_lord = VIMSHOTTARI_ORDER[star_idx % 9]
     pos_in_star = pos - STAR_LEN_DEG * star_idx
 
     # Sub level
-    start_i = KP_STAR_ORDER.index(star_lord)
-    cycle = KP_STAR_ORDER[start_i:] + KP_STAR_ORDER[:start_i]
+    start_i = VIMSHOTTARI_ORDER.index(star_lord)
+    cycle = VIMSHOTTARI_ORDER[start_i:] + VIMSHOTTARI_ORDER[:start_i]
     acc = 0.0
-    sub_lord = KP_STAR_ORDER[-1]
+    sub_lord = cycle[-1]
     sub_start = 0.0
     sub_span = STAR_LEN_DEG
     for lord in cycle:
-        portion = STAR_LEN_DEG * (KP_DASHA_YEARS[lord] / TOTAL_DASHA)
+        portion = STAR_LEN_DEG * (VIMSHOTTARI_YEARS[lord] / TOTAL_DASHA)
         if pos_in_star < acc + portion:
             sub_lord = lord
             sub_start = acc
@@ -229,12 +355,12 @@ def kp_star_sub_sub(ecl_deg_sidereal: float) -> Tuple[str, str, str, float, floa
         acc += portion
     pos_in_sub = pos_in_star - sub_start
 
-    # Sub-sub level (SSL)
-    cycle2 = KP_STAR_ORDER[KP_STAR_ORDER.index(sub_lord):] + KP_STAR_ORDER[:KP_STAR_ORDER.index(sub_lord)]
+    # Sub-sub level
+    cycle2 = VIMSHOTTARI_ORDER[VIMSHOTTARI_ORDER.index(sub_lord):] + VIMSHOTTARI_ORDER[:VIMSHOTTARI_ORDER.index(sub_lord)]
     acc2 = 0.0
-    ssl = KP_STAR_ORDER[-1]
+    ssl = cycle2[-1]
     for lord in cycle2:
-        portion2 = sub_span * (KP_DASHA_YEARS[lord] / TOTAL_DASHA)
+        portion2 = sub_span * (VIMSHOTTARI_YEARS[lord] / TOTAL_DASHA)
         if pos_in_sub < acc2 + portion2:
             ssl = lord
             break
@@ -243,10 +369,6 @@ def kp_star_sub_sub(ecl_deg_sidereal: float) -> Tuple[str, str, str, float, floa
     return (star_lord, sub_lord, ssl, STAR_LEN_DEG, pos_in_star, sub_span, pos_in_sub)
 
 def kp_star_and_sublord(ecl_deg_sidereal: float) -> Tuple[str, str, float, float]:
-    """
-    Compatibility wrapper around kp_star_sub_sub(..).
-    Returns: (star_lord, sub_lord, star_span_deg, pos_within_star_deg)
-    """
     star, sub, _ssl, star_span, pos_in_star, _sub_span, _pos_in_sub = kp_star_sub_sub(ecl_deg_sidereal)
     return (star, sub, star_span, pos_in_star)
 
@@ -255,7 +377,7 @@ def kp_star_and_sublord(ecl_deg_sidereal: float) -> Tuple[str, str, float, float
 # =============================================================================
 
 def shift_sidereal(values: List[float], ay_deg: float) -> List[float]:
-    """Shift ecliptic longitudes by -ayanamsa (tropical→sidereal)."""
+    """Shift tropical ecliptic longitudes by -ayanamsa → sidereal."""
     return [deg_wrap(v - ay_deg) for v in values]
 
 def house_of(long_deg: float, cusps_deg: List[float]) -> int:
@@ -280,7 +402,7 @@ def whole_sign_cusps_from_asc(asc_deg: float) -> List[float]:
     return [deg_wrap(first + 30.0 * i) for i in range(12)]
 
 def rotate_cusps_to_target_asc(cusps: List[float], current_asc: float, target_asc: float) -> List[float]:
-    """Rotate all cusps so that ASC becomes `target_asc` (KP number anchoring)."""
+    """Rotate all cusps so that ASC becomes `target_asc` (for KP 'number' anchoring)."""
     delta = deg_wrap(target_asc - current_asc)
     return [deg_wrap(c + delta) for c in cusps]
 
@@ -289,21 +411,13 @@ def rotate_cusps_to_target_asc(cusps: List[float], current_asc: float, target_as
 # =============================================================================
 
 def graha_drishti_offsets(planet: str, include_nodes_special: bool = True) -> Set[int]:
-    """
-    Returns house offsets (1..12 relative to planet's house) that receive aspect.
-    Everyone: 7th; Mars: 4th & 8th; Jupiter: 5th & 9th; Saturn: 3rd & 10th;
-    Nodes (optional): 5th & 9th in some traditions.
-    """
-    base = {7}
-    if planet == "Mars":
-        base |= {4, 8}
-    elif planet == "Jupiter":
-        base |= {5, 9}
-    elif planet == "Saturn":
-        base |= {3, 10}
-    elif include_nodes_special and planet in {"Rahu","Ketu"}:
-        base |= {5, 9}
-    return base
+    """Returns house offsets (1..12) receiving aspect."""
+    if planet in VEDIC_ASPECTS:
+        offs = set(VEDIC_ASPECTS[planet])
+        if not include_nodes_special and planet in {"Rahu","Ketu"}:
+            offs = {7}
+        return offs
+    return {7}
 
 def houses_aspected_by(planet_name: str, cusps: List[float], bodies: Dict[str, Any],
                        include_nodes_special: bool = True) -> Set[int]:
@@ -312,7 +426,8 @@ def houses_aspected_by(planet_name: str, cusps: List[float], bodies: Dict[str, A
     `bodies` should map planet name -> payload with 'longitude_deg'.
     """
     p = bodies.get(planet_name)
-    if not p: return set()
+    if not p:
+        return set()
     try:
         lon = float(p.get("longitude_deg"))
     except Exception:
@@ -372,12 +487,14 @@ def build_chart(
 ) -> Dict[str, Any]:
     """
     Wrapper over compute_chart with safe defaults for missing dt/place/coords.
+    NOTE: compute_chart expects 'mode' (not 'zodiac_mode').
     """
     d, t, tzr, la, lo = ensure_coords_and_tz(date, time, tz, place, latitude, longitude)
     return compute_chart({
         "date": d, "time": t, "tz": tzr,
         "place": place, "latitude": la, "longitude": lo,
-        "zodiac_mode": zodiac_mode, "ayanamsa": ayanamsa,
+        "mode": zodiac_mode,                 # ← REQUIRED key for astronomy.compute_chart
+        "ayanamsa": ayanamsa,
         "topocentric": bool(topocentric),
     })
 
@@ -528,9 +645,11 @@ def tithi_index(moon_deg: Optional[float], sun_deg: Optional[float]) -> Optional
     return int(el // 12.0)
 
 def moon_star(chart: Dict[str, Any]) -> Optional[str]:
-    """Return the nakṣatra lord (star-lord) of the Moon, if available."""
+    """Return the nakshatra lord (star-lord) of the Moon, if available (sidereal)."""
     moon = next((b for b in chart.get("bodies", []) if b.get("name") == "Moon"), None)
-    if not moon: return None
+    if not moon:
+        return None
+    # If chart is tropical, this yields tropical star — caller should pass sidereal Moon.
     star, *_ = kp_star_sub_sub(float(moon["longitude_deg"]))
     return star
 
@@ -568,32 +687,6 @@ def radicality_flags(chart: Dict[str, Any], tz_name: str, date: str, time_: str)
 # =============================================================================
 # Dataclasses / Inputs
 # =============================================================================
-
-class QuestionType(Enum):
-    JOB = "job"
-    MARRIAGE = "marriage"
-    LITIGATION = "litigation"
-    HEALTH = "health"
-    LOST_ITEM = "lost_item"
-    PROPERTY = "property"
-    FOREIGN = "foreign"
-    EDUCATION = "education"
-    CHILDREN = "children"
-    BUSINESS = "business"
-
-# Richer house mapping for Parāśarī & KP decisions
-ENHANCED_QUESTION_HOUSES: Dict[QuestionType, Dict[str, List[int]]] = {
-    QuestionType.JOB:        {"primary":[10],      "secondary":[6,2],  "supportive":[9,11], "obstructive":[12,8]},
-    QuestionType.MARRIAGE:   {"primary":[7],       "secondary":[2,11], "supportive":[1,5,9], "obstructive":[6,8,12]},
-    QuestionType.LITIGATION: {"primary":[6],       "secondary":[8,12], "supportive":[1,9,10], "obstructive":[7,11]},
-    QuestionType.HEALTH:     {"primary":[1],       "secondary":[5,9],  "supportive":[10,11], "obstructive":[6,8,12]},
-    QuestionType.LOST_ITEM:  {"primary":[2],       "secondary":[4,11], "supportive":[1,5,9], "obstructive":[8,12]},
-    QuestionType.EDUCATION:  {"primary":[4,5],     "secondary":[2,9],  "supportive":[1,10,11], "obstructive":[6,8,12]},
-    QuestionType.CHILDREN:   {"primary":[5],       "secondary":[1,9],  "supportive":[2,7,11], "obstructive":[6,8,12]},
-    QuestionType.PROPERTY:   {"primary":[4],       "secondary":[2,11], "supportive":[1,5,9], "obstructive":[6,8,12]},
-    QuestionType.FOREIGN:    {"primary":[12],      "secondary":[7,9],  "supportive":[3,11],   "obstructive":[2,4]},
-    QuestionType.BUSINESS:   {"primary":[7],       "secondary":[3,10], "supportive":[2,11],   "obstructive":[6,8,12]},
-}
 
 @dataclass
 class HoraryInput:
@@ -664,34 +757,35 @@ class HybridPrasnaInput:
 
 __all__ = [
     # Dataclasses & enums
-    "HoraryInput", "QuerentBirthData", "HybridPrasnaInput", "QuestionType",
-    "ENHANCED_QUESTION_HOUSES",
+    "HoraryInput","QuerentBirthData","HybridPrasnaInput","QuestionType",
+    "ENHANCED_QUESTION_HOUSES","normalize_question_type","normalize_question_type_str","get_question_profile",
 
     # Planet sets & constants
-    "PARASHARI_PLANETS", "PLANETS_WITH_NODES",
-    "SIGN_NAMES", "SIGN_LORDS", "MOOLATRIKONA", "FRIENDS", "ENEMIES",
-    "COMBUST_DEG", "BENEFICS", "MALEFICS",
+    "TRAD_PLANETS","RAHU_KETU","ALL_GRAHAS",
+    "SIGN_NAMES","SIGN_NAMES_EN","SIGN_LORDS","EXALTATION_SIGNS","MOOLATRIKONA_SIGNS",
+    "COMBUST_DEG","BENEFICS","MALEFICS",
+    "NAKSHATRAS","NAKSHATRA_LORDS","VIMSHOTTARI_ORDER","VIMSHOTTARI_YEARS","STAR_LEN_DEG","TOTAL_DASHA",
+    "VEDIC_ASPECTS","GANDANTA_WINDOW_DEG","is_gandanta",
 
     # Helpers
-    "deg_wrap", "sign_index", "sign_name_from_deg", "lord_of_sign",
-    "angular_sep", "is_sandhi",
-    "calculate_aspects", "calc_dignity_simple", "calc_dignity_rich",
+    "deg_wrap","sign_index","sign_name_from_deg","lord_of_sign",
+    "angular_sep","is_sandhi",
+    "calculate_aspects","calc_dignity_simple","calc_dignity_rich",
 
     # KP
-    "KP_STAR_ORDER", "KP_DASHA_YEARS", "STAR_LEN_DEG", "TOTAL_DASHA",
-    "kp_star_sub_sub", "kp_star_and_sublord",
+    "kp_star_sub_sub","kp_star_and_sublord",
 
     # Houses & zodiac
-    "shift_sidereal", "house_of", "whole_sign_cusps_from_asc", "rotate_cusps_to_target_asc",
+    "shift_sidereal","house_of","whole_sign_cusps_from_asc","rotate_cusps_to_target_asc",
 
     # Vedic drishti
-    "graha_drishti_offsets", "houses_aspected_by",
+    "graha_drishti_offsets","houses_aspected_by",
 
     # Chart/Houses
-    "ensure_coords_and_tz", "build_chart", "compute_houses_from_chart", "safe_get_asc", "safe_get_mc",
+    "ensure_coords_and_tz","build_chart","compute_houses_from_chart","safe_get_asc","safe_get_mc",
 
     # Pañcāṅga
-    "tithi_index", "moon_star",
+    "tithi_index","moon_star",
 
     # Radicality
     "radicality_flags",
