@@ -6,6 +6,7 @@ Vedic API — Payload normalization & validation (strict geocoding; core-wired)
 
 Public API
 ----------
+    # Normalizers (unchanged signatures)
     normalize_vim_payload(payload)          -> (norm, warns, tz_norm)
     normalize_yoga_payload(payload)         -> (norm, warns, tz_norm)
 
@@ -18,8 +19,13 @@ Public API
     normalize_shadbala_payload(payload)     -> (norm, warns, tz_norm)
     normalize_ashtakavarga_payload(payload) -> (norm, warns, tz_norm)
 
-    # Horary / Prasna (Parāśari + KP + Hybrid):
+    # Horary / Prasna (Parāśarī + KP + Hybrid):
     normalize_horary_payload(payload)       -> (norm, warns, tz_norm)
+
+    # NEW — Core wiring helpers (optional convenience):
+    prepare_horary_inputs(payload)          -> (method, core_input, warns, tz_norm)   # dataclass for the chosen method
+    run_horary(payload)                     -> (result_dict, warns, tz_norm)          # normalize + dispatch to core
+    run_horary_from_norm(norm)              -> result_dict                            # dispatch using normalized dict
 
 Key policies
 ------------
@@ -28,8 +34,23 @@ Key policies
   (preferred: app.core.geocoding.resolve_place; fallback: app.core.astronomy.resolve_place)
   — even if lat/lon/tz were also provided. On failure, we return a fatal reason.
 • Timescales helper used where appropriate (no jd leak to other systems).
-• Ashtakavarga: passes through `ruleset` and validated `ruleset_map` to core;
+• Aṣṭakavarga: passes through `ruleset` and validated `ruleset_map` to core;
   accepts optional `angles` {asc, mc}.
+
+Core wiring
+-----------
+This module can (optionally) call your core horary analyzers if available:
+
+- app.core.horary_shared:
+    • HoraryInput, HybridPrasnaInput, QuerentBirthData, QuestionType
+- app.core.horary_classical:
+    • analyze_parashari(HoraryInput), analyze_kp(HoraryInput)
+- app.core.horary_hybrid:
+    • analyze_hybrid_enhanced(HybridPrasnaInput)  # preferred
+      (falls back to analyze_hybrid if enhanced not present)
+
+If these modules are missing at import time, run_horary* helpers will return
+a clear error dict {ok: False, error: "horary_cores_unavailable"}.
 """
 
 from typing import Any, Dict, List, Optional, Tuple, Union, Set
@@ -39,13 +60,44 @@ import os
 import re
 import inspect
 
-# ── (Optional) link to horary primitives for enums (no heavy imports at import time) ──
+# ─────────────────────────────────────────────────────────────────────────────
+# Optional wiring to horary cores (lazy-safe)
+# ─────────────────────────────────────────────────────────────────────────────
 try:
-    from app.core.horary import QuestionType as _QuestionType  # for Enum mapping if available
-    _HORARY_ENUM_OK = True
+    from app.core.horary_shared import (
+        HoraryInput as _HoraryInput,
+        HybridPrasnaInput as _HybridPrasnaInput,
+        QuerentBirthData as _QuerentBirthData,
+        QuestionType as _QuestionTypeCore,
+    )
+    _HORARY_SHARED_OK = True
 except Exception:
-    _QuestionType = None  # type: ignore
-    _HORARY_ENUM_OK = False
+    _HoraryInput = _HybridPrasnaInput = _QuerentBirthData = _QuestionTypeCore = None  # type: ignore
+    _HORARY_SHARED_OK = False
+
+try:
+    from app.core.horary_classical import (
+        analyze_parashari as _core_parashari,
+        analyze_kp as _core_kp,
+    )
+    _HORARY_CLASSICAL_OK = True
+except Exception:
+    _core_parashari = _core_kp = None  # type: ignore
+    _HORARY_CLASSICAL_OK = False
+
+try:
+    # prefer enhanced if present
+    from app.core.horary_hybrid import analyze_hybrid_enhanced as _core_hybrid
+    _HORARY_HYBRID_OK = True
+except Exception:
+    try:
+        from app.core.horary_hybrid import analyze_hybrid as _core_hybrid  # type: ignore
+        _HORARY_HYBRID_OK = True
+    except Exception:
+        _core_hybrid = None  # type: ignore
+        _HORARY_HYBRID_OK = False
+
+_HORARY_CORES_AVAILABLE = _HORARY_SHARED_OK and (_HORARY_CLASSICAL_OK or _HORARY_HYBRID_OK)
 
 # ── Required geocoder when any place/POB is present (prefer dedicated module) ──
 _RESOLVE_PLACE = None
@@ -1111,7 +1163,7 @@ _QSTR_ALIASES: Dict[str, _LocalQuestionType] = {
 
 def _norm_question_type(v: Any) -> str:
     """
-    Normalize question_type string to match app.core.horary.QuestionType value.
+    Normalize question_type string to a canonical value.
     Returns the lowercase value string.
     """
     if isinstance(v, _LocalQuestionType):
@@ -1130,13 +1182,12 @@ def _norm_question_type(v: Any) -> str:
 def _as_core_qtype(value_str: str):
     """
     Try to convert normalized question-type string into the real Enum
-    app.core.horary.QuestionType if available; otherwise return None.
+    app.core.horary_shared.QuestionType if available; otherwise return None.
     """
-    if not _HORARY_ENUM_OK:
+    if not _HORARY_SHARED_OK or _QuestionTypeCore is None:
         return None
     try:
-        # Enum members are defined with .value matching our normalized string
-        for m in _QuestionType:  # type: ignore
+        for m in _QuestionTypeCore:  # type: ignore
             if str(m.value).lower() == value_str:
                 return m
     except Exception:
@@ -1158,8 +1209,8 @@ def normalize_horary_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], L
     """
     Normalize inputs for Horary / Prasna endpoints.
     Returns a dict that maps directly to:
-      - app.core.horary.HoraryInput fields when method="parashari" | "kp"
-      - app.core.horary.HybridPrasnaInput fields when method="hybrid"
+      - horary_shared.HoraryInput fields when method="parashari" | "kp"
+      - horary_shared.HybridPrasnaInput fields when method="hybrid"
 
     Accepted keys (superset):
       method|mode: "parashari" | "kp" | "hybrid"
@@ -1206,7 +1257,6 @@ def normalize_horary_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], L
         q_tz   = _coerce_str(payload.get("question_tz") or payload.get("tz") or payload.get("place_tz")).strip() or None
 
         # Question location (strict geocoding if any place string present)
-        # Allow: question_place / place / question_place_city|state|country
         if not any([payload.get("question_place"), payload.get("question_place_city"),
                     payload.get("question_place_state"), payload.get("question_place_country")]) and payload.get("place"):
             payload = dict(payload)
@@ -1282,7 +1332,6 @@ def normalize_horary_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], L
         if b_place_to_resolve:
             b_lat_r, b_lon_r, _b_elev_r, b_tz_r, b_fatal = _must_resolve_place_if_provided(payload, place_prefix="birth_", warns=warns)
             if b_fatal:
-                # Hybrid can still continue if birth cannot be resolved, but mark fatal to prevent core call
                 norm = {
                     "system": "horary",
                     "method": "hybrid",
@@ -1327,7 +1376,7 @@ def normalize_horary_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], L
             "question_type": qtype_val,
             "question_type_enum": qtype_enum,
             "question_text": qtext,
-            # nested querent birth object (as Horary.HybridPrasnaInput expects):
+            # nested querent birth object (as HybridPrasnaInput expects):
             "querent_birth": {
                 "date": b_date or None,
                 "time": b_time or None,
@@ -1470,7 +1519,158 @@ def normalize_horary_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], L
     return norm, warns, tz_norm or "UTC"
 
 
+# ============================ Horary Core Wiring (helpers) ============================
+
+def _build_classical_input_from_norm(norm: Dict[str, Any]) -> Optional["_HoraryInput"]:
+    if not _HORARY_SHARED_OK or _HoraryInput is None:
+        return None
+    qtype_enum = _as_core_qtype(norm.get("question_type"))
+    return _HoraryInput(
+        # moment
+        date=norm.get("date"),
+        time=norm.get("time"),
+        tz_name=norm.get("tz"),
+        # location
+        place=norm.get("place"),
+        latitude=norm.get("latitude"),
+        longitude=norm.get("longitude"),
+        # astro
+        zodiac_mode=norm.get("zodiac_mode", "sidereal"),
+        ayanamsa=norm.get("ayanamsa", "lahiri"),
+        ayanamsa_deg=_as_float(norm.get("ayanamsa_deg")),  # optional pass-through
+        house_system=norm.get("house_system", "sripati"),
+        # KP (present even for Parāśarī; only used by KP path)
+        kp_house_system=norm.get("kp_house_system", "placidus"),
+        kp_ayanamsa=norm.get("kp_ayanamsa", "krishnamurti"),
+        kp_number=norm.get("kp_number"),
+        kp_number_mode=norm.get("kp_number_mode", "anchor_asc"),
+        # question
+        question_type=qtype_enum or norm.get("question_type"),
+        question_text=norm.get("question_text"),
+        querent_house=int(norm.get("querent_house") or 1),
+        quesited_house=norm.get("quesited_house"),
+    )
+
+def _build_hybrid_input_from_norm(norm: Dict[str, Any]) -> Optional["_HybridPrasnaInput"]:
+    if not _HORARY_SHARED_OK or _HybridPrasnaInput is None or _QuerentBirthData is None:
+        return None
+    qb = norm.get("querent_birth") or {}
+    qtype_enum = _as_core_qtype(norm.get("question_type"))
+    birth = _QuerentBirthData(
+        date=qb.get("date"),
+        time=qb.get("time"),
+        tz_name=qb.get("tz_name"),
+        place=qb.get("place"),
+        latitude=qb.get("latitude"),
+        longitude=qb.get("longitude"),
+        zodiac_mode=qb.get("zodiac_mode", norm.get("zodiac_mode", "sidereal")),
+        ayanamsa=qb.get("ayanamsa", norm.get("ayanamsa", "lahiri")),
+    )
+    return _HybridPrasnaInput(
+        question_date=norm.get("question_date"),
+        question_time=norm.get("question_time"),
+        question_tz=norm.get("question_tz"),
+        question_place=norm.get("question_place"),
+        question_latitude=norm.get("question_latitude"),
+        question_longitude=norm.get("question_longitude"),
+        querent_birth=birth,
+        question_type=qtype_enum or norm.get("question_type"),
+        question_text=norm.get("question_text"),
+        zodiac_mode=norm.get("zodiac_mode", "sidereal"),
+        ayanamsa=norm.get("ayanamsa", "lahiri"),
+        house_system=norm.get("house_system", "sripati"),
+    )
+
+def run_horary_from_norm(norm: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Dispatch to core analyzers using a normalized horary payload dict (output of normalize_horary_payload).
+    Returns core result dict or an error dict with ok=False.
+    """
+    method = (norm.get("method") or "parashari").strip().lower()
+    if not _HORARY_CORES_AVAILABLE:
+        return {"ok": False, "error": "horary_cores_unavailable", "method": method}
+
+    if method == "hybrid":
+        if not _HORARY_HYBRID_OK or _core_hybrid is None:
+            return {"ok": False, "error": "hybrid_core_unavailable", "method": method}
+        core_in = _build_hybrid_input_from_norm(norm)
+        if core_in is None:
+            return {"ok": False, "error": "hybrid_input_build_failed", "method": method}
+        try:
+            res = _core_hybrid(core_in)  # type: ignore
+        except Exception as e:
+            return {"ok": False, "error": f"hybrid_core_exception:{e!s}", "method": method}
+        if isinstance(res, dict):
+            res.setdefault("method", "hybrid")
+        return res
+
+    # Classical: Parāśarī or KP
+    core_in = _build_classical_input_from_norm(norm)
+    if core_in is None:
+        return {"ok": False, "error": "classical_input_build_failed", "method": method}
+
+    if method == "kp":
+        if not _HORARY_CLASSICAL_OK or _core_kp is None:
+            return {"ok": False, "error": "kp_core_unavailable", "method": method}
+        try:
+            res = _core_kp(core_in)  # type: ignore
+        except Exception as e:
+            return {"ok": False, "error": f"kp_core_exception:{e!s}", "method": method}
+        if isinstance(res, dict):
+            res.setdefault("method", "kp")
+        return res
+
+    # Default → Parāśarī
+    if not _HORARY_CLASSICAL_OK or _core_parashari is None:
+        return {"ok": False, "error": "parashari_core_unavailable", "method": method}
+    try:
+        res = _core_parashari(core_in)  # type: ignore
+    except Exception as e:
+        return {"ok": False, "error": f"parashari_core_exception:{e!s}", "method": method}
+    if isinstance(res, dict):
+        res.setdefault("method", "parashari")
+    return res
+
+def prepare_horary_inputs(payload: Dict[str, Any]) -> Tuple[str, object, List[str], str]:
+    """
+    Convenience: normalize_horary_payload + build the appropriate core dataclass.
+    Returns (method, dataclass_input, warns, tz_norm). On fatal or build failure,
+    returns a (method, None, warns+['fatal'], tz_norm) and you should not call the core.
+    """
+    norm, warns, tz = normalize_horary_payload(payload)
+    method = (norm.get("method") or "parashari").strip().lower()
+
+    # Fatal early exit
+    if norm.get("fatal"):
+        return method, None, warns, tz
+
+    if method == "hybrid":
+        core_in = _build_hybrid_input_from_norm(norm)
+        if core_in is None:
+            warns.append("hybrid_input_build_failed")
+        return method, core_in, warns, tz
+
+    core_in = _build_classical_input_from_norm(norm)
+    if core_in is None:
+        warns.append("classical_input_build_failed")
+    return method, core_in, warns, tz
+
+def run_horary(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str], str]:
+    """
+    High-level helper for routes/tools:
+    - Normalizes the payload (strict geocoding policy)
+    - If no fatal errors, builds the appropriate dataclass and calls the core
+    - Returns (result_dict, warns, tz_norm)
+    """
+    norm, warns, tz = normalize_horary_payload(payload)
+    if norm.get("fatal"):
+        return {"ok": False, "error": norm["fatal"], "method": norm.get("method")}, warns, tz
+    res = run_horary_from_norm(norm)
+    return res, warns, tz
+
+
 __all__ = [
+    # Normalizers
     "normalize_vim_payload",
     "normalize_yoga_payload",
     "normalize_gochar_payload",
@@ -1479,4 +1679,8 @@ __all__ = [
     "normalize_shadbala_payload",
     "normalize_ashtakavarga_payload",
     "normalize_horary_payload",
+    # Wiring helpers
+    "prepare_horary_inputs",
+    "run_horary",
+    "run_horary_from_norm",
 ]
