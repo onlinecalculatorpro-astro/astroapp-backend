@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-horary_shared.py — unified Vedic/Prashna helpers (2025-09-29)
+horary_shared.py — unified Vedic/Prashna helpers (2025-09-29, patched)
 
 What this module provides
 -------------------------
@@ -22,8 +22,9 @@ What this module provides
 • KP-like star/sub/ssub helpers:
     - kp_star_sub_sub, kp_star_and_sublord (27-equal scheme; Abhijit is informational only)
 • Houses & charts:
-    - ensure_coords_and_tz, build_chart (wraps compute_chart)
-    - compute_houses_from_chart (tries strict JD → engine; fallback Equal)
+    - ensure_coords_and_tz (uses local 'now' in resolved tz)
+    - build_chart (wraps compute_chart)
+    - compute_houses_from_chart (tries strict JD → engine; fallback Equal; **no extra sidereal shift for Whole-Sign/Equal**)
     - whole_sign_cusps_from_asc, rotate_cusps_to_target_asc, house_of
     - safe_get_asc, safe_get_mc
 • Vedic dṛṣṭi utilities:
@@ -452,26 +453,35 @@ def ensure_coords_and_tz(
     lon: Optional[float],
 ) -> Tuple[str, str, str, float, float]:
     """
-    Fill missing lat/lon/tz from resolve_place; default to now/UTC if needed.
-    Returns (date, time, tz, lat, lon) with concrete values.
+    Resolve tz from args/place first, then generate local 'now' if date/time missing.
+    Fills lat/lon from place when absent; defaults to (0,0) and 'UTC' only if unresolved.
     """
-    if not (date and time_):
-        now = datetime.now(timezone.utc)
-        date = now.date().isoformat()
-        time_ = now.time().replace(microsecond=0).isoformat()
-        tz = tz or "UTC"
+    tz_guess = tz
 
-    if (lat is None or lon is None) and place:
-        rp = resolve_place(place)
+    # Pull from place if helpful
+    if (lat is None or lon is None or tz_guess is None) and place:
+        rp = resolve_place(place) or {}
         lat = lat if lat is not None else rp.get("lat")
         lon = lon if lon is not None else rp.get("lon")
-        tz = tz or rp.get("tz") or "UTC"
+        tz_guess = tz_guess or rp.get("tz")
 
-    tz = tz or "UTC"
+    tz_guess = tz_guess or "UTC"
+
+    # If date/time missing, use 'now' in the resolved tz
+    if not (date and time_):
+        try:
+            from zoneinfo import ZoneInfo
+            now_local = datetime.now(ZoneInfo(tz_guess))
+        except Exception:
+            now_local = datetime.now(timezone.utc)
+            tz_guess = "UTC"
+        date  = now_local.date().isoformat()
+        time_ = now_local.time().replace(microsecond=0).isoformat()
+
     if lat is None or lon is None:
         lat, lon = 0.0, 0.0
 
-    return str(date), str(time_), str(tz), float(lat), float(lon)
+    return str(date), str(time_), str(tz_guess), float(lat), float(lon)
 
 def build_chart(
     *,
@@ -529,27 +539,22 @@ def compute_houses_from_chart(
     """
     Calls app.core.houses_advanced.compute_house_system with whatever JD inputs
     are available from compute_chart(...).meta.timescales. If that fails,
-    returns Equal Houses from ASC. Applies sidereal shift to cusps if requested.
-    Supports Whole-Sign via house_system="whole_sign".
+    returns Equal Houses from ASC. Applies sidereal shift **only** to the advanced
+    engine output when requested. Whole-Sign and Equal fallback use chart's zodiac
+    as-is (no extra shift).
     """
     asc_any = safe_get_asc(chart)
     mc_any  = safe_get_mc(chart)
 
-    # Whole-Sign branch (ASC required)
+    # Whole-Sign branch (ASC required) — use chart's zodiac as-is (no extra shift).
     if (house_system or "").lower() == "whole_sign" and asc_any is not None:
         asc_deg = float(asc_any)
         cusps = whole_sign_cusps_from_asc(asc_deg)
-        if zodiac_mode.lower() == "sidereal" and isinstance(ayanamsa_deg, (int, float)):
-            cusps = shift_sidereal(cusps, float(ayanamsa_deg))
-            asc_out = deg_wrap(asc_deg - float(ayanamsa_deg))
-            mc_out  = deg_wrap(float(mc_any) - float(ayanamsa_deg)) if mc_any is not None else deg_wrap(asc_out + 90.0)
-        else:
-            asc_out = asc_deg
-            mc_out  = float(mc_any) if mc_any is not None else deg_wrap(asc_deg + 90.0)
+        mc_out  = float(mc_any) if mc_any is not None else deg_wrap(asc_deg + 90.0)
         return {
             "house_system": "whole_sign",
             "cusps_deg": cusps,
-            "asc_deg": asc_out,
+            "asc_deg": asc_deg,
             "mc_deg": mc_out,
             "vertex": None,
             "eastpoint": None,
@@ -572,11 +577,14 @@ def compute_houses_from_chart(
                  jd_ut=jd_ut, jd_ut1=jd_ut1),
             dict(latitude=latitude, longitude=longitude, house_system=house_system,
                  jd_tt=jd_tt),
+            # NEW: minimal jd_ut-only attempt
+            dict(latitude=latitude, longitude=longitude, house_system=house_system,
+                 jd_ut=jd_ut),
         ]
         for kwargs in trials:
-            if "jd_tt" in kwargs and kwargs["jd_tt"] is None:  continue
-            if "jd_ut1" in kwargs and kwargs["jd_ut1"] is None: continue
-            if "jd_ut" in kwargs and kwargs["jd_ut"] is None:   continue
+            # Skip trials where any provided JD is None
+            if any(k in kwargs and kwargs[k] is None for k in ("jd_tt","jd_ut","jd_ut1")):
+                continue
             try:
                 return compute_house_system(**kwargs)  # type: ignore[arg-type]
             except TypeError:
@@ -587,7 +595,7 @@ def compute_houses_from_chart(
 
     payload = _try_engine()
 
-    # Fallback: Equal from ASC
+    # Fallback: Equal from ASC — use chart's zodiac as-is (no extra shift).
     if not payload:
         if asc_any is None:
             raise ValueError("houses_fallback_failed:no_asc_in_chart")
@@ -595,19 +603,11 @@ def compute_houses_from_chart(
         cusps = [deg_wrap(asc_deg + i * 30.0) for i in range(12)]
         mc_guess = float(mc_any) if mc_any is not None else deg_wrap(asc_deg + 90.0)
 
-        if zodiac_mode.lower() == "sidereal" and isinstance(ayanamsa_deg, (int, float)):
-            cusps = shift_sidereal(cusps, float(ayanamsa_deg))
-            asc_out = deg_wrap(asc_deg - float(ayanamsa_deg))
-            mc_out  = deg_wrap(mc_guess - float(ayanamsa_deg))
-        else:
-            asc_out = asc_deg
-            mc_out  = mc_guess
-
         return {
             "house_system": f"{house_system} (fallback=Equal from ASC)",
             "cusps_deg": cusps,
-            "asc_deg": asc_out,
-            "mc_deg": mc_out,
+            "asc_deg": asc_deg,
+            "mc_deg": mc_guess,
             "vertex": None,
             "eastpoint": None,
             "warnings": ["houses_engine_unavailable_fallback_equal"],
@@ -784,7 +784,7 @@ __all__ = [
     # Chart/Houses
     "ensure_coords_and_tz","build_chart","compute_houses_from_chart","safe_get_asc","safe_get_mc",
 
-    # Pañcāṅga
+    # Pañcāṅга
     "tithi_index","moon_star",
 
     # Radicality
