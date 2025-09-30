@@ -81,7 +81,7 @@ def _top(items: List[Dict[str, Any]], n: int = 5) -> List[Dict[str, Any]]:
 # Grounds formatters (Parāśarī & KP)
 # ---------------------------------------------------------------------------
 
-def _parashari_grounds_from_result(p_res: Dict[str, Any], mapping: Dict[str, List[int]]) -> Dict[str, Any]]:
+def _parashari_grounds_from_result(p_res: Dict[str, Any], mapping: Dict[str, List[int]]) -> Dict[str, Any]:
     """Summarize Parāśarī result into for/against/conflicts/notes grounds."""
     for_list: List[Dict[str, Any]] = []
     against_list: List[Dict[str, Any]] = []
