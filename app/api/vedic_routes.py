@@ -339,7 +339,7 @@ def _build_civic_payload_vim(original: Dict[str, Any], norm: Dict[str, Any]) -> 
         civ["method"] = norm["method"]
     if norm.get("coordinate_mode"):
         civ["coordinate_mode"] = norm["coordinate_mode"]
-        civ["topocentric"] = (str(norm["coordinate_mode"]).lower() == "topocentric")
+        civ["topocentric"] = (str(norm.get("coordinate_mode")).lower() == "topocentric")
     elif "observer" in original:
         obs = str(original.get("observer") or "").strip().lower()
         civ["coordinate_mode"] = "topocentric" if obs == "topocentric" else "geocentric"
@@ -451,15 +451,15 @@ def _call_single_param_or_kwargs(fn, payload: Dict[str, Any]) -> Dict[str, Any]:
         sig = inspect.signature(fn)  # type: ignore[arg-type]
         params = list(sig.parameters.values())
     except Exception:
-        return fn(payload)  # type: ignore[misc]
+        return fn(payload)  # type: ignore/misc]
 
     if len(params) == 1 and params[0].kind in (
         inspect.Parameter.POSITIONAL_ONLY,
         inspect.Parameter.POSITIONAL_OR_KEYWORD,
     ):
-        return fn(payload)  # type: ignore[misc]
+        return fn(payload)  # type: ignore/misc]
     else:
-        return fn(**payload)  # type: ignore[misc]
+        return fn(**payload)  # type: ignore/misc]
 
 
 def _ensure_tree_envelope(res: Dict[str, Any], *, scheme: str) -> Dict[str, Any]:
@@ -1813,6 +1813,47 @@ def _horary_error(route: str, tz_norm: str, error: str, warns: List[str], status
     return jsonify(res), status
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Hybrid-specific: birth requirement
+# ──────────────────────────────────────────────────────────────────────────────
+def _has_birth_details(body: Dict[str, Any]) -> tuple[bool, List[str]]:
+    """
+    Hybrid decision needs natal context. Accept either:
+      • birth_jd_tt  (numeric), OR
+      • birth_date + birth_time + (birth_tz|birth_place_tz|place_tz|tz)
+        + birth_latitude + birth_longitude  (falls back to latitude/longitude if not given)
+    Returns (ok, missing_fields[]).
+    """
+    missing: List[str] = []
+    # Fast-path: explicit JD
+    if isinstance(body.get("birth_jd_tt"), (int, float)):
+        return True, missing
+
+    # Civil fields
+    if not str(body.get("birth_date") or "").strip():
+        missing.append("birth_date")
+    if not str(body.get("birth_time") or "").strip():
+        missing.append("birth_time")
+    tz = (body.get("birth_tz") or body.get("birth_place_tz")
+          or body.get("place_tz") or body.get("tz"))
+    if not str(tz or "").strip():
+        missing.append("birth_tz")
+
+    lat = body.get("birth_latitude") if (body.get("birth_latitude") is not None) else body.get("latitude")
+    lon = body.get("birth_longitude") if (body.get("birth_longitude") is not None) else body.get("longitude")
+    try:
+        lat = float(lat) if lat is not None else None
+        lon = float(lon) if lon is not None else None
+    except Exception:
+        lat = lon = None
+    if lat is None:
+        missing.append("birth_latitude")
+    if lon is None:
+        missing.append("birth_longitude")
+
+    return (len(missing) == 0), missing
+
+
 def _run_horary_single(method: str, body: Dict[str, Any], route_name: str):
     # Prefer payload helper first
     if callable(_horary_from_payload):
@@ -1879,9 +1920,22 @@ def horary_hybrid():
     Hybrid horary: run both Parāśarī and KP on the same normalized payload
     and return both results plus a lightweight agreement summary.
     """
+    body = request.get_json(silent=True) or {}
+
+    # ENFORCE: birth details required for Hybrid
+    ok_birth, missing = _has_birth_details(body)
+    if not ok_birth:
+        return jsonify({
+            "ok": False,
+            "error": "missing_birth_details",
+            "required_fields": ["birth_date","birth_time","birth_tz","birth_latitude","birth_longitude"],
+            "missing": missing,
+            "meta": {"route": "horary/hybrid", "branch": "validation",
+                     "tz_normalized": _tz_from_payload(body)}
+        }), 400
+
     # NEW: Prefer payload helper first
     if callable(_horary_from_payload):
-        body = request.get_json(silent=True) or {}
         try:
             b = dict(body or {})
             b["method"] = "hybrid"
@@ -1898,7 +1952,6 @@ def horary_hybrid():
     if not _HORARY_OK or not callable(_analyze_prasna_enhanced):
         return jsonify({"ok": False, "error": "horary_engine_unavailable"}), 503
 
-    body = request.get_json(silent=True) or {}
     hw, warns, tz_norm = _normalize_horary_payload(body)
 
     # Strict raw validation
@@ -1963,6 +2016,22 @@ def horary_generic():
     method = str(body.get("method") or "parashari").lower()
     if method not in ("parashari", "kp", "hybrid"):
         method = "parashari"
+
+    # ENFORCE: birth details required when method=hybrid (even before payload helper)
+    if method == "hybrid":
+        ok_birth, missing = _has_birth_details(body)
+        if not ok_birth:
+            res = {
+                "ok": False,
+                "error": "missing_birth_details",
+                "required_fields": ["birth_date","birth_time","birth_tz","birth_latitude","birth_longitude"],
+                "missing": missing,
+                "meta": {"route": "horary", "branch": "validation",
+                         "method": "hybrid", "deprecated": True,
+                         "preferred_endpoints": ["/api/vedic/horary/parashari", "/api/vedic/horary/kp", "/api/vedic/horary/hybrid"],
+                         "tz_normalized": _tz_from_payload(body)}
+            }
+            return jsonify(res), 400, {"X-Deprecated-Endpoint": "/api/vedic/horary"}
 
     # NEW: Prefer payload helper first
     if callable(_horary_from_payload):
