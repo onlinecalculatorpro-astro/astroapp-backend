@@ -1,32 +1,32 @@
 # -*- coding: utf-8 -*-
 """
-horary_classical.py — centralized rewrite (2025-09-29)
-------------------------------------------------------
+horary_classical.py — centralized rewrite (2025-09-30, patched)
+----------------------------------------------------------------
 Classical Horary / Prashna systems: Parāśarī and KP (no Hybrid here).
 
-Key features
-- Sidereal-correct houses: when zodiac_mode == "sidereal", cusps/angles shift by ayanāṁśa
-  so lords, KP partitions, and house tests remain consistent.
-- Whole-Sign support: house_system="whole_sign" makes houses = signs from Lagna.
-- Robust houses: tries app.core.houses_advanced with multiple JD signatures; safe fallback to Equal-from-ASC.
-- Parāśarī:
-    • Rich dignity scoring (exalt/own/mūlatrikoṇa, friend/enemy, sandhi, retro, combustion),
-      normalized to 0..1 per-planet.
-    • Vedic graha-dṛṣṭi (sign-based) adds benefic/malefic pressure to target houses.
+Key points & patches
+- **Single source of truth**: pulls core helpers from horary_shared to avoid drift.
+- **No double ayanāṁśa**: relies on horary_shared.compute_houses_from_chart() behavior
+  (advanced engine gets shifted if sidereal; Whole-Sign/Equal fallbacks use chart’s frame as-is).
+- **Robust houses**: tries app.core.houses_advanced with multiple JD signatures; safe fallback to Equal-from-ASC.
+- **Parāśarī**:
+    • Rich dignity scoring via shared.calc_dignity_rich (exalt/own/mūlatrikoṇa, friend/enemy,
+      sandhi, gandānta), then retro/combust tweaks and house relevance by question type.
+    • Sign-based graha-dṛṣṭi using shared.houses_aspected_by for benefic/malefic pressure.
     • Moon proximity boost to lords of target houses; light “radicality” multiplier.
     • Pañcāṅga snapshot (tithi index & Moon nakṣatra star-lord).
-- KP:
-    • Nakṣatra star → sub → sub-sub (SSL) partition.
+- **KP**:
+    • Nakṣatra star → sub → sub-sub (SSL) via shared.kp_star_sub_sub.
     • Significator chain: planet ⇒ star-lord ⇒ sign-lord (nodes act as agents).
     • Primary cusp evaluation by sub-lord with SSL tie-breaker.
-    • KP number anchoring rotates cusps (not only the ASC label).
-    • Ruling Planets (day-lord, Moon sign/star, ASC sign/star) add small confidence bias.
+    • KP number anchoring rotates **all cusps** (not just ASC label).
+    • Ruling Planets (day-lord, Moon sign/star, ASC sign/star) add a small confidence nudge.
 
 Public API
 - analyze_parashari(inp: HoraryInput) -> dict
 - analyze_kp(inp: HoraryInput) -> dict
-- analyze_prasna_enhanced(inp, method="parashari") -> dict
 - analyze_prasna(inp, method="parashari"|"kp") -> dict
+- analyze_prasna_enhanced(inp, method="parashari"|"kp") -> dict (adds {"method": ...})
 """
 
 from __future__ import annotations
@@ -40,59 +40,33 @@ from .horary_shared import (
     HoraryInput, QuestionType, ENHANCED_QUESTION_HOUSES, normalize_question_type,
 
     # Zodiac & angles
-    deg_wrap, sign_index, sign_name_from_deg, lord_of_sign, angular_sep,
-    house_of,
+    deg_wrap, sign_name_from_deg, lord_of_sign, angular_sep, house_of,
+
+    # KP helpers
+    kp_star_sub_sub,
 
     # Chart & houses
-    build_chart, compute_houses_from_chart,
+    build_chart, compute_houses_from_chart, safe_get_asc,
 
-    # Helpers
-    radicality_flags,
+    # Drishti
+    houses_aspected_by,
+
+    # Dignity & panchanga & radicality
+    calc_dignity_rich, tithi_index, moon_star, radicality_flags,
 )
 
 # =============================================================================
-# Local constants (kept here so we don't need to modify horary_shared again)
+# Local constants (kept minimal; defer to shared data where possible)
 # =============================================================================
 
 PARASHARI_PLANETS = ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn"]
 PLANETS_WITH_NODES = PARASHARI_PLANETS + ["Rahu","Ketu"]
 
-# Mūlatrikoṇa (sign indices)
-MOOLATRIKONA = {
-    "Sun": 4,      # Leo
-    "Moon": None,  # often omitted in fixed-sign scoring
-    "Mars": 0,     # Aries
-    "Mercury": 5,  # Virgo
-    "Jupiter": 8,  # Sagittarius
-    "Venus": 1,    # Taurus
-    "Saturn": 10,  # Aquarius
-}
-
-# Permanent friendship (simplified)
-FRIENDS = {
-    "Sun": {"Moon","Mars","Jupiter"},
-    "Moon": {"Sun","Mercury"},
-    "Mars": {"Sun","Moon","Jupiter"},
-    "Mercury": {"Sun","Venus"},
-    "Jupiter": {"Sun","Moon","Mars"},
-    "Venus": {"Mercury","Saturn"},
-    "Saturn": {"Mercury","Venus"},
-}
-ENEMIES = {
-    "Sun": {"Venus","Saturn"},
-    "Moon": set(),
-    "Mars": {"Mercury"},
-    "Mercury": {"Moon"},
-    "Jupiter": {"Venus","Mercury"},
-    "Venus": {"Sun","Moon"},
-    "Saturn": {"Sun","Moon"},
-}
-
-# Combustion thresholds (deg from Sun)
+# Combustion thresholds (deg from Sun) — conservative defaults
 COMBUST_DEG = {"Moon": 12.0,"Mercury": 12.0,"Venus": 10.0,"Mars": 17.0,"Jupiter": 11.0,"Saturn": 15.0}
 
-BENEFICS = {"Jupiter","Venus","Moon"}               # Mercury often neutral
-MALEFICS = {"Saturn","Mars","Sun","Rahu","Ketu"}    # Sun mild malefic; nodes malefic in horary
+BENEFICS: Set[str] = {"Jupiter","Venus","Moon"}               # Mercury often neutral
+MALEFICS: Set[str] = {"Saturn","Mars","Sun","Rahu","Ketu"}    # Sun mild malefic; nodes malefic in horary
 
 # Panchanga / Tithi labels (30)
 TITHI_NAMES = [
@@ -100,14 +74,8 @@ TITHI_NAMES = [
     "Ekadashi","Dwadashi","Trayodashi","Chaturdashi","Purnima/Amavasya",
 ]*2
 
-# KP star order & lengths (to build SSL locally)
-STAR_ORDER = ["Ketu","Venus","Sun","Moon","Mars","Rahu","Jupiter","Saturn","Mercury"]
-KP_DASHA_YEARS = {"Ketu":7,"Venus":20,"Sun":6,"Moon":10,"Mars":7,"Rahu":18,"Jupiter":16,"Saturn":19,"Mercury":17}
-STAR_LEN_DEG = 360.0 / 27.0
-TOTAL_DASHA = 120.0
-
 # =============================================================================
-# Local helpers needed only by this module (kept self-contained)
+# Local helpers
 # =============================================================================
 
 def _with_node_aliases(bodies_list: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -121,136 +89,115 @@ def _with_node_aliases(bodies_list: List[Dict[str, Any]]) -> Dict[str, Dict[str,
         d["Ketu"] = d["South Node"]
     return d
 
-def is_sandhi(deg: float, window: float = 1.0) -> bool:
-    """Near sign boundary within `window` degrees."""
-    d = deg_wrap(deg) % 30.0
-    return (d < window) or (30.0 - d < window)
-
-def kp_star_sub_sub(ecl_deg_sidereal: float) -> Tuple[str, str, str, float, float, float, float]:
-    """
-    Build star → sub → sub-sub (SSL) partition using Vimshottari proportions.
-    Returns (star_lord, sub_lord, ssl_lord, star_span, pos_in_star, sub_span, pos_in_sub).
-    """
-    pos = deg_wrap(ecl_deg_sidereal)
-    star_idx = int(pos // STAR_LEN_DEG)
-    star_lord = STAR_ORDER[star_idx % 9]
-    pos_in_star = pos - STAR_LEN_DEG * star_idx
-
-    # Sub level
-    cycle = STAR_ORDER[STAR_ORDER.index(star_lord):] + STAR_ORDER[:STAR_ORDER.index(star_lord)]
-    acc = 0.0
-    sub_lord = STAR_ORDER[-1]
-    sub_start = 0.0
-    sub_span = STAR_LEN_DEG
-    for lord in cycle:
-        portion = STAR_LEN_DEG * (KP_DASHA_YEARS[lord] / TOTAL_DASHA)
-        if pos_in_star < acc + portion:
-            sub_lord, sub_start, sub_span = lord, acc, portion
-            break
-        acc += portion
-    pos_in_sub = pos_in_star - sub_start
-
-    # Sub-sub from sub_lord
-    cycle2 = STAR_ORDER[STAR_ORDER.index(sub_lord):] + STAR_ORDER[:STAR_ORDER.index(sub_lord)]
-    acc2 = 0.0
-    ssl = STAR_ORDER[-1]
-    for lord in cycle2:
-        portion2 = sub_span * (KP_DASHA_YEARS[lord] / TOTAL_DASHA)
-        if pos_in_sub < acc2 + portion2:
-            ssl = lord
-            break
-        acc2 += portion2
-
-    return (star_lord, sub_lord, ssl, STAR_LEN_DEG, pos_in_star, sub_span, pos_in_sub)
-
-def calc_dignity_rich(long_deg: float, planet: str) -> float:
-    """
-    Rich dignity score (rough range before normalization ~ [-2.5..+2.5]).
-    Components:
-      +2.0 exaltation; -2.0 fall; +1.0 own sign; +0.75 moolatrikona
-      +0.5 friend sign / -0.5 enemy sign
-      -0.2 sandhi penalty
-    (Retrograde & combustion applied outside with context.)
-    """
-    sidx = sign_index(long_deg)
-    dign = 0.0
-
-    exalt_sign = {"Sun":0,"Moon":2,"Mars":9,"Mercury":5,"Jupiter":3,"Venus":11,"Saturn":6}
-    if planet in exalt_sign and sidx == exalt_sign[planet]:
-        dign += 2.0
-    elif planet in exalt_sign and sidx == (exalt_sign[planet] + 6) % 12:
-        dign -= 2.0
-
-    own = {"Sun":[4], "Moon":[3], "Mars":[0,7], "Mercury":[2,5],
-           "Jupiter":[8,11], "Venus":[1,6], "Saturn":[9,10]}
-    if planet in own and sidx in own[planet]:
-        dign += 1.0
-
-    if MOOLATRIKONA.get(planet) is not None and sidx == MOOLATRIKONA[planet]:
-        dign += 0.75
-
-    lord = lord_of_sign(long_deg)
-    if planet in FRIENDS and lord in FRIENDS[planet]:
-        dign += 0.5
-    if planet in ENEMIES and lord in ENEMIES[planet]:
-        dign -= 0.5
-
-    if is_sandhi(long_deg, 1.0):
-        dign -= 0.2
-
-    return dign
-
-def graha_drishti_offsets(planet: str, include_nodes_special: bool = True) -> Set[int]:
-    """
-    Vedic drishti (sign-based) as house offsets:
-    Everyone: 7th; Mars: 4th & 8th; Jupiter: 5th & 9th; Saturn: 3rd & 10th;
-    Nodes optional: 5th & 9th in some traditions.
-    """
-    base = {7}
-    if planet == "Mars": base |= {4, 8}
-    elif planet == "Jupiter": base |= {5, 9}
-    elif planet == "Saturn": base |= {3, 10}
-    elif include_nodes_special and planet in {"Rahu","Ketu"}:
-        base |= {5, 9}
-    return base
-
-def houses_aspected_by(planet_name: str, cusps: List[float], bodies: Dict[str, Any]) -> Set[int]:
-    """Sign-based drishti targets using current house structure."""
+def _kp_signified_houses_base(planet_name: str, chart: Dict[str, Any], cusps: List[float]) -> Set[int]:
+    """Occupancy + lordship of cusp signs for the given planet."""
+    houses: Set[int] = set()
+    bodies = _with_node_aliases(chart.get("bodies", []))
     p = bodies.get(planet_name)
-    if not p: return set()
+    if not p:
+        return houses
     try:
-        lon = float(p.get("longitude_deg"))
+        houses.add(house_of(float(p["longitude_deg"]), cusps))
+    except Exception:
+        pass
+    for i, cusp in enumerate(cusps, 1):
+        if lord_of_sign(cusp) == planet_name:
+            houses.add(i)
+    return houses
+
+def _kp_signified_houses_chain(planet_name: str, chart: Dict[str, Any], cusps: List[float]) -> Set[int]:
+    """
+    KP chain: planet ⇒ star-lord ⇒ sign-lord.
+    Nodes act as agents of their star-/sign-lords and the planets they conjoin (±3°) or oppose (7th by sign).
+    """
+    bodies = _with_node_aliases(chart.get("bodies", []))
+    p = bodies.get(planet_name)
+    if not p:
+        return set()
+    try:
+        lon = float(p["longitude_deg"])
     except Exception:
         return set()
-    h = house_of(lon, cusps)
-    targets: Set[int] = set()
-    for off in graha_drishti_offsets(planet_name):
-        t = ((h - 1 + (off - 1)) % 12) + 1
-        targets.add(t)
-    return targets
+    star_lord, sub_lord, ssl, *_ = kp_star_sub_sub(lon)
+    signlord = lord_of_sign(lon)
 
-def tithi_index(moon_deg: Optional[float], sun_deg: Optional[float]) -> Optional[int]:
-    """Return tithi index 0..29 from Moon-Sun elongation; None if unavailable."""
-    if moon_deg is None or sun_deg is None:
-        return None
-    el = deg_wrap(float(moon_deg) - float(sun_deg))
-    return int(el // 12.0)  # 30 tithis
+    sig: Set[int] = set()
+    for who in {planet_name, star_lord, signlord}:
+        sig |= _kp_signified_houses_base(who, chart, cusps)
 
-def moon_star(chart: Dict[str, Any]) -> Optional[str]:
-    """Return Moon nakshatra (star-lord) name via SSL helper (assumes sidereal Moon)."""
-    moon = next((b for b in chart.get("bodies", []) if b.get("name") == "Moon"), None)
-    if not moon: return None
-    star, *_ = kp_star_sub_sub(float(moon["longitude_deg"]))
-    return star
+    # Node agent rule
+    if planet_name in {"Rahu","Ketu"}:
+        sig |= _kp_signified_houses_base(star_lord, chart, cusps)
+        sig |= _kp_signified_houses_base(signlord, chart, cusps)
+        for other, ob in bodies.items():
+            if other == planet_name:
+                continue
+            try:
+                olon = float(ob["longitude_deg"])
+            except Exception:
+                continue
+            # tight conj or sign opposition
+            if angular_sep(lon, olon) <= 3.0 or abs((int(lon//30) - int(olon//30)) % 12) == 6:
+                sig |= _kp_signified_houses_base(other, chart, cusps)
+    return sig
 
-def rotate_cusps_to_target_asc(cusps: List[float], asc_current: float, asc_target: float) -> List[float]:
-    """Rotate all cusp degrees so that ASC becomes asc_target (deg)."""
-    delta = deg_wrap(asc_target - asc_current)
-    return [deg_wrap(c + delta) for c in cusps]
+def _kp_cusp_sub_lord_eval(cusp_house: int, chart: Dict[str, Any], cusps: List[float],
+                           positive: Set[int], negative: Set[int]) -> Tuple[bool, Set[int], str, Optional[str]]:
+    """Evaluate a cusp by its sub-lord; if borderline, peek at SSL for tie-break."""
+    cusp_deg = cusps[cusp_house-1]
+    star_lord, sub_lord, ssl, star_deg, pos_in_star, sub_span, pos_in_sub = kp_star_sub_sub(cusp_deg)
+    sig = _kp_signified_houses_chain(sub_lord, chart, cusps)
+    good = (len(sig & positive) > 0) and (len(sig & negative) == 0)
+
+    ssl_sig = _kp_signified_houses_chain(ssl, chart, cusps)
+    ssl_good = (len(ssl_sig & positive) > 0) and (len(ssl_sig & negative) == 0)
+    reason = f"sub={sub_lord}, ssl={ssl}, signified={sorted(sig)}, ssl_signified={sorted(ssl_sig)}"
+    chosen_ssl = ssl if (not good and ssl_good) else None
+    return (good or ssl_good), (sig if good else (ssl_sig if ssl_good else sig)), reason, chosen_ssl
+
+def _ruling_planets(chart: Dict[str, Any], tz_name: str, date: str, time_: str) -> Set[str]:
+    """KP Ruling Planets: day-lord, Moon sign-lord, Moon star-lord, ASC sign-lord, ASC star-lord."""
+    bodies = _with_node_aliases(chart.get("bodies", []))
+    # Day-lord
+    try:
+        from zoneinfo import ZoneInfo
+        dt_local = datetime.fromisoformat(f"{date}T{time_}").replace(tzinfo=ZoneInfo(tz_name))
+    except Exception:
+        dt_local = datetime.fromisoformat(f"{date}T{time_}").replace(tzinfo=timezone.utc)
+    WEEK_TO_LORD = ["Moon","Mars","Mercury","Jupiter","Venus","Saturn","Sun"]
+    daylord = WEEK_TO_LORD[dt_local.weekday()]
+
+    # Moon sign/star
+    moon = bodies.get("Moon")
+    moon_signlord = moon_starlord = None
+    if moon:
+        try:
+            md = float(moon["longitude_deg"])
+            moon_signlord = lord_of_sign(md)
+            moon_starlord, *_ = kp_star_sub_sub(md)
+        except Exception:
+            pass
+
+    # ASC sign/star
+    asc_deg = safe_get_asc(chart) or 0.0
+    asc_signlord = lord_of_sign(float(asc_deg))
+    asc_starlord, *_ = kp_star_sub_sub(float(asc_deg))
+
+    return {p for p in [daylord, moon_signlord, moon_starlord, asc_signlord, asc_starlord] if p}
 
 # =============================================================================
 # Internal helpers — Parāśarī
 # =============================================================================
+
+def _house_relevance_by_question(h: int, qtype: Optional[QuestionType]) -> float:
+    if not qtype or qtype not in ENHANCED_QUESTION_HOUSES:
+        return 0.5
+    m = ENHANCED_QUESTION_HOUSES[qtype]
+    if h in m.get("primary", []):    return 1.0
+    if h in m.get("secondary", []):  return 0.8
+    if h in m.get("supportive", []): return 0.6
+    if h in m.get("obstructive", []):return 0.2
+    return 0.4
 
 def _parashari_strengths(chart: Dict[str, Any], cusps: List[float],
                          question_type: Optional[QuestionType]) -> List[Dict[str, Any]]:
@@ -258,18 +205,7 @@ def _parashari_strengths(chart: Dict[str, Any], cusps: List[float],
     out: List[Dict[str, Any]] = []
     bodies = _with_node_aliases(chart.get("bodies", []))
     sun_lon: Optional[float] = float(bodies["Sun"]["longitude_deg"]) if "Sun" in bodies else None
-
     qtype = normalize_question_type(question_type) if question_type else None
-
-    def _house_relevance(h: int) -> float:
-        if not qtype or qtype not in ENHANCED_QUESTION_HOUSES:
-            return 0.5
-        m = ENHANCED_QUESTION_HOUSES[qtype]
-        if h in m.get("primary", []):    return 1.0
-        if h in m.get("secondary", []):  return 0.8
-        if h in m.get("supportive", []): return 0.6
-        if h in m.get("obstructive", []):return 0.2
-        return 0.4
 
     for nm in [p for p in PLANETS_WITH_NODES if p in bodies]:
         b = bodies[nm]
@@ -280,7 +216,7 @@ def _parashari_strengths(chart: Dict[str, Any], cusps: List[float],
         spd = float(b.get("speed_deg_per_day") or b.get("speed") or 0.0)
         h = house_of(lon, cusps)
 
-        # Base dignity
+        # Base dignity from shared (exalt/own/MT, friends/enemies, sandhi, gandānta)
         dig = calc_dignity_rich(lon, nm)
 
         # Combustion (skip Sun)
@@ -293,7 +229,7 @@ def _parashari_strengths(chart: Dict[str, Any], cusps: List[float],
             if nm in MALEFICS:   dig += 0.25
             elif nm in BENEFICS: dig -= 0.25
 
-        hstr = _house_relevance(h)
+        hstr = _house_relevance_by_question(h, qtype)
         is_retro = spd < 0
         overall = (dig + hstr + 2.5) / 5.0  # compress to ~0..1
 
@@ -314,7 +250,15 @@ def _parashari_strengths(chart: Dict[str, Any], cusps: List[float],
 # =============================================================================
 
 def analyze_parashari(inp: HoraryInput) -> Dict[str, Any]:
-    # Build question chart
+    """
+    Parāśarī-style reading of the question chart with:
+      - Rich dignity scoring
+      - House-based relevance for the asked topic
+      - Benefic/malefic drishti pressure
+      - Moon proximity & radicality nudges
+      - Panchanga snapshot
+    """
+    # Build question chart (tropical/sidereal per inp)
     chart = build_chart(
         date=inp.date, time=inp.time, tz=inp.tz_name,
         place=inp.place, latitude=inp.latitude, longitude=inp.longitude,
@@ -328,7 +272,7 @@ def analyze_parashari(inp: HoraryInput) -> Dict[str, Any]:
     la = float(observer.get("latitude", inp.latitude or 0.0))
     lo = float(observer.get("longitude", inp.longitude or 0.0))
 
-    # Houses/cusps
+    # Houses/cusps (uses shared semantics; no double shift)
     houses = compute_houses_from_chart(
         chart, latitude=la, longitude=lo,
         house_system=inp.house_system,
@@ -338,7 +282,7 @@ def analyze_parashari(inp: HoraryInput) -> Dict[str, Any]:
     cusps = list(houses.get("cusps_deg", []) or [])
 
     # Core angles + bodies
-    asc_deg = chart.get("angles", {}).get("asc_deg", chart.get("asc_deg"))
+    asc_deg = safe_get_asc(chart)
     bodies = _with_node_aliases(chart.get("bodies", []))
     moon_lon = (float(bodies["Moon"]["longitude_deg"]) if "Moon" in bodies else None)
     sun_lon  = (float(bodies["Sun"]["longitude_deg"])  if "Sun"  in bodies else None)
@@ -349,7 +293,7 @@ def analyze_parashari(inp: HoraryInput) -> Dict[str, Any]:
     # House lords (by cusp signs)
     house_lords: Dict[int, str] = {i+1: lord_of_sign(c) for i, c in enumerate(cusps)}
 
-    # Drishti pressure
+    # Drishti pressure (sign-based via shared houses_aspected_by)
     mapping = ENHANCED_QUESTION_HOUSES.get(qtype, {})
     target_pos = set(mapping.get("primary", []) + mapping.get("secondary", []) + mapping.get("supportive", []))
     target_neg = set(mapping.get("obstructive", []))
@@ -451,110 +395,16 @@ def analyze_parashari(inp: HoraryInput) -> Dict[str, Any]:
     }
 
 # =============================================================================
-# Internal helpers — KP
-# =============================================================================
-
-def _kp_signified_houses_base(planet_name: str, chart: Dict[str, Any], cusps: List[float]) -> Set[int]:
-    """Occupancy + lordship of cusp signs for the given planet."""
-    houses: Set[int] = set()
-    bodies = _with_node_aliases(chart.get("bodies", []))
-    p = bodies.get(planet_name)
-    if not p:
-        return houses
-    try:
-        houses.add(house_of(float(p["longitude_deg"]), cusps))
-    except Exception:
-        pass
-    for i, cusp in enumerate(cusps, 1):
-        if lord_of_sign(cusp) == planet_name:
-            houses.add(i)
-    return houses
-
-def _kp_signified_houses_chain(planet_name: str, chart: Dict[str, Any], cusps: List[float]) -> Set[int]:
-    """
-    KP chain: planet ⇒ star-lord ⇒ sign-lord.
-    Nodes act as agents of their star-/sign-lords and the planets they conjoin (±3°) or oppose (7th).
-    """
-    bodies = _with_node_aliases(chart.get("bodies", []))
-    p = bodies.get(planet_name)
-    if not p:
-        return set()
-    try:
-        lon = float(p["longitude_deg"])
-    except Exception:
-        return set()
-    star_lord, sub_lord, ssl, *_ = kp_star_sub_sub(lon)
-    signlord = lord_of_sign(lon)
-
-    sig: Set[int] = set()
-    for who in {planet_name, star_lord, signlord}:
-        sig |= _kp_signified_houses_base(who, chart, cusps)
-
-    # Node agent rule
-    if planet_name in {"Rahu","Ketu"}:
-        sig |= _kp_signified_houses_base(star_lord, chart, cusps)
-        sig |= _kp_signified_houses_base(signlord, chart, cusps)
-        for other, ob in bodies.items():
-            if other == planet_name:
-                continue
-            try:
-                olon = float(ob["longitude_deg"])
-            except Exception:
-                continue
-            # tight conj or sign opposition
-            if angular_sep(lon, olon) <= 3.0 or abs((int(lon//30) - int(olon//30)) % 12) == 6:
-                sig |= _kp_signified_houses_base(other, chart, cusps)
-    return sig
-
-def _kp_cusp_sub_lord_eval(cusp_house: int, chart: Dict[str, Any], cusps: List[float],
-                           positive: Set[int], negative: Set[int]) -> Tuple[bool, Set[int], str, Optional[str]]:
-    """Evaluate a cusp by its sub-lord; if borderline, peek at SSL for tie-break."""
-    cusp_deg = cusps[cusp_house-1]
-    star_lord, sub_lord, ssl, star_deg, pos_in_star, sub_span, pos_in_sub = kp_star_sub_sub(cusp_deg)
-    sig = _kp_signified_houses_chain(sub_lord, chart, cusps)
-    good = (len(sig & positive) > 0) and (len(sig & negative) == 0)
-
-    ssl_sig = _kp_signified_houses_chain(ssl, chart, cusps)
-    ssl_good = (len(ssl_sig & positive) > 0) and (len(ssl_sig & negative) == 0)
-    reason = f"sub={sub_lord}, ssl={ssl}, signified={sorted(sig)}, ssl_signified={sorted(ssl_sig)}"
-    chosen_ssl = ssl if (not good and ssl_good) else None
-    return (good or ssl_good), (sig if good else (ssl_sig if ssl_good else sig)), reason, chosen_ssl
-
-def _ruling_planets(chart: Dict[str, Any], tz_name: str, date: str, time_: str) -> Set[str]:
-    """KP Ruling Planets: day-lord, Moon sign-lord, Moon star-lord, ASC sign-lord, ASC star-lord."""
-    bodies = _with_node_aliases(chart.get("bodies", []))
-    # Day-lord
-    try:
-        from zoneinfo import ZoneInfo
-        dt_local = datetime.fromisoformat(f"{date}T{time_}").replace(tzinfo=ZoneInfo(tz_name))
-    except Exception:
-        dt_local = datetime.fromisoformat(f"{date}T{time_}").replace(tzinfo=timezone.utc)
-    WEEK_TO_LORD = ["Moon","Mars","Mercury","Jupiter","Venus","Saturn","Sun"]
-    daylord = WEEK_TO_LORD[dt_local.weekday()]
-
-    # Moon sign/star
-    moon = bodies.get("Moon")
-    moon_signlord = moon_starlord = None
-    if moon:
-        try:
-            md = float(moon["longitude_deg"])
-            moon_signlord = lord_of_sign(md)
-            moon_starlord, *_ = kp_star_sub_sub(md)
-        except Exception:
-            pass
-
-    # ASC sign/star
-    asc_deg = chart.get("angles", {}).get("asc_deg", chart.get("asc_deg")) or 0.0
-    asc_signlord = lord_of_sign(float(asc_deg))
-    asc_starlord, *_ = kp_star_sub_sub(float(asc_deg))
-
-    return {p for p in [daylord, moon_signlord, moon_starlord, asc_signlord, asc_starlord] if p}
-
-# =============================================================================
 # KP entrypoint
 # =============================================================================
 
 def analyze_kp(inp: HoraryInput) -> Dict[str, Any]:
+    """
+    KP (Krishnamurti Paddhati) reading:
+      - All calculations in SIDEREAL using KP ayanāṁśa (chart & houses).
+      - Decision from primary cusps’ sub-lords (SSL tie-breaker).
+      - Ruling Planets add small confidence bias.
+    """
     kp_aya = inp.kp_ayanamsa if inp.kp_ayanamsa is not None else "krishnamurti"
 
     # Chart (SIDEREAL) with KP ayanamsa
@@ -569,7 +419,7 @@ def analyze_kp(inp: HoraryInput) -> Dict[str, Any]:
     la = float(observer.get("latitude", inp.latitude or 0.0))
     lo = float(observer.get("longitude", inp.longitude or 0.0))
 
-    # Houses (KP system)
+    # Houses (KP system, sidereal)
     houses = compute_houses_from_chart(
         chart, latitude=la, longitude=lo,
         house_system=inp.kp_house_system,
@@ -581,7 +431,9 @@ def analyze_kp(inp: HoraryInput) -> Dict[str, Any]:
     # KP number anchoring (rotate cusps so ASC equals number-derived degree)
     if inp.kp_number and (inp.kp_number_mode or "anchor_asc").lower() == "anchor_asc":
         target = (max(1, min(249, int(inp.kp_number))) - 1) * (360.0 / 249.0)
-        cusps = rotate_cusps_to_target_asc(cusps, asc_deg_sid, target)
+        # rotate all cusps so that asc becomes target
+        delta = deg_wrap(target - asc_deg_sid)
+        cusps = [deg_wrap(c + delta) for c in cusps]
         asc_deg_sid = target
 
     # Decision via cusp sub-lords on primary houses
@@ -691,7 +543,7 @@ def analyze_kp(inp: HoraryInput) -> Dict[str, Any]:
 def analyze_prasna(inp: HoraryInput, method: str = "parashari") -> Dict[str, Any]:
     """
     method in {"parashari","kp"}.
-    (Hybrid is intentionally NOT implemented in this classical module.)
+    (Hybrid is intentionally NOT implemented here.)
     """
     try:
         m = (method or "parashari").strip().lower()
@@ -701,7 +553,7 @@ def analyze_prasna(inp: HoraryInput, method: str = "parashari") -> Dict[str, Any
     except Exception as e:
         return {"ok": False, "system": method, "error": str(e), "error_type": type(e).__name__}
 
-def analyze_prasna_enhanced(inp, method: str = "parashari"):
+def analyze_prasna_enhanced(inp: HoraryInput, method: str = "parashari"):
     """
     Thin wrapper so routes can import analyze_prasna_enhanced().
     Delegates to analyze_prasna() and adds a 'method' key for convenience.
