@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-horary_hybrid.py — hybrid pipeline (2025-09-29)
------------------------------------------------
+horary_hybrid.py — hybrid pipeline (2025-09-29, patched)
+--------------------------------------------------------
 Hybrid (birth + question-moment) prashna analysis.
 
 Pipeline
@@ -9,6 +9,7 @@ Pipeline
           Parāśarī + KP (via horary_classical.analyze_*).
 - Step 2: Parāśarī CROSS analysis (birth ↔ question) using house relevance,
           dignity, and inter-chart aspects (soft/hard).
+          **Patched:** both charts are aligned to the same zodiac frame first.
 - Step 3: Analyze QUESTION (horary) chart: Parāśarī + KP (classical engines).
 - Step 4: Fuse Step 2 & Step 3 into the FINAL verdict, with explicit grounds.
 
@@ -80,7 +81,7 @@ def _top(items: List[Dict[str, Any]], n: int = 5) -> List[Dict[str, Any]]:
 # Grounds formatters (Parāśarī & KP)
 # ---------------------------------------------------------------------------
 
-def _parashari_grounds_from_result(p_res: Dict[str, Any], mapping: Dict[str, List[int]]) -> Dict[str, Any]:
+def _parashari_grounds_from_result(p_res: Dict[str, Any], mapping: Dict[str, List[int]]) -> Dict[str, Any]]:
     """Summarize Parāśarī result into for/against/conflicts/notes grounds."""
     for_list: List[Dict[str, Any]] = []
     against_list: List[Dict[str, Any]] = []
@@ -222,6 +223,78 @@ def _snapshot(chart: Dict[str, Any], cusps: List[float]) -> Dict[str, Any]:
     }
 
 # ---------------------------------------------------------------------------
+# Frame alignment (NEW): ensure both charts are in the same zodiac for Step 2
+# ---------------------------------------------------------------------------
+
+def _shift_list(values: List[float], delta: float) -> List[float]:
+    return [deg_wrap(v + delta) for v in values]
+
+def _chart_shifted(chart: Dict[str, Any], delta: float) -> Dict[str, Any]:
+    """Return a shallow-copied chart with longitudes (bodies/angles) shifted by delta degrees."""
+    if not delta:
+        return chart
+    out = dict(chart)
+    # Bodies
+    bodies_new = []
+    for b in chart.get("bodies", []) or []:
+        b2 = dict(b)
+        try:
+            b2["longitude_deg"] = deg_wrap(float(b2["longitude_deg"]) + delta)
+        except Exception:
+            pass
+        bodies_new.append(b2)
+    out["bodies"] = bodies_new
+    # Angles
+    ang = dict(chart.get("angles", {}) or {})
+    for key in ("asc_deg","mc_deg"):
+        if key in ang and ang[key] is not None:
+            try:
+                ang[key] = deg_wrap(float(ang[key]) + delta)
+            except Exception:
+                pass
+    if ang:
+        out["angles"] = ang
+    return out
+
+def _align_zodiac_frames_for_cross(
+    b_chart: Dict[str, Any], b_cusps: List[float],
+    q_chart: Dict[str, Any], q_cusps: List[float],
+) -> Tuple[Dict[str, Any], List[float], Dict[str, Any], List[float]]:
+    """
+    If birth/question charts differ in zodiac mode, convert both to a common frame.
+    Policy: choose SIDEREAL if either is sidereal, else tropical.
+    Conversion uses each chart's own ayanamsa_deg from meta.
+    """
+    b_meta = b_chart.get("meta", {}) or {}
+    q_meta = q_chart.get("meta", {}) or {}
+    b_mode = (b_meta.get("zodiac_mode") or "").lower() or "sidereal"
+    q_mode = (q_meta.get("zodiac_mode") or "").lower() or "sidereal"
+    if b_mode == q_mode:
+        return b_chart, b_cusps, q_chart, q_cusps
+
+    target = "sidereal" if ("sidereal" in (b_mode, q_mode)) else "tropical"
+
+    # Birth transform
+    b = b_chart
+    bc = list(b_cusps)
+    if b_mode != target:
+        b_aya = float(b_meta.get("ayanamsa_deg") or 0.0)
+        delta = (-b_aya) if target == "sidereal" else (+b_aya)
+        b = _chart_shifted(b_chart, delta)
+        bc = _shift_list(b_cusps, delta)
+
+    # Question transform
+    q = q_chart
+    qc = list(q_cusps)
+    if q_mode != target:
+        q_aya = float(q_meta.get("ayanamsa_deg") or 0.0)
+        delta = (-q_aya) if target == "sidereal" else (+q_aya)
+        q = _chart_shifted(q_chart, delta)
+        qc = _shift_list(q_cusps, delta)
+
+    return b, bc, q, qc
+
+# ---------------------------------------------------------------------------
 # Step 2: Parāśarī cross-analysis (birth ↔ question)
 # ---------------------------------------------------------------------------
 
@@ -244,7 +317,7 @@ def _cross_score_parashari(
     qtype: QuestionType
 ) -> Tuple[float, Dict[str, Any], Dict[str, Any]]:
     """
-    Evaluate synergy between birth and question charts:
+    Evaluate synergy between birth and question charts (aligned to same zodiac):
       A) Question planets placed into BIRTH houses
       B) Birth planets placed into QUESTION houses
       C) Inter-chart aspects (same-name classical planets)
@@ -262,7 +335,7 @@ def _cross_score_parashari(
 
     # A) Question planets in BIRTH houses
     for nm, qb in bodies_q.items():
-        if nm not in bodies_b:  # limit to grahas present in both for stability
+        if nm not in bodies_b:
             continue
         try:
             lon = float(qb["longitude_deg"])
@@ -438,6 +511,11 @@ def analyze_hybrid(inp: HybridPrasnaInput) -> Dict[str, Any]:
     q_chart, q_houses, q_cusps = _build_question_bundle(inp)
     b_chart, b_houses, b_cusps = _build_birth_bundle(inp.querent_birth, inp.house_system)
 
+    # Align frames for cross-analysis (sidereal if either is sidereal)
+    b_chart_aligned, b_cusps_aligned, q_chart_aligned, q_cusps_aligned = _align_zodiac_frames_for_cross(
+        b_chart, b_cusps, q_chart, q_cusps
+    )
+
     # Snapshots (for UI/debug)
     q_snap = _snapshot(q_chart, q_cusps)
     b_snap = _snapshot(b_chart, b_cusps)
@@ -447,10 +525,10 @@ def analyze_hybrid(inp: HybridPrasnaInput) -> Dict[str, Any]:
     b_parashari = parashari_classical(b_hi)
     b_kp        = kp_classical(b_hi)
 
-    # --- Step 2: Parāśarī CROSS (birth ↔ question)
+    # --- Step 2: Parāśarī CROSS (birth ↔ question) on ALIGNED charts
     cross_p_score, cross_break, cross_grounds = _cross_score_parashari(
-        birth_chart=b_chart, birth_cusps=b_cusps,
-        q_chart=q_chart, q_cusps=q_cusps,
+        birth_chart=b_chart_aligned, birth_cusps=b_cusps_aligned,
+        q_chart=q_chart_aligned, q_cusps=q_cusps_aligned,
         qtype=qtype
     )
 
