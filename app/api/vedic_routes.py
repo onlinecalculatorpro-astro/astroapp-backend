@@ -1814,24 +1814,22 @@ def _horary_error(route: str, tz_norm: str, error: str, warns: List[str], status
 
 
 def _run_horary_single(method: str, body: Dict[str, Any], route_name: str):
-    """Shared runner for single-method endpoints with strict raw validation."""
-    # NEW: Prefer payload helper first
+    # Prefer payload helper first
     if callable(_horary_from_payload):
-         body = request.get_json(silent=True) or {}
-         try:
-             b = dict(body or {}); b["method"] = "hybrid"
-             res = _horary_from_payload(b)  # type: ignore
-             if isinstance(res, dict) and res.get("ok"):
-                 res.setdefault("meta", {}).update({
-                     "route": "horary/hybrid",
-                     "tz_normalized": _tz_from_payload(body),
-                     "branch": _PRED_PAYLOAD_BRANCH
-                 })
-                 return jsonify(res), 200
-             # otherwise, fall through to core fallback (parashari+kp merge)
-         except Exception:
-             pass
-
+        try:
+            b = dict(body or {})
+            b["method"] = method  # respect caller: "parashari" or "kp"
+            res = _horary_from_payload(b)  # type: ignore
+            if isinstance(res, dict):
+                res.setdefault("meta", {}).update({
+                    "route": route_name,                       # label correctly
+                    "tz_normalized": _tz_from_payload(body),
+                    "branch": _PRED_PAYLOAD_BRANCH
+                })
+                return jsonify(res), (200 if res.get("ok") else 400)
+        except Exception:
+            pass
+    
     # Fallback to horary core
     if not _HORARY_OK or not callable(_analyze_prasna_enhanced):
         return jsonify({"ok": False, "error": "horary_engine_unavailable"}), 503
