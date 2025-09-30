@@ -137,7 +137,8 @@ def _kp_signified_houses_chain(planet_name: str, chart: Dict[str, Any], cusps: L
             except Exception:
                 continue
             # tight conj or sign opposition
-            if angular_sep(lon, olon) <= 3.0 or abs((int(lon//30) - int(olon//30)) % 12) == 6:
+            from .horary_shared import sign_index  # already imported at top
+            if angular_sep(lon, olon) <= 3.0 or (abs(sign_index(lon) - sign_index(olon)) % 12) == 6:
                 sig |= _kp_signified_houses_base(other, chart, cusps)
     return sig
 
@@ -426,7 +427,8 @@ def analyze_kp(inp: HoraryInput) -> Dict[str, Any]:
         zodiac_mode="sidereal", ayanamsa_deg=ay_deg
     )
     cusps = list(houses.get("cusps_deg", []) or [])
-    asc_deg_sid = float(houses.get("asc_deg"))
+    asc_deg_sid = float(houses.get("asc_deg") or safe_get_asc(chart) or 0.0)
+
 
     # KP number anchoring (rotate cusps so ASC equals number-derived degree)
     if inp.kp_number and (inp.kp_number_mode or "anchor_asc").lower() == "anchor_asc":
