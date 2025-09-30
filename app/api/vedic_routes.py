@@ -610,7 +610,7 @@ def _run_with_registry_first(
         try:
             civ = civic_builder(body, norm)
             civ["scheme"] = scheme_key
-            out = _compute_dasha_registry(civ)  # type: ignore[misc]
+            out = _compute_dasha_registry(civ)  # type: ignore/misc]
             if isinstance(out, dict) and out.get("ok"):
                 out = _ensure_tree_envelope(out, scheme=scheme_key)
                 return _wrap_ok(out, warns, tz_norm, branch="registry.compute_dasha", route_name=route_name)
@@ -841,7 +841,7 @@ def _ayanamsa_deg_from_key(jd_tt: Optional[float], key: str) -> Optional[float]:
     try:
         if jd_tt is not None:
             try:
-                return float(get_ayanamsa_deg(jd_tt, key))  # type: ignore[misc]
+                return float(get_ayanamsa_deg(jd_tt, key))  # type: ignore/misc]
             except Exception:
                 pass
         return float(get_ayanamsa_deg(None, key))  # type: ignore/misc
@@ -1247,7 +1247,7 @@ def vedic_stations():
     if normalize_stations_payload is None:
         return jsonify({"ok": False, "error": "validator_unavailable"}), 503
 
-    norm, warns, tz_norm = normalize_stations_payload(body)  # type: ignore[misc]
+    norm, warns, tz_norm = normalize_stations_payload(body)  # type: ignore/misc]
     tr = norm.get("time_range")
     if not (isinstance(tr, list) and len(tr) == 2 and tr[0] and tr[1]):
         return jsonify({"ok": False, "error": "missing_date_window"}), 400
@@ -1854,6 +1854,100 @@ def _has_birth_details(body: Dict[str, Any]) -> tuple[bool, List[str]]:
     return (len(missing) == 0), missing
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# NEW (HORARY-ONLY CHANGE): Strength enrichment helpers for Parāśarī
+# ──────────────────────────────────────────────────────────────────────────────
+def _build_strength_payload_from_parashari(res: Dict[str, Any], body: Dict[str, Any], tz_norm: str) -> Dict[str, Any]:
+    """
+    Construct a precise, engine-friendly payload using the original horary
+    question’s civil inputs, while seeding angles/cusps/mode from the
+    Parāśarī result (if provided).
+    """
+    cd = (res.get("chart_data") or {}) if isinstance(res, dict) else {}
+    meta = (res.get("meta") or {}) if isinstance(res, dict) else {}
+
+    payload: Dict[str, Any] = {
+        "date": body.get("date") or body.get("birth_date"),
+        "time": body.get("time") or body.get("birth_time"),
+        "tz": tz_norm,
+        "place_tz": tz_norm,
+        "latitude": body.get("latitude") or body.get("lat"),
+        "longitude": body.get("longitude") or body.get("lon"),
+        "elevation_m": body.get("elevation_m") or body.get("elevation"),
+        "zodiac_mode": meta.get("zodiac_mode") or body.get("zodiac_mode") or body.get("mode") or "sidereal",
+        "ayanamsa": meta.get("ayanamsa") or body.get("ayanamsa") or "lahiri",
+        "house_system": meta.get("house_system") or body.get("house_system") or "sripati",
+    }
+
+    # Angles / cusps from Parāśarī result if present
+    asc = cd.get("ASC_deg") or cd.get("asc_deg")
+    if isinstance(asc, (int, float)):
+        payload["angles"] = {"asc": float(asc)}
+    cusps = cd.get("cusps_deg") or cd.get("house_cusps_deg")
+    if isinstance(cusps, (list, tuple)) and len(cusps) == 12:
+        payload["house_cusps_deg"] = list(cusps)
+
+    # Pass through optional knobs if provided by caller
+    if body.get("vargas"):
+        payload["vargas"] = body.get("vargas")
+    if body.get("ruleset"):
+        payload["ruleset"] = body.get("ruleset")
+    if body.get("ruleset_map"):
+        payload["ruleset_map"] = body.get("ruleset_map")
+    if body.get("angles") and "angles" not in payload:
+        payload["angles"] = body.get("angles")
+
+    return payload
+
+
+def _maybe_attach_strengths_parashari(res: Dict[str, Any], body: Dict[str, Any], tz_norm: str) -> Dict[str, Any]:
+    """
+    If `res` is a Parāśarī horary result, compute Śaḍbala & Aṣṭakavarga using
+    your core engines and attach them under `res["strength"]`.
+    """
+    try:
+        if not isinstance(res, dict):
+            return res
+        # Only attach to Parāśarī results
+        tag = str(res.get("method") or res.get("system") or "parashari").strip().lower()
+        if tag != "parashari":
+            return res
+
+        strength_payload = _build_strength_payload_from_parashari(res, body, tz_norm)
+
+        shad_out = None
+        av_out = None
+        warns_local: List[str] = []
+
+        # Import cores locally (keeps non-horary sections untouched)
+        try:
+            from app.core.shadbala import compute_shadbala as _compute_shadbala_core  # type: ignore
+            shad_out = _compute_shadbala_core(strength_payload)
+        except Exception as e:
+            warns_local.append(f"shadbala_enrich_failed:{type(e).__name__}")
+
+        try:
+            from app.core.ashtakavarga import compute_ashtakavarga as _compute_ashtakavarga_core  # type: ignore
+            av_out = _compute_ashtakavarga_core(strength_payload)
+        except Exception as e:
+            warns_local.append(f"ashtakavarga_enrich_failed:{type(e).__name__}")
+
+        if (isinstance(shad_out, dict) and shad_out.get("ok")) or (isinstance(av_out, dict) and av_out.get("ok")):
+            res.setdefault("strength", {})
+            if isinstance(shad_out, dict) and shad_out.get("ok"):
+                res["strength"]["shadbala"] = shad_out
+            if isinstance(av_out, dict) and av_out.get("ok"):
+                res["strength"]["ashtakavarga"] = av_out
+
+        if warns_local:
+            res.setdefault("warnings", []).extend(warns_local)
+        return res
+    except Exception:
+        # Never break the horary route due to enrichment
+        res.setdefault("warnings", []).append("strength_enrichment_error")
+        return res
+
+
 def _run_horary_single(method: str, body: Dict[str, Any], route_name: str):
     # Prefer payload helper first
     if callable(_horary_from_payload):
@@ -1862,6 +1956,10 @@ def _run_horary_single(method: str, body: Dict[str, Any], route_name: str):
             b["method"] = method  # respect caller: "parashari" or "kp"
             res = _horary_from_payload(b)  # type: ignore
             if isinstance(res, dict):
+                # HORARY-ONLY CHANGE: Strength enrichment for Parāśarī
+                if method == "parashari" and isinstance(res, dict):
+                    res = _maybe_attach_strengths_parashari(res, body, _tz_from_payload(body))
+
                 res.setdefault("meta", {}).update({
                     "route": route_name,                       # label correctly
                     "tz_normalized": _tz_from_payload(body),
@@ -1892,6 +1990,10 @@ def _run_horary_single(method: str, body: Dict[str, Any], route_name: str):
         return jsonify({"ok": False, "error": f"{route_name.replace('/', '_')}_failed", "detail": str(ex)}), 400
 
     if isinstance(res, dict):
+        # HORARY-ONLY CHANGE: Strength enrichment for Parāśarī
+        if method == "parashari":
+            res = _maybe_attach_strengths_parashari(res, body, tz_norm)
+
         res.setdefault("meta", {})
         res["meta"].update({"route": route_name, "tz_normalized": tz_norm, "branch": "horary_core"})
         if warns:
@@ -1941,6 +2043,13 @@ def horary_hybrid():
             b["method"] = "hybrid"
             res = _horary_from_payload(b)  # type: ignore
             if isinstance(res, dict):
+                # HORARY-ONLY CHANGE: Strength enrichment (Parāśarī leg only)
+                try:
+                    if isinstance(res.get("parashari"), dict):
+                        res["parashari"] = _maybe_attach_strengths_parashari(res["parashari"], body, _tz_from_payload(body))
+                except Exception:
+                    res.setdefault("warnings", []).append("strength_enrichment_error")
+
                 res.setdefault("meta", {}).update({"route": "horary/hybrid",
                                                    "tz_normalized": _tz_from_payload(body),
                                                    "branch": _PRED_PAYLOAD_BRANCH})
@@ -1965,6 +2074,9 @@ def horary_hybrid():
     try:
         inp = _HoraryInput(**hw)  # type: ignore
         res_par = _analyze_prasna_enhanced(inp, method="parashari")  # type: ignore
+        # HORARY-ONLY CHANGE: Strength enrichment for Parāśarī leg
+        if isinstance(res_par, dict):
+            res_par = _maybe_attach_strengths_parashari(res_par, body, tz_norm)
         res_kp  = _analyze_prasna_enhanced(inp, method="kp")         # type: ignore
     except Exception as ex:
         return jsonify({"ok": False, "error": "horary_hybrid_failed", "detail": str(ex)}), 400
@@ -2040,6 +2152,15 @@ def horary_generic():
             b["method"] = method
             res = _horary_from_payload(b)  # type: ignore
             if isinstance(res, dict):
+                # HORARY-ONLY CHANGE: Strength enrichment for Parāśarī (single) or Parāśarī leg (hybrid)
+                try:
+                    if method == "parashari":
+                        res = _maybe_attach_strengths_parashari(res, body, _tz_from_payload(body))
+                    elif method == "hybrid" and isinstance(res.get("parashari"), dict):
+                        res["parashari"] = _maybe_attach_strengths_parashari(res["parashari"], body, _tz_from_payload(body))
+                except Exception:
+                    res.setdefault("warnings", []).append("strength_enrichment_error")
+
                 res.setdefault("meta", {}).update({"route": "horary",
                                                    "tz_normalized": _tz_from_payload(body),
                                                    "branch": _PRED_PAYLOAD_BRANCH,
@@ -2070,6 +2191,9 @@ def horary_generic():
         inp = _HoraryInput(**hw)  # type: ignore
         if method == "hybrid":
             res_par = _analyze_prasna_enhanced(inp, method="parashari")  # type: ignore
+            # HORARY-ONLY CHANGE: Strength enrichment for Parāśarī leg
+            if isinstance(res_par, dict):
+                res_par = _maybe_attach_strengths_parashari(res_par, body, tz_norm)
             res_kp  = _analyze_prasna_enhanced(inp, method="kp")         # type: ignore
             ok_par = bool(isinstance(res_par, dict) and res_par.get("ok"))
             ok_kp  = bool(isinstance(res_kp, dict) and res_kp.get("ok"))
@@ -2098,6 +2222,10 @@ def horary_generic():
         return jsonify({"ok": False, "error": "horary_failed", "detail": str(ex)}), 400, {"X-Deprecated-Endpoint": "/api/vedic/horary"}
 
     if isinstance(res, dict):
+        # HORARY-ONLY CHANGE: Strength enrichment for Parāśarī
+        if method == "parashari":
+            res = _maybe_attach_strengths_parashari(res, body, tz_norm)
+
         res.setdefault("meta", {})
         res["meta"].update({"route": "horary", "tz_normalized": tz_norm, "branch": "horary_core",
                             "method": method, "deprecated": True,
