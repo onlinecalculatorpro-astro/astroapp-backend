@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-horary_shared.py — unified Vedic/Prashna helpers (2025-09-30, patched)
+horary_shared.py — unified Vedic/Prashna helpers (2025-10-01)
 
 What this module provides
 -------------------------
@@ -15,14 +15,14 @@ What this module provides
     - NAKSHATRAS (27 + Abhijit), NAKSHATRA_LORDS
     - VIMSHOTTARI_ORDER, VIMSHOTTARI_YEARS
     - VEDIC_ASPECTS (graha dṛṣṭi), GANDANTA ranges
-    - BENEFICS/MALEFICS, COMBUST_DEG
+    - BENEFICS / MALEFICS, COMBUST_DEG
 
 • Zodiac math & dignity:
     - deg_wrap, sign_index, sign_name_from_deg(lang="en"/"sa")
     - lord_of_sign, angular_sep, is_sandhi, is_gandanta
     - calculate_aspects (Ptolemaic), calc_dignity_simple / calc_dignity_rich
 
-• KP-like star/sub/ssub helpers (27-equal):
+• KP star/sub/ssub helpers (27-equal):
     - kp_star_sub_sub, kp_star_and_sublord
 
 • Houses & charts:
@@ -31,6 +31,7 @@ What this module provides
     - compute_houses_from_chart (advanced JD path → fallback Equal; **no extra sidereal shift for Whole-Sign/Equal**)
     - whole_sign_cusps_from_asc, rotate_cusps_to_target_asc, house_of
     - safe_get_asc, safe_get_mc
+    - get_house_lords_from_cusps
 
 • Vedic dṛṣṭi utilities:
     - graha_drishti_offsets, houses_aspected_by
@@ -44,6 +45,11 @@ What this module provides
 • Question mapping (classical + karakas):
     - ENHANCED_QUESTION_HOUSES
     - normalize_question_type / normalize_question_type_str
+
+• Convenience helpers:
+    - bodies_by_name_with_nodes (adds Rahu/Ketu aliases for North/South Node)
+    - shift_sidereal / shift_sidereal_value
+    - ayanamsa_from_meta
 """
 
 from __future__ import annotations
@@ -346,7 +352,7 @@ def calc_dignity_rich(longitude: float, planet: str) -> float:
 def kp_star_sub_sub(ecl_deg_sidereal: float) -> Tuple[str, str, str, float, float, float, float]:
     """
     Returns: (star_lord, sub_lord, sub_sub_lord, star_span_deg, pos_in_star_deg, sub_span_deg, pos_in_sub_deg)
-    Note: expects a sidereal longitude if you want sidereal nakshatra.
+    Note: expects a *sidereal* longitude if you want sidereal nakshatra.
     """
     pos = deg_wrap(ecl_deg_sidereal)
     star_idx = int(pos // STAR_LEN_DEG)  # 0..26
@@ -395,6 +401,10 @@ def shift_sidereal(values: List[float], ay_deg: float) -> List[float]:
     """Shift tropical ecliptic longitudes by -ayanamsa → sidereal."""
     return [deg_wrap(v - ay_deg) for v in values]
 
+def shift_sidereal_value(value: float, ay_deg: float) -> float:
+    """Shift a single tropical longitude by -ayanamsa → sidereal."""
+    return deg_wrap(value - ay_deg)
+
 def house_of(long_deg: float, cusps_deg: List[float]) -> int:
     """
     Return house number 1..12 for a longitude given cusp longitudes (H1..H12).
@@ -420,6 +430,10 @@ def rotate_cusps_to_target_asc(cusps: List[float], current_asc: float, target_as
     """Rotate all cusps so that ASC becomes `target_asc` (for KP 'number' anchoring)."""
     delta = deg_wrap(target_asc - current_asc)
     return [deg_wrap(c + delta) for c in cusps]
+
+def get_house_lords_from_cusps(cusps_deg: List[float]) -> Dict[int, str]:
+    """Return {house#: sign-lord} for the provided cusp list."""
+    return {i + 1: lord_of_sign(c) for i, c in enumerate(cusps_deg or [])}
 
 # =============================================================================
 # Vedic graha-dṛṣṭi helpers (sign-based)
@@ -634,8 +648,8 @@ def compute_houses_from_chart(
 
     if zodiac_mode.lower() == "sidereal" and isinstance(ayanamsa_deg, (int, float)):
         cusps     = shift_sidereal(cusps, float(ayanamsa_deg))
-        asc_deg_h = deg_wrap(asc_deg_h - float(ayanamsa_deg))
-        mc_deg_h  = deg_wrap(mc_deg_h  - float(ayanamsa_deg))
+        asc_deg_h = shift_sidereal_value(asc_deg_h, float(ayanamsa_deg))
+        mc_deg_h  = shift_sidereal_value(mc_deg_h,  float(ayanamsa_deg))
 
     return {
         "house_system": payload.get("house_system", house_system),
@@ -696,6 +710,28 @@ def radicality_flags(chart: Dict[str, Any], tz_name: str, date: str, time_: str)
         "hour_lord": hour_lord,
         "fits": fits,
     }
+
+# =============================================================================
+# Convenience helpers
+# =============================================================================
+
+def bodies_by_name_with_nodes(bodies_list: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """
+    Index bodies by name and ensure Rahu/Ketu aliases exist for North/South Node.
+    """
+    d = {b.get("name"): b for b in bodies_list if isinstance(b, dict) and b.get("name")}
+    if "North Node" in d and "Rahu" not in d:
+        d["Rahu"] = d["North Node"]
+    if "South Node" in d and "Ketu" not in d:
+        d["Ketu"] = d["South Node"]
+    return d
+
+def ayanamsa_from_meta(chart: Dict[str, Any]) -> Optional[float]:
+    """Read ayanamsa (deg) from chart.meta if present."""
+    try:
+        return float((chart.get("meta") or {}).get("ayanamsa_deg"))
+    except Exception:
+        return None
 
 # =============================================================================
 # Dataclasses / Inputs
@@ -789,7 +825,7 @@ __all__ = [
     "kp_star_sub_sub","kp_star_and_sublord",
 
     # Houses & zodiac
-    "shift_sidereal","house_of","whole_sign_cusps_from_asc","rotate_cusps_to_target_asc",
+    "shift_sidereal","shift_sidereal_value","house_of","whole_sign_cusps_from_asc","rotate_cusps_to_target_asc","get_house_lords_from_cusps",
 
     # Vedic drishti
     "graha_drishti_offsets","houses_aspected_by",
@@ -802,4 +838,7 @@ __all__ = [
 
     # Radicality
     "radicality_flags",
+
+    # Convenience
+    "bodies_by_name_with_nodes","ayanamsa_from_meta",
 ]
