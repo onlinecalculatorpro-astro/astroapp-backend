@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-horary_shared.py — unified Vedic/Prashna helpers (2025-09-29, patched)
+horary_shared.py — unified Vedic/Prashna helpers (2025-09-30, patched)
 
 What this module provides
 -------------------------
@@ -13,18 +13,18 @@ What this module provides
     - SIGN_LORDS, EXALTATION_SIGNS, MOOLATRIKONA_SIGNS
     - NAKSHATRAS (27 + Abhijit), NAKSHATRA_LORDS
     - VIMSHOTTARI_ORDER, VIMSHOTTARI_YEARS
-    - VEDIC_ASPECTS (graha dṛṣṭi), GANDANTA ranges (helpers provided)
+    - VEDIC_ASPECTS (graha dṛṣṭi), GANDANTA ranges
     - BENEFICS/MALEFICS, COMBUST_DEG
 • Zodiac math & dignity:
     - deg_wrap, sign_index, sign_name_from_deg(lang="en"/"sa")
     - lord_of_sign, angular_sep, is_sandhi, is_gandanta
     - calculate_aspects (Ptolemaic), calc_dignity_simple / calc_dignity_rich
 • KP-like star/sub/ssub helpers:
-    - kp_star_sub_sub, kp_star_and_sublord (27-equal scheme; Abhijit is informational only)
+    - kp_star_sub_sub, kp_star_and_sublord (27-equal scheme; Abhijit informational only)
 • Houses & charts:
     - ensure_coords_and_tz (uses local 'now' in resolved tz)
     - build_chart (wraps compute_chart)
-    - compute_houses_from_chart (tries strict JD → engine; fallback Equal; **no extra sidereal shift for Whole-Sign/Equal**)
+    - compute_houses_from_chart (advanced JD path → fallback Equal; **no extra sidereal shift for Whole-Sign/Equal**)
     - whole_sign_cusps_from_asc, rotate_cusps_to_target_asc, house_of
     - safe_get_asc, safe_get_mc
 • Vedic dṛṣṭi utilities:
@@ -86,12 +86,13 @@ MOOLATRIKONA_SIGNS: Dict[str, int] = {
 
 # Combustion thresholds (deg from Sun) — conservative defaults
 COMBUST_DEG: Dict[str, float] = {
-    "Moon": 12.0, "Mercury": 12.0, "Venus": 10.0, "Mars": 17.0, "Jupiter": 11.0, "Saturn": 15.0
+    "Moon": 12.0, "Mercury": 12.0, "Venus": 10.0,
+    "Mars": 17.0, "Jupiter": 11.0, "Saturn": 15.0
 }
 
 # Simple benefic/malefic sets
 BENEFICS: Set[str] = {"Jupiter","Venus","Moon"}
-MALEFICS: Set[str] = {"Saturn","Mars","Sun","Rahu","Ketu"}  # Sun often treated mild malefic in horary
+MALEFICS: Set[str] = {"Saturn","Mars","Sun","Rahu","Ketu"}  # Sun often mild malefic in horary
 
 # Nakshatra system (27 regular + Abhijit informational; KP math uses 27 equal)
 NAKSHATRAS = [
@@ -540,13 +541,13 @@ def compute_houses_from_chart(
     Calls app.core.houses_advanced.compute_house_system with whatever JD inputs
     are available from compute_chart(...).meta.timescales. If that fails,
     returns Equal Houses from ASC. Applies sidereal shift **only** to the advanced
-    engine output when requested. Whole-Sign and Equal fallback use chart's zodiac
+    engine output when requested. Whole-Sign and Equal fallback use chart’s zodiac
     as-is (no extra shift).
     """
     asc_any = safe_get_asc(chart)
     mc_any  = safe_get_mc(chart)
 
-    # Whole-Sign branch (ASC required) — use chart's zodiac as-is (no extra shift).
+    # Whole-Sign branch (ASC required) — use chart’s zodiac as-is (no extra shift).
     if (house_system or "").lower() == "whole_sign" and asc_any is not None:
         asc_deg = float(asc_any)
         cusps = whole_sign_cusps_from_asc(asc_deg)
@@ -577,7 +578,7 @@ def compute_houses_from_chart(
                  jd_ut=jd_ut, jd_ut1=jd_ut1),
             dict(latitude=latitude, longitude=longitude, house_system=house_system,
                  jd_tt=jd_tt),
-            # NEW: minimal jd_ut-only attempt
+            # Minimal jd_ut-only attempt
             dict(latitude=latitude, longitude=longitude, house_system=house_system,
                  jd_ut=jd_ut),
         ]
@@ -595,7 +596,7 @@ def compute_houses_from_chart(
 
     payload = _try_engine()
 
-    # Fallback: Equal from ASC — use chart's zodiac as-is (no extra shift).
+    # Fallback: Equal from ASC — use chart’s zodiac as-is (no extra shift).
     if not payload:
         if asc_any is None:
             raise ValueError("houses_fallback_failed:no_asc_in_chart")
@@ -784,7 +785,7 @@ __all__ = [
     # Chart/Houses
     "ensure_coords_and_tz","build_chart","compute_houses_from_chart","safe_get_asc","safe_get_mc",
 
-    # Pañcāṅга
+    # Pañcāṅga
     "tithi_index","moon_star",
 
     # Radicality
