@@ -247,16 +247,18 @@ def _parashari_strengths(chart: Dict[str, Any], cusps: List[float],
     return out
 
 # =============================================================================
-# Parāśarī entrypoint
+# Parāśarī entrypoint (CORRECTED)
 # =============================================================================
 
 def analyze_parashari(inp: HoraryInput) -> Dict[str, Any]:
     """
     Parāśarī-style reading of the question chart with:
       - Rich dignity scoring
+      - House LORDSHIP evaluation (PRIMARY FIX)
       - House-based relevance for the asked topic
       - Benefic/malefic drishti pressure
-      - Moon proximity & radicality nudges
+      - Moon proximity & radicality penalties
+      - Karaka (natural significator) evaluation
       - Panchanga snapshot
     """
     # Build question chart (tropical/sidereal per inp)
@@ -294,11 +296,54 @@ def analyze_parashari(inp: HoraryInput) -> Dict[str, Any]:
     # House lords (by cusp signs)
     house_lords: Dict[int, str] = {i+1: lord_of_sign(c) for i, c in enumerate(cusps)}
 
-    # Drishti pressure (sign-based via shared houses_aspected_by)
+    # Get question house mapping
     mapping = ENHANCED_QUESTION_HOUSES.get(qtype, {})
-    target_pos = set(mapping.get("primary", []) + mapping.get("secondary", []) + mapping.get("supportive", []))
-    target_neg = set(mapping.get("obstructive", []))
+    primary, secondary = mapping.get("primary", []), mapping.get("secondary", [])
+    supportive, obstructive = mapping.get("supportive", []), mapping.get("obstructive", [])
+    target_pos = set(primary + secondary + supportive)
+    target_neg = set(obstructive)
 
+    # === CORRECTED SCORING ===
+    primary_score = secondary_score = obstruction_score = 0.0
+
+    # 1. Score HOUSE LORDS first (primary significators)
+    for h in primary:
+        lord = house_lords.get(h)
+        if lord:
+            lord_data = next((s for s in strengths if s["planet"] == lord), None)
+            if lord_data:
+                primary_score += lord_data["overall_strength"] * 4.0
+
+    for h in secondary:
+        lord = house_lords.get(h)
+        if lord:
+            lord_data = next((s for s in strengths if s["planet"] == lord), None)
+            if lord_data:
+                secondary_score += lord_data["overall_strength"] * 2.5
+
+    # 2. Then score planets by house POSITION (lighter weight)
+    for s in strengths:
+        if s["house"] in primary:
+            primary_score += s["overall_strength"] * 1.5
+        elif s["house"] in secondary:
+            secondary_score += s["overall_strength"] * 1.0
+        elif s["house"] in supportive:
+            secondary_score += s["overall_strength"] * 0.6
+        elif s["house"] in obstructive:
+            obstruction_score += s["overall_strength"] * 2.0
+
+    # 3. Karaka (natural significator) evaluation
+    karaka_bonus = 0.0
+    karakas = mapping.get("karaka", [])
+    for k in karakas:
+        k_data = next((s for s in strengths if s["planet"] == k), None)
+        if k_data:
+            if k_data["overall_strength"] > 0.65:
+                karaka_bonus += 0.4
+            elif k_data["overall_strength"] < 0.35:
+                karaka_bonus -= 0.3  # Weak karaka is negative
+
+    # 4. Drishti pressure (sign-based via shared houses_aspected_by)
     drishti_bonus = drishti_malus = 0.0
     for nm in bodies:
         if nm not in PLANETS_WITH_NODES:
@@ -313,18 +358,7 @@ def analyze_parashari(inp: HoraryInput) -> Dict[str, Any]:
             drishti_malus += 0.20 * hits_pos
             drishti_bonus += 0.05 * hits_neg
 
-    # Score buckets from planetary placements
-    primary, secondary = mapping.get("primary", []), mapping.get("secondary", [])
-    supportive, obstructive = mapping.get("supportive", []), mapping.get("obstructive", [])
-
-    primary_score = secondary_score = obstruction_score = 0.0
-    for s in strengths:
-        if s["house"] in primary:      primary_score   += s["overall_strength"] * 3.0
-        elif s["house"] in secondary:  secondary_score += s["overall_strength"] * 2.0
-        elif s["house"] in supportive: secondary_score += s["overall_strength"] * 1.0
-        elif s["house"] in obstructive:obstruction_score += s["overall_strength"] * 2.0
-
-    # Moon proximity bonus to lords of target houses
+    # 5. Moon proximity bonus to lords of target houses
     prox_bonus = 0.0
     if moon_lon is not None:
         for pl in {house_lords.get(h) for h in (primary + secondary)}:
@@ -335,18 +369,36 @@ def analyze_parashari(inp: HoraryInput) -> Dict[str, Any]:
                 except Exception:
                     pass
 
-    # Radicality multiplier
+    # 6. Radicality check WITH PENALTIES for chart defects
     date = inp.date or datetime.now(timezone.utc).date().isoformat()
     time_ = inp.time or datetime.now(timezone.utc).time().replace(microsecond=0).isoformat()
     rad = radicality_flags(chart, inp.tz_name or "UTC", date, time_)
-    rad_mult = 1.10 if rad.get("fits") else 1.0
+    
+    # Check for chart defects
+    penalties = 0
+    # Saturn in 1st house
+    if any(s["planet"] == "Saturn" and s["house"] == 1 for s in strengths):
+        penalties += 1
+    # Overcrowding (4+ planets in 1st)
+    if len([s for s in strengths if s["house"] == 1]) >= 4:
+        penalties += 1
+    # Debilitated Lagna lord
+    asc_lord = lord_of_sign(float(asc_deg or 0.0))
+    if any(s["planet"] == asc_lord and s["dignity_score"] < -0.3 for s in strengths):
+        penalties += 1
+
+    # Apply radicality multiplier with penalties
+    if rad.get("fits"):
+        rad_mult = max(0.75, 1.10 - 0.12 * penalties)
+    else:
+        rad_mult = max(0.70, 0.95 - 0.10 * penalties)
 
     # Pañcāṅga snapshot
     t_idx = tithi_index(moon_lon, sun_lon)
     moon_star_label = moon_star(chart)
 
     # Final aggregate
-    total_positive = (primary_score + secondary_score + prox_bonus + drishti_bonus) * rad_mult
+    total_positive = (primary_score + secondary_score + prox_bonus + karaka_bonus + drishti_bonus) * rad_mult
     total_negative = obstruction_score + drishti_malus
     net_score = total_positive - total_negative
 
@@ -366,6 +418,9 @@ def analyze_parashari(inp: HoraryInput) -> Dict[str, Any]:
             "ayanamsa": inp.ayanamsa,
             "ayanamsa_deg_used": ay_deg,
             "house_system": inp.house_system,
+            "route": "horary/parashari",
+            "branch": "predictive.payload",
+            "tz_normalized": inp.tz_name or "UTC",
             "analysis_time": datetime.now(timezone.utc).isoformat()
         },
         "panchanga": {
@@ -387,14 +442,15 @@ def analyze_parashari(inp: HoraryInput) -> Dict[str, Any]:
             "secondary_score": round(secondary_score, 3),
             "obstruction_score": round(obstruction_score, 3),
             "moon_proximity_bonus": round(prox_bonus, 3),
+            "karaka_bonus": round(karaka_bonus, 3),
             "drishti_bonus": round(drishti_bonus, 3),
             "drishti_malus": round(drishti_malus, 3),
             "radicality_multiplier": rad_mult,
+            "radicality_penalties": penalties,
             "net_score": round(net_score, 3)
         },
         "judgement": {"answer": answer, "confidence": round(conf, 3)}
     }
-
 # =============================================================================
 # KP entrypoint
 # =============================================================================
