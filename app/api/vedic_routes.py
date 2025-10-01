@@ -227,19 +227,35 @@ except Exception:
 # ──────────────────────────────────────────────────────────────────────────────
 _HORARY_OK = False
 _horary_err = None
+
+# Defaults in case both imports fail
+_analyze_prasna_enhanced = None  # type: ignore
+_HoraryInput = None              # type: ignore
+_QuestionType = None             # type: ignore
+
 try:
-    from app.core.horary import (  # type: ignore
+    # Prefer the new consolidated module
+    from app.core.horary_classical import (  # type: ignore
         analyze_prasna_enhanced as _analyze_prasna_enhanced,
         HoraryInput as _HoraryInput,
         QuestionType as _QuestionType,
     )
     _HORARY_OK = True
-except Exception as _he:
-    _HORARY_OK = False
-    _horary_err = repr(_he)
-    _analyze_prasna_enhanced = None  # type: ignore
-    _HoraryInput = None               # type: ignore
-    _QuestionType = None              # type: ignore
+except Exception as _e1:
+    try:
+        # Fallback to legacy re-export (if your build still provides it)
+        from app.core.horary import (  # type: ignore
+            analyze_prasna_enhanced as _analyze_prasna_enhanced,
+            HoraryInput as _HoraryInput,
+            QuestionType as _QuestionType,
+        )
+        _HORARY_OK = True
+    except Exception as _e2:
+        _HORARY_OK = False
+        _horary_err = f"primary_import_failed={repr(_e1)}; fallback_import_failed={repr(_e2)}"
+        _analyze_prasna_enhanced = None  # type: ignore
+        _HoraryInput = None              # type: ignore
+        _QuestionType = None             # type: ignore
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1788,7 +1804,8 @@ def _normalize_horary_payload(body: Dict[str, Any]) -> tuple[Dict[str, Any], Lis
         "zodiac_mode": norm.get("zodiac_mode", "sidereal"),
         "ayanamsa": norm.get("ayanamsa", "lahiri"),
         "ayanamsa_deg": _coerce_float(body.get("ayanamsa_deg")),
-        "house_system": body.get("house_system") or "sripati",
+        # Leave empty: Parāśarī will default to whole_sign later
+        "house_system": body.get("house_system") or None,
         # KP options
         "kp_house_system": body.get("kp_house_system") or "placidus",
         "kp_ayanamsa": body.get("kp_ayanamsa") or "krishnamurti",
