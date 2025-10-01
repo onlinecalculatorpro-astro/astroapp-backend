@@ -1857,7 +1857,24 @@ def _has_birth_details(body: Dict[str, Any]) -> tuple[bool, List[str]]:
 # ──────────────────────────────────────────────────────────────────────────────
 # NEW (HORARY-ONLY CHANGE): Strength enrichment helpers for Parāśarī
 # ──────────────────────────────────────────────────────────────────────────────
-def _build_strength_payload_from_parashari(res: Dict[str, Any], body: Dict[str, Any], tz_norm: str) -> Dict[str, Any]:
+
+def _parashari_apply_defaults_to_payload(p: Dict[str, Any]) -> None:
+    """
+    In-place: ensure Parāśarī sane defaults if caller omitted them.
+    • house_system → whole_sign (if missing)
+    • topocentric → False (geocentric) unless observer/topocentric explicitly supplied
+    """
+    if not isinstance(p, dict):
+        return
+    if not p.get("house_system"):
+        p["house_system"] = "whole_sign"
+    if "observer" not in p and "topocentric" not in p:
+        p["topocentric"] = False
+
+
+def _build_strength_payload_from_parashari(res: Dict[str, Any],
+                                           body: Dict[str, Any],
+                                           tz_norm: str) -> Dict[str, Any]:
     """
     Construct a precise, engine-friendly payload using the original horary
     question’s civil inputs, while seeding angles/cusps/mode from the
@@ -1872,11 +1889,12 @@ def _build_strength_payload_from_parashari(res: Dict[str, Any], body: Dict[str, 
         "tz": tz_norm,
         "place_tz": tz_norm,
         "latitude": body.get("latitude") or body.get("lat"),
-        "longitude": body.get("longitude") or body.get("lon"),
+        "longitude": body.get("longitude") or body.get("lon") or body.get("longitude"),
         "elevation_m": body.get("elevation_m") or body.get("elevation"),
         "zodiac_mode": meta.get("zodiac_mode") or body.get("zodiac_mode") or body.get("mode") or "sidereal",
         "ayanamsa": meta.get("ayanamsa") or body.get("ayanamsa") or "lahiri",
-        "house_system": meta.get("house_system") or body.get("house_system") or "sripati",
+        # Default to whole-sign for Parāśarī consistency if nothing supplied:
+        "house_system": meta.get("house_system") or body.get("house_system") or "whole_sign",
     }
 
     # Angles / cusps from Parāśarī result if present
@@ -1887,7 +1905,7 @@ def _build_strength_payload_from_parashari(res: Dict[str, Any], body: Dict[str, 
     if isinstance(cusps, (list, tuple)) and len(cusps) == 12:
         payload["house_cusps_deg"] = list(cusps)
 
-    # Pass through optional knobs if provided by caller
+    # Optional knobs passthrough
     if body.get("vargas"):
         payload["vargas"] = body.get("vargas")
     if body.get("ruleset"):
@@ -1897,13 +1915,68 @@ def _build_strength_payload_from_parashari(res: Dict[str, Any], body: Dict[str, 
     if body.get("angles") and "angles" not in payload:
         payload["angles"] = body.get("angles")
 
+    # Parāśarī sane defaults (house system, geocentric) for strength runs too
+    _parashari_apply_defaults_to_payload(payload)
     return payload
 
 
-def _maybe_attach_strengths_parashari(res: Dict[str, Any], body: Dict[str, Any], tz_norm: str) -> Dict[str, Any]:
+def _surface_strength_summary(res: Dict[str, Any]) -> None:
+    """
+    Populate:
+      meta.used_shadbala, meta.used_ashtakavarga
+      scoring_breakdown.strength_summary.{shadbala_totals, ashtakavarga_SAV, ashtakavarga_SAV_avg}
+    Does nothing if strength blocks are missing.
+    """
+    if not isinstance(res, dict):
+        return
+
+    st = res.get("strength") or {}
+    meta = res.setdefault("meta", {})
+    scoring = res.setdefault("scoring_breakdown", {})
+    summary = scoring.setdefault("strength_summary", {})
+
+    # Flags
+    meta["used_shadbala"] = bool(st.get("shadbala") or st.get("shadbala_totals"))
+    meta["used_ashtakavarga"] = bool(st.get("ashtakavarga") or st.get("ashtakavarga_SAV"))
+
+    # Śaḍbala totals
+    sb_totals = None
+    if isinstance(st.get("shadbala_totals"), dict):
+        sb_totals = st["shadbala_totals"]
+    elif isinstance(st.get("shadbala"), dict) and isinstance(st["shadbala"].get("totals"), dict):
+        sb_totals = st["shadbala"]["totals"]
+    elif isinstance(st.get("shadbala"), list):
+        try:
+            sb_totals = {
+                row["planet"]: row.get("shadbala_rupa")
+                for row in st["shadbala"]
+                if isinstance(row, dict) and "planet" in row
+            }
+        except Exception:
+            sb_totals = None
+    if sb_totals:
+        summary["shadbala_totals"] = sb_totals
+
+    # Aṣṭakavarga SAV + avg
+    sav = None
+    if isinstance(st.get("ashtakavarga_SAV"), dict):
+        sav = st["ashtakavarga_SAV"]
+    elif isinstance(st.get("ashtakavarga"), dict) and isinstance(st["ashtakavarga"].get("SAV"), dict):
+        sav = st["ashtakavarga"]["SAV"]
+    if isinstance(sav, dict):
+        summary["ashtakavarga_SAV"] = sav
+        nums = [v for v in sav.values() if isinstance(v, (int, float))]
+        if nums:
+            summary["ashtakavarga_SAV_avg"] = sum(nums) / float(len(nums))
+
+
+def _maybe_attach_strengths_parashari(res: Dict[str, Any],
+                                      body: Dict[str, Any],
+                                      tz_norm: str) -> Dict[str, Any]:
     """
     If `res` is a Parāśarī horary result, compute Śaḍbala & Aṣṭakavarga using
-    your core engines and attach them under `res["strength"]`.
+    your core engines and attach them under `res["strength"]`. Then surface a
+    compact summary (no verdict change).
     """
     try:
         if not isinstance(res, dict):
@@ -1933,11 +2006,20 @@ def _maybe_attach_strengths_parashari(res: Dict[str, Any], body: Dict[str, Any],
             warns_local.append(f"ashtakavarga_enrich_failed:{type(e).__name__}")
 
         if (isinstance(shad_out, dict) and shad_out.get("ok")) or (isinstance(av_out, dict) and av_out.get("ok")):
-            res.setdefault("strength", {})
+            st = res.setdefault("strength", {})
             if isinstance(shad_out, dict) and shad_out.get("ok"):
-                res["strength"]["shadbala"] = shad_out
+                st["shadbala"] = shad_out
+                # Optionally lift common totals if core exposes them
+                if isinstance(shad_out.get("totals"), dict):
+                    st["shadbala_totals"] = shad_out["totals"]
             if isinstance(av_out, dict) and av_out.get("ok"):
-                res["strength"]["ashtakavarga"] = av_out
+                st["ashtakavarga"] = av_out
+                # Optionally flatten SAV if core exposes it nested
+                if isinstance(av_out.get("SAV"), dict):
+                    st["ashtakavarga_SAV"] = av_out["SAV"]
+
+        # Surface compact keys where clients look
+        _surface_strength_summary(res)
 
         if warns_local:
             res.setdefault("warnings", []).extend(warns_local)
@@ -1949,31 +2031,40 @@ def _maybe_attach_strengths_parashari(res: Dict[str, Any], body: Dict[str, Any],
 
 
 def _run_horary_single(method: str, body: Dict[str, Any], route_name: str):
+    tz_norm_payload = _tz_from_payload(body)
+
     # Prefer payload helper first
     if callable(_horary_from_payload):
         try:
             b = dict(body or {})
             b["method"] = method  # respect caller: "parashari" or "kp"
+            # Ensure Parāśarī defaults even in payload-helper path
+            if method == "parashari":
+                _parashari_apply_defaults_to_payload(b)
             res = _horary_from_payload(b)  # type: ignore
             if isinstance(res, dict):
                 # HORARY-ONLY CHANGE: Strength enrichment for Parāśarī
-                if method == "parashari" and isinstance(res, dict):
-                    res = _maybe_attach_strengths_parashari(res, body, _tz_from_payload(body))
+                if method == "parashari":
+                    res = _maybe_attach_strengths_parashari(res, body, tz_norm_payload)
 
                 res.setdefault("meta", {}).update({
-                    "route": route_name,                       # label correctly
-                    "tz_normalized": _tz_from_payload(body),
+                    "route": route_name,
+                    "tz_normalized": tz_norm_payload,
                     "branch": _PRED_PAYLOAD_BRANCH
                 })
                 return jsonify(res), (200 if res.get("ok") else 400)
         except Exception:
             pass
-    
+
     # Fallback to horary core
     if not _HORARY_OK or not callable(_analyze_prasna_enhanced):
         return jsonify({"ok": False, "error": "horary_engine_unavailable"}), 503
 
     hw, warns, tz_norm = _normalize_horary_payload(body)
+
+    # Apply Parāśarī defaults after normalization and before building input
+    if method == "parashari":
+        _parashari_apply_defaults_to_payload(hw)
 
     # Strict raw validation (pre-normalization guarantees)
     e = _validate_civil_raw(body, tz_norm)
@@ -2036,17 +2127,21 @@ def horary_hybrid():
                      "tz_normalized": _tz_from_payload(body)}
         }), 400
 
-    # NEW: Prefer payload helper first
+    # Prefer payload helper first
     if callable(_horary_from_payload):
         try:
             b = dict(body or {})
             b["method"] = "hybrid"
+            # Ensure Parāśarī defaults for the Parāśarī leg inside helper
+            _parashari_apply_defaults_to_payload(b)
             res = _horary_from_payload(b)  # type: ignore
             if isinstance(res, dict):
-                # HORARY-ONLY CHANGE: Strength enrichment (Parāśarī leg only)
+                # Strength enrichment (Parāśarī leg only)
                 try:
                     if isinstance(res.get("parashari"), dict):
-                        res["parashari"] = _maybe_attach_strengths_parashari(res["parashari"], body, _tz_from_payload(body))
+                        res["parashari"] = _maybe_attach_strengths_parashari(
+                            res["parashari"], body, _tz_from_payload(body)
+                        )
                 except Exception:
                     res.setdefault("warnings", []).append("strength_enrichment_error")
 
@@ -2063,6 +2158,9 @@ def horary_hybrid():
 
     hw, warns, tz_norm = _normalize_horary_payload(body)
 
+    # Apply Parāśarī defaults once (used by Parāśarī leg)
+    _parashari_apply_defaults_to_payload(hw)
+
     # Strict raw validation
     e = _validate_civil_raw(body, tz_norm)
     if e:
@@ -2074,7 +2172,6 @@ def horary_hybrid():
     try:
         inp = _HoraryInput(**hw)  # type: ignore
         res_par = _analyze_prasna_enhanced(inp, method="parashari")  # type: ignore
-        # HORARY-ONLY CHANGE: Strength enrichment for Parāśarī leg
         if isinstance(res_par, dict):
             res_par = _maybe_attach_strengths_parashari(res_par, body, tz_norm)
         res_kp  = _analyze_prasna_enhanced(inp, method="kp")         # type: ignore
@@ -2129,7 +2226,7 @@ def horary_generic():
     if method not in ("parashari", "kp", "hybrid"):
         method = "parashari"
 
-    # ENFORCE: birth details required when method=hybrid (even before payload helper)
+    # ENFORCE: birth details required when method=hybrid
     if method == "hybrid":
         ok_birth, missing = _has_birth_details(body)
         if not ok_birth:
@@ -2145,27 +2242,33 @@ def horary_generic():
             }
             return jsonify(res), 400, {"X-Deprecated-Endpoint": "/api/vedic/horary"}
 
-    # NEW: Prefer payload helper first
+    # Prefer payload helper first
     if callable(_horary_from_payload):
         try:
             b = dict(body or {})
             b["method"] = method
+            if method in ("parashari", "hybrid"):
+                _parashari_apply_defaults_to_payload(b)
             res = _horary_from_payload(b)  # type: ignore
             if isinstance(res, dict):
-                # HORARY-ONLY CHANGE: Strength enrichment for Parāśarī (single) or Parāśarī leg (hybrid)
+                # Strength enrichment for Parāśarī or Parāśarī leg
                 try:
                     if method == "parashari":
                         res = _maybe_attach_strengths_parashari(res, body, _tz_from_payload(body))
                     elif method == "hybrid" and isinstance(res.get("parashari"), dict):
-                        res["parashari"] = _maybe_attach_strengths_parashari(res["parashari"], body, _tz_from_payload(body))
+                        res["parashari"] = _maybe_attach_strengths_parashari(
+                            res["parashari"], body, _tz_from_payload(body)
+                        )
                 except Exception:
                     res.setdefault("warnings", []).append("strength_enrichment_error")
 
-                res.setdefault("meta", {}).update({"route": "horary",
-                                                   "tz_normalized": _tz_from_payload(body),
-                                                   "branch": _PRED_PAYLOAD_BRANCH,
-                                                   "deprecated": True,
-                                                   "preferred_endpoints": ["/api/vedic/horary/parashari", "/api/vedic/horary/kp", "/api/vedic/horary/hybrid"]})
+                res.setdefault("meta", {}).update({
+                    "route": "horary",
+                    "tz_normalized": _tz_from_payload(body),
+                    "branch": _PRED_PAYLOAD_BRANCH,
+                    "deprecated": True,
+                    "preferred_endpoints": ["/api/vedic/horary/parashari", "/api/vedic/horary/kp", "/api/vedic/horary/hybrid"],
+                })
                 status = 200 if res.get("ok") else 400
                 return jsonify(res), status, {"X-Deprecated-Endpoint": "/api/vedic/horary"}
         except Exception:
@@ -2176,6 +2279,8 @@ def horary_generic():
         return jsonify({"ok": False, "error": "horary_engine_unavailable"}), 503
 
     hw, warns, tz_norm = _normalize_horary_payload(body)
+    if method in ("parashari", "hybrid"):
+        _parashari_apply_defaults_to_payload(hw)
 
     # Strict raw validation
     e = _validate_civil_raw(body, tz_norm)
@@ -2191,7 +2296,6 @@ def horary_generic():
         inp = _HoraryInput(**hw)  # type: ignore
         if method == "hybrid":
             res_par = _analyze_prasna_enhanced(inp, method="parashari")  # type: ignore
-            # HORARY-ONLY CHANGE: Strength enrichment for Parāśarī leg
             if isinstance(res_par, dict):
                 res_par = _maybe_attach_strengths_parashari(res_par, body, tz_norm)
             res_kp  = _analyze_prasna_enhanced(inp, method="kp")         # type: ignore
@@ -2209,8 +2313,8 @@ def horary_generic():
                 "kp": res_kp,
                 "merged": merged,
                 "warnings": warns or [],
-                "meta": {"route": "horary", "tz_normalized": tz_norm, "branch": "horary_core", "method": "hybrid",
-                         "deprecated": True,
+                "meta": {"route": "horary", "tz_normalized": tz_norm, "branch": "horary_core",
+                         "method": "hybrid", "deprecated": True,
                          "preferred_endpoints": ["/api/vedic/horary/parashari", "/api/vedic/horary/kp", "/api/vedic/horary/hybrid"]},
             }
             status = 200 if (ok_par or ok_kp) else 400
@@ -2222,14 +2326,15 @@ def horary_generic():
         return jsonify({"ok": False, "error": "horary_failed", "detail": str(ex)}), 400, {"X-Deprecated-Endpoint": "/api/vedic/horary"}
 
     if isinstance(res, dict):
-        # HORARY-ONLY CHANGE: Strength enrichment for Parāśarī
         if method == "parashari":
             res = _maybe_attach_strengths_parashari(res, body, tz_norm)
 
         res.setdefault("meta", {})
-        res["meta"].update({"route": "horary", "tz_normalized": tz_norm, "branch": "horary_core",
-                            "method": method, "deprecated": True,
-                            "preferred_endpoints": ["/api/vedic/horary/parashari", "/api/vedic/horary/kp", "/api/vedic/horary/hybrid"]})
+        res["meta"].update({
+            "route": "horary", "tz_normalized": tz_norm, "branch": "horary_core",
+            "method": method, "deprecated": True,
+            "preferred_endpoints": ["/api/vedic/horary/parashari", "/api/vedic/horary/kp", "/api/vedic/horary/hybrid"]
+        })
         if warns:
             res.setdefault("warnings", []).extend(warns)
 
