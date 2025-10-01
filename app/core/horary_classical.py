@@ -9,12 +9,14 @@ Key points & patches
 - **No double ayanāṁśa**: relies on horary_shared.compute_houses_from_chart() behavior
   (advanced engine gets shifted if sidereal; Whole-Sign/Equal fallbacks use chart’s frame as-is).
 - **Robust houses**: tries app.core.houses_advanced with multiple JD signatures; safe fallback to Equal-from-ASC.
-- **Parāśarī**:
+- **Parāśarī (orthodox tweaks)**:
+    • Geocentric planets, Whole-Sign default when caller omits house system.
     • Rich dignity scoring via shared.calc_dignity_rich (exalt/own/mūlatrikoṇa, friend/enemy,
       sandhi, gandānta), then retro/combust tweaks and house relevance by question type.
-    • Sign-based graha-dṛṣṭi using shared.houses_aspected_by for benefic/malefic pressure.
-    • Moon proximity boost to lords of target houses; light “radicality” multiplier.
-    • Pañcāṅga snapshot (tithi index & Moon nakṣatra star-lord).
+    • Sign-based graha-dṛṣṭi using shared.houses_aspected_by with light upacaya tempering.
+    • Moon proximity boost to lords of target houses; “radicality” multiplier via shared.radicality_flags.
+    • Pañcāṅga snapshot (tithi & Moon nakṣatra star-lord).
+    • Verdict labels use “yes / no / maybe” (not “uncertain”).
 - **KP**:
     • Nakṣatra star → sub → sub-sub (SSL) via shared.kp_star_sub_sub.
     • Significator chain: planet ⇒ star-lord ⇒ sign-lord (nodes act as agents).
@@ -59,20 +61,25 @@ from .horary_shared import (
 # Local constants (kept minimal; defer to shared data where possible)
 # =============================================================================
 
-PARASHARI_PLANETS = ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn"]
-PLANETS_WITH_NODES = PARASHARI_PLANETS + ["Rahu","Ketu"]
+PARASHARI_PLANETS = ["Sun", "Moon", "Mercury", "Venus", "Mars", "Jupiter", "Saturn"]
+PLANETS_WITH_NODES = PARASHARI_PLANETS + ["Rahu", "Ketu"]
 
 # Combustion thresholds (deg from Sun) — conservative defaults
-COMBUST_DEG = {"Moon": 12.0,"Mercury": 12.0,"Venus": 10.0,"Mars": 17.0,"Jupiter": 11.0,"Saturn": 15.0}
+COMBUST_DEG = {
+    "Moon": 12.0, "Mercury": 12.0, "Venus": 10.0,
+    "Mars": 17.0, "Jupiter": 11.0, "Saturn": 15.0,
+}
 
-BENEFICS: Set[str] = {"Jupiter","Venus","Moon"}               # Mercury often neutral
-MALEFICS: Set[str] = {"Saturn","Mars","Sun","Rahu","Ketu"}    # Sun mild malefic; nodes malefic in horary
+BENEFICS: Set[str] = {"Jupiter", "Venus", "Moon"}            # Mercury often neutral
+MALEFICS: Set[str] = {"Saturn", "Mars", "Sun", "Rahu", "Ketu"}  # Sun mild malefic; nodes malefic in horary
 
 # Panchanga / Tithi labels (30)
 TITHI_NAMES = [
     "Pratipada","Dvitiya","Tritiya","Chaturthi","Panchami","Shashthi","Saptami","Ashtami","Navami","Dashami",
     "Ekadashi","Dwadashi","Trayodashi","Chaturdashi","Purnima/Amavasya",
 ]*2
+
+UPACHAYA = {3, 6, 10, 11}
 
 # =============================================================================
 # Local helpers
@@ -88,6 +95,7 @@ def _with_node_aliases(bodies_list: List[Dict[str, Any]]) -> Dict[str, Dict[str,
     if "South Node" in d and "Ketu" not in d:
         d["Ketu"] = d["South Node"]
     return d
+
 
 def _kp_signified_houses_base(planet_name: str, chart: Dict[str, Any], cusps: List[float]) -> Set[int]:
     """Occupancy + lordship of cusp signs for the given planet."""
@@ -105,6 +113,7 @@ def _kp_signified_houses_base(planet_name: str, chart: Dict[str, Any], cusps: Li
             houses.add(i)
     return houses
 
+
 def _kp_signified_houses_chain(planet_name: str, chart: Dict[str, Any], cusps: List[float]) -> Set[int]:
     """
     KP chain: planet ⇒ star-lord ⇒ sign-lord.
@@ -118,6 +127,7 @@ def _kp_signified_houses_chain(planet_name: str, chart: Dict[str, Any], cusps: L
         lon = float(p["longitude_deg"])
     except Exception:
         return set()
+
     star_lord, sub_lord, ssl, *_ = kp_star_sub_sub(lon)
     signlord = lord_of_sign(lon)
 
@@ -126,7 +136,7 @@ def _kp_signified_houses_chain(planet_name: str, chart: Dict[str, Any], cusps: L
         sig |= _kp_signified_houses_base(who, chart, cusps)
 
     # Node agent rule
-    if planet_name in {"Rahu","Ketu"}:
+    if planet_name in {"Rahu", "Ketu"}:
         sig |= _kp_signified_houses_base(star_lord, chart, cusps)
         sig |= _kp_signified_houses_base(signlord, chart, cusps)
         for other, ob in bodies.items():
@@ -137,15 +147,21 @@ def _kp_signified_houses_chain(planet_name: str, chart: Dict[str, Any], cusps: L
             except Exception:
                 continue
             # tight conj or sign opposition
-            from .horary_shared import sign_index  # already imported at top
+            from .horary_shared import sign_index  # defer import
             if angular_sep(lon, olon) <= 3.0 or (abs(sign_index(lon) - sign_index(olon)) % 12) == 6:
                 sig |= _kp_signified_houses_base(other, chart, cusps)
     return sig
 
-def _kp_cusp_sub_lord_eval(cusp_house: int, chart: Dict[str, Any], cusps: List[float],
-                           positive: Set[int], negative: Set[int]) -> Tuple[bool, Set[int], str, Optional[str]]:
+
+def _kp_cusp_sub_lord_eval(
+    cusp_house: int,
+    chart: Dict[str, Any],
+    cusps: List[float],
+    positive: Set[int],
+    negative: Set[int],
+) -> Tuple[bool, Set[int], str, Optional[str]]:
     """Evaluate a cusp by its sub-lord; if borderline, peek at SSL for tie-break."""
-    cusp_deg = cusps[cusp_house-1]
+    cusp_deg = cusps[cusp_house - 1]
     star_lord, sub_lord, ssl, star_deg, pos_in_star, sub_span, pos_in_sub = kp_star_sub_sub(cusp_deg)
     sig = _kp_signified_houses_chain(sub_lord, chart, cusps)
     good = (len(sig & positive) > 0) and (len(sig & negative) == 0)
@@ -156,16 +172,18 @@ def _kp_cusp_sub_lord_eval(cusp_house: int, chart: Dict[str, Any], cusps: List[f
     chosen_ssl = ssl if (not good and ssl_good) else None
     return (good or ssl_good), (sig if good else (ssl_sig if ssl_good else sig)), reason, chosen_ssl
 
+
 def _ruling_planets(chart: Dict[str, Any], tz_name: str, date: str, time_: str) -> Set[str]:
     """KP Ruling Planets: day-lord, Moon sign-lord, Moon star-lord, ASC sign-lord, ASC star-lord."""
     bodies = _with_node_aliases(chart.get("bodies", []))
+
     # Day-lord
     try:
         from zoneinfo import ZoneInfo
         dt_local = datetime.fromisoformat(f"{date}T{time_}").replace(tzinfo=ZoneInfo(tz_name))
     except Exception:
         dt_local = datetime.fromisoformat(f"{date}T{time_}").replace(tzinfo=timezone.utc)
-    WEEK_TO_LORD = ["Moon","Mars","Mercury","Jupiter","Venus","Saturn","Sun"]
+    WEEK_TO_LORD = ["Moon", "Mars", "Mercury", "Jupiter", "Venus", "Saturn", "Sun"]
     daylord = WEEK_TO_LORD[dt_local.weekday()]
 
     # Moon sign/star
@@ -199,6 +217,7 @@ def _house_relevance_by_question(h: int, qtype: Optional[QuestionType]) -> float
     if h in m.get("supportive", []): return 0.6
     if h in m.get("obstructive", []):return 0.2
     return 0.4
+
 
 def _parashari_strengths(chart: Dict[str, Any], cusps: List[float],
                          question_type: Optional[QuestionType]) -> List[Dict[str, Any]]:
@@ -247,25 +266,26 @@ def _parashari_strengths(chart: Dict[str, Any], cusps: List[float],
     return out
 
 # =============================================================================
-# Parāśarī entrypoint (CORRECTED)
+# Parāśarī entrypoint (orthodox adjustments)
 # =============================================================================
 
 def analyze_parashari(inp: HoraryInput) -> Dict[str, Any]:
     """
     Parāśarī-style reading of the question chart with:
+      - Geocentric planets, Whole-Sign default (if caller omitted house system)
       - Rich dignity scoring
-      - House LORDSHIP evaluation (PRIMARY FIX)
+      - House LORDSHIP evaluation (primary focus)
       - House-based relevance for the asked topic
-      - Benefic/malefic drishti pressure
+      - Benefic/malefic drishti pressure (tempered in upacaya)
       - Moon proximity & radicality penalties
       - Karaka (natural significator) evaluation
-      - Panchanga snapshot
+      - Pañcanga snapshot
     """
-    # Build question chart (tropical/sidereal per inp)
+    # Build question chart — orthodox Parāśarī prefers geocentric planets
     chart = build_chart(
         date=inp.date, time=inp.time, tz=inp.tz_name,
         place=inp.place, latitude=inp.latitude, longitude=inp.longitude,
-        zodiac_mode=inp.zodiac_mode, ayanamsa=inp.ayanamsa, topocentric=True
+        zodiac_mode=inp.zodiac_mode, ayanamsa=inp.ayanamsa, topocentric=False
     )
 
     meta = chart.get("meta", {}) or {}
@@ -275,10 +295,11 @@ def analyze_parashari(inp: HoraryInput) -> Dict[str, Any]:
     la = float(observer.get("latitude", inp.latitude or 0.0))
     lo = float(observer.get("longitude", inp.longitude or 0.0))
 
-    # Houses/cusps (uses shared semantics; no double shift)
+    # Houses/cusps (uses shared semantics; no double shift). Default Whole-Sign if unspecified.
+    effective_house_system = (inp.house_system or "whole_sign")
     houses = compute_houses_from_chart(
         chart, latitude=la, longitude=lo,
-        house_system=inp.house_system,
+        house_system=effective_house_system,
         zodiac_mode=inp.zodiac_mode,
         ayanamsa_deg=ay_deg
     )
@@ -303,10 +324,10 @@ def analyze_parashari(inp: HoraryInput) -> Dict[str, Any]:
     target_pos = set(primary + secondary + supportive)
     target_neg = set(obstructive)
 
-    # === CORRECTED SCORING ===
+    # === Scoring ===
     primary_score = secondary_score = obstruction_score = 0.0
 
-    # 1. Score HOUSE LORDS first (primary significators)
+    # 1) Lords of primary/secondary houses: primary significators
     for h in primary:
         lord = house_lords.get(h)
         if lord:
@@ -321,7 +342,7 @@ def analyze_parashari(inp: HoraryInput) -> Dict[str, Any]:
             if lord_data:
                 secondary_score += lord_data["overall_strength"] * 2.5
 
-    # 2. Then score planets by house POSITION (lighter weight)
+    # 2) Planets by house POSITION (lighter weight)
     for s in strengths:
         if s["house"] in primary:
             primary_score += s["overall_strength"] * 1.5
@@ -332,33 +353,42 @@ def analyze_parashari(inp: HoraryInput) -> Dict[str, Any]:
         elif s["house"] in obstructive:
             obstruction_score += s["overall_strength"] * 2.0
 
-    # 3. Karaka (natural significator) evaluation
+    # 3) Karaka (natural significators)
     karaka_bonus = 0.0
-    karakas = mapping.get("karaka", [])
-    for k in karakas:
+    for k in mapping.get("karaka", []):
         k_data = next((s for s in strengths if s["planet"] == k), None)
         if k_data:
             if k_data["overall_strength"] > 0.65:
                 karaka_bonus += 0.4
             elif k_data["overall_strength"] < 0.35:
-                karaka_bonus -= 0.3  # Weak karaka is negative
+                karaka_bonus -= 0.3
 
-    # 4. Drishti pressure (sign-based via shared houses_aspected_by)
+    # 4) Drishti pressure (sign-based via shared.houses_aspected_by) with upacaya tempering
     drishti_bonus = drishti_malus = 0.0
     for nm in bodies:
         if nm not in PLANETS_WITH_NODES:
             continue
         tgt = houses_aspected_by(nm, cusps, bodies)
+        if not tgt:
+            continue
         hits_pos = len(tgt & target_pos)
         hits_neg = len(tgt & target_neg)
+        upa_hits_pos = len((tgt & target_pos) & UPACHAYA)
+
         if nm in BENEFICS:
+            # Benefic aspecting positive targets is good; aspecting obstructive houses slightly dampens
             drishti_bonus += 0.15 * hits_pos
             drishti_malus += 0.10 * hits_neg
         else:
-            drishti_malus += 0.20 * hits_pos
+            # Malefic aspecting positive targets is harmful, but upacaya softens the blow
+            # Reduce malus by ~50% for hits that land in upacaya houses; give a tiny adaptive bonus
+            harmful = max(0, hits_pos - 0.5 * upa_hits_pos)
+            drishti_malus += 0.20 * harmful
+            drishti_bonus += 0.03 * upa_hits_pos  # growth-through-challenge flavor
+            # Malefic hitting obstructive houses helps a little
             drishti_bonus += 0.05 * hits_neg
 
-    # 5. Moon proximity bonus to lords of target houses
+    # 5) Moon proximity bonus to lords of target houses
     prox_bonus = 0.0
     if moon_lon is not None:
         for pl in {house_lords.get(h) for h in (primary + secondary)}:
@@ -369,12 +399,11 @@ def analyze_parashari(inp: HoraryInput) -> Dict[str, Any]:
                 except Exception:
                     pass
 
-    # 6. Radicality check WITH PENALTIES for chart defects
+    # 6) Radicality (planetary hour/day & chart-condition flags) + penalties
     date = inp.date or datetime.now(timezone.utc).date().isoformat()
     time_ = inp.time or datetime.now(timezone.utc).time().replace(microsecond=0).isoformat()
     rad = radicality_flags(chart, inp.tz_name or "UTC", date, time_)
-    
-    # Check for chart defects
+
     penalties = 0
     # Saturn in 1st house
     if any(s["planet"] == "Saturn" and s["house"] == 1 for s in strengths):
@@ -407,7 +436,7 @@ def analyze_parashari(inp: HoraryInput) -> Dict[str, Any]:
     elif net_score < -1.25:
         answer, conf = "no",  min(0.96, 0.74 + 0.06 * abs(net_score))
     else:
-        answer, conf = "uncertain", 0.62
+        answer, conf = "maybe", 0.62
 
     return {
         "ok": True,
@@ -417,16 +446,16 @@ def analyze_parashari(inp: HoraryInput) -> Dict[str, Any]:
             "zodiac_mode": inp.zodiac_mode,
             "ayanamsa": inp.ayanamsa,
             "ayanamsa_deg_used": ay_deg,
-            "house_system": inp.house_system,
+            "house_system": effective_house_system,
             "route": "horary/parashari",
-            "branch": "predictive.payload",
+            "branch": "horary_core",
             "tz_normalized": inp.tz_name or "UTC",
-            "analysis_time": datetime.now(timezone.utc).isoformat()
+            "analysis_time": datetime.now(timezone.utc).isoformat(),
         },
         "panchanga": {
             "tithi_index": t_idx,
             "tithi_label": (TITHI_NAMES[t_idx] if t_idx is not None else None),
-            "moon_star": moon_star_label
+            "moon_star": moon_star_label,
         },
         "chart_data": {
             "ASC_deg": asc_deg,
@@ -434,7 +463,7 @@ def analyze_parashari(inp: HoraryInput) -> Dict[str, Any]:
             "Moon_deg": moon_lon,
             "Moon_sign": (sign_name_from_deg(float(moon_lon)) if moon_lon is not None else None),
             "cusps_deg": cusps,
-            "house_lords": house_lords
+            "house_lords": house_lords,
         },
         "planetary_analysis": strengths,
         "scoring_breakdown": {
@@ -447,10 +476,11 @@ def analyze_parashari(inp: HoraryInput) -> Dict[str, Any]:
             "drishti_malus": round(drishti_malus, 3),
             "radicality_multiplier": rad_mult,
             "radicality_penalties": penalties,
-            "net_score": round(net_score, 3)
+            "net_score": round(net_score, 3),
         },
-        "judgement": {"answer": answer, "confidence": round(conf, 3)}
+        "judgement": {"answer": answer, "confidence": round(conf, 3)},
     }
+
 # =============================================================================
 # KP entrypoint
 # =============================================================================
@@ -464,7 +494,7 @@ def analyze_kp(inp: HoraryInput) -> Dict[str, Any]:
     """
     kp_aya = inp.kp_ayanamsa if inp.kp_ayanamsa is not None else "krishnamurti"
 
-    # Chart (SIDEREAL) with KP ayanamsa
+    # Chart (SIDEREAL) with KP ayanamsa; KP commonly uses Placidus & topocentric in practice
     chart = build_chart(
         date=inp.date, time=inp.time, tz=inp.tz_name,
         place=inp.place, latitude=inp.latitude, longitude=inp.longitude,
@@ -485,11 +515,9 @@ def analyze_kp(inp: HoraryInput) -> Dict[str, Any]:
     cusps = list(houses.get("cusps_deg", []) or [])
     asc_deg_sid = float(houses.get("asc_deg") or safe_get_asc(chart) or 0.0)
 
-
     # KP number anchoring (rotate cusps so ASC equals number-derived degree)
     if inp.kp_number and (inp.kp_number_mode or "anchor_asc").lower() == "anchor_asc":
         target = (max(1, min(249, int(inp.kp_number))) - 1) * (360.0 / 249.0)
-        # rotate all cusps so that asc becomes target
         delta = deg_wrap(target - asc_deg_sid)
         cusps = [deg_wrap(c + delta) for c in cusps]
         asc_deg_sid = target
@@ -520,14 +548,14 @@ def analyze_kp(inp: HoraryInput) -> Dict[str, Any]:
 
     # Verdict
     if yes_hits > no_hits:
-        base_conf = 0.70 + 0.05*(yes_hits - no_hits)
+        base_conf = 0.70 + 0.05 * (yes_hits - no_hits)
         base_ans = "yes"
     elif no_hits > yes_hits:
-        base_conf = 0.70 + 0.05*(no_hits - yes_hits)
+        base_conf = 0.70 + 0.05 * (no_hits - yes_hits)
         base_ans = "no"
     else:
         base_conf = 0.62
-        base_ans = "uncertain"
+        base_ans = "maybe"
 
     conf = min(0.97, base_conf + min(0.06, 0.02 * rp_support))
 
@@ -581,7 +609,10 @@ def analyze_kp(inp: HoraryInput) -> Dict[str, Any]:
             "house_system": inp.kp_house_system,
             "kp_number": inp.kp_number,
             "kp_number_mode": inp.kp_number_mode,
-            "analysis_time": datetime.now(timezone.utc).isoformat()
+            "analysis_time": datetime.now(timezone.utc).isoformat(),
+            "route": "horary/kp",
+            "branch": "horary_core",
+            "tz_normalized": inp.tz_name or "UTC",
         },
         "kp_core": {
             "ASC_deg_sid": asc_deg_sid,
@@ -591,7 +622,11 @@ def analyze_kp(inp: HoraryInput) -> Dict[str, Any]:
         "cusp_analysis": detailed_cusps,
         "planetary_kp": planetary_kp,
         "signification_evidence": evidence,
-        "judgement": {"answer": base_ans, "confidence": round(conf, 3), "method": "KP cusp sub-lords (+SSL & RP bias)"}
+        "judgement": {
+            "answer": base_ans,
+            "confidence": round(conf, 3),
+            "method": "KP cusp sub-lords (+SSL & RP bias)",
+        },
     }
 
 # =============================================================================
@@ -611,6 +646,7 @@ def analyze_prasna(inp: HoraryInput, method: str = "parashari") -> Dict[str, Any
     except Exception as e:
         return {"ok": False, "system": method, "error": str(e), "error_type": type(e).__name__}
 
+
 def analyze_prasna_enhanced(inp: HoraryInput, method: str = "parashari"):
     """
     Thin wrapper so routes can import analyze_prasna_enhanced().
@@ -620,6 +656,7 @@ def analyze_prasna_enhanced(inp: HoraryInput, method: str = "parashari"):
     if isinstance(res, dict):
         res.setdefault("method", (method or "").lower())
     return res
+
 
 __all__ = [
     "HoraryInput", "QuestionType", "ENHANCED_QUESTION_HOUSES",
